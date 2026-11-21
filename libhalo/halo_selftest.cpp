@@ -8052,6 +8052,8 @@ void conv1d_cases(const Plugin& pl) {
                         C{ 6, 3, 2, 1, 1, 0, 1 }, C{ 16, 32, 4, 1, 1, 0, 2 },
                         C{ 16, 128, 16, 1, 1, 1, 8 }, C{ 6, 3, 8, 1, 1, 1, 4 },
                         C{ 16, 32, 2, 1, 1, 0, 2 }, C{ 16, 64, 4, 1, 1, 1, 2, 8 },
+                        /* the Haru codec's heavy convolutions, at their real widths */
+                        C{ 1024, 2048, 16, 1, 1, 0, 8 }, C{ 2048, 64, 7, 1, 1, 0, 1 },
                         C{ 6, 3, 8, 1, 1, 0, 4, 8 } }) {
         /* Bounds of whole strides: 13 and 30 rounded up to the stride; the op reads them times
          * cu_div. */
@@ -8193,6 +8195,7 @@ void conv_t1d_cases(const Plugin& pl) {
     struct C { int64_t cin, cout, s, k, pad; };   /* pad -1: absent */
     for (const C& c : { C{ 16, 32, 2, 4, -1 }, C{ 16, 32, 8, 16, -1 }, C{ 16, 32, 5, 10, 0 },
                         C{ 16, 128, 3, 6, 0 }, C{ 16, 32, 2, 2, 0 }, C{ 16, 32, 2, 2, -1 },
+                        C{ 2048, 1024, 8, 16, -1 },
                         C{ 16, 32, 4, 8, 1 } }) {
         const std::vector<int32_t> cu = { 0, 5, 12 };
         const int64_t R = 12, O = R * c.s;

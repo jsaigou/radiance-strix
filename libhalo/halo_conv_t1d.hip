@@ -196,6 +196,125 @@ inline int c1_st_of(hipError_t e) { return e == hipSuccess ? RAD_OK : HALO_NO(RA
 inline bool c1_is_bf16(const RadTensor* t) { return t && t->dtype == RAD_BF16; }
 inline bool c1_is_i32(const RadTensor* t) { return t && t->dtype == RAD_I32; }
 
+typedef __bf16 c1_bf162 __attribute__((ext_vector_type(2)));
+
+// ---------------------------------------------------------------------------- conv_t1d small-row
+// The decoder's transposed convolution is a few input rows against a large weight; the tiled kernel
+// above stages the weight to LDS through 128 rows of x. This path is the m16 matrix-vector product
+// per phase (blockIdx.z): a wave an output channel, K = taps * cin split SK ways and reduced in LDS
+// in split order, the weight streamed coalesced once. Bias only -- the transposed conv has no
+// residual or activation. MT is M rounded up to 1, 2, 4, 8 or 16; rows past M are computed on row
+// M-1 and dropped.
+template <int MT>
+__global__ __launch_bounds__(1024) void conv_t1d_small_kernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+    const uint16_t* __restrict__ bias, const int* __restrict__ cu, uint16_t* __restrict__ y,
+    int n_seq, int rx, int cin, int cout, int s, int P, int taps, int x_ld, int y_ld, int M,
+    int K, int WV, int SK) {
+    extern __shared__ float red[];
+    constexpr int WAVE = 32, VEC = 8;
+    const int tid = threadIdx.x, wave = tid / WAVE, lane = tid % WAVE;
+    const int col_local = wave / SK, ksplit = wave % SK;
+    const int j = blockIdx.x * WV + col_local;
+    const int ph = blockIdx.z, qoff = ph < P ? 1 : 0;
+    const int Ks = K / SK, kbase = ksplit * Ks;
+    const uint16_t* wph = w + (size_t)ph * cout * K;
+
+    int s0[MT], len[MT];
+#pragma unroll
+    for (int i = 0; i < MT; ++i) {
+        const int r = i < M ? i : M - 1;
+        const int sq = seq_of(cu, n_seq, r);
+        s0[i] = cu[sq];
+        len[i] = cu[sq + 1] - cu[sq];
+    }
+
+    float acc[MT];
+#pragma unroll
+    for (int i = 0; i < MT; ++i) acc[i] = 0.f;
+
+    if (j < cout) {
+        const uint16_t* Wj = wph + (size_t)j * K + kbase + lane * VEC;
+        const int niter = Ks / (WAVE * VEC);
+        const int rem = Ks - niter * (WAVE * VEC);
+        const bool has_tail = rem > 0 && lane < rem / VEC;
+        halo_u32x4 wbuf[8];
+#pragma unroll
+        for (int t = 0; t < 8; ++t)
+            if (t < niter) wbuf[t] = *(const halo_u32x4*)(Wj + t * WAVE * VEC);
+        halo_u32x4 wtail;
+        if (has_tail) wtail = *(const halo_u32x4*)(Wj + niter * WAVE * VEC);
+
+        const halo_u32x4 zero = { 0u, 0u, 0u, 0u };
+        for (int t = 0; t < niter; ++t) {
+            const c1_bf162* wp = (const c1_bf162*)&wbuf[t];
+            const int kk = kbase + lane * VEC + t * WAVE * VEC;
+            const int tap = kk / cin, ci = kk % cin;
+#pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                const int r = i < M ? i : M - 1;
+                const int qi = (r - s0[i]) + qoff - tap;
+                const bool live = qi >= 0 && qi < len[i];
+                const int irow = s0[i] + qi;
+                const int irc = irow < 0 ? 0 : (irow >= rx ? rx - 1 : irow);
+                const halo_u32x4 av =
+                    live ? *(const halo_u32x4*)(x + (size_t)irc * x_ld + ci) : zero;
+                const c1_bf162* ap = (const c1_bf162*)&av;
+#pragma unroll
+                for (int p = 0; p < VEC / 2; ++p)
+                    acc[i] = __builtin_amdgcn_fdot2_f32_bf16(ap[p], wp[p], acc[i], false);
+            }
+        }
+        if (has_tail) {
+            const c1_bf162* wp = (const c1_bf162*)&wtail;
+            const int kk = kbase + lane * VEC + niter * WAVE * VEC;
+            const int tap = kk / cin, ci = kk % cin;
+#pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                const int r = i < M ? i : M - 1;
+                const int qi = (r - s0[i]) + qoff - tap;
+                const bool live = qi >= 0 && qi < len[i];
+                const int irow = s0[i] + qi;
+                const int irc = irow < 0 ? 0 : (irow >= rx ? rx - 1 : irow);
+                const halo_u32x4 av =
+                    live ? *(const halo_u32x4*)(x + (size_t)irc * x_ld + ci) : zero;
+                const c1_bf162* ap = (const c1_bf162*)&av;
+#pragma unroll
+                for (int p = 0; p < VEC / 2; ++p)
+                    acc[i] = __builtin_amdgcn_fdot2_f32_bf16(ap[p], wp[p], acc[i], false);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < MT; ++i) {
+            float v = acc[i];
+            for (int off = WAVE / 2; off > 0; off >>= 1) v += __shfl_xor(v, off);
+            if (lane == 0) red[(col_local * SK + ksplit) * MT + i] = v;
+        }
+    }
+    __syncthreads();
+    if (ksplit == 0 && j < cout && lane < M) {
+        float v = 0.f;
+        for (int s = 0; s < SK; ++s) v += red[(col_local * SK + s) * MT + lane];
+        v += bf2f(bias[j]);
+        const int sq = seq_of(cu, n_seq, lane);
+        const int q = lane - cu[sq] + qoff;
+        const int orow = cu[sq] * s + q * s + ph - P;
+        y[(size_t)orow * y_ld + j] = f32_to_bf16(v);
+    }
+}
+
+inline int conv_t1d_small_mt(int M) {
+    if (M <= 1) return 1;
+    if (M <= 2) return 2;
+    if (M <= 4) return 4;
+    if (M <= 8) return 8;
+    return 16;
+}
+inline bool conv_t1d_small_legal(int K, int WV, int SK) {
+    return SK >= 1 && WV >= 1 && WV * SK * 32 <= 1024 && K % SK == 0 && ((K / SK) % 8) == 0 &&
+           (K / SK) / (32 * 8) <= 8;
+}
+
 }  // namespace
 
 // ============================================================== the plugin ABI entry point
@@ -224,6 +343,38 @@ extern "C" int halo_rad_conv_t1d(const RadArgs* a, RadStream s) {
     if (n_seq <= 0 || rx <= 0 || ry < rx * st || halo_numel(w) < cin * cout * kw ||
         halo_numel(b) < cout)
         return HALO_NO(RAD_E_SHAPE);
+    /* Small-row path: the decoder's few input rows against a large weight, streamed
+     * coalesced once (the m16 pattern); the tiled kernel below stages the weight through
+     * 128 rows of x. */
+    const long long Kll = (long long)taps * cin;
+    if (Kll <= (1ll << 30) && rx >= 1 && rx <= 16) {
+        const int K = (int)Kll;
+        const int wv = 1, mt = conv_t1d_small_mt((int)rx);
+        int sk = 0;
+        static const int ladder[] = { 1, 2, 4, 5, 8, 10, 16, 20, 32 };
+        for (int cand : ladder)
+            if (conv_t1d_small_legal(K, wv, cand)) { sk = cand; if ((long long)cout * cand >= 1280) break; }
+        if (sk) {
+            const dim3 grid((unsigned)((cout + wv - 1) / wv), 1, (unsigned)st),
+                       block((unsigned)(wv * sk * 32));
+            const size_t smem = (size_t)wv * sk * mt * sizeof(float);
+#define C1TS(MT)                                                                                  \
+            hipLaunchKernelGGL((conv_t1d_small_kernel<MT>), grid, block, smem, (hipStream_t)s,     \
+                               (const uint16_t*)x->data, (const uint16_t*)w->data,                \
+                               (const uint16_t*)b->data, (const int*)cu->data, (uint16_t*)y->data,\
+                               (int)n_seq, (int)rx, (int)cin, (int)cout, (int)st, (int)P, taps,   \
+                               (int)xl, (int)yl, (int)rx, K, wv, sk)
+            switch (mt) {
+                case 1: C1TS(1); break;
+                case 2: C1TS(2); break;
+                case 4: C1TS(4); break;
+                case 8: C1TS(8); break;
+                default: C1TS(16); break;
+            }
+#undef C1TS
+            return c1_st_of(hipGetLastError());
+        }
+    }
     if (cout >= 128) {
         constexpr int TP = 4, TC = 2, BP = 128, BC = 128;
         hipLaunchKernelGGL((conv_t1d_kernel<TP, TC>),

@@ -111,6 +111,124 @@ __global__ __launch_bounds__(kT) void conv1d_direct_kernel(
     y[(size_t)row * y_ld + co] = f32_to_bf16(acc);
 }
 
+// ---------------------------------------------------------------------------- conv1d small-row
+// A call with few rows (one audio frame) streams the whole weight once per row through the direct
+// kernel above, one element a thread, at tens of GB/s. This path treats it as the m16 GEMM's
+// matrix-vector product: a wave an output column, K = k * cin split SK ways and reduced in LDS in
+// split order, a lane holding eight contiguous K and dotting with v_dot2_f32_bf16, the weight
+// loaded up front so its latency hides under the dots. The weight is streamed coalesced, at the
+// 200+ GB/s the skinny GEMM reaches. MT is M rounded up to 1, 2, 4, 8 or 16; rows past M are
+// computed on row M-1 and dropped. Bias, residual and activation follow the direct kernel exactly.
+#if defined(__HIP__)
+typedef __bf16 c1_bf162 __attribute__((ext_vector_type(2)));
+
+template <int MT>
+__global__ __launch_bounds__(1024) void conv1d_small_kernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+    const uint16_t* __restrict__ bias, const uint16_t* __restrict__ res,
+    const int* __restrict__ cu, uint16_t* __restrict__ y, int n_seq, int rx, int cin, int cout,
+    int k, int dil, int pad, int stride, int cdiv, int x_ld, int y_ld, int res_ld, int act,
+    int M, int K, int WV, int SK) {
+    extern __shared__ float red[];
+    constexpr int WAVE = 32, VEC = 8;
+    const int tid = threadIdx.x, wave = tid / WAVE, lane = tid % WAVE;
+    const int col_local = wave / SK, ksplit = wave % SK;
+    const int j = blockIdx.x * WV + col_local;
+    const int Ks = K / SK, kbase = ksplit * Ks;
+
+    int s0[MT], s1[MT];
+#pragma unroll
+    for (int i = 0; i < MT; ++i) {
+        const int r = i < M ? i : M - 1;
+        const int sq = seq_of(cu, n_seq, r * stride * cdiv);
+        s0[i] = cu[sq] / cdiv;
+        s1[i] = cu[sq + 1] / cdiv;
+    }
+
+    float acc[MT];
+#pragma unroll
+    for (int i = 0; i < MT; ++i) acc[i] = 0.f;
+
+    if (j < cout) {
+        const uint16_t* Wj = w + (size_t)j * K + kbase + lane * VEC;
+        const int niter = Ks / (WAVE * VEC);
+        const int rem = Ks - niter * (WAVE * VEC);
+        const bool has_tail = rem > 0 && lane < rem / VEC;
+        halo_u32x4 wbuf[8];
+#pragma unroll
+        for (int t = 0; t < 8; ++t)
+            if (t < niter) wbuf[t] = *(const halo_u32x4*)(Wj + t * WAVE * VEC);
+        halo_u32x4 wtail;
+        if (has_tail) wtail = *(const halo_u32x4*)(Wj + niter * WAVE * VEC);
+
+        const halo_u32x4 zero = { 0u, 0u, 0u, 0u };
+        for (int t = 0; t < niter; ++t) {
+            const c1_bf162* wp = (const c1_bf162*)&wbuf[t];
+            const int kk = kbase + lane * VEC + t * WAVE * VEC;
+            const int tap = kk / cin, ci = kk % cin;
+#pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                const int r = i < M ? i : M - 1;
+                const int ir = r * stride + tap * dil - pad;
+                const bool live = ir >= s0[i] && ir < s1[i];
+                const int irc = ir < 0 ? 0 : (ir >= rx ? rx - 1 : ir);
+                const halo_u32x4 av =
+                    live ? *(const halo_u32x4*)(x + (size_t)irc * x_ld + ci) : zero;
+                const c1_bf162* ap = (const c1_bf162*)&av;
+#pragma unroll
+                for (int p = 0; p < VEC / 2; ++p)
+                    acc[i] = __builtin_amdgcn_fdot2_f32_bf16(ap[p], wp[p], acc[i], false);
+            }
+        }
+        if (has_tail) {
+            const c1_bf162* wp = (const c1_bf162*)&wtail;
+            const int kk = kbase + lane * VEC + niter * WAVE * VEC;
+            const int tap = kk / cin, ci = kk % cin;
+#pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                const int r = i < M ? i : M - 1;
+                const int ir = r * stride + tap * dil - pad;
+                const bool live = ir >= s0[i] && ir < s1[i];
+                const int irc = ir < 0 ? 0 : (ir >= rx ? rx - 1 : ir);
+                const halo_u32x4 av =
+                    live ? *(const halo_u32x4*)(x + (size_t)irc * x_ld + ci) : zero;
+                const c1_bf162* ap = (const c1_bf162*)&av;
+#pragma unroll
+                for (int p = 0; p < VEC / 2; ++p)
+                    acc[i] = __builtin_amdgcn_fdot2_f32_bf16(ap[p], wp[p], acc[i], false);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < MT; ++i) {
+            float v = acc[i];
+            for (int off = WAVE / 2; off > 0; off >>= 1) v += __shfl_xor(v, off);
+            if (lane == 0) red[(col_local * SK + ksplit) * MT + i] = v;
+        }
+    }
+    __syncthreads();
+    if (ksplit == 0 && j < cout && lane < M) {
+        float v = 0.f;
+        for (int s = 0; s < SK; ++s) v += red[(col_local * SK + s) * MT + lane];
+        if (bias) v += bf2f(bias[j]);
+        if (res) v += bf2f(res[(size_t)lane * res_ld + j]);
+        v = conv_act(v, act);
+        y[(size_t)lane * y_ld + j] = f32_to_bf16(v);
+    }
+}
+
+inline int conv1d_small_mt(int M) {
+    if (M <= 1) return 1;
+    if (M <= 2) return 2;
+    if (M <= 4) return 4;
+    if (M <= 8) return 8;
+    return 16;
+}
+inline bool conv1d_small_legal(int K, int WV, int SK) {
+    return SK >= 1 && WV >= 1 && WV * SK * 32 <= 1024 && K % SK == 0 && ((K / SK) % 8) == 0 &&
+           (K / SK) / (32 * 8) <= 8;
+}
+#endif
+
 // ---------------------------------------------------------------------------- conv_t1d
 // The transposed convolution of kernel `taps` s (two taps or one), stride s, padding P
 // ((k - s) / 2, or 0 for the causal form) as s convolutions of `taps` taps, one a grid slice
@@ -1002,6 +1120,40 @@ extern "C" int halo_rad_conv1d(const RadArgs* a, RadStream s) {
                                  * gfx1201 WMMA body and is not ported yet. */
     const uint16_t* rp = res ? (const uint16_t*)res->data : nullptr;
     (void)tiled;
+#if defined(__HIP__)
+    /* Small-row path: a wave an output column, the weight streamed coalesced once (the m16
+     * pattern), for the codec's few-row calls; the direct kernel below streams it one element
+     * a thread, tens of GB/s at those heights. */
+    const long long Kll = k * cin;
+    if (Kll <= (1ll << 30) && ry >= 1 && ry <= 16 && (cin % 8) == 0 && (xl % 8) == 0 &&
+        ((uintptr_t)x->data & 15) == 0 && ((uintptr_t)w->data & 15) == 0) {
+        const int K = (int)Kll;
+        const int wv = 1, mt = conv1d_small_mt((int)ry);
+        int sk = 0;
+        static const int ladder[] = { 1, 2, 4, 5, 8, 10, 16, 20, 32 };
+        for (int cand : ladder)
+            if (conv1d_small_legal(K, wv, cand)) { sk = cand; if ((long long)cout * cand >= 1280) break; }
+        if (sk) {
+            const dim3 grid((unsigned)((cout + wv - 1) / wv)), block((unsigned)(wv * sk * 32));
+            const size_t smem = (size_t)wv * sk * mt * sizeof(float);
+#define C1S(MT)                                                                                  \
+            hipLaunchKernelGGL((conv1d_small_kernel<MT>), grid, block, smem, (hipStream_t)s,      \
+                               (const uint16_t*)x->data, (const uint16_t*)w->data, bp, rp,       \
+                               (const int*)cu->data, (uint16_t*)y->data, (int)n_seq, (int)rx,    \
+                               (int)cin, (int)cout, (int)k, (int)dil, pad, (int)st, (int)cdiv,   \
+                               (int)xl, (int)yl, (int)rl, act, (int)ry, K, wv, sk)
+            switch (mt) {
+                case 1: C1S(1); break;
+                case 2: C1S(2); break;
+                case 4: C1S(4); break;
+                case 8: C1S(8); break;
+                default: C1S(16); break;
+            }
+#undef C1S
+            return st_of(hipGetLastError());
+        }
+    }
+#endif
     hipLaunchKernelGGL(conv1d_direct_kernel, dim3(blocks_for(ry * cout)), dim3(kT), 0,
                        (hipStream_t)s, (const uint16_t*)x->data, (const uint16_t*)w->data,
                        bp, rp, (const int*)cu->data, (uint16_t*)y->data,
