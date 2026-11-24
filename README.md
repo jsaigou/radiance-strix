@@ -19,8 +19,8 @@
 >
 > | | |
 > |---|---|
-> | `main` branch | an exact mirror of the original (no changes), with all release tags |
-> | `unofficial-fixes` branch (default) | the original at commit `451b136` plus everything below, this banner, and notes under [`fork-notes/`](fork-notes/) |
+> | `upstream` branch | an exact copy of the original's `main` at commit `451b136` (2026-11-05), never committed to and **not kept current** (the original has moved on); tagged `upstream-451b136`. It was called `main` until 2026-11-24 |
+> | `main` branch (default) | the original at commit `451b136` plus everything below, this banner, and notes under [`fork-notes/`](fork-notes/). It was called `unofficial-fixes` until 2026-11-24; old links redirect |
 > | Fix 1 | MTP speculation depth 3 aborted with "scratch buffer absent or too small" on Strix Halo (`libhalo/halo_attn_decode_h256_gqa6.hip`) |
 > | Fix 2 | `libhalo` prefill split-KV merge overwrote decode rows in mixed steps (silent corruption under concurrency) |
 > | Kernels and formats | 3-bit experts, IQ3_XXS / IQ2_S / IQ4_NL / IQ4_XS / Q5_0 / Q2_0 expert GEMMs, Q8_0 and Q6_K dense, a faster MoE decode kernel: [`docs/FORK-KERNELS.md`](docs/FORK-KERNELS.md) |

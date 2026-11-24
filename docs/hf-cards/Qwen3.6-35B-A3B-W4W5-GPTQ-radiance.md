@@ -72,8 +72,8 @@ mapped to the nearest formats the engine serves fast), with credit to Unsloth ([
 
 Rounding: GPTQ (Hessian-weighted, with error compensation), calibrated on Project Gutenberg prose plus Radiance source text; the evaluation text was disjoint from the calibration text. Built from `data/recipes/q36-w4w5-gptq.recipe` in the fork. The embedded recipe's calibration path was replaced with a neutral placeholder (`/calibration/hessians`); the weights and every other byte are unchanged, and the scrubbed file produced identical output to the original on our test prompts.
 
-Tooling, recipes and the measurements behind this card are public in the fork: [`docs/RAD-FILES.md`](https://github.com/jsaigou/radiance-strix/blob/unofficial-fixes/docs/RAD-FILES.md) and
-[`docs/FORK-KERNELS.md`](https://github.com/jsaigou/radiance-strix/blob/unofficial-fixes/docs/FORK-KERNELS.md).
+Tooling, recipes and the measurements behind this card are public in the fork: [`docs/RAD-FILES.md`](https://github.com/jsaigou/radiance-strix/blob/main/docs/RAD-FILES.md) and
+[`docs/FORK-KERNELS.md`](https://github.com/jsaigou/radiance-strix/blob/main/docs/FORK-KERNELS.md).
 
 ## Quality (measured by us, on our own sets)
 

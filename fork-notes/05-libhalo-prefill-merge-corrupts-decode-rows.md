@@ -1,6 +1,6 @@
 # libhalo: the prefill split-KV merge overwrites the decode rows of a mixed step
 
-*Fixed on branch `unofficial-fixes` of this unofficial fork. Not reported to, or confirmed by, the original author. This is the cause of the symptom described in note 04.*
+*Fixed on branch `main` (called `unofficial-fixes` until 2026-11-24) of this unofficial fork. Not reported to, or confirmed by, the original author. This is the cause of the symptom described in note 04.*
 
 ## Summary
 

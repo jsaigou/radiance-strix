@@ -72,8 +72,8 @@ mapped to the nearest formats the engine serves fast), with credit to Unsloth ([
 
 Rounding: round to nearest with a searched scale, no calibration. Built from `data/recipes/q36-w4w5-rtn.recipe` in the fork.
 
-Tooling, recipes and the measurements behind this card are public in the fork: [`docs/RAD-FILES.md`](https://github.com/jsaigou/radiance-strix/blob/unofficial-fixes/docs/RAD-FILES.md) and
-[`docs/FORK-KERNELS.md`](https://github.com/jsaigou/radiance-strix/blob/unofficial-fixes/docs/FORK-KERNELS.md).
+Tooling, recipes and the measurements behind this card are public in the fork: [`docs/RAD-FILES.md`](https://github.com/jsaigou/radiance-strix/blob/main/docs/RAD-FILES.md) and
+[`docs/FORK-KERNELS.md`](https://github.com/jsaigou/radiance-strix/blob/main/docs/FORK-KERNELS.md).
 
 ## Quality (measured by us, on our own sets)
 

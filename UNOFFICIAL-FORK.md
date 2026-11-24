@@ -20,11 +20,11 @@ wants any of it, they are welcome to take it (it is Apache-2.0), and this fork c
 
 | Branch | Contents |
 |---|---|
-| `main` | An exact mirror of the original's `main`, including all release tags. Never committed to. |
-| `unofficial-fixes` (default) | The original at commit `451b136` (2026-11-05, which is `v1.17.0` plus 58 later commits) **plus** the changes below. |
+| `upstream` | An exact copy of the original's `main` at `451b136` (2026-11-05), tagged `upstream-451b136`, with the original's release tags up to `v1.17.0`. Never committed to and **not kept current**: the original has moved on. It was called `main` until 2026-11-24. |
+| `main` (default) | The original at commit `451b136` (2026-11-05, which is `v1.17.0` plus 58 later commits) **plus** the changes below. It was called `unofficial-fixes` until 2026-11-24; old links redirect. |
 | `kernel-full` | The same history the default branch now carries (kept as a named reference for the kernel work). |
 
-Changes on `unofficial-fixes`, relative to the original:
+Changes on `main`, relative to the original (`git diff upstream main`):
 
 1. **Bug fix:** `libhalo/halo_attn_decode_h256_gqa6.hip` — MTP speculation at depth 3 aborted on Strix Halo with
    "scratch buffer absent or too small". The declare-time scratch sizing now also sweeps `q_len`. Details and verification:

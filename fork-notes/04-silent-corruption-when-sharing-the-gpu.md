@@ -1,6 +1,6 @@
 # Silent output corruption with 2+ concurrent sequences (cause and fix: note 05)
 
-*Fixed by note 05 on branch `unofficial-fixes` of this unofficial fork. Not reported to, or confirmed by, the original author. This note keeps the symptom description and the corrections made on the way.*
+*Fixed by note 05 on branch `main` (called `unofficial-fixes` until 2026-11-24) of this unofficial fork. Not reported to, or confirmed by, the original author. This note keeps the symptom description and the corrections made on the way.*
 
 ## Summary
 

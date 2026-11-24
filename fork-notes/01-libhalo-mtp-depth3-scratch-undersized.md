@@ -1,6 +1,6 @@
 # libhalo: MTP depth 3 aborts with "scratch buffer absent or too small" (q_len=4 decode, gqa 8)
 
-*Fixed on branch `unofficial-fixes` of this unofficial fork. Not reported to, or confirmed by, the original author.*
+*Fixed on branch `main` (called `unofficial-fixes` until 2026-11-24) of this unofficial fork. Not reported to, or confirmed by, the original author.*
 
 ## Summary
 
