@@ -92,8 +92,20 @@ enum class Kind { Image, Video, Audio };
  *           zero rows ahead of its patches, which the tower fills with its class and register
  *           tokens. Pictures are spelled <img> placeholders </img>; a video one such run a
  *           tubelet, each after its "Frame i sampled at T seconds and frame i+1 ...: " label,
- *           runs joined by a newline. Tokens at their positions (NoPE). */
-enum class Family { QwenVL, Gemma4, Lfm2, UnlimitedOcr, Glm5Next, Pixtral, Radio };
+ *           runs joined by a newline. Tokens at their positions (NoPE).
+ *   MuseGlimmer  Meta's Muse Glimmer 30B: a picture (a video frame the same) resized so both
+ *           sides are multiples of patch * merge and its merged-token count stays under the cap
+ *           (max_image_tokens, a frame max_frame_rows), to the whole-merged-patch grid whose
+ *           aspect is nearest its own (muse_size, no floor band: a small picture is downscaled
+ *           onto the grid). Resized with torchvision's antialiased Lanczos on the uint8 pixels
+ *           (resize_lanczos_torch); values (u / 255 - mean) / std in f32, rounded to bf16. A
+ *           patch row is (frame, channel, y, x), the reference's (temporal, channel), a picture
+ *           duplicated to fill the depth. A picture is spelled <image_start> <|patch|>*N
+ *           <image_end>; a video one <vid_start>, then per temporal group the text `Time: T s`
+ *           and <|video|>*N rows, the groups separated by <|vid_frame_separator|> and closed by
+ *           <vid_end>, T the group's first frame time (the reference stamps a group once, after
+ *           repeating the last frame to a whole group). */
+enum class Family { QwenVL, Gemma4, Lfm2, UnlimitedOcr, Glm5Next, Pixtral, Radio, MuseGlimmer };
 
 struct VisionConfig {
     Family  family = Family::QwenVL;
@@ -116,6 +128,11 @@ struct VisionConfig {
     float   mean[3] = { 0.5f, 0.5f, 0.5f };
     float   stdv[3] = { 0.5f, 0.5f, 0.5f };
     int32_t tok_image = -1, tok_video = -1, tok_start = -1, tok_end = -1;
+    /* MuseGlimmer: the video run's own markers, <vid_start>, <vid_end> and the groups'
+     * <|vid_frame_separator|> (a picture shares tok_start and tok_end). A container that numbers
+     * them (`video_start_token_id`, `video_end_token_id`, `video_frame_separator_token_id`)
+     * wins; otherwise the vocabulary resolves the spellings at Processor::init. */
+    int32_t tok_video_start = -1, tok_video_end = -1, tok_video_sep = -1;
     /* Lfm2: the tiling (see Family). `max_segment_patches` is the tower's longest segment. */
     int32_t min_tiles = 0, max_tiles = 0, tile = 0;
     bool    use_thumbnail = false;
@@ -433,9 +450,10 @@ public:
     int encoder_video(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
                       int32_t max_frames, std::vector<Frame>* out, std::string* why) const;
 
-    /* A soundtrack: its first stream, mono at `rate` Hz, at most `max_samples`. */
-    int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
-                      std::vector<float>* out, std::string* why) const;
+    /* A soundtrack: its first stream at `rate` Hz, at most `max_samples` a channel, as
+     * decode_audio lays `channels` (1: mono). */
+    int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int32_t channels,
+                      int64_t max_samples, std::vector<float>* out, std::string* why) const;
 
     /* Audio, when the program declares an audio encoder; `merge` and `max_frames` are the
      * encoder's. */
@@ -456,11 +474,13 @@ private:
     int image_glm5next(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     int image_pixtral(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     int image_radio(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
+    int image_muse(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     int video_radio(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
     /* Lfm2's markers: <|img_thumbnail|>, and <|img_row_R_col_C|> at (R-1) * max_tiles + C-1. */
     int32_t              tok_thumbnail_ = -1;
     std::vector<int32_t> tok_tiles_;
     int video_gemma4(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
+    int video_muse(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
 
     VisionConfig cfg_{};
     AudioConfig  acfg_{};
@@ -494,6 +514,21 @@ std::vector<int64_t> sample_frames_gemma4(const VideoInfo& info, double fps, int
  * within `max_patches`, aspect ratio kept (get_aspect_ratio_preserving_size). */
 int gemma4_size(int64_t h, int64_t w, int32_t patch, int32_t pool, int64_t max_patches,
                 int64_t* oh, int64_t* ow, std::string* why);
+
+/* MuseGlimmer's smart_resize (MuseGlimmer{Image,Video}Processor.smart_resize): the whole
+ * merged-patch grid (`factor` = patch * merge pixels a side, so a grid cell is one output row)
+ * under `max_tokens` merged tokens whose aspect is nearest the picture's own, in Python's
+ * doubles. A picture over the cap scales to the cap first. */
+int muse_size(int64_t h, int64_t w, int32_t factor, int64_t max_tokens, int64_t* oh, int64_t* ow,
+              std::string* why);
+
+/* MuseGlimmerVideoProcessor.sample_frames: `total * fps / native` frames, truncated, clamped to
+ * [temporal, min(num_frames, total)] and floored to a whole temporal group, then torch's
+ * linspace(0, total - 1, n) truncated to integers. A stream with no stated rate is taken at
+ * 24 fps. */
+std::vector<int64_t> sample_frames_muse(const VideoInfo& info, double fps, int32_t temporal,
+                                        int32_t num_frames);
+
 /* Radio's tile for a picture of w x h pixels (NVIDIA's _compute_target_patches, Python's
  * round-half-even included) and for a video frame (_compute_target_patches_video), in patches. */
 void radio_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, int32_t* hp);
@@ -503,6 +538,9 @@ void radio_video_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, 
  * filter's overshoot. Separable, width first, as ATen's CPU kernel; a side that keeps its size is
  * the identity. */
 void resize_bicubic_aa_f32(const Frame& in, int32_t w, int32_t h, std::vector<float>* out);
+/* The Muse Glimmer reference's resize filter, torchvision's antialiased Lanczos on the uint8
+ * pixels (see processor.cpp). */
+void resize_lanczos_torch(const Frame& in, int32_t w, int32_t h, Frame* out);
 /* PIL's antialiased bicubic resample of packed RGB, bit for bit: fixed-point coefficients, a
  * horizontal pass into an 8-bit intermediate and then a vertical one. */
 void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out);

@@ -7,9 +7,10 @@
 #pragma once
 
 #include "rad_test.h"
+#include "e2e_config.h"
 #include "tiny_model.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -24,7 +25,7 @@
 
 namespace decision_e2e {
 
-using json = nlohmann::ordered_json;   /* the request order, which Laya reads */
+using json = rad::Json;   /* the request order, which Laya reads */
 
 inline std::vector<std::string> engine_env() {
     return { "ROCR_VISIBLE_DEVICES=99", "RADIANCE_HOST_VRAM_MIB=1024", "OMP_WAIT_POLICY=passive",
@@ -36,7 +37,7 @@ inline std::vector<std::string> engine_argv(const std::string& model,
     std::vector<std::string> a = { RAD_E2E_SERVER, "--model", model, "--kernels", "libref",
                                    "--debug-accept-reference-kernels" };
     a.insert(a.end(), args.begin(), args.end());
-    return a;
+    return radtest::config_argv(a);
 }
 
 inline std::string tail(const std::string& log, int n = 14) {

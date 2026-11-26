@@ -52,7 +52,7 @@ int decode_video(const uint8_t*, size_t, SampleFn, const void*, int64_t, Video*,
 int h264_roundtrip(const Frame&, int32_t, Frame*, std::string* why) { return no_decoder(why); }
 bool h264_roundtrip_available() { return false; }
 int decode_audio(const uint8_t*, size_t, int32_t, int64_t, std::vector<float>*,
-                 std::string* why) {
+                 std::string* why, int32_t) {
     return no_decoder(why);
 }
 
@@ -77,6 +77,55 @@ constexpr const char* kFormats =
     "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpegts,flv,ogg,gif,apng,image2pipe,png_pipe,"
     "jpeg_pipe,jpegls_pipe,jpegxl_pipe,webp_pipe,bmp_pipe,tiff_pipe,qoi_pipe,pgm_pipe,ppm_pipe,"
     "pbm_pipe,pam_pipe,gif_pipe,avif,heif";
+
+/* The size a PNG or JPEG states in its header, read from the bytes: such a picture needs no
+ * stream probe. avformat_find_stream_info decodes the whole picture once to learn its size and the
+ * decode then runs it again (a 1024x1024 PNG 8.8 -> 19.9 ms). False for any other format, or a
+ * header it cannot read, which are probed as before. */
+uint32_t be16(const uint8_t* p) { return (uint32_t)p[0] << 8 | p[1]; }
+uint32_t be32(const uint8_t* p) { return be16(p) << 16 | be16(p + 2); }
+
+bool still_size(const AVInputFormat* f, const uint8_t* p, size_t n, int* w, int* h) {
+    if (!f || !f->name) return false;
+    if (std::strcmp(f->name, "png_pipe") == 0) {
+        /* Signature, then IHDR first: length 13, type, width, height. */
+        static const uint8_t kSig[8] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+        if (n < 24 || std::memcmp(p, kSig, 8) != 0 || be32(p + 8) != 13 ||
+            std::memcmp(p + 12, "IHDR", 4) != 0)
+            return false;
+        const uint32_t pw = be32(p + 16), ph = be32(p + 20);
+        if (pw == 0 || ph == 0 || pw > INT32_MAX || ph > INT32_MAX) return false;
+        *w = (int)pw;
+        *h = (int)ph;
+        return true;
+    }
+    if (std::strcmp(f->name, "jpeg_pipe") == 0) {
+        /* Segments from SOI to the first start of frame (SOF0..SOF15 bar DHT, JPG and DAC):
+         * precision, then height, then width. */
+        if (n < 4 || p[0] != 0xff || p[1] != 0xd8) return false;
+        size_t at = 2;
+        while (at + 4 <= n) {
+            if (p[at] != 0xff) return false;
+            const uint8_t m = p[at + 1];
+            if (m == 0xff) { ++at; continue; }                       /* fill byte */
+            if (m == 0x01 || (m >= 0xd0 && m <= 0xd7)) { at += 2; continue; }   /* no length */
+            if (m == 0xd9 || m == 0xda) return false;               /* EOI or scan before a frame */
+            const uint32_t len = be16(p + at + 2);
+            if (len < 2) return false;
+            if (m >= 0xc0 && m <= 0xcf && m != 0xc4 && m != 0xc8 && m != 0xcc) {
+                if (len < 7 || at + 9 > n) return false;
+                const uint32_t ph = be16(p + at + 5), pw = be16(p + at + 7);
+                if (pw == 0 || ph == 0) return false;
+                *w = (int)pw;
+                *h = (int)ph;
+                return true;
+            }
+            at += 2 + len;
+        }
+        return false;
+    }
+    return false;
+}
 
 struct MemIO {
     const uint8_t* p = nullptr;
@@ -124,6 +173,10 @@ struct Input {
     AVFormatContext* fmt = nullptr;
     AVCodecContext*  dec = nullptr;
     int              stream = -1;
+    /* A PNG or JPEG opened for decoding: the stream was not probed, and these are the size its
+     * header states (still_size). */
+    bool             still = false;
+    int              still_w = 0, still_h = 0;
 
     ~Input() {
         if (dec) avcodec_free_context(&dec);
@@ -134,7 +187,9 @@ struct Input {
         }
     }
 
-    int open(const uint8_t* data, size_t n, bool want_decoder, std::string* why) {
+    /* `max_pixels` > 0 makes the decoder refuse a larger picture itself. */
+    int open(const uint8_t* data, size_t n, bool want_decoder, std::string* why,
+             int64_t max_pixels = 0) {
         io.p = data; io.n = n; io.at = 0;
         constexpr int kBuf = 64 * 1024;
         uint8_t* buf = static_cast<uint8_t*>(av_malloc(kBuf));
@@ -155,8 +210,11 @@ struct Input {
             *why = "not a recognised image or video format (" + averr(e) + ")";
             return RAD_E_INVAL;
         }
-        e = avformat_find_stream_info(fmt, nullptr);
-        if (e < 0) { *why = "could not read the stream headers (" + averr(e) + ")"; return RAD_E_INVAL; }
+        still = want_decoder && still_size(fmt->iformat, data, n, &still_w, &still_h);
+        if (!still) {
+            e = avformat_find_stream_info(fmt, nullptr);
+            if (e < 0) { *why = "could not read the stream headers (" + averr(e) + ")"; return RAD_E_INVAL; }
+        }
         const AVCodec* codec = nullptr;
         stream = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
         if (stream < 0 || !codec) { *why = "no picture in it: the media holds no video stream"; return RAD_E_INVAL; }
@@ -166,8 +224,10 @@ struct Input {
         e = avcodec_parameters_to_context(dec, fmt->streams[stream]->codecpar);
         if (e < 0) { *why = "decoder setup failed (" + averr(e) + ")"; return RAD_E_INVAL; }
         /* Decodes run on server workers, one per request in flight; a few threads each avoids
-         * oversubscribing the machine. */
-        dec->thread_count = 4;
+         * oversubscribing the machine. One picture gains nothing from frame threads, whose start
+         * and exit are all they would add. */
+        dec->thread_count = still ? 1 : 4;
+        if (max_pixels > 0) dec->max_pixels = max_pixels;
         e = avcodec_open2(dec, codec, nullptr);
         if (e < 0) { *why = std::string("no decoder for ") + codec->name + " (" + averr(e) + ")"; return RAD_E_UNSUPPORTED; }
         return RAD_OK;
@@ -316,11 +376,12 @@ int decode_image(const uint8_t* data, size_t n, int64_t max_pixels, Frame* out, 
     if (!why) why = &w;
     if (!data || n == 0) { *why = "empty"; return RAD_E_INVAL; }
     Input in;
-    RAD_TRY(in.open(data, n, true, why));
+    RAD_TRY(in.open(data, n, true, why, max_pixels));
     const AVCodecParameters* cp = in.fmt->streams[in.stream]->codecpar;
-    if (cp->width <= 0 || cp->height <= 0) { *why = "the image has no size"; return RAD_E_INVAL; }
-    if ((int64_t)cp->width * cp->height > max_pixels) {
-        *why = "the image is " + std::to_string(cp->width) + "x" + std::to_string(cp->height) +
+    const int hw = in.still ? in.still_w : cp->width, hh = in.still ? in.still_h : cp->height;
+    if (hw <= 0 || hh <= 0) { *why = "the image has no size"; return RAD_E_INVAL; }
+    if ((int64_t)hw * hh > max_pixels) {
+        *why = "the image is " + std::to_string(hw) + "x" + std::to_string(hh) +
                ", over the server's " + std::to_string(max_pixels) + "-pixel limit for a source";
         return RAD_E_INVAL;
     }
@@ -350,11 +411,12 @@ int decode_image_rgba(const uint8_t* data, size_t n, int64_t max_pixels, FrameRG
     if (!why) why = &w;
     if (!data || n == 0) { *why = "empty"; return RAD_E_INVAL; }
     Input in;
-    RAD_TRY(in.open(data, n, true, why));
+    RAD_TRY(in.open(data, n, true, why, max_pixels));
     const AVCodecParameters* cp = in.fmt->streams[in.stream]->codecpar;
-    if (cp->width <= 0 || cp->height <= 0) { *why = "the image has no size"; return RAD_E_INVAL; }
-    if ((int64_t)cp->width * cp->height > max_pixels) {
-        *why = "the image is " + std::to_string(cp->width) + "x" + std::to_string(cp->height) +
+    const int hw = in.still ? in.still_w : cp->width, hh = in.still ? in.still_h : cp->height;
+    if (hw <= 0 || hh <= 0) { *why = "the image has no size"; return RAD_E_INVAL; }
+    if ((int64_t)hw * hh > max_pixels) {
+        *why = "the image is " + std::to_string(hw) + "x" + std::to_string(hh) +
                ", over the server's " + std::to_string(max_pixels) + "-pixel limit for a source";
         return RAD_E_INVAL;
     }
@@ -626,7 +688,7 @@ struct AudioIn {
 }  /* namespace */
 
 int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_samples,
-                 std::vector<float>* out, std::string* why) {
+                 std::vector<float>* out, std::string* why, int32_t out_channels) {
     std::string w;
     if (!why) why = &w;
     out->clear();
@@ -636,6 +698,10 @@ int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_sample
     AVCodecContext* dec = in.dec;
     const int channels = dec->ch_layout.nb_channels > 0 ? dec->ch_layout.nb_channels : 1;
     if (dec->sample_rate <= 0) { *why = "the audio stream states no sample rate"; return RAD_E_INVAL; }
+    /* Kept channels are gathered interleaved and laid channel-major at the end. */
+    const bool keep = out_channels > 1 && channels == out_channels;
+    std::vector<float> il;
+    auto frames = [&] { return keep ? (int64_t)(il.size() / channels) : (int64_t)out->size(); };
 
     /* Resampled at the source's own layout, float interleaved; the mono mean is taken after. A
      * layout the stream does not state is taken as `channels` unordered channels. */
@@ -658,7 +724,11 @@ int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_sample
         uint8_t* dst = reinterpret_cast<uint8_t*>(buf.data());
         const int got = swr_convert(in.swr, &dst, cap, src, n_in);
         if (got < 0) { *why = "resampling failed (" + averr(got) + ")"; return RAD_E_INVAL; }
-        for (int i = 0; i < got && (int64_t)out->size() < max_samples; ++i) {
+        for (int i = 0; i < got && frames() < max_samples; ++i) {
+            if (keep) {
+                il.insert(il.end(), buf.begin() + (size_t)i * channels, buf.begin() + (size_t)(i + 1) * channels);
+                continue;
+            }
             float s = 0.0f;
             for (int c = 0; c < channels; ++c) s += buf[(size_t)i * channels + c];
             out->push_back(channels == 1 ? s : s / (float)channels);
@@ -676,7 +746,7 @@ int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_sample
     }
     int st = RAD_OK;
     bool done = false;
-    while (!done && (int64_t)out->size() < max_samples) {
+    while (!done && frames() < max_samples) {
         e = av_read_frame(in.fmt, pkt);
         if (e < 0) {
             avcodec_send_packet(dec, nullptr);   /* drain */
@@ -694,10 +764,20 @@ int decode_audio(const uint8_t* data, size_t n, int32_t rate, int64_t max_sample
         if (e != AVERROR(EAGAIN) && e != AVERROR_EOF) { *why = "the audio would not decode (" + averr(e) + ")"; st = RAD_E_INVAL; break; }
     }
     /* Flush what the resampler still holds. */
-    if (st == RAD_OK && (int64_t)out->size() < max_samples) st = take(nullptr, 0);
+    if (st == RAD_OK && frames() < max_samples) st = take(nullptr, 0);
     av_packet_free(&pkt);
     av_frame_free(&f);
     if (st < 0) return st;
+    if (keep) {
+        const size_t m = il.size() / channels;
+        out->resize(il.size());
+        for (size_t i = 0; i < m; ++i)
+            for (int c = 0; c < channels; ++c) (*out)[c * m + i] = il[i * channels + c];
+    } else if (out_channels > 1) {
+        const size_t m = out->size();
+        out->resize(m * out_channels);
+        for (int32_t c = 1; c < out_channels; ++c) std::copy_n(out->begin(), m, out->begin() + c * m);
+    }
     if (out->empty()) { *why = "the audio decoded to no samples"; return RAD_E_INVAL; }
     return RAD_OK;
 }

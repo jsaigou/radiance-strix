@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# radiance-flags BIN FLAGS... -- run the radiance binary BIN configured by a pre-2.0 command line.
+#
+# The server reads only a YAML file (radiance --config, docs/MULTIMODEL.md §4). This writes FLAGS
+# as that file with rad-yaml (the tool beside BIN), then replaces itself with `BIN --config FILE`,
+# so the process a script waits on, signals or greps for is the server itself. The file goes to
+# $TMPDIR and is left there for the run's record.
+set -euo pipefail
+bin="$1"; shift
+cfg="$(mktemp "${TMPDIR:-/tmp}/radiance.XXXXXX.yaml")"
+"$(dirname "$bin")/rad-yaml" "$@" > "$cfg"
+exec "$bin" --config "$cfg"

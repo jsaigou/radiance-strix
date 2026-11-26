@@ -4,9 +4,9 @@
 #include "ggml.h"
 #include "peg-parser.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
-using ordered_json = nlohmann::ordered_json;
+using ordered_json = rad::Json;
 
 static std::string_view trim_trailing_space(std::string_view sv, int max = -1) {
     int count = 0;

@@ -19,6 +19,16 @@ bool cgroup_room(const std::string& dir, bool v2, int64_t* room);
 void cgroup_levels(const std::string& root, std::string path, bool v2,
                    const std::function<bool(const std::string& dir, int64_t room)>& visit);
 
+/* Every level of every memory cgroup the process is in, leaf first: `visit(dir, room)` until it
+ * returns false (cgroup_levels). /proc/self/cgroup reads "0::/path" on v2 and "N:memory:/path"
+ * (or a comma list naming memory) on v1; each level up to the visible root is a limit of its
+ * own. */
+void memory_cgroups(const std::function<bool(const std::string& dir, int64_t room)>& visit);
+
+/* The least room any of those levels leaves (cgroup_room), or INT64_MAX when none sets a limit:
+ * a container's --memory, which the OOM killer enforces whatever MemAvailable says. */
+int64_t cgroup_least_room();
+
 /* Whether `need` more bytes fit in host memory after `still` more this process will allocate
  * first and `margin` (--host-headroom-mib) stays free, or why not. Checks MemAvailable; every
  * memory cgroup from the process's own up to the visible root (Docker's --memory, enforced by the

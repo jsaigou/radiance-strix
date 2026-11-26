@@ -209,6 +209,66 @@ TEST(the_unconditional_branch_is_the_conditional_prompt_at_guidance_one) {
     }
 }
 
+TEST(breeze_reference_rows_are_repeated_with_the_guidance_one_prompt) {
+    for (float cfg : {1.0f, 2.0f}) {
+        AudioFixture f;
+        f.build();
+        f.prog.audio_gen.ref_max = 1;
+        f.prog.audio_gen.ref_rate = 50;
+        f.prog.audio_gen.ref_hop = 4;
+        f.prog.audio_gen.ref_max_samples = 8;
+        CHECK_OK(f.start());
+        auto r = f.req(cfg);
+        r->ref_audio.assign(4, 0.25f);
+        r->ref_cu = {0, 4};
+        r->ref_frame = {-1, 0, -1, -1};
+        std::string why;
+        if (cfg != 1.0f) {
+            CHECK_EQ(f.drv.submit(std::move(r), &why), RAD_E_INVAL);
+            CHECK(has(why, "guidance_scale 1"));
+            continue;
+        }
+        CHECK_OK(f.drv.submit(std::move(r), &why));
+        const RadBatch* b = f.drv.next(0);
+        REQUIRE(b != nullptr && b->gen == RAD_GEN_PASS_PROMPT);
+        const auto* A = b->agen_b;
+        REQUIRE(A->ref_frame_h != nullptr && A->ref_frame != nullptr);
+        CHECK_EQ(A->ref_frame_h[1], 0);
+        CHECK_EQ(A->ref_frame_h[4], -1);
+        CHECK_EQ(A->ref_frame_h[5], cfg == 1.0f ? 0 : -1);
+        for (int64_t i = 0; i < b->n_tok; ++i) CHECK_EQ(A->ref_frame[i], A->ref_frame_h[i]);
+        CHECK_EQ(A->ref_samples, (int64_t)4);
+        f.answer(b, 0, 0);
+        CHECK_OK(f.drv.done());
+    }
+}
+
+TEST(reference_direction_keeps_each_guidance_branchs_reference_map) {
+    for (float cfg : {1.0f, 4.0f}) {
+        AudioFixture f;
+        f.build();
+        f.prog.audio_gen.ref_max = 1;
+        f.prog.audio_gen.ref_rate = 50;
+        f.prog.audio_gen.ref_hop = 4;
+        f.prog.audio_gen.ref_max_samples = 8;
+        CHECK_OK(f.start());
+        auto r = f.req(cfg);
+        r->ref_audio.assign(4, 0.25f); r->ref_cu = {0, 4};
+        r->ref_frame = {-1, 0, -1, -1}; r->neg_ref_frame = {-1, 0};
+        std::string why;
+        CHECK_OK(f.drv.submit(std::move(r), &why));
+        const RadBatch* b = f.drv.next(0);
+        REQUIRE(b && b->agen_b && b->agen_b->prompt_cu_h);
+        CHECK_EQ(b->n_tok, (int64_t)(cfg == 1.0f ? 8 : 6));
+        CHECK_EQ(b->agen_b->prompt_cu_h[1], 4);
+        CHECK_EQ(b->agen_b->prompt_cu_h[2], b->n_tok);
+        CHECK_EQ(b->agen_b->ref_frame_h[5], 0);
+        for (int64_t i = 0; i < b->n_tok; ++i)
+            CHECK_EQ(b->agen_b->ref_frame[i], b->agen_b->ref_frame_h[i]);
+        f.answer(b, 0, 0); CHECK_OK(f.drv.done());
+    }
+}
+
 /* A hybrid language model (paged attention beside a linear-attention state and a convolution
  * group, as Qwen3.5's delta-net layers keep) of one branch: every pass stages one sequence a
  * request, the state groups' rows are the sequence's slots, and each entry carries its context

@@ -4,8 +4,9 @@
 # the checkpoint holds it. The format is ling3-w4a8-rtn.recipe's, so the same kernels serve both.
 #
 #   1. rad-convert <checkpoint> --recipe data/recipes/ling3-w4a8-rtn.recipe -o ling3-w4a8-rtn.rad
-#   2. RADIANCE_CALIB_DIR=<calib dir> radiance --model ling3-w4a8-rtn.rad ...   (a calibration run:
-#      whole experts per rank; push a corpus that looks like the traffic through prefill)
+#   2. RADIANCE_CALIB_DIR=<calib dir> radiance --config calib.yaml   (a calibration run, the YAML's
+#      model ling3-w4a8-rtn.rad: whole experts per rank; push a corpus that looks like the traffic
+#      through prefill)
 #   3. CALIB=<calib dir> rad-convert <checkpoint> --recipe data/recipes/ling3-w4a8-gptq.recipe \
 #          --reuse ling3-w4a8-rtn.rad -o ling3-w4a8-gptq.rad
 #

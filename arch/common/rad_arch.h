@@ -37,9 +37,12 @@ namespace rad {
 namespace arch {
 
 /* One thread per tensor-parallel rank in one process (spec §1), and declare runs once per rank,
- * so declared handles are per-rank state; a single global would let rank 1 overwrite rank 0.
- * libr4d all-reduces over 2/4/8 ranks, hence eight. */
-enum { MAX_RANKS = 8 };
+ * so declared handles are per-instance state; a single global would let rank 1 overwrite rank 0.
+ * libr4d all-reduces over 2/4/8 ranks, hence eight ranks. Several engines may run in the process
+ * (docs/MULTIMODEL.md), each with its own ranks, so state is indexed by the instance's slot
+ * (rad_build_slot at declare, rad_slot in step), unique across all of them, never by the rank two
+ * engines share. */
+enum { MAX_RANKS = 8, MAX_SLOTS = RAD_MAX_SLOTS };
 
 /* ================================================================== a debug residual probe
  *
@@ -181,10 +184,9 @@ inline long long calib_target() {
  * from an exercised one: libquant reads a per-expert file only when it holds several times K
  * rows. `domain` is what the tap summed; a reader quantising in another domain converts the file
  * itself (libquant's calib_sum). */
-inline bool calib_write_host(const float* h, int64_t k, long long rows, const char* what,
-                             uint32_t domain, int rank) {
-    const char* dir = calib_dir();
-    if (!dir || !h || k <= 0) return false;
+inline bool calib_write_host_to(const char* dir, const float* h, int64_t k, long long rows,
+                                 const char* what, uint32_t domain, int rank) {
+    if (!dir || !*dir || !h || k <= 0) return false;
     char path[512];
     std::snprintf(path, sizeof path, "%s/gram.r%d.%s.bin", dir, rank, what);
     FILE* f = std::fopen(path, "wb");
@@ -208,6 +210,11 @@ inline bool calib_write_host(const float* h, int64_t k, long long rows, const ch
     return okw;
 }
 
+inline bool calib_write_host(const float* h, int64_t k, long long rows, const char* what,
+                             uint32_t domain, int rank) {
+    return calib_write_host_to(calib_dir(), h, k, rows, what, domain, rank);
+}
+
 /* The same file from a device accumulator: copied back on the block's stream, then written. */
 inline bool calib_write(RadCtx* c, rad_buf b, int64_t k, long long rows, const char* what,
                         uint32_t domain) {
@@ -220,13 +227,27 @@ inline bool calib_write(RadCtx* c, rad_buf b, int64_t k, long long rows, const c
     return calib_write_host(h.data(), k, rows, what, domain, rad_rank(c));
 }
 
-/* A pinned host buffer of at least `bytes`, one per rank, held for the process lifetime, so a tap
- * that copies a scratch back every pass runs at link speed. Null (and logged) on failure. */
+/* A selected architecture tap may use the build context's directory directly, rather than the
+ * legacy process environment helper above. */
+inline bool calib_write_to(RadCtx* c, rad_buf b, int64_t k, long long rows, const char* what,
+                           uint32_t domain, const char* dir) {
+    if (!dir || !*dir || !b || k <= 0) return false;
+    void* p = rad_buf_ptr(c, b);
+    if (!p) return false;
+    std::vector<float> h((size_t)(k * k));
+    if (rad_memcpy_async(h.data(), p, (int64_t)h.size() * 4, rad_stream(c)) < 0) return false;
+    if (rad_stream_sync(rad_stream(c)) < 0) return false;
+    return calib_write_host_to(dir, h.data(), k, rows, what, domain, rad_rank(c));
+}
+
+/* A pinned host buffer of at least `bytes`, one per instance (slot), held for the process
+ * lifetime, so a tap that copies a scratch back every pass runs at link speed. Null (and logged)
+ * on failure. */
 inline float* calib_staging(RadCtx* c, int64_t bytes) {
     static std::mutex mu;
-    static std::map<int, std::pair<void*, int64_t>> per_rank;
+    static std::map<int, std::pair<void*, int64_t>> per_slot;
     std::lock_guard<std::mutex> lk(mu);
-    std::pair<void*, int64_t>& s = per_rank[rad_rank(c)];
+    std::pair<void*, int64_t>& s = per_slot[rad_slot(c)];
     if (s.second >= bytes) return (float*)s.first;
     if (s.first) rad_dev_free(s.first, RAD_MEM_HOST_PINNED);
     s.first = rad_dev_alloc(bytes, RAD_MEM_HOST_PINNED);
@@ -340,8 +361,24 @@ private:
     std::string             scope_;
 };
 
-/* Returns the first negative status from a declare step. */
-#define RAD_ARCH_TRY(expr)  do { int _s = (expr); if (_s < 0) return _s; } while (0)
+/* Returns the first negative status from a declare step, and says where the status crossed. A
+ * step can return a status with no message of its own, and a failed declare would then report
+ * the status alone. Every level the status passes prints one line, innermost first, so the lines
+ * read as the path from the step that failed up to the plugin's declare. */
+#ifdef __FILE_NAME__
+#define RAD_ARCH_FILE __FILE_NAME__
+#else
+#define RAD_ARCH_FILE __FILE__
+#endif
+#define RAD_ARCH_TRY(expr)                                                                  \
+    do {                                                                                    \
+        int _s = (expr);                                                                    \
+        if (_s < 0) {                                                                       \
+            fprintf(stderr, "radiance: declare: %s, from %s:%d\n", rad_strerror(_s),        \
+                    RAD_ARCH_FILE, __LINE__);                                               \
+            return _s;                                                                      \
+        }                                                                                   \
+    } while (0)
 
 /* ================================================================== C++-side decl helpers */
 /* C++ forms of rad_group_layer() and friends, which are C compound literals (a GNU extension in
@@ -699,8 +736,13 @@ inline void prefetch_beside(RadCtx* c, rad_op op, rad_weight w, int64_t T) {
 }
 /* The `prefetch` of `w`'s first `bytes` where a library serves it; 0 otherwise. A plugin declares
  * none where the deployment turns the reads off (RadBuildCtx::weight_prefetch_off). */
-inline rad_op decl_prefetch(RadBuilder* b, rad_weight w, int64_t bytes) {
+inline rad_op decl_prefetch(RadBuilder* b, rad_weight w, int64_t bytes, int64_t blocks = 0) {
     if (!w || bytes <= 0 || !rad_op_declared(b, "prefetch")) return 0;
+    /* `blocks`: the workgroups reading, where the architecture measured its own count (docs/OPS.md);
+     * 0 leaves the kernel's. Stated only when asked, so a declaration without it is what it was. */
+    if (blocks > 0)
+        return RAD_OP(b, "prefetch", RAD_PARAMS(RAD_INT("bytes", bytes), RAD_INT("blocks", blocks)),
+                      RAD_WEIGHTS(w));
     return RAD_OP(b, "prefetch", RAD_PARAMS(RAD_INT("bytes", bytes)), RAD_WEIGHTS(w));
 }
 
@@ -760,9 +802,6 @@ struct Geom {
     /* Messages below this many bytes use the exact all-reduce even with a lossy wire. Passed as
      * `all_reduce`'s `min_bytes`; 0 leaves the default to the kernel plugin. */
     int64_t wire_min_bytes = 0;
-    /* RAD_ATTN_FP8_* bits: the attention products accepted in e4m3 (RadBuildCtx describes it).
-     * decl_attn passes it on as `attn_paged`'s `prefill_fp8`. */
-    int     attn_prefill_fp8 = 0;
     float   eps        = 1e-6f;
     /* GemmaRMSNorm's `1 +`. Qwen3.5, Qwen3-Next and Gemma normalise with `x_hat * (1 + w)` and
      * store `w` near 0.1, so reading it as a plain gain shrinks every normed activation 5-10x. An
@@ -798,12 +837,42 @@ struct Geom {
      * setting because producers and consumers must agree; the plugin reads it off a trunk weight's
      * encoding and every linear checks its own against it. */
     bool    w_bf16 = false;
+    /* The linears are rotated int8 (rad_fp8.h's linear_is_w8h: IQ8R, or the 128-group form) with
+     * one activation scale per `w_i8_group` columns, for a plugin whose producers are declared away
+     * from its probe: each then declares an int8 code pair (ActFP8::declare_pair). Model-wide as
+     * w_bf16 is. */
+    bool    w_i8h = false;
+    int64_t w_i8_group = 128;
 
     int64_t q_dim()   const { return n_head * head_dim; }
     int64_t kv_dim()  const { return n_head_kv * head_dim; }
     int64_t qkv_dim() const { return q_dim() + 2 * kv_dim(); }
     int64_t gqa()     const { return n_head_kv ? n_head / n_head_kv : 0; }
 };
+
+/* A linear of the bf16 blocks (rad_block_mlp.h, rad_block_attn_gated.h, rad_block_gdn.h): its
+ * weight, declared at what the model holds, and the `gemm_nt` dtype that reads it. A `bf16x12`
+ * weight, libquant's lossless packing of a bf16 one in 12.25 bits a value (docs/TOOLS.md), is
+ * declared over every plane at its codes' dtype and read at "bf16x12" (docs/OPS.md), whose rows
+ * give bf16's bytes. Any other weight is declared bf16 and read at `g.dtype`, so a container with
+ * no bf16x12 weight declares the graph it did before. */
+struct LinearBF16 {
+    rad_weight  w     = 0;
+    const char* dtype = nullptr;   /* gemm_nt's */
+};
+
+inline LinearBF16 decl_linear_bf16(RadBuilder* b, const Geom& g, const char* name,
+                                   std::initializer_list<int64_t> shape, int shard,
+                                   RadWeightGroup group,
+                                   std::initializer_list<int64_t> row_parts = {}) {
+    RadEncoding e{};
+    const bool x12 = weight_enc(b, name, &e) && rad_enc_is(&e, "bf16x12") && e.n_planes > 0;
+    LinearBF16 l;
+    l.w     = decl_w(b, name, x12 ? e.plane[0].dtype : (uint32_t)RAD_BF16, shape,
+                     RAD_ACCESS_PER_TOKEN, shard, group, 0, row_parts);
+    l.dtype = x12 ? "bf16x12" : g.dtype;
+    return l;
+}
 
 /* The KV cache dtype: RadBuildCtx::kv_dtype (--kv-cache-dtype), or `dflt` when it is
  * RAD_DT_INVALID (not given). Every architecture in this tree passes RAD_BF16 as the default. */
@@ -1034,7 +1103,6 @@ inline int geom_from(Geom& g, const RadModelMeta* m, const RadBuildCtx* c,
     g.world     = c->world_size ? c->world_size : 1;
     g.wire_exact= c->tp_wire_lossy ? 0 : 1;
     g.wire_min_bytes = c->tp_wire_min_bytes;
-    g.attn_prefill_fp8 = c->attn_prefill_fp8;
     g.eps       = m->rms_eps;
     g.theta     = m->rope_theta;
     g.rope_scale= 1.0f;   /* yarn_from reads the model's rotary scaling */
@@ -1351,16 +1419,6 @@ inline rad_op decl_rotary(RadBuilder* b, const Geom& g, const char* name,
     return rad_decl_op(b, name, p.data(), (int)p.size(), weights, nw);
 }
 
-/* An `attn_paged` op with the deployment's `prefill_fp8` appended (docs/OPS.md). At 0 the
- * parameters are passed unchanged, so op identities and tune keys do not change. */
-inline rad_op decl_attn(RadBuilder* b, const Geom& g, const char* name,
-                        const RadParam* params, int n, const rad_weight* weights, int nw) {
-    if (g.attn_prefill_fp8 == 0) return rad_decl_op(b, name, params, n, weights, nw);
-    std::vector<RadParam> p(params, params + n);
-    p.push_back(RAD_INT("prefill_fp8", g.attn_prefill_fp8));
-    return rad_decl_op(b, name, p.data(), (int)p.size(), weights, nw);
-}
-
 /* Reads a model's rotary scaling into `g.rope_scale` and `g.yarn`. Every architecture calls it
  * after geom_from, for the target ("") and for a drafter with its own config ("draft."). Only the
  * free-form keys are read; RadModelMeta::rope_scale is not, since a factor without its type would
@@ -1495,6 +1553,46 @@ inline void batch_split(const RadBatch* b, int64_t* n_seq_dec, int64_t* n_tok_de
         case RAD_PHASE_DECODE:  *n_seq_dec = b->n_seq;       *n_tok_dec = b->n_tok;       break;
         default:                *n_seq_dec = b->n_seq_decode; *n_tok_dec = b->n_tok_decode; break;
     }
+}
+
+/* What a step's attention reads of the QSA selection (AttnGatedFP8::qsa_use), which decides what
+ * the indexer issues for the layer (QsaIndexer::step, docs/QSA.md "Below the bound"):
+ *
+ *   kQsaSelect  score and select, per layer: a step past the exactness bound, a streamed group,
+ *               and every step of a block that did not ask for the forms below;
+ *   kQsaUnread  nothing reads the selection: the step is entirely at or below the bound and its
+ *               attention is the dense one, or the sparse row over the sequence's own block table
+ *               (one row a sequence), which is what the selection would be. The indexer stores its
+ *               keys and tail and issues no query, score or select;
+ *   kQsaOnce    the attention reads a selection (the sparse row a query) on a step entirely at or
+ *               below the bound: every complete block is taken whatever it scores, so the
+ *               selection depends on the positions and the block table alone and is the same
+ *               bytes at every layer. The first full-attention layer of the pass issues it;
+ *               no later layer issues a query, a score or a select. */
+enum QsaUse : int { kQsaSelect = 0, kQsaUnread = 1, kQsaOnce = 2 };
+
+/* Ops of a chain that is independent of a block's own, for the block to issue behind its ordered
+ * launches. A recorded pass lets a launch start beside the last ordered one when it touches
+ * nothing in flight (Ctx::haz_mark). A dependent chain issued in one piece is therefore a row of
+ * ordered launches, each paid in turn; issued one op behind each of the block's own ordered
+ * launches, every op of it is unordered behind the block's launch in front of it, and still
+ * behind its own predecessor, which that launch already waited for. The block calls `at(k)` for
+ * k = 0, 1, 2, ... behind its ordered launches in turn, and the owner issues what is left once
+ * the block returns. The chain must read nothing the block writes and write nothing the block
+ * touches, and its buffers must be excluded from sharing (rad_buf_concurrent): they are in use at
+ * launches the linear order puts after their last declared use. */
+struct SideOps {
+    void (*fn)(void* u, int stage) = nullptr;
+    void* u = nullptr;
+    void at(int stage) const { if (fn) fn(u, stage); }
+};
+
+/* RADIANCE_DEBUG_QSA_EAGER: every step is kQsaSelect, each layer issuing its own selection. An
+ * instrument for comparing that sequence with the forms above (the text must not move); read
+ * once. */
+inline bool qsa_eager() {
+    static const bool on = std::getenv("RADIANCE_DEBUG_QSA_EAGER") != nullptr;
+    return on;
 }
 
 /* The step batch's entry for one declared KV group (built once per step by the core, spec §8). */
@@ -1664,6 +1762,11 @@ inline int drafter_kv_group(RadBuilder* b, Names& nm, const RadBuildCtx* ctx, Ge
  * an imported checkpoint (rad_builder.h, rad_arch_serves_imports). */
 #define RAD_ARCH_SERVES_IMPORTS(V)                                                             \
     extern "C" int rad_arch_serves_imports(void) { return V; }
+
+/* RAD_ARCH_MULTI_INSTANCE() states that the plugin keeps all per-instance state by slot, so several
+ * engines in one process may run it at once (rad_builder.h, rad_arch_multi_instance). */
+#define RAD_ARCH_MULTI_INSTANCE()                                                              \
+    extern "C" int rad_arch_multi_instance(void) { return 1; }
 
 }  /* namespace arch */
 }  /* namespace rad */

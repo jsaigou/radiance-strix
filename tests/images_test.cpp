@@ -12,6 +12,8 @@
 
 #include "mm/media.h"
 
+#include <future>
+
 namespace {
 
 struct Images {
@@ -440,6 +442,193 @@ TEST(a_streamed_generation_sends_previews_then_the_image) {
     CHECK(ev[2].contains("usage"));
     CHECK(!ev[2].contains("partial_image_index"));
     CHECK_EQ(s.f->srv->in_flight(), (int64_t)0);
+}
+
+TEST(auto_edit_size_respects_a_tight_pixel_limit_after_rounding) {
+    if (!mm::decoder_available()) return;
+    Images s;
+    s.img.inf.default_width = s.img.inf.default_height = 1024;
+    s.img.inf.max_tokens = 4096;
+    const std::string pic = png(128, 96, 255, 255);
+    REQUIRE(!pic.empty());
+    const HttpResponse res = s.post("/v1/images/edits",
+        { { "prompt", "x" }, { "image", data_url(pic) } });
+    REQUIRE_EQ(res.status, 200);
+    CHECK_EQ(s.last().width, 1152);
+    CHECK_EQ(s.last().height, 896);
+}
+
+
+TEST(an_admitted_image_waits_for_the_previous_adapter_slot) {
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
+    FakeImageGen image;
+    int attempts = 0;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        d.images = &image;
+        o.image_model = true;
+        o.gen_lora_acquire = [&](const auto&, int32_t* slot, std::shared_ptr<void>* hold,
+                                 std::string*, std::string*) {
+            if (++attempts == 1) return RAD_E_FULL;
+            *slot = 0;
+            *hold = std::make_shared<int>(0);
+            return RAD_OK;
+        };
+    }});
+    const auto result = f.post("/v1/images/generations",
+        R"({"prompt":"a cup","size":"64x64","loras":["turbo"]})");
+    CHECK_EQ(result.status, 200);
+    CHECK_EQ(attempts, 2);
+    CHECK_EQ(f.srv->in_flight(), 0);
+}
+
+TEST(disconnecting_the_head_image_waiter_releases_its_turn_and_admission) {
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
+    FakeImageGen image;
+    std::promise<void> attempted;
+    std::atomic<bool> tried{false}, disconnected{false};
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        d.images = &image;
+        o.image_model = true;
+        o.gen_lora_acquire = [&](const auto& choices, int32_t* slot, std::shared_ptr<void>* hold,
+                                 std::string*, std::string*) {
+            if (choices.front().first == "busy") {
+                if (!tried.exchange(true)) attempted.set_value();
+                return RAD_E_FULL;
+            }
+            *slot = 0;
+            *hold = std::make_shared<int>(0);
+            return RAD_OK;
+        };
+    }});
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/images/generations";
+    q.body = R"({"prompt":"a cup","size":"64x64","loras":["busy"]})";
+    q.closed = [&] { return disconnected.load(); };
+    auto first = std::async(std::launch::async, [&] { return f.srv->router().dispatch(q).status; });
+    const auto started = attempted.get_future().wait_for(std::chrono::seconds(3));
+    auto second = std::async(std::launch::async, [&] {
+        return f.post("/v1/images/generations",
+                      R"({"prompt":"a cup","size":"64x64","loras":["next"]})").status;
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (f.srv->in_flight() < 2 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const auto admitted = f.srv->in_flight();
+    disconnected.store(true);
+    CHECK(started == std::future_status::ready);
+    CHECK_EQ(admitted, 2);
+    CHECK_EQ(first.get(), 499);
+    CHECK_EQ(second.get(), 200);
+    CHECK_EQ(f.srv->in_flight(), 0);
+}
+
+
+/* Admission callbacks are serialized, but the fake generator must also tolerate
+ * overlapping HTTP threads after they leave the adapter queue. */
+namespace {
+struct ConcurrentImageGen : FakeImageGen {
+    std::mutex mutex;
+    int submit(std::unique_ptr<gen::Request> r, std::string* why) override {
+        std::lock_guard lock(mutex);
+        return FakeImageGen::submit(std::move(r), why);
+    }
+};
+}
+
+TEST(image_adapter_waiters_acquire_in_fifo_order_even_for_a_cached_choice) {
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
+    ConcurrentImageGen image;
+    std::atomic<bool> release_head{false}, attempted{false};
+    std::atomic<bool> middle_queued{false}, last_queued{false};
+    std::promise<void> head_seen, middle_seen, last_seen;
+    std::vector<std::string> acquired;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        d.images = &image;
+        o.image_model = true;
+        o.gen_lora_acquire = [&](const auto& choices, int32_t* slot, std::shared_ptr<void>* hold,
+                                 std::string*, std::string*) {
+            const auto& name = choices.front().first;
+            if (name == "busy" && !release_head.load()) {
+                if (!attempted.exchange(true)) head_seen.set_value();
+                return RAD_E_FULL;
+            }
+            acquired.push_back(name);
+            *slot = 0;
+            *hold = std::make_shared<int>(0);
+            return RAD_OK;
+        };
+    }});
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto request = [&](const char* name, std::atomic<bool>* queued, std::promise<void>* seen) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/images/generations";
+        q.body = json({{"prompt", "a cup"}, {"size", "64x64"}, {"loras", {name}}}).dump();
+        // peer_gone() is checked after insertion, so this is a queue-order barrier.
+        q.closed = [&, queued, seen] {
+            if (queued && !queued->exchange(true)) seen->set_value();
+            return std::chrono::steady_clock::now() >= deadline;
+        };
+        return f.srv->router().dispatch(q).status;
+    };
+    auto first = std::async(std::launch::async, [&] { return request("busy", nullptr, nullptr); });
+    CHECK(head_seen.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    auto middle = std::async(std::launch::async, [&] {
+        return request("middle", &middle_queued, &middle_seen);
+    });
+    CHECK(middle_seen.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    auto last = std::async(std::launch::async, [&] {
+        return request("cached", &last_queued, &last_seen);
+    });
+    CHECK(last_seen.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    release_head.store(true);
+    CHECK_EQ(first.get(), 200);
+    CHECK_EQ(middle.get(), 200);
+    CHECK_EQ(last.get(), 200);
+    CHECK(acquired == std::vector<std::string>({"busy", "middle", "cached"}));
+    CHECK_EQ(f.srv->in_flight(), 0);
+}
+
+TEST(stopping_the_server_releases_all_image_adapter_waiters) {
+    if (!mm::decoder_available()) SKIP("image codec unavailable");
+    ConcurrentImageGen image;
+    std::promise<void> attempted;
+    std::atomic<bool> tried{false}, second_queued{false}, cancel{false};
+    std::promise<void> second_seen;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& o, Deps& d) {
+        d.images = &image;
+        o.image_model = true;
+        o.gen_lora_acquire = [&](const auto&, int32_t*, std::shared_ptr<void>*,
+                                 std::string*, std::string*) {
+            if (!tried.exchange(true)) attempted.set_value();
+            return RAD_E_FULL;
+        };
+    }});
+    auto request = [&](bool second) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/images/generations";
+        q.body = R"({"prompt":"a cup","size":"64x64","loras":["busy"]})";
+        q.closed = [&, second] {
+            if (second && !second_queued.exchange(true)) second_seen.set_value();
+            return cancel.load();
+        };
+        return f.srv->router().dispatch(q).status;
+    };
+    auto first = std::async(std::launch::async, [&] { return request(false); });
+    CHECK(attempted.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    auto second = std::async(std::launch::async, [&] { return request(true); });
+    CHECK(second_seen.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    f.srv->stop();
+    const auto a = first.wait_for(std::chrono::seconds(2));
+    const auto b = second.wait_for(std::chrono::seconds(2));
+    cancel.store(true); // Bound cleanup even if a shutdown regression is introduced.
+    CHECK(a == std::future_status::ready);
+    CHECK(b == std::future_status::ready);
+    CHECK_EQ(first.get(), 429);
+    CHECK_EQ(second.get(), 429);
+    CHECK_EQ(f.srv->in_flight(), 0);
 }
 
 RAD_TEST_MAIN()

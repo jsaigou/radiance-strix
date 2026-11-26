@@ -2013,7 +2013,7 @@ struct Model {
     bool            slice_attn = false;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* A DFlash2 drafter's config key, from vLLM's speculators layout (the speculator's keys at the
  * top of `draft.`) or z-lab's (under `draft.dflash_config.`), whichever the checkpoint has. */
@@ -2162,17 +2162,31 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     dw.attn    = decl_b(b, nm.f("df_attn"), dg.act_dtype, {qr, qd});
     dw.gate_up = decl_b(b, nm.f("df_gate_up"), dg.act_dtype, {qr, 2 * dg.n_ff});
     dw.ffn     = decl_b(b, nm.f("df_ffn"),  dg.act_dtype, {qr, dg.n_ff});
-    dw.srcq    = decl_b(b, nm.f("df_srcq"), RAD_F8E4M3, {dg.max_tok, dc.n_taps * dg.n_embd});
-    dw.srcs    = decl_b(b, nm.f("df_srcs"), RAD_F32,
-                        {dg.max_tok, fp8_blocks(dc.n_taps * dg.n_embd)});
-    dw.cq      = decl_b(b, nm.f("df_cq"),   RAD_F8E4M3, {dg.max_tok, dg.n_embd});
-    dw.cs      = decl_b(b, nm.f("df_cs"),   RAD_F32,    {dg.max_tok, fp8_blocks(dg.n_embd)});
-    dw.h2q     = decl_b(b, nm.f("df_h2q"),  RAD_F8E4M3, {qr, dg.n_embd});
-    dw.h2s     = decl_b(b, nm.f("df_h2s"),  RAD_F32,    {qr, fp8_blocks(dg.n_embd)});
-    dw.atq     = decl_b(b, nm.f("df_atq"),  RAD_F8E4M3, {qr, qd});
-    dw.ats     = decl_b(b, nm.f("df_ats"),  RAD_F32,    {qr, fp8_blocks(qd)});
-    dw.ffq     = decl_b(b, nm.f("df_ffq"),  RAD_F8E4M3, {qr, dg.n_ff});
-    dw.ffs     = decl_b(b, nm.f("df_ffs"),  RAD_F32,    {qr, fp8_blocks(dg.n_ff)});
+    /* The codes the drafter's linears read: int8 with one f32 scale per (row, group) for linears
+     * stored rotated int8 (the -df2 recipe's), which the drafter's `fc` tells; E4M3 with a scale
+     * per 128 for an MXFP4 drafter (rad_fp8.h's DenseFP8). */
+    RAD_ARCH_TRY(Dflash2::probe_i8(b, nm, "draft", &dc.act_i8, &dc.act_g8));
+    dc.fc_mapped = true;
+    const uint32_t dqt = dc.act_i8 ? RAD_I8 : RAD_F8E4M3;
+    const int64_t  dqg = dc.act_i8 ? dc.act_g8 : (int64_t)RAD_FP8_BLOCK;
+    if (dc.act_i8 && ((dc.n_taps * dg.n_embd) % dqg || dg.n_embd % dqg || qd % dqg ||
+                      dg.n_ff % dqg)) {
+        fprintf(stderr, "radiance: a rotated int8 drafter takes widths in whole %lld-column scale "
+                        "groups; this one is n_embd %lld, q %lld, n_ff %lld\n", (long long)dqg,
+                (long long)dg.n_embd, (long long)qd, (long long)dg.n_ff);
+        return RAD_E_INVAL;
+    }
+    auto dqs = [&](int64_t n) { return (n + dqg - 1) / dqg; };
+    dw.srcq    = decl_b(b, nm.f("df_srcq"), dqt,     {dg.max_tok, dc.n_taps * dg.n_embd});
+    dw.srcs    = decl_b(b, nm.f("df_srcs"), RAD_F32, {dg.max_tok, dqs(dc.n_taps * dg.n_embd)});
+    dw.cq      = decl_b(b, nm.f("df_cq"),   dqt,     {dg.max_tok, dg.n_embd});
+    dw.cs      = decl_b(b, nm.f("df_cs"),   RAD_F32, {dg.max_tok, dqs(dg.n_embd)});
+    dw.h2q     = decl_b(b, nm.f("df_h2q"),  dqt,     {qr, dg.n_embd});
+    dw.h2s     = decl_b(b, nm.f("df_h2s"),  RAD_F32, {qr, dqs(dg.n_embd)});
+    dw.atq     = decl_b(b, nm.f("df_atq"),  dqt,     {qr, qd});
+    dw.ats     = decl_b(b, nm.f("df_ats"),  RAD_F32, {qr, dqs(qd)});
+    dw.ffq     = decl_b(b, nm.f("df_ffq"),  dqt,     {qr, dg.n_ff});
+    dw.ffs     = decl_b(b, nm.f("df_ffs"),  RAD_F32, {qr, dqs(dg.n_ff)});
     dw.sel_h   = decl_b(b, nm.f("df_selh"), dg.act_dtype, {sr, dg.n_embd});
     dw.hp      = decl_b(b, nm.f("df_hp"),   dg.act_dtype, {sr, dc.sel_rank});
     dw.dq      = decl_b(b, nm.f("df_dq"),   RAD_I8,  {sr, dg.n_embd});
@@ -2255,15 +2269,16 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
              (long long)dg.n_layer, (long long)m.n_main, (long long)dg.n_head_all,
              (long long)dg.n_head_kv_all, (long long)dg.head_dim, (long long)dg.n_ff_all,
              dc.causal ? "causal" : "non-causal", (long long)dc.window, m.n_taps,
-             (long long)dc.steps(), m.df2.head_i8 ? "8-bit" : "2-bit");
+             (long long)dc.steps(), m.df2.head_i8 ? "8-bit" : m.df2.head_bf16 ? "bf16" : "2-bit");
     return RAD_OK;
 }
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
 
-    Model& m = g_model[ctx->rank];
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
@@ -3155,7 +3170,7 @@ static void trunk_overlap(RadCtx* c, const Model& m, const RadBatch* batch, int6
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    Model& m = g_model[rad_rank(c)];
+    Model& m = g_model[rad_slot(c)];
 
     /* An encoder pass runs only its encoder. */
     if (batch->enc) {
@@ -3301,6 +3316,14 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
      * DFlash2 one too (rad_block_dflash2.h). */
     (void)gemma4::dflash_probe(meta, out);
     (void)gemma4::dflash2_probe(meta, out);
+    /* Chained launches pay on the dense trunk under any drafter and without one: its decode
+     * kernels have chained forms (libr4d's rad_kernel_chain), the two-rank junctions among them,
+     * and the weight reads beside the reductions then stay on lane 0 instead of a second queue.
+     * Gemma 4 31B on two R9700, ms a decode step unchained / chained: grouped int8 35.81 / 27.60
+     * without a drafter and 42.14 / 31.23 with the assistant head (44.93 / 34.17 at four
+     * sequences); w4a8 26.14 / 15.78 and 32.30 / 20.36 (35.93 / 25.01). The 12B with its head:
+     * bf16 38.65 / 28.84, grouped int8 24.35 / 14.74. */
+    out->chain_pays = RAD_CHAIN_ALWAYS;
     /* The tower's pooling window, so a pass size the core picks itself is whole windows. */
     if (Gemma4Vision::present(meta)) {
         const int64_t k = rad_meta_geti(meta, "vision_config.pooling_kernel_size", 0);
@@ -3314,6 +3337,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 }
 
 #ifndef RAD_ARCH_NO_EXPORTS
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(gemma4_bf16, "gemma4", "compressed-tensors", "0.1.0",
                 "Gemma 4 dense (text, images, E2B/E4B/12B audio), w4a8 or w8a8 from its bf16 or its CT-INT4 (QAT) "
                 "release: sliding-window and proportional-RoPE global attention over a plain "

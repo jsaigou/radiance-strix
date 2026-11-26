@@ -72,14 +72,14 @@ function loraDropdown(node) {
         if (announce) {
           alert(names.length
             ? `loras dropdown now lists ${names.length} adapter(s):\n\n${names.join("\n")}`
-            : "this radiance server lists no LoRAs\n(start it with --lora-dir)");
+            : "this radiance server lists no LoRAs\n(configure it with lora-dir)");
         }
       })
       .catch((e) => {
         console.warn(`[RadianceMiniMax] cannot list LoRAs from ${base}:`, e);
         if (announce) {
           alert(`cannot list LoRAs from ${base}: ${e}\n` +
-                "(the server must be reachable from this browser, and not run with --no-cors)");
+                "(the server must be reachable from this browser, and not configured with no-cors)");
         }
       });
   };

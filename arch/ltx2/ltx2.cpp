@@ -58,7 +58,8 @@
  *
  * Every network computes in bf16, as the reference loads it; the latents, the guidance and the
  * sampler are f32. The text encoder's, the connectors' and the DiT's large linears are bf16 or
- * block fp8 as the container holds them (data/recipes/ltx-2.5-fp8.recipe); the vocoder runs in
+ * rotated int8 as the container holds them (data/recipes/ltx-2.5-bf16.recipe,
+ * ltx-2.5-iq8r.recipe), one kind a container; the vocoder runs in
  * f32 (its anti-aliased activation's kernels are f32), its log-mel input rounded where the
  * reference's bf16 one is.
  *
@@ -93,7 +94,7 @@ enum { kMaxSteps = 64, kDefSteps = 30 };
 /* Time: 24 frames a second; a video of n chunks is 8 n + 1 frames over n + 1 latent frames. A
  * decode pass is a chunk of frames; chunk 0 decodes the whole video, a tile at a time. */
 enum { kFps = 24, kFpc = 8, kFtail = 1, kLpc = 1, kLtail = 1, kDecLat = 2 };
-enum { kMinChunks = 2, kMaxChunks = 20, kDefChunks = 15 };
+enum { kMinChunks = 2, kMaxChunks = 40, kDefChunks = 15 };
 /* Space: 32 pixels a latent; sides multiples of 32 from 256, 3:1 at most; the release's 960 x 544
  * canvas by default, and four times its area at most -- the two-stage recipe's 1920 x 1088. A
  * step holds at most the video rows of 121 frames at that size. */
@@ -182,8 +183,11 @@ static int64_t positions(const RadVideoGeom* g, float* pos, int64_t cap) {
 }
 
 /* ================================================================== linears */
-/* An activation a linear reads: its bf16 plane and, for block-fp8 linears, its codes, which a
- * quantiser makes from the plane (QuantFP8). */
+/* An activation a linear reads: its bf16 plane and, for block-fp8 or rotated int8 linears, its
+ * codes, which a quantiser makes from the plane (QuantFP8: E4M3, or had_quant_act_i8g's int8 at
+ * the weights' scale group). Rows narrower than that group carry no codes: a bf16 linear reads
+ * them (the latents' projections in). Where no library serves the rotating quantiser, each int8
+ * linear quantises its own input and this declares none. */
 struct Act {
     ActFP8   a{};
     QuantFP8 q{};
@@ -196,27 +200,30 @@ struct Act {
         if (!a.x) return RAD_E_INVAL;
         Geom gg = g;
         gg.max_tok = rows;
-        RAD_ARCH_TRY(a.declare_qs(b, nm, gg, name, width, rows));
+        if (g.w_i8h && width % g.w_i8_group) return RAD_OK;
+        RAD_ARCH_TRY(a.declare_pair(b, nm, gg, name, width, rows, g.w_i8h, g.w_i8_group,
+                                    "had_quant_act_i8g"));
+        if (g.w_i8h && !a.q8_fed) return RAD_OK;
         return q.declare(b, gg, a, width);
     }
     /* The codes of rows [r0, r0 + rows), at those rows' count. */
     void step(RadCtx* c, int64_t rows, int64_t r0 = 0) const {
         if (!q.op || rows <= 0) return;
         RAD_ISSUE_N(c, q.op, rows, brow_slice(a.x, r0, rows, n), brow_slice(a.cq(), r0, rows, n),
-                    brow_slice(a.cs(), r0, rows, n / RAD_FP8_BLOCK));
+                    brow_slice(a.cs(), r0, rows, n / a.cg()));
     }
 };
 
 /* A linear, y = x W^T (+ b): `gemm_nt_bias` over the bf16 plane for a bf16 weight (the bias in the
- * GEMM's one rounding, as torch's), or `gemm_nt_q` over the codes for a block-fp8 one with the
- * bias added after (`table_add`, one more rounding). `small` keeps a weight bf16 in any container
- * (a gate's logits: too few rows for 128-row fp8 blocks). The input and output rows may sit at
- * different offsets of their buffers. */
+ * GEMM's one rounding, as torch's), or `gemm_nt_q` over the codes for a block-fp8 or rotated int8
+ * one with the bias added after (`table_add`, one more rounding). `small` keeps a weight bf16 in
+ * any container (a gate's logits: too few rows for 128-row fp8 blocks). The input and output rows
+ * may sit at different offsets of their buffers. */
 struct Lin {
     LinearFP8  l{};
     rad_weight w = 0, bias = 0;
     rad_op     op = 0, op_b = 0;
-    bool       fp8 = false;
+    bool       fp8 = false;      /* read through its codes: block fp8, or rotated int8 */
     bool       mapped = false;   /* the weight's name map was made already (a probe's) */
     int64_t    N = 0, K = 0;
 
@@ -257,9 +264,11 @@ struct Lin {
         l.mapped = mapped;
         RAD_ARCH_TRY(l.declare(b, nm, g, base, N, K, RAD_SHARD_NONE, grp_layer(group), wsrc, in.a, y,
                                max_rows, parts));
-        if (l.bf16 || l.i8 || l.mx || l.w4 || l.paro || l.paro5) {
-            fprintf(stderr, "radiance: ltx2: '%s' is not block fp8; this plugin reads bf16 or "
-                            "block-fp8 linears\n", base);
+        const bool other = l.bf16 || l.mx || l.w4 || l.paro || l.paro5 || l.iqr;
+        if (other || (g.w_i8h ? !(l.i8 && l.i8_rot) : l.i8)) {
+            fprintf(stderr, "radiance: ltx2: '%s' is not %s as the first DiT projection is; this "
+                            "plugin reads bf16, block-fp8 or rotated int8 linears, one kind a "
+                            "container\n", base, g.w_i8h ? "rotated int8" : "block fp8");
             return RAD_E_UNSUPPORTED;
         }
         op = l.op;
@@ -285,9 +294,12 @@ struct Lin {
                 RAD_ISSUE_N(c, op, rows, brow_slice(in.a.x, ri, rows, K), RAD_W(w), out);
             return;
         }
-        RAD_ISSUE_N(c, op, rows, brow_slice(in.a.q, ri, rows, K),
-                    brow_slice(in.a.s, ri, rows, K / RAD_FP8_BLOCK), RAD_W(l.w), RAD_W(l.ws), out,
-                    RAD_NONE, RAD_NONE);
+        if (l.i8)
+            l.step(c, in.a, y, ri + rows, ri, rows, ro);
+        else
+            RAD_ISSUE_N(c, op, rows, brow_slice(in.a.q, ri, rows, K),
+                        brow_slice(in.a.s, ri, rows, K / RAD_FP8_BLOCK), RAD_W(l.w), RAD_W(l.ws),
+                        out, RAD_NONE, RAD_NONE);
         if (op_b) RAD_ISSUE_N(c, op_b, rows, out, RAD_W(bias), out);
     }
 };
@@ -712,7 +724,7 @@ struct Model {
     rad_buf b_ddcu = 0, b_dsig = 0, b_dtg = 0, b_dgrid = 0, b_dg5 = 0;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* ================================================================== check_format */
 static long long tgeti(const RadModelMeta* m, const char* key, long long def) {
@@ -2370,7 +2382,7 @@ static int declare_audio(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     for (const char* w : { "voc.conv_in.weight", "bwe.conv_in.weight" }) {
         if (weight_codes_dtype(b, w, RAD_F32) != RAD_F32) {
             fprintf(stderr, "radiance: ltx2: '%s' is stored %s; the vocoders run in f32 -- convert "
-                            "with data/recipes/ltx-2.5-bf16.recipe or ltx-2.5-fp8.recipe, which "
+                            "with one of data/recipes/ltx-2.5-*.recipe, which "
                             "cast them\n", w, rad_dtype_name(weight_codes_dtype(b, w, RAD_F32)));
             return RAD_E_UNSUPPORTED;
         }
@@ -3140,7 +3152,8 @@ static const double kStage2[] = { 0.909375, 0.725, 0.421875 };
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
     if (ctx->is_draft) {
         fprintf(stderr, "radiance: ltx2: this plugin has no draft scope\n");
         return RAD_E_UNSUPPORTED;
@@ -3150,7 +3163,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         "every head\n");
         return RAD_E_UNSUPPORTED;
     }
-    Model& m = g_model[ctx->rank];
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     Names& nm = m.nm;
@@ -3217,8 +3230,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_INVAL;
     }
 
-    /* ---- bf16 or block fp8: what the container holds for the first DiT projection decides every
-     * large linear (rad_fp8.h, Geom::w_bf16) */
+    /* ---- bf16, block fp8 or rotated int8: what the container holds for the first DiT projection
+     * decides every large linear (rad_arch.h, Geom::w_bf16 and w_i8h) */
     {
         LinearFP8 probe{};
         RAD_ARCH_TRY(probe.probe(b, nm, m.gd, "dit.blk.0.attn1.qkv",
@@ -3226,9 +3239,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    "transformer.transformer_blocks.0.attn1.to_k.weight",
                                    "transformer.transformer_blocks.0.attn1.to_v.weight" }));
         RadEncoding e{};
-        const bool plain = weight_enc(b, nm.f("dit.blk.0.attn1.qkv.weight"), &e) &&
-                           rad_enc_is(&e, "plain");
-        m.gd.w_bf16 = m.gt.w_bf16 = plain;
+        const bool known = weight_enc(b, nm.f("dit.blk.0.attn1.qkv.weight"), &e);
+        m.gd.w_bf16 = m.gt.w_bf16 = known && rad_enc_is(&e, "plain");
+        m.gd.w_i8h = m.gt.w_i8h = known && linear_is_w8h(e);
+        if (m.gd.w_i8h) m.gd.w_i8_group = m.gt.w_i8_group = linear_w8h_group(e);
     }
 
     /* ---- the scheduler: the base model's shifted linspace, or the distilled release's sigmas */
@@ -3371,7 +3385,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 "bandwidth extender%s%s",
              distilled ? " distilled" : "", (long long)m.tL, (long long)m.tC, m.cv.blk.size(),
              m.ca.blk.size(), (long long)m.nb, (long long)m.D, (long long)m.Da,
-             m.gd.w_bf16 ? "bf16" : "block-fp8", m.venc ? "decoder + encoder" : "decoder",
+             m.gd.w_bf16 ? "bf16" : m.gd.w_i8h ? "rotated int8" : "block-fp8",
+             m.venc ? "decoder + encoder" : "decoder",
              m.ups ? ", latent upsampler x2" : "", m.dur ? ", duration head" : "");
     return RAD_OK;
 }
@@ -4144,7 +4159,7 @@ static void step_upscale(RadCtx* c, const RadBatch* batch, const Model& m) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
+    const Model& m = g_model[rad_slot(c)];
     if (!batch->gen || !batch->vgen_b) {
         rad_step_fail(c, "ltx2 is a video generator and runs its generator passes only");
         return;
@@ -4179,12 +4194,14 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PROBE(ltx2)
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(ltx2, "ltx2", "", "0.1.0",
                 "LTX-2.5 (t2va, i2va): a Gemma 4 text encoder and connectors, the duration head, a "
                 "22B dual-stream audio-video diffusion transformer with four-way guidance, the "
                 "causal 3D video VAE (tiled past the default canvas) and the diffusion decoder, the "
                 "audio VAE with a BigVGAN vocoder and bandwidth extension, the x2 latent upsampler; "
-                "bf16 or block-fp8 linears")
+                "bf16, block-fp8 or rotated int8 linears")
 
 extern "C" int64_t rad_arch_video_positions(int which, const RadVideoGeom* g, float* pos,
                                             int64_t cap) {

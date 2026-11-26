@@ -21,11 +21,12 @@ namespace clef_bf16 {
 using namespace rad::arch;
 
 /* One head per rank beside the trunk's own per-rank state (qwen35_bf16::g_model). */
-static ClefHead g_head[MAX_RANKS];
+static ClefHead g_head[MAX_SLOTS];
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
     if (!ClefHead::present(meta)) {
         std::fprintf(stderr, "radiance: clef_bf16 serves a container converted with "
                              "--set decision.type=clef and the head added (--add "
@@ -36,13 +37,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The trunk's declare does not take part in sizing declares (no probe), so its state and the
      * head's are the real ones. The head goes after the vision tower: its buffers join the same
      * arena, and it reads the final norm's rows, the lm_head and the trunk's cache block size. */
-    qwen35_bf16::Model& m = qwen35_bf16::g_model[ctx->rank];
+    qwen35_bf16::Model& m = qwen35_bf16::g_model[rad_build_slot(ctx)];
     /* The lm_head's row would be sampled once and discarded: with this fill declared, the trunk
      * skips the lm_head on a step every sampled row of which carries a request's words
      * (plugin_words_cover_rows) and leaves zero rows instead. */
     m.op_logits_fill = clef_logits_fill(b, m.nm, m.g, m.b_logits);
     if (!m.op_logits_fill) return RAD_E_INVAL;
-    ClefHead& h = g_head[ctx->rank];
+    ClefHead& h = g_head[rad_build_slot(ctx)];
     h = ClefHead{};
     return h.declare(b, meta, ctx, m.nm, m.g, m.b_h, m.b_logits, m.w_lm_head, m.kv_full,
                      (int)m.g.n_layer + 256);
@@ -52,8 +53,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
     qwen35_bf16::step(c, batch);
     /* An encoder pass runs the tower alone and leaves no rows for the head. */
     if (batch->enc) return;
-    qwen35_bf16::Model& m = qwen35_bf16::g_model[rad_rank(c)];
-    ClefHead& h = g_head[rad_rank(c)];
+    qwen35_bf16::Model& m = qwen35_bf16::g_model[rad_slot(c)];
+    ClefHead& h = g_head[rad_slot(c)];
     /* The final norm's rows are still in `h` after the trunk's step; the logits row of each
      * sampled sequence has been written, and the head adds its values beside it. */
     h.step_tokens(c, batch, m.b_h);
@@ -62,6 +63,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
 }  /* namespace clef_bf16 */
 
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(clef_bf16, "clef", "", "0.1.0",
                 "Cloudflare's clef / clef-flash (9B, 27B): the Qwen3.5 trunk of qwen35_bf16, bf16, "
                 "with the joint schema head on the card for /v1/systemone")

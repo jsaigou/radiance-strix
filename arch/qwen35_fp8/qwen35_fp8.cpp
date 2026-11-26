@@ -56,15 +56,16 @@
  *
  * Its differences are behind `#if QWEN35_W8A8`: check_format's method, the probe that learns the
  * trunk is int8 before the activations are declared (and refuses one that is not), and the plugin
- * identity. The int8 activation pairs follow from the probe. */
+ * identity. The int8 activation pairs follow from the probe.
+ *
+ * Both macros together are `qwen35moe_w8a8`, the routed build with that trunk: the experts are
+ * rotated too (int8 at a bf16 scale a 128 of K, or the four-bit forms) and read the int8 codes the
+ * trunk's own quantisers write (rad_block_moe_fp8.h, MoeFP8::a8). */
 #ifndef QWEN35_MOE
 #define QWEN35_MOE 0
 #endif
 #ifndef QWEN35_W8A8
 #define QWEN35_W8A8 0
-#endif
-#if QWEN35_MOE && QWEN35_W8A8
-#error "qwen35_w8a8 is the dense build; a routed int8 trunk is not a format this file serves"
 #endif
 /* The plugin's name for a message, expanded once more so it is QWEN35_NS's value. */
 #define QWEN35_STR_X(x) #x
@@ -152,6 +153,8 @@ struct Model {
     /* The trunk's linears are int8 (LinearFP8::i8), learned before the activations are declared
      * because it decides whether they carry an int8 code pair. Only qwen35_w8a8 sets it. */
     bool trunk_i8 = false;
+    /* The int8 trunk's scale group: 128, or 256 for IQ8R (linear_w8h_group). */
+    int64_t trunk_g8 = RAD_FP8_BLOCK;
 
     /* the residual stream and the two vocabulary edges */
     rad_buf b_x = 0, b_hout = 0, b_logits = 0;
@@ -245,7 +248,7 @@ struct Model {
     bool      pipe_serial_noted = false;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 #if !QWEN35_MOE
 /* The narrowest step the pipelined prefill takes, and its first piece: half the step rounded up
@@ -267,9 +270,9 @@ static int check_format(const RadModelMeta* meta) {
     /* The format the convert stated (the recipe's --set keys); the trunk probe in declare() holds
      * the weights to it. */
     if (!method || std::strcmp(method, "w8a8") != 0 || !fmt || std::strcmp(fmt, "fwht128") != 0) {
-        fprintf(stderr, "radiance: qwen35_w8a8 serves a container converted for an int8 trunk "
-                        "(quant_method 'w8a8', fmt 'fwht128': data/recipes/"
-                        "q38-27b-w8a8-df2.recipe's --set keys); this one says '%s' / '%s'.\n",
+        fprintf(stderr, "radiance: " QWEN35_STR(QWEN35_NS) " serves a container converted for an "
+                        "int8 trunk (quant_method 'w8a8', fmt 'fwht128': data/recipes/"
+                        "q38-27b-iq8r.recipe's --set keys); this one says '%s' / '%s'.\n",
                 method ? method : "(none)", fmt ? fmt : "(none)");
         return RAD_E_UNSUPPORTED;
     }
@@ -399,22 +402,34 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     dw.attn    = decl_b(b, nm.f("df_attn"), dg.act_dtype, {qr, qd});
     dw.gate_up = decl_b(b, nm.f("df_gate_up"), dg.act_dtype, {qr, 2 * dg.n_ff});
     dw.ffn     = decl_b(b, nm.f("df_ffn"),  dg.act_dtype, {qr, dg.n_ff});
-    /* FP8 copies. The drafter's six linears are block-scaled fp8 over a bf16 checkpoint
-     * (rad_fp8.h's DenseFP8), so every activation feeding one has an E4M3 copy and an f32 scale
-     * plane. `srcq` is the largest (50 MiB at a 2048-token chunk and five taps) and halves the
-     * bytes of the context pass's dominant GEMM. */
-    dw.srcq    = decl_b(b, nm.f("df_srcq"), RAD_F8E4M3,
-                        {dg.max_tok, dc.n_taps * dg.n_embd});
-    dw.srcs    = decl_b(b, nm.f("df_srcs"), RAD_F32,
-                        {dg.max_tok, fp8_blocks(dc.n_taps * dg.n_embd)});
-    dw.cq      = decl_b(b, nm.f("df_cq"),   RAD_F8E4M3, {dg.max_tok, dg.n_embd});
-    dw.cs      = decl_b(b, nm.f("df_cs"),   RAD_F32,    {dg.max_tok, fp8_blocks(dg.n_embd)});
-    dw.h2q     = decl_b(b, nm.f("df_h2q"),  RAD_F8E4M3, {qr, dg.n_embd});
-    dw.h2s     = decl_b(b, nm.f("df_h2s"),  RAD_F32,    {qr, fp8_blocks(dg.n_embd)});
-    dw.atq     = decl_b(b, nm.f("df_atq"),  RAD_F8E4M3, {qr, qd});
-    dw.ats     = decl_b(b, nm.f("df_ats"),  RAD_F32,    {qr, fp8_blocks(qd)});
-    dw.ffq     = decl_b(b, nm.f("df_ffq"),  RAD_F8E4M3, {qr, dg.n_ff});
-    dw.ffs     = decl_b(b, nm.f("df_ffs"),  RAD_F32,    {qr, fp8_blocks(dg.n_ff)});
+    /* The codes the drafter's six linears read: every activation feeding one has an 8-bit copy
+     * and an f32 scale plane. E4M3 with a scale per 128 for block fp8 or MXFP4 linears (rad_fp8.h's
+     * DenseFP8), int8 with a scale per 128 or IQ8R's 256 for rotated int8 ones, which the drafter's
+     * `fc` tells apart.
+     * `srcq` is the largest (50 MiB at a 2048-token chunk and five taps) and halves the bytes of
+     * the context pass's dominant GEMM. */
+    RAD_ARCH_TRY(Dflash2::probe_i8(b, nm, "draft", &dc.act_i8, &dc.act_g8));
+    dc.fc_mapped = true;
+    const uint32_t dqt = dc.act_i8 ? RAD_I8 : RAD_F8E4M3;
+    const int64_t  dqg = dc.act_i8 ? dc.act_g8 : (int64_t)RAD_FP8_BLOCK;
+    if (dc.act_i8 && ((dc.n_taps * dg.n_embd) % dqg || dg.n_embd % dqg || qd % dqg ||
+                      dg.n_ff % dqg)) {
+        fprintf(stderr, "radiance: a rotated int8 drafter takes widths in whole %lld-column scale groups; "
+                        "this one is n_embd %lld, q %lld, n_ff %lld\n", (long long)dqg,
+                (long long)dg.n_embd, (long long)qd, (long long)dg.n_ff);
+        return RAD_E_INVAL;
+    }
+    auto dqs = [&](int64_t n) { return (n + dqg - 1) / dqg; };
+    dw.srcq    = decl_b(b, nm.f("df_srcq"), dqt, {dg.max_tok, dc.n_taps * dg.n_embd});
+    dw.srcs    = decl_b(b, nm.f("df_srcs"), RAD_F32, {dg.max_tok, dqs(dc.n_taps * dg.n_embd)});
+    dw.cq      = decl_b(b, nm.f("df_cq"),   dqt,     {dg.max_tok, dg.n_embd});
+    dw.cs      = decl_b(b, nm.f("df_cs"),   RAD_F32, {dg.max_tok, dqs(dg.n_embd)});
+    dw.h2q     = decl_b(b, nm.f("df_h2q"),  dqt,     {qr, dg.n_embd});
+    dw.h2s     = decl_b(b, nm.f("df_h2s"),  RAD_F32, {qr, dqs(dg.n_embd)});
+    dw.atq     = decl_b(b, nm.f("df_atq"),  dqt,     {qr, qd});
+    dw.ats     = decl_b(b, nm.f("df_ats"),  RAD_F32, {qr, dqs(qd)});
+    dw.ffq     = decl_b(b, nm.f("df_ffq"),  dqt,     {qr, dg.n_ff});
+    dw.ffs     = decl_b(b, nm.f("df_ffs"),  RAD_F32, {qr, dqs(dg.n_ff)});
     dw.sel_h   = decl_b(b, nm.f("df_selh"), dg.act_dtype, {sr, dg.n_embd});
     dw.hp      = decl_b(b, nm.f("df_hp"),   dg.act_dtype, {sr, dc.sel_rank});
     dw.dq      = decl_b(b, nm.f("df_dq"),   RAD_I8,  {sr, dg.n_embd});
@@ -518,9 +533,10 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
 
-    Model& m = g_model[ctx->rank];
+    Model& m = g_model[rad_build_slot(ctx)];
     if (m.pipe_tbl) rad_dev_free(m.pipe_tbl, RAD_MEM_HOST_PINNED);
     m = Model{};
     m.nm = Names(ctx->scope);
@@ -565,6 +581,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * `model.language_model.layers.N` and its MTP block separately under `mtp.`; subtracting it
      * would drop full-attention layer 63 and silently run a trunk one layer short. */
     m.n_main = g.n_layer;
+    const bool calib_requested = ctx->calib_dir && *ctx->calib_dir;
+    const bool calib_mtp_layer = QWEN35_W8A8 && !QWEN35_MOE && calib_requested && nextn > 0 &&
+        ctx->calib_layer_lo == m.n_main && ctx->calib_layer_hi == m.n_main + 1;
+#if !QWEN35_MOE
+    const bool calib_trunk_layers = calib_requested &&
+        (!ctx->calib_layer_hi || ctx->calib_layer_lo < m.n_main);
+#endif
+    if (calib_requested && !calib_mtp_layer && ctx->calib_layer_hi > m.n_main) {
+        if (nextn > 0)
+            fprintf(stderr, "radiance: qwen35: select only the virtual MTP layer for draft-head "
+                            "calibration on dense qwen35_w8a8\n");
+        else
+            fprintf(stderr, "radiance: qwen35: --calib-layers extends past the trunk, with no MTP "
+                            "layer to calibrate\n");
+        return RAD_E_INVAL;
+    }
 
     /* Qwen3.5's norms are GemmaRMSNorm, `x_hat * (1 + w)` (vLLM imports GemmaRMSNorm as
      * Qwen3_5RMSNorm). This covers input_layernorm, post_attention_layernorm, the final norm and
@@ -629,51 +661,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* ---- the three KV groups. The attention cache is bf16 by default; `kv_dtype` follows it.
      *
-     * --kv-cache-dtype fp8 makes it E4M3. The cache is `n_head_kv * head_dim * 2` bytes per token
-     * per layer (2 KiB per rank here), paid only by the 16 attention layers; the 48 delta-net
-     * layers carry fixed-size state. At eight sequences of 16k that is 4.3 GB of reads per step,
-     * most of the cost of depth at that concurrency, and fp8 halves it along with each sequence's
-     * KV pool footprint.
+     * --kv-cache-dtype i8 makes it the int8 cache (abi/rad_builder.h): K and V as int8 codes
+     * with one f16 scale each per token and head, half the bf16 cache's bytes. The cache is paid
+     * only by the 16 attention layers; the 48 delta-net layers carry fixed-size state. At eight
+     * sequences of 16k the bf16 cache is 8.6 GB of reads per step, most of the cost of depth at
+     * that concurrency, and int8 halves it along with each sequence's KV pool footprint.
      *
-     * Off by default for quality: greedy continuations from a long prompt agree for a few hundred
-     * tokens and then diverge, and the fp8 side can produce syntactically broken code where bf16
-     * stays clean, which matters for a coding model.
-     *
-     * The descales stay at libr4d's default of 1.0 (vLLM's default too); the kernels index them
-     * per (sequence, head), so calibrated descales need no other mechanism. The fp8kv attention
-     * rows and `kv_store_fp8` are in libr4d, the core sizes a page from the group's dtype, and the
-     * drafter's cache takes the same dtype (declare_dflash2). */
+     * Off by default because it changes the model's output slightly. The core sizes a page from
+     * the group's dtype, and the drafter's cache takes the same dtype (declare_dflash2). */
     RadKVGroupDecl fd{};
     fd.kind      = RAD_KV_FULL;
     fd.dtype     = rad_kv_cache_dtype(ctx, RAD_BF16);
     fd.n_head_kv = g.n_head_kv;
     fd.head_dim  = g.head_dim;
-    /* --kv-cache-dtype fp8_v4 / k6_v4 (RadBuildCtx::kv_quant): V as int4 in groups of 32 with f16
-     * scales, K E4M3 as above or int6 the same way (libr4d's fp8_v4 / k6_v4 rows). A token's row
-     * is 25 or 22 * head_dim / 16 bytes instead of 2 * head_dim, so the group is declared at half
-     * that and the core sizes pages from it; only those kernels read the layout. The drafter's
-     * group stays E4M3 (declare_dflash2). The engine asks only for a layout probe() offered. */
-    const int kvq = fd.dtype == RAD_F8E4M3 ? ctx->kv_quant : RAD_KVQ_NONE;
-    const char* kvq_name = kvq == RAD_KVQ_V4 ? "fp8_v4" : kvq == RAD_KVQ_K6V4 ? "k6_v4" : nullptr;
-    if (kvq != RAD_KVQ_NONE && !kvq_name) {
-        fprintf(stderr, "radiance: KV cache layout %d is not one this plugin knows\n", kvq);
-        return RAD_E_UNSUPPORTED;
-    }
-    if (kvq_name && !(g.head_dim == 256 && g.n_head == 6 * g.n_head_kv)) {
-        fprintf(stderr, "radiance: --kv-cache-dtype %s has libr4d rows at head_dim 256, gqa 6 "
-                        "only; this model is head_dim %lld, gqa %lld\n", kvq_name,
-                (long long)g.head_dim, (long long)(g.n_head_kv ? g.n_head / g.n_head_kv : 0));
-        return RAD_E_UNSUPPORTED;
-    }
-    const int64_t row16 = kvq == RAD_KVQ_V4 ? 25 : kvq == RAD_KVQ_K6V4 ? 22 : 32;
-    fd.head_dim = g.head_dim * row16 / 32;
     m.kv_full = rad_decl_kv_group(b, nm.f("kv_attn"), &fd);
     /* The op parameter must use the spelling the rows band on, which is rad_dtype_name's. */
-    g.kv_dtype = kvq_name ? kvq_name : rad_dtype_name(fd.dtype);
-    if (kvq_name)
-        rad_note(b, "kv cache %s: %s K, int4 V, in groups of 32 with f16 scales, %lld bytes a token "
-                    "and head instead of %lld", kvq_name, kvq == RAD_KVQ_V4 ? "E4M3" : "int6",
-                 (long long)(g.head_dim * row16 / 16), (long long)(2 * g.head_dim));
+    g.kv_dtype = rad_dtype_name(fd.dtype);
 
     /* The SSM state cache is f32, or f16 under --state-cache-dtype f16 (RadBuildCtx::state_dtype).
      *
@@ -716,6 +719,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         RadEncoding enc{};
         m.trunk_i8 = weight_enc(b, nm.f("blk.%lld.ssm_inz.weight", (long long)l), &enc) &&
                      (linear_is_w8h(enc) || linear_is_wnh(enc));
+        if (m.trunk_i8) m.trunk_g8 = linear_w8h_group(enc);
         break;
     }
     if (!m.trunk_i8) {
@@ -733,7 +737,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * (143 MiB) beside its 285 MiB bf16 buffer. */
     m.b_x       = decl_b(b, nm.f("x"),        g.act_dtype, {g.max_tok, g.n_embd});
     m.a_h.x     = decl_b(b, nm.f("h"),        g.act_dtype, {g.max_tok, g.n_embd});
-    RAD_ARCH_TRY(m.a_h.declare_qs(b, nm, g, "h", g.n_embd, 0, m.trunk_i8));
+    RAD_ARCH_TRY(m.a_h.declare_qs(b, nm, g, "h", g.n_embd, 0, m.trunk_i8, true,
+                                   m.trunk_g8));
 
     m.b_qg      = decl_b(b, nm.f("attn_qg"),  g.act_dtype, {g.max_tok, g.n_head, 2 * g.head_dim});
     m.b_k       = decl_b(b, nm.f("attn_k"),   g.act_dtype, {g.max_tok, kv_dim});
@@ -749,7 +754,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * it must not share storage with transients. */
     m.b_rope_cs = decl_b(b, nm.f("rope_cs"), RAD_F32, {rope_table_rows(g), m.n_rot},
                          RAD_BUF_PERSIST);
-    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "attn_out", q_dim, 0, m.trunk_i8));
+    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "attn_out", q_dim, 0, m.trunk_i8, true,
+                                   m.trunk_g8));
 
     /* `gdn_in` is conv_dim + v_dim, not in_dim: a and b have their own buffer because the
      * checkpoint keeps them bf16, while the fp8 output gate is the tail of this one
@@ -769,7 +775,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* Rank 3, as libr4d's scan and recurrent kernels require; the quantiser reads dim 0 as the
      * row. */
     m.a_go.x    = decl_b(b, nm.f("gdn_o"),    g.act_dtype, {g.max_tok, gc.n_head_v, gc.head_v});
-    RAD_ARCH_TRY(m.a_go.declare_qs(b, nm, g, "gdn_o", v_dim, 0, m.trunk_i8));
+    RAD_ARCH_TRY(m.a_go.declare_qs(b, nm, g, "gdn_o", v_dim, 0, m.trunk_i8, true,
+                                   m.trunk_g8));
 
 #if QWEN35_MOE
     /* ---- the routing geometry, read here so a refusal names the container's key. `n_ff` is
@@ -848,24 +855,60 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                              RAD_BUF_PERSIST);
         m.b_egu     = decl_b(b, nm.f("moe_gate_up"), g.act_dtype, {K, 2 * mc.n_ff_exp});
         m.a_eff.x   = decl_b(b, nm.f("moe_ffn"),    g.act_dtype, {K, mc.n_ff_exp});
-        m.a_eff.q   = decl_b(b, nm.f("moe_ffn.q"),  RAD_F8E4M3,  {K, mc.n_ff_exp});
-        m.a_eff.s   = decl_b(b, nm.f("moe_ffn.s"),  RAD_F32,     {K, fp8_blocks(mc.n_ff_exp)});
+        if (m.trunk_i8) {
+            /* An int8 trunk's routed arm is int8 throughout: the gated product's rotated codes
+             * at one scale a 128 of K, an expert's width a rank being whole 128s and not always
+             * whole 256s (MoeFP8::a8). */
+            m.a_eff.g8 = RAD_FP8_BLOCK;
+            m.a_eff.q8 = decl_b(b, nm.f("moe_ffn.q8"), RAD_I8,  {K, mc.n_ff_exp});
+            m.a_eff.s8 = decl_b(b, nm.f("moe_ffn.s8"), RAD_F32, {K, fp8_blocks(mc.n_ff_exp)});
+            m.a_eff.q8_fed = m.a_eff.q8_rot = true;
+        } else {
+            m.a_eff.q   = decl_b(b, nm.f("moe_ffn.q"),  RAD_F8E4M3,  {K, mc.n_ff_exp});
+            m.a_eff.s   = decl_b(b, nm.f("moe_ffn.s"),  RAD_F32,     {K, fp8_blocks(mc.n_ff_exp)});
+        }
         m.b_edn     = decl_b(b, nm.f("moe_down"),   g.act_dtype, {K, g.n_embd});
         if (mc.n_ff_shared > 0) {
             m.b_emoe  = decl_b(b, nm.f("moe_out"),   g.act_dtype, {R, g.n_embd});
             m.b_sgu   = decl_b(b, nm.f("shexp_gate_up"), g.act_dtype, {R, 2 * mc.n_ff_shared});
             m.a_sff.x = decl_b(b, nm.f("shexp_ffn"),     g.act_dtype, {R, mc.n_ff_shared});
+            if (m.trunk_i8) {
+                /* The shared expert's down projection is a trunk linear, and its input's codes
+                 * take the group its own weight is stored at, read from layer 0's through that
+                 * layer's own LinearFP8 (which then maps it once): a recipe keeps it at a 128
+                 * where a rank's share of its width is not whole 256s. */
+                LinearFP8& sd = m.layers[0].mlp.sh_down;
+                RAD_ARCH_TRY(sd.probe(b, nm, g, nm.f("blk.0.ffn_down_shexp"),
+                                      { nm.ckpt("model.language_model.layers.0.mlp."
+                                                "shared_expert.down_proj.weight") }));
+                const int64_t sg = sd.probed_i8 ? sd.probed_g8 : m.trunk_g8;
+                RAD_ARCH_TRY(m.a_sff.declare_pair(b, nm, g, "shexp_ffn", mc.n_ff_shared, R, true,
+                                                  sg, "gated_had_quant_i8g"));
+            } else {
             m.a_sff.q = decl_b(b, nm.f("shexp_ffn.q"),   RAD_F8E4M3,  {R, mc.n_ff_shared});
             m.a_sff.s = decl_b(b, nm.f("shexp_ffn.s"),   RAD_F32, {R, fp8_blocks(mc.n_ff_shared)});
+            }
             m.b_sout  = decl_b(b, nm.f("shexp_out"),     g.act_dtype, {R, g.n_embd});
             m.b_sgate = decl_b(b, nm.f("shexp_gate"),    g.act_dtype, {R, 1});
         }
-        if (mc.expert_rot) RAD_ARCH_TRY(m.a_hr.declare_qs(b, nm, g, "moe_hr", g.n_embd));
+        /* The experts' rotated copy of the block input. An int8 trunk whose norms write rotated
+         * int8 codes (below) needs none: the experts read `h`'s own. Where they do not (the CPU
+         * kernels), had_quant_act_i8g writes this one at a scale a 128. */
+        const bool h_fed = m.trunk_i8 && rad_op_declared(b, "rmsnorm_had_quant_i8g") &&
+                           (g.world != 2 || rad_op_declared(b, "ar_rmsnorm_had_quant_i8g"));
+        if (m.trunk_i8 && !h_fed) {
+            RAD_ARCH_TRY(m.a_hr.declare_qs(b, nm, g, "moe_hr", g.n_embd, 0, true, false,
+                                           RAD_FP8_BLOCK));
+            m.a_hr.q8_fed = m.a_hr.q8_rot = true;
+        } else if (mc.expert_rot && !m.trunk_i8) {
+            RAD_ARCH_TRY(m.a_hr.declare_qs(b, nm, g, "moe_hr", g.n_embd));
+        }
     }
 #else
     m.b_gate_up = decl_b(b, nm.f("gate_up"),  g.act_dtype, {g.max_tok, 2 * g.n_ff});
     m.a_ffn.x   = decl_b(b, nm.f("ffn"),      g.act_dtype, {g.max_tok, g.n_ff});
-    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff, 0, m.trunk_i8));
+    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff, 0, m.trunk_i8, true,
+                                   m.trunk_g8));
 #endif
 
 #if QWEN35_W8A8
@@ -879,7 +922,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (rad_op_declared(b, "rmsnorm_had_quant_i8g") &&
         (g.world != 2 || rad_op_declared(b, "ar_rmsnorm_had_quant_i8g")))
         m.a_h.q8_fed = m.a_h.q8_rot = true;
+#if !QWEN35_MOE
     if (rad_op_declared(b, "gated_had_quant_i8g")) m.a_ffn.q8_fed = m.a_ffn.q8_rot = true;
+#endif
     /* The delta net's output likewise, from the decode conv fold's epilogue
      * (gdn_conv_recurrent_update_had) and had_quant_act_i8g on the other rows (GdnFP8::q_o). */
     if (rad_op_declared(b, "gdn_conv_recurrent_update_had") && rad_op_declared(b, "had_quant_act_i8g"))
@@ -1081,12 +1126,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.layers.resize((size_t)m.n_main);
 #if !QWEN35_MOE
     /* GPTQ calibration over the trunk's own int8 codes (rad_calib_full.h, site_i8): one rank, the
-     * serial step. The scratch is the widest input's square, the feed-forward's. */
-    if (ctx->calib_dir && *ctx->calib_dir && g.world > 1) {
-        fprintf(stderr, "radiance: qwen35: --calib-dir records an int8 trunk at --tp 1 only\n");
+     * serial step. MTP-only calibration selects virtual layer n_main and does not touch this tap. */
+    if (calib_trunk_layers && g.world > 1) {
+        fprintf(stderr, "radiance: qwen35: --calib-dir records an int8 trunk at --tp 1 only; "
+                        "select only the MTP layer for replicated-head calibration\n");
         return RAD_E_INVAL;
     }
-    RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, m.n_main, 0, std::max<int64_t>(g.n_ff, g.n_embd)));
+    if (calib_trunk_layers)
+        RAD_ARCH_TRY(m.calib.begin(b, nm, g, ctx, m.n_main, 0,
+                                   std::max<int64_t>(g.n_ff, g.n_embd)));
 #endif
     for (int64_t l = 0; l < m.n_main; ++l) {
         Layer& lay = m.layers[(size_t)l];
@@ -1251,8 +1299,23 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      *
      * Also only when there is no DFlash2 drafter (`n_taps` == 0): a deployment drafts with one,
      * and DFlash2 (one forward per block rather than one per token) is the better one here. */
-    /* (A vocabulary-weighted head has no output.weight for the draft head to read.) */
-    if (nextn > 0 && g.max_spec > 0 && m.n_taps == 0 && !m.n_vcls) {
+    if (calib_mtp_layer && m.n_taps > 0) {
+        fprintf(stderr, "radiance: qwen35: MTP draft-head calibration cannot use a DFlash2 drafter\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    const bool want_mtp = nextn > 0 && (g.max_spec > 0 || calib_mtp_layer) && !m.n_taps;
+    const bool draft_q2 = want_mtp &&
+        mtp_draft_head_q2(b, nm.f("mtp.draft_head.weight"), nm.ckpt("lm_head.weight"));
+    if (calib_mtp_layer && !draft_q2) {
+        fprintf(stderr, "radiance: qwen35: MTP draft-head calibration requires a U2 "
+                        "mtp.draft_head.weight\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    /* A split target has no single output.weight. It can still verify the proposals of an
+     * independent U2 head. Older split-head containers carry neither that head nor the MTP
+     * block, even if the checkpoint metadata advertises NextN. Leave them trunk-only. */
+    if (want_mtp && (m.w_lm_head || draft_q2 || ctx->draft_coupling)) {
+        const int pitch = MtpHead::proposal_pitch(ctx->draft_coupling != 0);
         /* Sized at max_tok, not max_logit_rows: a draft round is one row per sequence, but the
          * history pass that fills the head's own K and V is one row per token over a whole prefill
          * chunk (26 MiB at a 512-token chunk, beside 477 MiB of head weights). */
@@ -1261,19 +1324,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.b_mtp_c = decl_b(b, nm.f("mtp_c"), g.act_dtype, {g.max_tok, 2 * g.n_embd});
         m.b_mtp_x = decl_b(b, nm.f("mtp_x"), g.act_dtype, {g.max_tok, g.n_embd});
 
-        /* The 2-bit draft head's working set, at max_logit_rows, since only a draft round (one row
-         * per sequence) uses it. `mtp_dsum` is quant_act_i8's group-major
-         * [n_embd/128][ceil(M/16)*16] plane, first dimension the K group, not the token. */
-        if (mtp_draft_head_q2(b, nm.f("mtp.draft_head.weight"), nm.ckpt("lm_head.weight"))) {
-            const int64_t dmpad = ((g.max_logit_rows + 15) / 16) * 16;
-            m.b_mtp_dq   = decl_b(b, nm.f("mtp_dq"),   RAD_I8,   {g.max_logit_rows, g.n_embd});
-            m.b_mtp_ds   = decl_b(b, nm.f("mtp_ds"),   RAD_F32,  {g.max_logit_rows, 1});
+        /* One row per drafting sequence, even if verification or KLD needs many more target
+         * logits rows. mtp_dsum is quant_act_i8's group-major [n_embd/128][ceil(M/16)*16]. */
+        if (draft_q2 && !calib_mtp_layer) {
+            const int64_t dmpad = ((g.max_seqs + 15) / 16) * 16;
+            m.b_mtp_dq   = decl_b(b, nm.f("mtp_dq"),   RAD_I8,   {g.max_seqs, g.n_embd});
+            m.b_mtp_ds   = decl_b(b, nm.f("mtp_ds"),   RAD_F32,  {g.max_seqs, 1});
             m.b_mtp_dsum = decl_b(b, nm.f("mtp_dsum"), RAD_F32,  {g.n_embd / 128, dmpad});
-            m.b_mtp_dlog = decl_b(b, nm.f("mtp_dlog"), g.act_dtype, {g.max_logit_rows, g.n_vocab_all});
+            m.b_mtp_dlog = decl_b(b, nm.f("mtp_dlog"), g.act_dtype, {g.max_seqs, g.n_vocab_all});
             /* A draft round's proposal comes out of row_topk here, never through the sampler's
              * token buffer. */
-            m.b_mtp_didx = decl_b(b, nm.f("mtp_didx"), RAD_I32,  {g.max_logit_rows, 1});
-            m.b_mtp_dval = decl_b(b, nm.f("mtp_dval"), RAD_F32,  {g.max_logit_rows, 1});
+            m.b_mtp_didx = decl_b(b, nm.f("mtp_didx"), RAD_I32, {g.max_seqs, pitch});
+            m.b_mtp_dval = decl_b(b, nm.f("mtp_dval"), RAD_F32, {g.max_seqs, pitch});
         }
 
         /* The head reuses the trunk's working buffers (`attn_qg`, `attn_k`, the ffn planes, `h`),
@@ -1289,6 +1351,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         tw.dq = m.b_mtp_dq; tw.ds = m.b_mtp_ds;  tw.dsum = m.b_mtp_dsum;
         tw.dlog = m.b_mtp_dlog; tw.didx = m.b_mtp_didx; tw.dval = m.b_mtp_dval;
         tw.attn = tw_attn;  tw.mlp = tw_mlp;
+        tw.coupled = !calib_mtp_layer && ctx->draft_coupling != 0;
+        if (calib_mtp_layer) {
+            tw.calib_dir = ctx->calib_dir;
+            tw.calib_tokens = ctx->calib_tokens;
+        }
 
         MtpHead::Src ts{};
         ts.fc                 = nm.ckpt("mtp.fc.weight");
@@ -1320,10 +1387,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         ts.mlp.up      = nm.ckpt("mtp.layers.0.mlp.up_proj.weight");
         ts.mlp.down    = nm.ckpt("mtp.layers.0.mlp.down_proj.weight");
 #endif
-        /* The trunk maps this same tensor as `output.weight`; the draft head maps it again under a
-         * name of its own, which the recipe quantises to two bits (mtp_draft_head_q2). */
-        ts.lm          = nm.ckpt("lm_head.weight");
-
         /* Bound as one more layer of the trunk's full-attention group, at absolute index n_main,
          * so a draft round writes its K and V at the slot of the trunk's token for that position.
          * A rejected draft is then overwritten rather than rolled back (rad_block_mtp_fp8.h). */
@@ -1333,15 +1396,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    m.w_lm_head, final_wadd, tw, ts));
         m.have_mtp = true;
 
-        /* Serial drafter: `max_spec` dependent passes, each embedding the last one's proposal.
-         * The 2-bit head writes its own argmax into `mtp_didx`; without it `mtp_didx` is 0 and the
-         * bf16 head goes through the ordinary sampler chain. */
+        /* A U2 drafter writes a greedy or coupled proposal to column zero. The BF16 fallback
+         * uses the ordinary sampler. Calibration carries no projection, proposal or draft depth. */
         RadDrafterDecl dd{};
         dd.name           = "mtp";
-        dd.kind           = RAD_DRAFT_SERIAL;
+        dd.kind           = calib_mtp_layer ? RAD_DRAFT_HISTORY : RAD_DRAFT_SERIAL;
         dd.depth          = ctx->max_spec;
         dd.proposal       = m.b_mtp_didx;
-        dd.proposal_pitch = 1;
+        dd.proposal_pitch = calib_mtp_layer ? 0 : pitch;
         dd.mask_token     = -1;
         RAD_ARCH_TRY(rad_declare_drafter(b, &dd));
     }
@@ -1389,7 +1451,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         rad_note(b, "MTP head: the first of %lld NextN layer(s) under `mtp.`, as absolute layer "
                     "%lld of the full-attention KV group",
                  (long long)nextn, (long long)m.n_main);
-    else if (nextn > 0)
+    else if (want_mtp && m.n_vcls)
+        rad_note(b, "no native MTP: this split-head container has no independent U2 draft head");
+    else if (nextn > 0 && !m.have_df)
         rad_note(b, "the %lld MTP/NextN layer(s) under `mtp.` are not loaded: this deployment "
                     "does not speculate", (long long)nextn);
 
@@ -1645,7 +1709,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
 #endif
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    Model& m = g_model[rad_rank(c)];
+    Model& m = g_model[rad_slot(c)];
 
     /* An encoder pass runs only the vision tower (RadBatch::enc). */
     if (batch->enc) {
@@ -1772,17 +1836,22 @@ static void step(RadCtx* c, const RadBatch* batch) {
  * 0 when the container carries no drafter. */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
-    /* --kv-cache-dtype fp8_v4 / k6_v4: libr4d's rows for them are the h256/gqa6 attention
-     * family's (Qwen3.8-27B), so other geometries are refused at startup rather than in declare. */
-    {
-        const long long hd  = meta->head_dim ? meta->head_dim
-                                             : (meta->n_head ? meta->n_embd / meta->n_head : 0);
-        const long long nkv = meta->n_head_kv ? meta->n_head_kv : meta->n_head;
-        if (hd == 256 && nkv > 0 && meta->n_head == 6 * nkv)
-            out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
-    }
     /* The delta-net state cache is declared at RadBuildCtx::state_dtype. */
     out->state_f16_ok = 1;
+#if QWEN35_W8A8 && !QWEN35_MOE
+    /* Chained launches pay on an int8 or a trellis trunk with and without its drafter: every
+     * kernel of its decode chain has a chained form (libr4d's rad_kernel_chain), the two-rank
+     * junctions among them. Qwen3.8-27B, ms a decode step unchained / chained, on two R9700: as
+     * IQ8R 32.14 / 21.98 without a drafter and 36.54 / 26.52 with DFlash2 (40.75 / 32.09 at four
+     * sequences), as IQ4R-S-V4 with DFlash2 29.32 / 20.46 (35.37 / 26.81). On one R9700, which
+     * has no junction to wait behind, the IQ8R trunk measured 49.57 / 47.94 without a drafter and
+     * 56.13 / 54.23 with DFlash2.
+     *
+     * Not the routed build: its grouped GEMMs, router and gather have no chained form, and
+     * Qwen3.6-35B-A3B on two R9700s measured a decode step of 10.27 / 11.77 / 12.35 ms at 1, 4 and
+     * 8 sequences with them against 10.25 / 11.58 / 12.25 without. */
+    out->chain_pays = RAD_CHAIN_ALWAYS;
+#endif
     const char* da = rad_meta_gets(meta, "draft.architectures", "");
     if (da && std::strstr(da, "DFlash2")) {
         const long long bs = rad_meta_geti(meta, "draft.dflash_config.block_size", 8);
@@ -1804,8 +1873,19 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
  * expanded first, so these forward the expanded namespace. */
 #define QWEN35_PROBE_X(NS)              RAD_ARCH_PROBE(NS)
 #define QWEN35_PLUGIN_X(NS, ...)        RAD_ARCH_PLUGIN(NS, __VA_ARGS__)
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 QWEN35_PROBE_X(QWEN35_NS)
-#if QWEN35_MOE
+#if QWEN35_MOE && QWEN35_W8A8
+QWEN35_PLUGIN_X(QWEN35_NS, QWEN35_ARCH_ID, "w8a8_fwht128", "0.1.0",
+                "Qwen3.5 / 3.6 MoE (35B-A3B), an int8 trunk and int8 experts: i8 weights rotated "
+                "by a 128-wide Hadamard against int8 activations the same rotation quantises; the "
+                "dense graph with a routed feed-forward (256 experts, 8 a token, and a shared "
+                "expert), gated attention over paged KV every fourth layer and gated delta net "
+                "between")
+/* An imported checkpoint is never a rotated int8 trunk: qwen35moe_fp8 serves those. */
+RAD_ARCH_SERVES_IMPORTS(0)
+#elif QWEN35_MOE
 QWEN35_PLUGIN_X(QWEN35_NS, QWEN35_ARCH_ID, "fp8_e4m3", "0.1.0",
                 "Qwen3.5 / 3.6 MoE (35B-A3B), block-scaled fp8 weights and fp8 activations: the "
                 "dense graph with a routed feed-forward (256 experts, 8 a token, and a shared "

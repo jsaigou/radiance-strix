@@ -6,7 +6,7 @@
  * vendor/ runs while a reply is read. */
 #include "llama/common/json-schema-to-grammar.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cctype>
@@ -17,7 +17,7 @@
 
 namespace rad {
 
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 
 namespace {
 
@@ -303,7 +303,7 @@ private:
 
 /* ================================================================== JSON text helpers */
 
-/* A string's JSON encoding without its quotes, byte for byte what nlohmann::json::dump writes:
+/* A string's JSON encoding without its quotes, byte for byte what Json::dump writes:
  * two-character escapes where JSON has one, \u00XX in lower-case hex for other control
  * characters, and everything else (DEL and UTF-8 included) verbatim. */
 void json_escape_into(std::string& out, const char* p, size_t n) {
@@ -581,7 +581,7 @@ private:
         while (!v.empty() && is_ws((unsigned char)v.front())) v.remove_prefix(1);
         if (v.empty()) out += "null";
         else if (const char* lit = json_literal(v)) out += lit;
-        else if (nlohmann::json::accept(v)) out.append(v.data(), v.size());
+        else if (Json::accept(v)) out.append(v.data(), v.size());
         else out += json_quote(scalar_);
         scalar_.clear();
     }
@@ -592,7 +592,7 @@ private:
         std::string j;
         j.reserve(cont_.size() + 8);
         normalise(cont_, j);
-        if (partial || nlohmann::json::accept(j)) out += j;
+        if (partial || Json::accept(j)) out += j;
         else out += json_quote(cont_);
         cont_.clear();
     }
@@ -746,8 +746,8 @@ struct ReplyFormat::Impl {
     /* Object family. `object`: a call's arguments are one object. `ns_object`: the object's own
      * `{` ends the name (name_suffix empty), and ns_core is "{". */
     bool object = false, ns_object = false;
-    /* Tagged family, name_suffix empty: a call's name ends where arg_prefix or end_core begins,
-     * and that tag is the first of the call's body. */
+    /* Tagged family, no core in name_suffix (empty, or whitespace alone): a call's name ends
+     * where arg_prefix or end_core begins, and that tag is the first of the call's body. */
     bool name_open = false;
     /* Where a key or value may begin, besides the object's punctuation: the dialect string's
      * opener, and the call's close and end (written there by a reply that leaves its object
@@ -810,7 +810,9 @@ int ReplyFormat::compile(const ChatFormat& f, std::shared_ptr<const ReplyFormat>
     m.name_end = f.arg_name_suffix + f.arg_value_prefix;
     if (f.typed_tags()) m.name_end_json = f.arg_name_suffix + f.arg_json_value_prefix;
     m.object = f.has_tools() && f.object_args();
-    m.name_open = f.has_tools() && !m.object && f.name_suffix.empty();
+    /* A suffix with no core of its own ends the name at whitespace, and the name then runs to
+     * the first argument tag or the call's end, as it does without a suffix (Ling 3.0). */
+    m.name_open = f.has_tools() && !m.object && m.ns_core.empty();
     if (m.object && f.name_suffix.empty()) {
         m.ns_object = true;
         m.ns_core = "{";
@@ -1063,7 +1065,8 @@ int ReplyParser::create(std::shared_ptr<const ReplyFormat> fmt, const ReplyOptio
     /* A response format replaces the call grammar outright; the calls are not parsed. */
     P.calls  = want_calls && !opt.response_format;
     P.breaks = want_calls && F.f.has_reasoning() && !F.f.reasoning_breaks.empty();
-    P.pure   = !F.f.has_reasoning() && !want_calls && !opt.response_format;
+    P.pure   = !F.f.has_reasoning() && !want_calls && !opt.response_format &&
+               F.f.content_open.empty();
     P.anywhere = F.f.reasoning_anywhere && F.f.has_reasoning() && opt.extract_reasoning &&
                  !opt.response_format;
 
@@ -1093,6 +1096,7 @@ enum class St : uint8_t {
     LeadWs,       /* whitespace before the reply proper: dropped */
     ThinkOpen,    /* the core of reasoning_open */
     ThinkOpenWs,  /* the optional whitespace that ends reasoning_open */
+    ContentOpen,  /* content_open, the header of a reply that does not reason */
     Think,        /* reasoning text */
     ThinkCloseWs, /* the optional whitespace that ends reasoning_close */
     Text,         /* content, watching for the call opener when calls are on */
@@ -1149,6 +1153,7 @@ struct ReplyStream::Impl {
     explicit Impl(const ReplyParser::Impl& p) : P(p), F(p.fmt->impl()) {
         content.init(P.terminators.empty() ? nullptr : &P.terms, &P.terminators);
         st = P.pure ? St::Text : St::LeadWs;
+        think_hold_on = P.calls && !F.f.reasoning_breaks.empty();
         if (P.anywhere) {
             text_dfa = P.calls ? &F.text_think : &F.think_only;
             n_open = P.calls ? F.openers.size() : 0;
@@ -1211,6 +1216,16 @@ struct ReplyStream::Impl {
     std::string vheld;
     size_t      vs_pos = 0;
     bool        fenced = false;
+    /* Channel-scoped protocols (Muse): with tools on, a trailing `to=NAME<|message|>` while
+     * reasoning streams is the handoff to a tool call, not reasoning text. The reasoning's
+     * tail is held until it cannot grow into framing or a header; a completed tool-channel
+     * header is dropped along with everything after it -- the section opener is where the
+     * call machinery takes over. Without the hold the header lands in the reasoning stream,
+     * and a model that hesitates at the handoff repeats it (observed on Muse Glimmer: three
+     * or four `to=read<|message|>` headers before the section, under speculative decoding). */
+    bool        think_hold_on = false;
+    std::string think_hold;
+    bool        think_handoff = false;
 
     /* The argument object being read: its open brackets; whether a key (not a value) is being
      * read; a separator read but not yet written (written only once the next member shows the
@@ -1293,12 +1308,107 @@ struct ReplyStream::Impl {
 
     void think_out(const char* p, size_t n) {
         if (n == 0) return;
+        if (think_handoff) return;   /* past the tool-channel header: call framing, dropped */
         touch(0);
-        if (think_text) { msg.reasoning.append(p, n); return; }
-        for (size_t i = 0; i < n; ++i)
-            if (!is_blank((unsigned char)p[i])) { think_text = true; break; }
-        think_pend.append(p, n);
-        if (think_text) { msg.reasoning += think_pend; think_pend.clear(); }
+        if (!think_hold_on) {
+            if (think_text) { msg.reasoning.append(p, n); return; }
+            for (size_t i = 0; i < n; ++i)
+                if (!is_blank((unsigned char)p[i])) { think_text = true; break; }
+            think_pend.append(p, n);
+            if (think_text) { msg.reasoning += think_pend; think_pend.clear(); }
+            return;
+        }
+        think_hold.append(p, n);
+        flush_think_hold(false);
+    }
+
+    void emit_reasoning_upto(size_t emit) {
+        if (emit == 0) return;
+        const std::string part = think_hold.substr(0, emit);
+        if (think_text) { msg.reasoning += part; }
+        else {
+            for (size_t i = 0; i < part.size(); ++i)
+                if (!is_blank((unsigned char)part[i])) { think_text = true; break; }
+            think_pend += part;
+            if (think_text) { msg.reasoning += think_pend; think_pend.clear(); }
+        }
+    }
+
+    /* The handoff position from the last `<|eom|>`: the tail reads as the tool-channel
+     * header -- optional `<|start|>assistant`, ws, `to=`, recipient name bytes (never
+     * `user`: that transition matches the reply close above and is consumed by it), then
+     * `<|message|>` or a prefix of it while the header streams. npos: no handoff. */
+    size_t tool_handoff_at() const {
+        static const std::string eom = "<|eom|>", start = "<|start|>assistant", to = "to=";
+        /* The framing is bounded (terminator + assistant + `to=` + a recipient + the message
+         * marker); scanning only the tail keeps a byte-at-a-time stream linear. */
+        const size_t wstart = think_hold.size() - std::min(kHoldWindow, think_hold.size());
+        size_t p = std::string::npos;
+        for (size_t q = think_hold.find(eom, wstart); q != std::string::npos;
+             q = think_hold.find(eom, q + 1))
+            p = q;
+        if (p == std::string::npos) return std::string::npos;
+        size_t k = p + eom.size();
+        if (think_hold.compare(k, start.size(), start) == 0) k += start.size();
+        while (k < think_hold.size() && is_ws((unsigned char)think_hold[k])) ++k;
+        if (think_hold.compare(k, to.size(), to) != 0) return std::string::npos;
+        return p;   /* everything from `<|eom|>` on is the tool call's framing */
+    }
+
+    /* Muse's channel protocol, per the reference parsers (vLLM's muse reasoning/tool
+     * parsers; llama.cpp PR #26841): reasoning streams until `<|eom|>`, and the model
+     * sometimes leaves the analysis channel WITHOUT it, opening a tool channel directly
+     * (`<|start|>assistant to=read<|message|>`) -- a documented model-side defect. So the
+     * reasoning's tail is held while it could still grow into that framing, and once the
+     * handoff is detected everything from the header on is dropped: the call machinery
+     * (the section + invoke tags) has already produced the tool_calls events. */
+    void flush_think_hold(bool final_feed) {
+        if (think_handoff) return;   /* past the handoff: framing, dropped */
+        size_t emit = think_hold.size();
+        const size_t handoff = tool_handoff_at();
+        if (handoff != std::string::npos) {
+            emit = handoff;
+            think_handoff = true;
+        } else if (!final_feed) {
+            /* Hold a tail that could still grow into the handoff framing: a partial
+             * `<|eom|>` / `<|start|>` / `<|message|>` marker, or a trailing ` to=NAME`. */
+            static const std::string markers[] = {"<|eom|>", "<|start|>", "<|message|>"};
+            for (const std::string& mk : markers)
+                for (size_t k = std::min(mk.size(), think_hold.size()); k > 0; --k)
+                    if (think_hold.compare(think_hold.size() - k, k, mk, 0, k) == 0)
+                        emit = std::min(emit, think_hold.size() - k);
+            const size_t wstart_t = think_hold.size() - std::min(kHoldWindow, think_hold.size());
+            size_t at = std::string::npos;
+            for (size_t q = think_hold.find("to=", wstart_t); q != std::string::npos;
+                 q = think_hold.find("to=", q + 1))
+                at = q;
+            if (at != std::string::npos) {
+                bool tail = true;
+                for (size_t k = at + 3; k < think_hold.size(); ++k)
+                    if (!is_name_byte((unsigned char)think_hold[k])) { tail = false; break; }
+                if (tail) {
+                    size_t a = at;
+                    while (a > 0 && is_ws((unsigned char)think_hold[a - 1])) --a;
+                    emit = std::min(emit, a);
+                }
+            }
+            if (emit >= think_hold.size()) {
+                emit_reasoning_upto(emit);
+                think_hold.clear();   /* nothing held: everything goes out now */
+                return;
+            }
+        }
+        if (emit > 0) emit_reasoning_upto(emit);
+        think_hold.erase(0, emit);
+        if (final_feed) think_hold.clear();
+    }
+
+    /* The tail the framing scans read; a longer tail is real reasoning, never framing. */
+    static constexpr size_t kHoldWindow = 160;
+
+    static bool is_name_byte(unsigned char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+               c == '_' || c == '.' || c == '-';
     }
 
     void text_out(const char* p, size_t n) {
@@ -1667,7 +1777,7 @@ struct ReplyStream::Impl {
         const bool json = bare_txt.size() < kBareKeep && !v.empty() &&
                           (v == "true" || v == "false" || v == "null" ||
                            ((v[0] == '-' || (v[0] >= '0' && v[0] <= '9')) &&
-                            nlohmann::json::accept(v)));
+                            Json::accept(v)));
         if (!json) lenient();
     }
 
@@ -2026,7 +2136,7 @@ struct ReplyStream::Impl {
      * surrogate escape, a vertical tab or form feed after the value). Such a value is read by the
      * grammar's other arm, as text, so the arguments stay JSON. */
     void json_value_done(std::string_view text) {
-        begin_value_out(ValueOut::Raw, /*json=*/nlohmann::json::accept(text));
+        begin_value_out(ValueOut::Raw, /*json=*/Json::accept(text));
         val.add(text.data(), text.size(), scratch);
         val.finish(false, scratch);
         flush_scratch();
@@ -2051,6 +2161,20 @@ struct ReplyStream::Impl {
                 return p + 1;
             }
             /* No block: what was held is read again as whatever follows one. */
+            st = after_no_block();
+            read_again(lhold);
+            lhold.clear();
+            return p;
+        }
+
+        case St::ContentOpen: {
+            const unsigned char c = (unsigned char)*p;
+            if (lpos < F.f.content_open.size() && (unsigned char)F.f.content_open[lpos] == c) {
+                lhold.push_back((char)c);
+                if (++lpos == F.f.content_open.size()) { lhold.clear(); st = after_think(); }
+                return p + 1;
+            }
+            /* Not the header: what was held is content (or the start of the document). */
             st = after_think();
             read_again(lhold);
             lhold.clear();
@@ -2066,10 +2190,11 @@ struct ReplyStream::Impl {
         case St::Think: {
             const Dfa& d = P.breaks ? F.think_breaks : F.think;
             p = scan(d, p, e, &hit, [this](const char* q, size_t n) { think_out(q, n); });
-            if (hit == 0) { trail = 0; st = St::ThinkCloseWs; }
+            if (hit == 0) { flush_think_hold(true); trail = 0; st = St::ThinkCloseWs; }
             else if (hit > 0) {
                 const std::string& marker = d.pattern(hit);
                 if (!F.section_open_core.empty() && marker == F.section_open_core) {
+                    flush_think_hold(true);
                     open_section();
                     st = St::Text;
                 } else if (!F.section_open_core.empty() && !section_active) {
@@ -2754,10 +2879,17 @@ struct ReplyStream::Impl {
         return e;
     }
 
-    St after_lead() const {
+    St after_lead() {
         if (F.f.has_reasoning() && P.opt.extract_reasoning)
             return F.open_core.empty() ? St::Think : St::ThinkOpen;
-        return after_think();
+        return after_no_block();
+    }
+    /* The reply did not open a reasoning block: its content_open header, when the format has one,
+     * is matched from the first byte (the bytes of a failed reasoning opener are read again). */
+    St after_no_block() {
+        if (F.f.content_open.empty()) return after_think();
+        lpos = 0;
+        return St::ContentOpen;
     }
     St after_think() const { return P.opt.response_format ? St::RfWs : St::Text; }
 
@@ -2887,6 +3019,14 @@ struct ReplyStream::Impl {
             rerun();
         }
         if (st == St::ObjStr || st == St::ObjQStr) str_flush();
+        /* The reply ended inside a header that never completed: its bytes are the reply. */
+        while (!F.f.content_open.empty() && !lhold.empty() &&
+               (st == St::ContentOpen || st == St::ThinkOpen)) {
+            st = st == St::ThinkOpen ? after_no_block() : after_think();
+            read_again(lhold);
+            lhold.clear();
+            rerun();
+        }
         while (in_loose_attempt()) {
             fail_attempt();
             rerun();
@@ -2935,6 +3075,7 @@ struct ReplyStream::Impl {
         }
         hold.clear();
         ds = 0;
+        if (think_hold_on) flush_think_hold(true);
         if (!think_text) think_pend.clear();
         content.finish(msg.content);
         if (cur >= 0) publish(cur, true);

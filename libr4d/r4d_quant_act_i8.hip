@@ -21,7 +21,7 @@ template <int THR, bool CHAIN = false>
 __device__ __forceinline__ void r4d_quant_act_i8_body(
     const __hip_bfloat16* __restrict__ A, signed char* __restrict__ Q, float* __restrict__ S,
     int K) {
-  if (CHAIN) r4d_chain_wait();
+  if (CHAIN) r4d_chain_wait_vec();
   const int row = blockIdx.x;
   const __hip_bfloat16* a = A + (size_t)row * K;
   signed char* q = Q + (size_t)row * K;
@@ -78,10 +78,11 @@ __global__ __launch_bounds__(THR) void r4dchain_quant_act_i8(
 // membership is unchanged.
 #define R4D_QAI8_MAXG 256
 
+#define R4D_QUANT_ACT_I8_ASUM_PARAMS                                                            \
+    const __hip_bfloat16* __restrict__ A, signed char* __restrict__ Q,                          \
+    float* __restrict__ S, float* __restrict__ Asum, int K, int group, int Mpad
 template <int THR>
-__global__ __launch_bounds__(THR) void r4d_quant_act_i8_asum_kernel(
-    const __hip_bfloat16* __restrict__ A, signed char* __restrict__ Q, float* __restrict__ S,
-    float* __restrict__ Asum, int K, int group, int Mpad) {
+__device__ __forceinline__ void r4d_quant_act_i8_asum_body(R4D_QUANT_ACT_I8_ASUM_PARAMS) {
   const int row = blockIdx.x;
   const __hip_bfloat16* a = A + (size_t)row * K;
   signed char* q = Q + (size_t)row * K;
@@ -118,6 +119,17 @@ __global__ __launch_bounds__(THR) void r4d_quant_act_i8_asum_kernel(
   for (int g = threadIdx.x; g < G; g += THR)
     Asum[(size_t)g * Mpad + row] = (float)gs[g];
 }
+
+// The kernel around the body: CH `r4dchain` is the chained form (r4d_chain.h), taken at decode
+// heights.
+template <int THR, class CH>
+__global__ __launch_bounds__(THR)
+void r4d_quant_act_i8_asum_kernel(R4D_QUANT_ACT_I8_ASUM_PARAMS) {
+  if (CH::on) r4d_chain_wait_vec();
+  r4d_quant_act_i8_asum_body<THR>(A, Q, S, Asum, K, group, Mpad);
+  if (CH::on) r4d_chain_done();
+}
+#undef R4D_QUANT_ACT_I8_ASUM_PARAMS
 
 // The plugin ABI entry point (RadLaunchFn); a refused shape is a status code, not a throw. See
 // libr4d/r4d_args.h.
@@ -173,9 +185,12 @@ extern "C" int r4d_rad_quant_act_i8(const RadArgs* args, RadStream stream) {
   const long long mpad = ((M + 15) / 16) * 16;
   if (r4d_numel(as) < (K / group) * mpad) return R4D_NO(RAD_E_SCRATCH);
 
-#define R4D_QAI8A_LAUNCH(T) emit_rc = R4D_EMIT(stream, (r4d_quant_act_i8_asum_kernel<T>),        \
+  const bool chain = r4d_geti_or(args, "chain", 0) != 0 && M <= 64;
+#define R4D_QAI8A_CH(T, CH_) R4D_EMIT(stream, (r4d_quant_act_i8_asum_kernel<T, CH_>),            \
     dim3((int)M), dim3(T), 0, (const __hip_bfloat16*)r4d_p(x), (signed char*)r4d_wp(q),          \
     (float*)r4d_wp(sc), (float*)r4d_wp(as), (int)K, (int)group, (int)mpad)
+#define R4D_QAI8A_LAUNCH(T) emit_rc = chain ? R4D_QAI8A_CH(T, r4dchain)                          \
+                                            : R4D_QAI8A_CH(T, R4dUnchained)
   switch (thr) {
     case 128:  R4D_QAI8A_LAUNCH(128);  break;
     case 256:  R4D_QAI8A_LAUNCH(256);  break;
@@ -184,5 +199,6 @@ extern "C" int r4d_rad_quant_act_i8(const RadArgs* args, RadStream stream) {
     default:   return R4D_NO(RAD_E_INVAL);
   }
 #undef R4D_QAI8A_LAUNCH
+#undef R4D_QAI8A_CH
   return emit_rc;
 }

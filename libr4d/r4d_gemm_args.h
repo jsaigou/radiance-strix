@@ -155,6 +155,10 @@ static inline int cfg_for(const RadArgs* a, long long K, long long M, long long 
         out->npw = 4;
         sk_pin   = 8;
     }
+    /* W2A8 at one row tile is bound by the weight stream (a vocabulary head of 80 to 170 MB), and
+     * its N tiles already fill the card, so a deep split only adds reduction work: the ladder's
+     * answer of 20 at K = 2560 runs the 124160-row head in 144 us where a split of 2 takes 133. */
+    if (br == BR_W2A8 && c->mb <= 0 && out->mb == 1) sk_pin = 2;
     const int bound = block_bound(br, out->mb, out->npw);
     if (sk_pin && (out->wv * sk_pin * 32 > bound ||
                    (unit > 0 && (K % ((long long)sk_pin * unit)))))

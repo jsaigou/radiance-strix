@@ -3,7 +3,9 @@
 #include "shape.h"
 #include "rad_internal.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
+#include "util/rowpool.h"
+#include "util/simd.h"
 
 #include <algorithm>
 #include <array>
@@ -36,6 +38,10 @@ ShapeGenInfo shape_info(const RadShapeGenDecl& d, const std::string& name) {
 
 /* ================================================================== the picture */
 namespace {
+
+/* The picture's passes below compute each output row from its own inputs only, in the same order
+ * whichever thread runs it, so they spread over the row pool and stay bit-exact. */
+constexpr int kRowWidth = 8;
 
 /* An 8-bit image, `ch` channels interleaved. */
 struct Img {
@@ -74,13 +80,17 @@ void resize_area_down(const Img& s, int32_t dw, int32_t dh, Img* d) {
     const double sx = (double)s.w / dw, sy = (double)s.h / dh;
     const std::vector<AreaTap> xt = area_tab(s.w, dw, sx), yt = area_tab(s.h, dh, sy);
     const int32_t ch = s.ch;
-    std::vector<float> row((size_t)dw * ch), acc((size_t)dw * ch);
     d->w = dw; d->h = dh; d->ch = ch;
     d->px.assign((size_t)dw * dh * ch, 0);
-    size_t k = 0;
-    for (int32_t dy = 0; dy < dh; ++dy) {
-        std::fill(acc.begin(), acc.end(), 0.0f);
-        for (; k < yt.size() && yt[k].di == dy; ++k) {
+    /* Each destination row's first tap in yt, which lists them in row order. */
+    std::vector<size_t> first((size_t)dh + 1, yt.size());
+    for (size_t k = yt.size(); k-- > 0;) first[(size_t)yt[k].di] = k;
+    for (int32_t dy = dh; dy-- > 0;) first[(size_t)dy] = std::min(first[(size_t)dy], first[(size_t)dy + 1]);
+    row_pool_run(dh, kRowWidth, [&](int64_t dy) {
+        thread_local std::vector<float> row, acc;
+        row.assign((size_t)dw * ch, 0.0f);
+        acc.assign((size_t)dw * ch, 0.0f);
+        for (size_t k = first[(size_t)dy]; k < yt.size() && yt[k].di == dy; ++k) {
             std::fill(row.begin(), row.end(), 0.0f);
             const uint8_t* src = s.at(yt[k].si, 0);
             for (const AreaTap& t : xt)
@@ -88,9 +98,9 @@ void resize_area_down(const Img& s, int32_t dw, int32_t dh, Img* d) {
                     row[(size_t)t.di * ch + c] += src[(size_t)t.si * ch + c] * t.alpha;
             for (size_t i = 0; i < acc.size(); ++i) acc[i] += row[i] * yt[k].alpha;
         }
-        uint8_t* dst = d->at(dy, 0);
+        uint8_t* dst = d->at((int32_t)dy, 0);
         for (size_t i = 0; i < acc.size(); ++i) dst[i] = sat_u8(acc[i]);
-    }
+    });
 }
 
 /* cv::resize's fixed-point separable filter for 8-bit images: each tap's float coefficient
@@ -140,31 +150,43 @@ Taps taps_cubic(int32_t ssize, int32_t dsize) {
 }
 
 void resize_fixed(const Img& s, const Taps& tx, const Taps& ty, int32_t dw, int32_t dh, Img* d) {
-    const int32_t ch = s.ch;
-    /* Every source row through the horizontal taps, then each destination row from its rows. */
-    std::vector<int32_t> hrow((size_t)s.h * dw * ch);
-    for (int32_t y = 0; y < s.h; ++y)
-        for (int32_t dx = 0; dx < dw; ++dx)
+    const int32_t ch = s.ch, kx = tx.ksize, ky = ty.ksize;
+    /* Every source row through the horizontal taps, then each destination row from its rows. The
+     * clamped source offsets are worked out once a tap, so the loops below only multiply and add,
+     * in the same order as one pixel at a time. */
+    std::vector<int32_t> xo((size_t)dw * kx);
+    for (int32_t dx = 0; dx < dw; ++dx)
+        for (int32_t k = 0; k < kx; ++k)
+            xo[(size_t)dx * kx + k] = std::clamp(tx.ofs[(size_t)dx] + k, 0, s.w - 1) * ch;
+    const size_t rw = (size_t)dw * ch;
+    std::vector<int32_t> hrow((size_t)s.h * rw);
+    row_pool_run(s.h, kRowWidth, [&](int64_t y) {
+        const uint8_t* src = s.at((int32_t)y, 0);
+        int32_t* h = hrow.data() + (size_t)y * rw;
+        for (int32_t dx = 0; dx < dw; ++dx) {
+            const int32_t* o = xo.data() + (size_t)dx * kx;
+            const int16_t* cf = tx.c.data() + (size_t)dx * kx;
             for (int32_t c = 0; c < ch; ++c) {
                 int32_t sum = 0;
-                for (int32_t k = 0; k < tx.ksize; ++k) {
-                    const int32_t sx = std::clamp(tx.ofs[(size_t)dx] + k, 0, s.w - 1);
-                    sum += s.at(y, sx)[c] * tx.c[(size_t)dx * tx.ksize + k];
-                }
-                hrow[((size_t)y * dw + dx) * ch + c] = sum;
+                for (int32_t k = 0; k < kx; ++k) sum += src[o[k] + c] * cf[k];
+                h[(size_t)dx * ch + c] = sum;
             }
+        }
+    });
     d->w = dw; d->h = dh; d->ch = ch;
     d->px.assign((size_t)dw * dh * ch, 0);
-    for (int32_t dy = 0; dy < dh; ++dy)
-        for (int32_t i = 0; i < dw * ch; ++i) {
-            int64_t v = 0;
-            for (int32_t k = 0; k < ty.ksize; ++k) {
-                const int32_t sy = std::clamp(ty.ofs[(size_t)dy] + k, 0, s.h - 1);
-                v += (int64_t)hrow[(size_t)sy * dw * ch + i] * ty.c[(size_t)dy * ty.ksize + k];
-            }
-            const int64_t r = (v + (1 << 21)) >> 22;
-            d->px[(size_t)dy * dw * ch + i] = (uint8_t)std::clamp<int64_t>(r, 0, 255);
+    row_pool_run(dh, kRowWidth, [&](int64_t dy) {
+        thread_local std::vector<int64_t> acc;
+        acc.assign(rw, 0);
+        for (int32_t k = 0; k < ky; ++k) {
+            const int32_t sy = std::clamp(ty.ofs[(size_t)dy] + k, 0, s.h - 1);
+            const int32_t* h = hrow.data() + (size_t)sy * rw;
+            simd::madd_i32_i64(acc.data(), h, ty.c[(size_t)dy * ky + k], rw);
         }
+        uint8_t* out = d->px.data() + (size_t)dy * rw;
+        for (size_t i = 0; i < rw; ++i)
+            out[i] = (uint8_t)std::clamp<int64_t>((acc[i] + (1 << 21)) >> 22, 0, 255);
+    });
 }
 
 /* cv2.resize(src, (dw, dh), INTER_AREA). */
@@ -219,13 +241,22 @@ int shape_picture(const ShapeGenInfo& g, const mm::FrameRGBA& rgba, std::vector<
     const int32_t H = rgba.h, W = rgba.w;
     if (H < 1 || W < 1 || rgba.rgba.size() != (size_t)H * W * 4) return no("the picture is empty");
     /* ---- ImageProcessorV2.recenter: the alpha's bounding box on a square of the longer side */
+    /* Each row's first and last opaque column, then their extremes. */
+    std::vector<int32_t> rx0((size_t)H), rx1((size_t)H);
+    row_pool_run(H, kRowWidth, [&](int64_t y) {
+        const uint8_t* r = rgba.rgba.data() + (size_t)y * W * 4;
+        int32_t a = 0, b = W - 1;
+        while (a < W && !r[(size_t)a * 4 + 3]) ++a;
+        while (b > a && !r[(size_t)b * 4 + 3]) --b;
+        rx0[(size_t)y] = a;
+        rx1[(size_t)y] = a < W ? b : -1;
+    });
     int32_t y0 = H, y1 = -1, x0 = W, x1 = -1;
     for (int32_t y = 0; y < H; ++y)
-        for (int32_t x = 0; x < W; ++x)
-            if (rgba.rgba[((size_t)y * W + x) * 4 + 3]) {
-                y0 = std::min(y0, y); y1 = std::max(y1, y);
-                x0 = std::min(x0, x); x1 = std::max(x1, x);
-            }
+        if (rx1[(size_t)y] >= 0) {
+            y0 = std::min(y0, y); y1 = std::max(y1, y);
+            x0 = std::min(x0, rx0[(size_t)y]); x1 = std::max(x1, rx1[(size_t)y]);
+        }
     if (y1 < 0) return no("the picture is fully transparent: nothing to make a shape of");
     const int32_t h = y1 - y0, w = x1 - x0;
     if (h == 0 || w == 0)
@@ -250,16 +281,17 @@ int shape_picture(const ShapeGenInfo& g, const mm::FrameRGBA& rgba, std::vector<
     Img sq;
     sq.w = size; sq.h = size; sq.ch = 3;
     sq.px.assign((size_t)size * size * 3, 255);
-    for (int32_t y = 0; y < h2; ++y)
+    row_pool_run(h2, kRowWidth, [&](int64_t y) {
         for (int32_t x = 0; x < w2; ++x) {
-            const uint8_t* p = fit.at(y, x);
+            const uint8_t* p = fit.at((int32_t)y, x);
             const float a = (float)p[3] / 255.0f;
-            uint8_t* q = sq.at(oy + y, ox + x);
+            uint8_t* q = sq.at(oy + (int32_t)y, ox + x);
             for (int c = 0; c < 3; ++c) {
                 const float v = (float)p[c] * a + 255.0f * (1.0f - a);
                 q[c] = (uint8_t)std::clamp(v, 0.0f, 255.0f);
             }
         }
+    });
     /* ---- the canvas, INTER_CUBIC */
     const int32_t C = (int32_t)g.canvas;
     Img can;
@@ -268,16 +300,17 @@ int shape_picture(const ShapeGenInfo& g, const mm::FrameRGBA& rgba, std::vector<
     const int32_t E = (int32_t)g.enc_size, P = (int32_t)g.enc_patch, G = E / P;
     const AaTaps ta = aa_taps(C, E);
     std::vector<float> hor((size_t)C * E * 3), img((size_t)E * E * 3);
-    for (int32_t y = 0; y < C; ++y)
+    row_pool_run(C, kRowWidth, [&](int64_t y) {
         for (int32_t x = 0; x < E; ++x)
             for (int c = 0; c < 3; ++c) {
                 float s = 0.0f;
                 const std::vector<float>& wt = ta.w[(size_t)x];
                 for (size_t k = 0; k < wt.size(); ++k)
-                    s += wt[k] * ((float)can.at(y, ta.lo[(size_t)x] + (int32_t)k)[c] / 255.0f);
+                    s += wt[k] * ((float)can.at((int32_t)y, ta.lo[(size_t)x] + (int32_t)k)[c] / 255.0f);
                 hor[((size_t)y * E + x) * 3 + c] = s;
             }
-    for (int32_t y = 0; y < E; ++y)
+    });
+    row_pool_run(E, kRowWidth, [&](int64_t y) {
         for (int32_t x = 0; x < E; ++x)
             for (int c = 0; c < 3; ++c) {
                 float s = 0.0f;
@@ -287,6 +320,7 @@ int shape_picture(const ShapeGenInfo& g, const mm::FrameRGBA& rgba, std::vector<
                 img[((size_t)y * E + x) * 3 + c] =
                     (float)((s - g.pix_mean[c]) / g.pix_std[c]);
             }
+    });
     /* ---- patches, row-major; a patch's values (channel, row, column) */
     const int64_t pd = 3 * (int64_t)P * P;
     patches->assign((size_t)G * G * pd, 0.0f);
@@ -332,13 +366,23 @@ namespace {
 /* A 3 x 3 x 3 dilation of an n^3 mask (zero outside), as separable maxima along each axis. */
 void dilate(std::vector<uint8_t>& m, int64_t n) {
     std::vector<uint8_t> t(m.size());
+    /* One axis: each voxel ORs its two neighbours along it, where they exist. Along the
+     * contiguous axis a line of n voxels at a time; along the others whole rows of `stride`
+     * voxels, each with the rows either side of it. */
     auto pass = [&](const std::vector<uint8_t>& src, std::vector<uint8_t>& dst, int64_t stride) {
-        for (int64_t p = 0; p < (int64_t)src.size(); ++p) {
-            const int64_t c = (p / stride) % n;
-            uint8_t v = src[(size_t)p];
-            if (c > 0) v |= src[(size_t)(p - stride)];
-            if (c + 1 < n) v |= src[(size_t)(p + stride)];
-            dst[(size_t)p] = v;
+        const uint8_t* s = src.data();
+        uint8_t* d = dst.data();
+        const int64_t total = (int64_t)src.size(), plane = n * stride;
+        for (int64_t base = 0; base < total; base += plane) {
+            if (stride == 1) {
+                simd::or_adjacent_u8(d + base, s + base, (size_t)n);
+                continue;
+            }
+            for (int64_t c = 0; c < n; ++c) {
+                const uint8_t* a = s + base + c * stride;
+                simd::or3_u8(d + base + c * stride, a, c > 0 ? a - stride : nullptr,
+                             c + 1 < n ? a + stride : nullptr, (size_t)stride);
+            }
         }
     };
     pass(m, t, 1);
@@ -353,43 +397,85 @@ std::vector<uint32_t> shape_refine(const std::vector<float>& prev, int32_t rp, i
                                    double level, bool last) {
     const int64_t np = (int64_t)rp + 1, n = (int64_t)r + 1;
     std::vector<uint8_t> near((size_t)(np * np * np), 0);
-    auto sgn = [](float v) { return (v > 0.0f) - (v < 0.0f); };
     const float lv = (float)level;
-    for (int64_t i = 0; i < np; ++i)
-        for (int64_t j = 0; j < np; ++j)
-            for (int64_t k = 0; k < np; ++k) {
-                const int64_t p = (i * np + j) * np + k;
-                const float raw = prev[(size_t)p];
-                if (std::isnan(raw)) continue;
-                const float v = raw - lv;
-                const int s = sgn(v);
-                bool cross = std::fabs(v) < 0.95f;
-                const int64_t nb[6][3] = { { i - 1, j, k }, { i + 1, j, k }, { i, j - 1, k },
-                                           { i, j + 1, k }, { i, j, k - 1 }, { i, j, k + 1 } };
-                for (int q = 0; q < 6 && !cross; ++q) {
-                    const int64_t a = nb[q][0], b = nb[q][1], c = nb[q][2];
-                    /* Outside the grid the reference replicates the border, and a neighbour not
-                     * sampled stands in as the point itself: neither crosses. */
-                    if (a < 0 || a >= np || b < 0 || b >= np || c < 0 || c >= np) continue;
-                    const float u = prev[(size_t)((a * np + b) * np + c)];
-                    if (std::isnan(u)) continue;
-                    cross = sgn(u - lv) != s;
+    /* A point is near the surface when it is within 0.95 of the level, or a neighbour along an
+     * axis lies on the other side of it (neither a NaN, which is not sampled; past the grid's
+     * edge the reference replicates the border, which never crosses). The sign of raw - lv is
+     * the comparison of raw with lv, so each row's simd::level_bits_f32 bitmaps answer it 64
+     * points at a time, three planes held at once. */
+    const int64_t W = (np + 63) / 64, rowb = W * 4;
+    std::vector<uint64_t> bits((size_t)(3 * np * rowb));
+    auto plane = [&](int64_t i) { return bits.data() + (size_t)((i % 3) * np * rowb); };
+    auto classify = [&](int64_t i) {
+        uint64_t* pl = plane(i);
+        for (int64_t j = 0; j < np; ++j) {
+            uint64_t* row = pl + j * rowb;
+            simd::level_bits_f32(&prev[(size_t)((i * np + j) * np)], (size_t)np, lv, 0.95f, row,
+                                 row + W, row + 2 * W, row + 3 * W);
+        }
+    };
+    auto diff = [&](const uint64_t* a, const uint64_t* b, int64_t w) {   /* rows of four maps */
+        return ((a[w] ^ b[w]) | (a[W + w] ^ b[W + w])) & ~b[2 * W + w];
+    };
+    /* Row maps moved one point along k: `up` holds point k - 1 at bit k, `dn` point k + 1. */
+    std::vector<uint64_t> up((size_t)rowb), dn((size_t)rowb);
+    if (np > 0) classify(0);
+    for (int64_t i = 0; i < np; ++i) {
+        if (i + 1 < np) classify(i + 1);
+        for (int64_t j = 0; j < np; ++j) {
+            const uint64_t* c = plane(i) + j * rowb;
+            for (int m = 0; m < 3; ++m)
+                for (int64_t w = 0; w < W; ++w) {
+                    const uint64_t* x = c + m * W;
+                    up[(size_t)(m * W + w)] = (x[w] << 1) | (w > 0 ? x[w - 1] >> 63 : 0);
+                    dn[(size_t)(m * W + w)] = (x[w] >> 1) | (w + 1 < W ? x[w + 1] << 63 : 0);
                 }
-                near[(size_t)p] = cross;
+            const uint64_t* nb[4] = { j > 0 ? c - rowb : nullptr, j + 1 < np ? c + rowb : nullptr,
+                                      i > 0 ? plane(i - 1) + j * rowb : nullptr,
+                                      i + 1 < np ? plane(i + 1) + j * rowb : nullptr };
+            uint8_t* out = near.data() + (size_t)((i * np + j) * np);
+            for (int64_t w = 0; w < W; ++w) {
+                /* The row's points only; k - 1 exists from k = 1, k + 1 up to k = np - 2. */
+                const int64_t k0 = w * 64, left = np - k0;
+                const uint64_t inside = left >= 64 ? ~0ull : (1ull << left) - 1;
+                const uint64_t has_dn = left > 64 ? ~0ull : (1ull << (left - 1)) - 1;
+                uint64_t x = c[3 * W + w] | (diff(c, up.data(), w) & (w == 0 ? ~1ull : ~0ull)) |
+                             (diff(c, dn.data(), w) & has_dn);
+                for (const uint64_t* o : nb) if (o) x |= diff(c, o, w);
+                x &= inside & ~c[2 * W + w];
+                while (x) {
+                    out[k0 + __builtin_ctzll(x)] = 1;
+                    x &= x - 1;
+                }
             }
+        }
+    }
     if (!last) dilate(near, np);
     std::vector<uint8_t> mark((size_t)(n * n * n), 0);
-    auto up = [&](int64_t c) { return (c * r + rp / 2) / rp; };
-    for (int64_t i = 0; i < np; ++i)
-        for (int64_t j = 0; j < np; ++j)
-            for (int64_t k = 0; k < np; ++k)
-                if (near[(size_t)((i * np + j) * np + k)])
-                    mark[(size_t)((up(i) * n + up(j)) * n + up(k))] = 1;
+    auto upi = [&](int64_t c) { return (c * r + rp / 2) / rp; };
+    /* The masks are sparse: eight bytes looked at a time. */
+    auto each_set = [](const std::vector<uint8_t>& m, auto&& fn) {
+        const size_t sz = m.size();
+        size_t p = 0;
+        for (; p + 8 <= sz; p += 8) {
+            uint64_t x;
+            std::memcpy(&x, m.data() + p, 8);
+            while (x) {
+                const int b = __builtin_ctzll(x) >> 3;
+                fn((int64_t)p + b);
+                x &= ~(0xffull << (8 * b));
+            }
+        }
+        for (; p < sz; ++p) if (m[p]) fn((int64_t)p);
+    };
+    each_set(near, [&](int64_t p) {
+        const int64_t i = p / (np * np), j = p / np % np, k = p % np;
+        mark[(size_t)((upi(i) * n + upi(j)) * n + upi(k))] = 1;
+    });
     dilate(mark, n);
     if (last) dilate(mark, n);
     std::vector<uint32_t> pts;
-    for (int64_t p = 0; p < (int64_t)mark.size(); ++p)
-        if (mark[(size_t)p]) pts.push_back((uint32_t)p);
+    each_set(mark, [&](int64_t p) { pts.push_back((uint32_t)p); });
     return pts;
 }
 
@@ -520,50 +606,91 @@ void shape_mesh(const std::vector<float>& field, int32_t r, double bounds, doubl
     const int64_t n = (int64_t)r + 1, nn = n * n;
     const float lv = (float)level;
     const double sc = 2.0 * bounds / (double)n;
+    /* Each grid row's bitmaps (simd::level_bits_f32), for the two planes a slab of cubes lies
+     * between: bit k of row j of plane p is grid point (i + p, j, k). */
+    const int64_t W = (n + 63) / 64;
+    std::vector<uint64_t> gt[2], nan[2], scratch((size_t)(2 * W));
+    for (int p = 0; p < 2; ++p) { gt[p].assign((size_t)(n * W + 1), 0); nan[p].assign((size_t)(n * W + 1), 0); }
+    auto classify = [&](int64_t i, int p) {
+        for (int64_t j = 0; j < n; ++j)
+            simd::level_bits_f32(&field[(size_t)((i * n + j) * n)], (size_t)n, lv, 0.0f,
+                                 &gt[p][(size_t)(j * W)], scratch.data(), &nan[p][(size_t)(j * W)],
+                                 scratch.data() + W);
+    };
     /* An edge's vertex by its first grid point: the x edges between planes i and i + 1, and the
-     * y and z edges of planes i and i + 1. */
-    std::vector<int32_t> ex((size_t)nn), ey[2], ez[2];
+     * y and z edges of planes i and i + 1. Vertex indices only grow, so a slot holds a vertex of
+     * the current slab when it is at least the vertex count the slab started at (`v_now`; for
+     * the edges of plane i, which the slab before also made, `v_last`): no slot is cleared. */
+    std::vector<int32_t> ex((size_t)nn, -1), ey[2], ez[2];
     for (int p = 0; p < 2; ++p) { ey[p].assign((size_t)nn, -1); ez[p].assign((size_t)nn, -1); }
     auto value = [&](int64_t i, int64_t j, int64_t k) {
         return field[(size_t)((i * n + j) * n + k)];
     };
+    /* Bits [w * 64, w * 64 + 64) of a row, moved down by one: bit k is the row's bit k + 1. */
+    auto next = [&](const uint64_t* row, int64_t w) {
+        return (row[w] >> 1) | (w + 1 < W ? row[w + 1] << 63 : 0);
+    };
+    if (n >= 2) classify(0, 1);
+    int32_t v_last = 0;
     for (int64_t i = 0; i + 1 < n; ++i) {
-        std::fill(ex.begin(), ex.end(), -1);
+        std::swap(gt[0], gt[1]);
+        std::swap(nan[0], nan[1]);
+        classify(i + 1, 1);
         if (i > 0) {
             std::swap(ey[0], ey[1]);
             std::swap(ez[0], ez[1]);
-            std::fill(ey[1].begin(), ey[1].end(), -1);
-            std::fill(ez[1].begin(), ez[1].end(), -1);
         }
-        for (int64_t j = 0; j + 1 < n; ++j)
-            for (int64_t k = 0; k + 1 < n; ++k) {
-                float v[8];
-                bool skip = false;
-                int m = 0;
-                for (int c = 0; c < 8 && !skip; ++c) {
-                    v[c] = value(i + (c & 1), j + (c >> 1 & 1), k + (c >> 2 & 1));
-                    if (std::isnan(v[c])) skip = true;
-                    else if (v[c] > lv) m |= 1 << c;
+        const int32_t v_now = (int32_t)(out->v.size() / 3);
+        auto fresh = [&](int32_t at, int a, int64_t bi) {
+            return at >= (a == 0 || bi == 1 ? v_now : v_last) && at >= 0;
+        };
+        for (int64_t j = 0; j + 1 < n; ++j) {
+            const uint64_t* g[4] = { &gt[0][(size_t)(j * W)], &gt[1][(size_t)(j * W)],
+                                     &gt[0][(size_t)((j + 1) * W)], &gt[1][(size_t)((j + 1) * W)] };
+            const uint64_t* q[4] = { &nan[0][(size_t)(j * W)], &nan[1][(size_t)(j * W)],
+                                     &nan[0][(size_t)((j + 1) * W)], &nan[1][(size_t)((j + 1) * W)] };
+            for (int64_t w = 0; w < W; ++w) {
+                /* Corner c of the cube at k: row c & 3 (i, j offsets), at k + (c >> 2). */
+                uint64_t cb[8], any = 0, all = ~0ull, bad = 0;
+                for (int c = 0; c < 4; ++c) {
+                    cb[c] = g[c][w];
+                    cb[c + 4] = next(g[c], w);
+                    bad |= q[c][w] | next(q[c], w);
                 }
-                if (skip || m == 0 || m == 255) continue;
-                for (int t = 0; t < 30 && T.tri[m][t] >= 0; ++t) {
-                    const int e = T.tri[m][t];
-                    const int c0 = T.edge[e][0], c1 = T.edge[e][1], a = e / 4;
-                    const int64_t bi = c0 & 1, bj = c0 >> 1 & 1, bk = c0 >> 2 & 1;
-                    int32_t* slot = a == 0 ? &ex[(size_t)((j + bj) * n + k + bk)]
-                                  : a == 1 ? &ey[bi][(size_t)(j * n + k + bk)]
-                                           : &ez[bi][(size_t)((j + bj) * n + k)];
-                    if (*slot < 0) {
-                        const float t0 = v[c0], t1 = v[c1];
-                        const float f = t1 != t0 ? (lv - t0) / (t1 - t0) : 0.5f;
-                        float g[3] = { (float)(i + bi), (float)(j + bj), (float)(k + bk) };
-                        g[a] += f;
-                        *slot = (int32_t)(out->v.size() / 3);
-                        for (int d = 0; d < 3; ++d) out->v.push_back((float)(g[d] * sc - bounds));
+                for (int c = 0; c < 8; ++c) { any |= cb[c]; all &= cb[c]; }
+                /* Cubes start at k < n - 1. */
+                const int64_t k0 = w * 64;
+                uint64_t live = any & ~all & ~bad;
+                if (n - 1 - k0 < 64) live &= (n - 1 - k0 > 0) ? (1ull << (n - 1 - k0)) - 1 : 0;
+                while (live) {
+                    const int b = __builtin_ctzll(live);
+                    live &= live - 1;
+                    const int64_t k = k0 + b;
+                    int m = 0;
+                    for (int c = 0; c < 8; ++c) m |= (int)((cb[c] >> b) & 1u) << c;
+                    float v[8];
+                    for (int c = 0; c < 8; ++c) v[c] = value(i + (c & 1), j + (c >> 1 & 1), k + (c >> 2 & 1));
+                    for (int t = 0; t < 30 && T.tri[m][t] >= 0; ++t) {
+                        const int e = T.tri[m][t];
+                        const int c0 = T.edge[e][0], c1 = T.edge[e][1], a = e / 4;
+                        const int64_t bi = c0 & 1, bj = c0 >> 1 & 1, bk = c0 >> 2 & 1;
+                        int32_t* slot = a == 0 ? &ex[(size_t)((j + bj) * n + k + bk)]
+                                      : a == 1 ? &ey[bi][(size_t)(j * n + k + bk)]
+                                               : &ez[bi][(size_t)((j + bj) * n + k)];
+                        if (!fresh(*slot, a, bi)) {
+                            const float t0 = v[c0], t1 = v[c1];
+                            const float f = t1 != t0 ? (lv - t0) / (t1 - t0) : 0.5f;
+                            float gp[3] = { (float)(i + bi), (float)(j + bj), (float)(k + bk) };
+                            gp[a] += f;
+                            *slot = (int32_t)(out->v.size() / 3);
+                            for (int d = 0; d < 3; ++d) out->v.push_back((float)(gp[d] * sc - bounds));
+                        }
+                        out->f.push_back((uint32_t)*slot);
                     }
-                    out->f.push_back((uint32_t)*slot);
                 }
             }
+        }
+        v_last = v_now;
     }
 }
 
@@ -610,7 +737,7 @@ std::string glb(const ShapeMesh& m) {
     put(bin, nrm.data(), vb);
     put(bin, m.f.data(), ib);
     while (bin.size() % 4) bin.push_back('\0');
-    using nlohmann::json;
+    using json = Json;
     json j;
     j["asset"] = { { "version", "2.0" }, { "generator", "radiance" } };
     j["scene"] = 0;

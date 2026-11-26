@@ -12,6 +12,8 @@ static int64_t now_ns() {
     return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+int64_t sink_now_ns() { return now_ns(); }
+
 const char* finish_reason_oai(Finish f) {
     switch (f) {
         case Finish::Stop:
@@ -62,7 +64,7 @@ void Sink::enable_logprobs(int n) {
     alt_n_.assign(ring_.size(), 0);
 }
 
-bool Sink::push(int32_t token, const TokenLogprobs* lp) {
+bool Sink::push(int32_t token, const TokenLogprobs* lp, int64_t now) {
     const uint64_t h = head_.load(std::memory_order_relaxed);
     const uint64_t t = tail_.load(std::memory_order_acquire);
     if (h - t > mask_) {
@@ -81,11 +83,18 @@ bool Sink::push(int32_t token, const TokenLogprobs* lp) {
     }
     head_.store(h + 1, std::memory_order_release);
 
-    const int64_t t_now = now_ns() - t_start_ns_;
+    const int64_t t_now = (now >= 0 ? now : now_ns()) - t_start_ns_;
     if (h == 0) t_first_.store(t_now, std::memory_order_release);
     t_last_.store(t_now, std::memory_order_release);
 
-    notify();
+    /* A wake only while the consumer is asleep (asleep_): at hundreds of streams a wake per
+     * token per stream, for consumers already awake draining, is a syscall each on the
+     * scheduler thread. Every push while it sleeps wakes it, so a wake that lands after its
+     * predicate test but before it sleeps (notify() takes no lock) is repaired by the next
+     * push, not left to the bounded wait. The fence orders the head store before the flag's
+     * load, against the consumer's flag store before its predicate's head load. */
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (asleep_.load(std::memory_order_relaxed)) notify();
     return true;
 }
 
@@ -155,7 +164,9 @@ bool Sink::wait(int timeout_ms) {
     };
     if (ready()) return true;
     std::unique_lock<std::mutex> lk(m_);
+    asleep_.store(true, std::memory_order_seq_cst);
     cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms), ready);
+    asleep_.store(false, std::memory_order_relaxed);
     return ready();
 }
 

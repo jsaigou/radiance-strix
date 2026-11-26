@@ -11,7 +11,7 @@
 #include "rad_internal.h"
 #include "text/tokenizer.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cctype>
@@ -27,6 +27,9 @@ namespace server {
 Server::Server(const Deps& d, const ServerOptions& o)
     : deps_(d), opt_(o),
       metrics_(o.model_id, o.max_ctx > 0 ? o.max_ctx : 32768) {
+    if (!opt_.kv_cache_dtype.empty())
+        metrics_.set_cache_config(opt_.kv_cache_dtype, opt_.kv_block_size, opt_.prefix_cache,
+                                  opt_.prefix_cache_mib);
     lim_.model_id = opt_.model_id;
     lim_.version = opt_.version;
     lim_.max_ctx = opt_.max_ctx;
@@ -59,24 +62,9 @@ Server::Server(const Deps& d, const ServerOptions& o)
 }
 
 bool Server::local_operator(const HttpRequest& req) const {
-    if (!req.peer_is_loopback() || req.is_cross_origin()) return false;
-    if (req.host_is_loopback()) return true;
-    const std::string host = req.host_authority();
-    if (host.empty()) return false;   /* a socket always carries a Host; the in-process case
-                                         passed host_is_loopback on its empty peer */
-    for (const std::string& a : opt_.local_hosts) {
-        std::string want = a;
-        for (char& ch : want) ch = (char)std::tolower((unsigned char)ch);
-        if (want == host) return true;
-    }
-    /* Bound to one concrete address, the box answers to that name on itself. */
-    std::string bind = opt_.host;
-    for (char& ch : bind) ch = (char)std::tolower((unsigned char)ch);
-    if (!bind.empty() && bind.front() == '[' && bind.back() == ']')
-        bind = bind.substr(1, bind.size() - 2);
-    if (!bind.empty() && bind != "0.0.0.0" && bind != "::" && bind != "*")
-        return bind == host;
-    return false;
+    /* The three-leg rule itself lives beside the request it reads (server::local_operator,
+     * http.cpp) so the fleet's front applies the very same one. */
+    return server::local_operator(req, opt_.host, opt_.local_hosts);
 }
 
 Server::~Server() { stop(); }
@@ -120,13 +108,13 @@ void Server::register_routes() {
     router_.post("/v1/embeddings",       [this](const HttpRequest& q) { return handle_embeddings(q); });
     router_.post("/rerank", [this](const HttpRequest& q) { return handle_rerank(q); });
     router_.post("/v1/rerank", [this](const HttpRequest& q) { return handle_rerank(q); });
-    router_.post("/v1/images/generations", [this](const HttpRequest& q) { return handle_images(q, false); });
-    router_.post("/v1/images/edits",     [this](const HttpRequest& q) { return handle_images(q, true); });
+    router_.post("/v1/images/generations", [this](const HttpRequest& q) { return run_job(q, &Server::handle_image_generate); });
+    router_.post("/v1/images/edits",     [this](const HttpRequest& q) { return run_job(q, &Server::handle_image_edit); });
     router_.post("/v1/systemone",        [this](const HttpRequest& q) { return handle_systemone(q); });
     /* LiteLLM's name for the same endpoint. */
     router_.post("/v1/decisions",        [this](const HttpRequest& q) { return handle_systemone(q); });
     /* Speech to text, for a model whose plugin says how it transcribes (RadAudioFormat). */
-    router_.post("/v1/audio/speech", [this](const HttpRequest& q) { return handle_speech(q); });
+    router_.post("/v1/audio/speech", [this](const HttpRequest& q) { return run_job(q, &Server::handle_speech); });
     router_.post("/v1/videos",       [this](const HttpRequest& q) { return handle_video_create(q); });
     router_.get ("/v1/videos",       [this](const HttpRequest& q) { return handle_video_list(q); });
     router_.get ("/v1/videos/:id",   [this](const HttpRequest& q) { return handle_video_get(q); });
@@ -135,7 +123,7 @@ void Server::register_routes() {
     router_.get ("/v1/videos/:id/content",
                  [this](const HttpRequest& q) { return handle_video_content(q); });
     /* Hunyuan3D-2's API server: a shape from a picture. */
-    router_.post("/generate",        [this](const HttpRequest& q) { return handle_shape_generate(q); });
+    router_.post("/generate",        [this](const HttpRequest& q) { return run_job(q, &Server::handle_shape_generate); });
     router_.post("/send",            [this](const HttpRequest& q) { return handle_shape_send(q); });
     router_.get ("/status/:uid",     [this](const HttpRequest& q) { return handle_shape_status(q); });
     router_.post("/v1/audio/transcriptions",
@@ -168,8 +156,8 @@ void Server::register_routes() {
     router_.get ("/v1/models",           [this](const HttpRequest& q) { return handle_models(q); });
     router_.get ("/v1/loras",            [this](const HttpRequest& q) { return handle_loras(q); });
     router_.get ("/v1/models/*id",       [this](const HttpRequest& q) { return handle_models(q); });
-    router_.post("/v1/load_lora_adapter",   [this](const HttpRequest& q) { return handle_lora_admin(q, true); });
-    router_.post("/v1/unload_lora_adapter", [this](const HttpRequest& q) { return handle_lora_admin(q, false); });
+    router_.post_guarded("/v1/load_lora_adapter",   [this](const HttpRequest& q) { return handle_lora_admin(q, true); });
+    router_.post_guarded("/v1/unload_lora_adapter", [this](const HttpRequest& q) { return handle_lora_admin(q, false); });
     /* The same routes without /v1, as llama-server answers them, for clients whose base URL is
      * the bare host. */
     router_.post("/chat/completions",    [this](const HttpRequest& q) { return handle_chat(q); });
@@ -179,10 +167,10 @@ void Server::register_routes() {
     router_.post("/completions",         [this](const HttpRequest& q) { return handle_native_completion(q); });
     router_.post("/infill",              [this](const HttpRequest& q) { return handle_infill(q); });
     router_.post("/embeddings",          [this](const HttpRequest& q) { return handle_embeddings(q); });
-    router_.post("/images/generations",  [this](const HttpRequest& q) { return handle_images(q, false); });
-    router_.post("/images/edits",        [this](const HttpRequest& q) { return handle_images(q, true); });
+    router_.post("/images/generations",  [this](const HttpRequest& q) { return run_job(q, &Server::handle_image_generate); });
+    router_.post("/images/edits",        [this](const HttpRequest& q) { return run_job(q, &Server::handle_image_edit); });
     router_.post("/audio/transcriptions", [this](const HttpRequest& q) { return handle_transcription(q); });
-    router_.post("/audio/speech",        [this](const HttpRequest& q) { return handle_speech(q); });
+    router_.post("/audio/speech",        [this](const HttpRequest& q) { return run_job(q, &Server::handle_speech); });
     router_.get ("/models",              [this](const HttpRequest& q) { return handle_models(q); });
     /* llama-server's: the prompt a chat request renders to, and how many tokens it is. */
     router_.post("/apply-template",      [this](const HttpRequest& q) { return handle_apply_template(q); });
@@ -224,13 +212,13 @@ void Server::register_routes() {
     router_.get ("/version",             [this](const HttpRequest& q) { return handle_version(q); });
     router_.get ("/server_info",         [this](const HttpRequest& q) { return handle_server_info(q); });
     router_.get ("/props",               [this](const HttpRequest& q) { return handle_props(q); });
-    router_.get ("/diagnostics",         [this](const HttpRequest& q) { return handle_diagnostics(q); });
+    router_.get_guarded ("/diagnostics",         [this](const HttpRequest& q) { return handle_diagnostics(q); });
 
     router_.post("/tokenize",            [this](const HttpRequest& q) { return handle_tokenize(q); });
     router_.post("/detokenize",          [this](const HttpRequest& q) { return handle_detokenize(q); });
     router_.get ("/get_tokenizer_info",  [this](const HttpRequest& q) { return handle_tokenizer_info(q); });
 
-    router_.post("/reset_prefix_cache",  [this](const HttpRequest& q) { return handle_reset_prefix_cache(q); });
+    router_.post_guarded("/reset_prefix_cache",  [this](const HttpRequest& q) { return handle_reset_prefix_cache(q); });
 
     /* The dashboard, also at `/`, since that is what a person with the host and port types. */
     router_.get ("/",                    [this](const HttpRequest& q) { return handle_dashboard(q); });
@@ -239,17 +227,20 @@ void Server::register_routes() {
     router_.get ("/graph",               [this](const HttpRequest& q) { return handle_graph(q); });
     router_.get ("/sessions",            [this](const HttpRequest& q) { return handle_sessions(q); });
     /* The control vector's switch, for the dashboard's Model view and for automation: a
-     * deployment with no vector found answers 404 here. */
-    router_.get ("/admin/control-vector",
+     * deployment with no vector found answers 404 here. Both verbs answer the local operator
+     * only keyless (handle_control_vector enforces it); registered guarded so the front reads
+     * that fact here too and will not wake a parked model for a stranger's GET. */
+    router_.get_guarded ("/admin/control-vector",
                  [this](const HttpRequest& q) { return handle_control_vector(q); });
-    router_.post("/admin/control-vector",
+    router_.post_guarded("/admin/control-vector",
                  [this](const HttpRequest& q) { return handle_control_vector(q); });
     /* Forget one stored conversation: by its client label in the path (or `?label=`, for a
-     * label the path cannot carry), or by engine id with `?id=`. */
+     * label the path cannot carry), or by engine id with `?id=`. Guarded like the other admin
+     * writes -- and both shapes, so the front does not wake a model to be refused. */
     router_.add ("DELETE", "/sessions/:label",
-                 [this](const HttpRequest& q) { return handle_session_release(q); });
+                 [this](const HttpRequest& q) { return handle_session_release(q); }, true);
     router_.add ("DELETE", "/sessions",
-                 [this](const HttpRequest& q) { return handle_session_release(q); });
+                 [this](const HttpRequest& q) { return handle_session_release(q); }, true);
 }
 
 /* Workers beyond the admission ceiling. A generation holds its connection's worker for its whole
@@ -258,6 +249,9 @@ void Server::register_routes() {
  * keeps probes, the dashboard, 429 answers and idle keep-alive connections serviceable. The same
  * number bounds the connections that may wait once the reserve is busy too. */
 static const int64_t kSpareWorkers = 64;
+/* What a request hears when its model stops or goes off its cards while it runs. The rest of the
+ * process serves on, and the model comes back for the next request. */
+static const char* const kLeaving = "this model is stopping or leaving its cards; send the request again";
 
 void Server::note_ready(uint64_t begin_ns) {
     if (begin_ns == 0) return;
@@ -375,8 +369,12 @@ std::string Server::check_thinking_budget() const {
 }
 
 void Server::stop() {
-    stopping_.store(true);
     transport_.stop();
+    retire();
+}
+
+void Server::retire() {
+    stopping_.store(true);
     stop_videos();
     stop_shapes();
     drain_graveyard(2000);
@@ -492,13 +490,18 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
         }
     }
 
+    /* The control-vector variant is a name of the served model, not an adapter: it takes no
+     * slot. */
+    const bool variant =
+        !opt_.control_vector_variant.empty() && r.model == opt_.control_vector_variant;
+
     /* Runtime LoRA: `model` picks the adapter. The served model's own name, or no name, is the
      * base; with adapters enabled anything else must be a loaded adapter, since a typo served by
      * the base would answer as the wrong model without a word. */
     int32_t  lora_slot = -1;
     uint64_t lora_uid = 0;
     std::shared_ptr<void> lora_hold;
-    if (opt_.lora_acquire && !r.model.empty() && r.model != opt_.model_id) {
+    if (opt_.lora_acquire && !r.model.empty() && r.model != opt_.model_id && !variant) {
         if (opt_.lora_acquire(r.model, &lora_slot, &lora_uid, &lora_hold) != RAD_OK) {
             std::string names = opt_.model_id;
             if (opt_.lora_names)
@@ -513,14 +516,22 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
         }
     }
 
-    /* The control vector: the request's own choice, else the deployment's runtime default. A
-     * deployment with no vector refuses the on state by name rather than serve the stock model. */
+    /* The control vector: the variant's name turns it on, else the request's own choice, else the
+     * deployment's runtime default. The variant's name with an explicit `false` is refused rather
+     * than served either way, since the request asks for both. A deployment with no vector refuses
+     * the on state by name rather than serve the stock model. */
     bool projection_on = false;
     {
         const bool named = r.control_vector >= 0;
-        projection_on = named
-            ? (r.control_vector == 1)
-            : (deps_.control_vector.get_default && deps_.control_vector.get_default());
+        if (variant && named && r.control_vector == 0) {
+            *err = err_bad("control_vector",
+                           "is false, but model '" + r.model + "' is the control-vector variant, "
+                           "which runs with the vector on; send one or the other");
+            return RAD_E_INVAL;
+        }
+        const bool by_default =
+            deps_.control_vector.get_default && deps_.control_vector.get_default();
+        projection_on = variant || (named ? r.control_vector == 1 : by_default);
         if (projection_on &&
             !(deps_.control_vector.available && deps_.control_vector.available())) {
             *err = err_bad("control_vector",
@@ -606,8 +617,7 @@ std::optional<HttpResponse> Server::abandoned(const HttpRequest& req,
     if (r) record(*r, gens, Finish::Cancelled);
     retire(gens);
     release(n);
-    if (!gone)
-        return error_response(err_overloaded("the server is shutting down"), req.peer, shape);
+    if (!gone) return error_response(err_overloaded(kLeaving), req.peer, shape);
     metrics_.observe_http(499);
     return HttpResponse::text(499, "client closed request\n");
 }
@@ -924,9 +934,14 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
     for (const auto& p : r.prompts) n_prompt += (int64_t)p.tokens.size();
 
     int64_t n_gen = 0;
-    double ttft = -1.0, tpot = -1.0, decode = -1.0, e2e = 0.0;
+    double ttft = -1.0, tpot = -1.0, decode = -1.0, e2e = 0.0, queue = -1.0;
     for (const auto& g : gens) {
         int64_t produced = g.sink->n_produced();
+        /* Arrival to the first admission among the request's choices. */
+        if (const int64_t ta = g.sink->t_admitted_ns(); ta >= 0) {
+            const double t = (double)ta * 1e-9;
+            queue = queue < 0 ? t : std::min(queue, t);
+        }
         n_gen += produced;
         e2e = std::max(e2e, (double)g.sink->age_ns() * 1e-9);
         int64_t tf = g.sink->t_first_token_ns(), tl = g.sink->t_last_token_ns();
@@ -941,7 +956,7 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
             }
         }
     }
-    metrics_.observe_request(n_prompt, n_gen, ttft, tpot, e2e, decode,
+    metrics_.observe_request(n_prompt, n_gen, ttft, tpot, e2e, decode, queue,
                              r.n, r.max_tokens, to_reason(overall));
 
     /* The request log's closing line: this request's share of what /metrics aggregates (finish,
@@ -1068,9 +1083,9 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
 /* ------------------------------------------------------------------ llama-server's native shape */
 
 /* What a request was served with, under llama-server's names: its `generation_settings`. */
-static nlohmann::ordered_json native_settings(const OaiRequest& r) {
+static json native_settings(const OaiRequest& r) {
     const SamplingParams& sp = r.sp;
-    nlohmann::ordered_json p;
+    json p;
     p["seed"]               = sp.seed;
     p["temperature"]        = sp.temp;
     p["top_k"]              = sp.top_k;
@@ -1119,7 +1134,7 @@ json Server::native_result(const OaiRequest& r, const Generation& g, const std::
     const Sink* one = g.sink.get();
     const TimingsOut t = timings_of(&one, 1, r.t_received_ns);
     const int64_t n_prompt = (int64_t)r.prompts[(size_t)g.prompt_index].tokens.size();
-    nlohmann::ordered_json o;
+    json o;
     o["index"]   = g.index;
     o["content"] = content;
     o["tokens"]  = r.return_tokens ? g.tokens : std::vector<int32_t>{};
@@ -1141,7 +1156,7 @@ json Server::native_result(const OaiRequest& r, const Generation& g, const std::
     if (r.want_logprobs && !r.stream) {
         const std::vector<LogprobEntry> kept = kept_logprobs(g.logprobs, g.stop_cut);
         o["completion_probabilities"] =
-            nlohmann::ordered_json::parse("[" + logprobs_content(kept.data(), kept.size()) + "]");
+            json::parse("[" + logprobs_content(kept.data(), kept.size()) + "]");
     }
     return o;
 }
@@ -1151,19 +1166,19 @@ json Server::native_result(const OaiRequest& r, const Generation& g, const std::
 static std::string text_chunk(const OaiRequest& r, int index, const std::string& delta,
                               const char* finish_reason, const TimingsOut* t = nullptr,
                               const std::string& logprobs = std::string()) {
-    nlohmann::ordered_json ch;
+    json ch;
     ch["text"] = delta;
     ch["index"] = index;
-    if (!logprobs.empty()) ch["logprobs"] = nlohmann::ordered_json::parse(logprobs);
+    if (!logprobs.empty()) ch["logprobs"] = json::parse(logprobs);
     else ch["logprobs"] = nullptr;
     if (finish_reason) ch["finish_reason"] = finish_reason; else ch["finish_reason"] = nullptr;
-    nlohmann::ordered_json o;
+    json o;
     o["id"] = r.id;
     o["object"] = "text_completion";
     o["created"] = r.created;
     o["model"] = r.model;
     if (!r.system_fingerprint.empty()) o["system_fingerprint"] = r.system_fingerprint;
-    o["choices"] = nlohmann::ordered_json::array({ch});
+    o["choices"] = json::array({ch});
     if (t && t->valid) o["timings"] = timings_json(*t);
     return sse_event(o.dump());
 }
@@ -1173,22 +1188,22 @@ static std::string text_chunk(const OaiRequest& r, int index, const std::string&
  * supplied, and the time since the prompt phase began. */
 static std::string progress_chunk(const OaiRequest& r, int index, const Sink& s) {
     const int64_t ta = s.t_admitted_ns();
-    nlohmann::ordered_json pp;
+    json pp;
     pp["total"]     = s.progress_total();
     pp["cache"]     = s.progress_cached();
     pp["processed"] = s.progress_processed();
     pp["time_ms"]   = ta >= 0 ? (s.age_ns() - ta) / 1000000 : 0;
     if (r.shape == ApiShape::LlamaNative) {
         /* llama-server's native chunk carries the progress at its top level. */
-        nlohmann::ordered_json o;
+        json o;
         o["index"] = index;
         o["content"] = "";
-        o["tokens"] = nlohmann::ordered_json::array();
+        o["tokens"] = json::array();
         o["stop"] = false;
         o["prompt_progress"] = std::move(pp);
         return sse_event(o.dump());
     }
-    nlohmann::ordered_json ch;
+    json ch;
     if (r.endpoint == Endpoint::Chat) {
         ch["index"] = index;
         ch["delta"] = { { "role", "assistant" }, { "content", nullptr } };
@@ -1198,13 +1213,13 @@ static std::string progress_chunk(const OaiRequest& r, int index, const Sink& s)
         ch["logprobs"] = nullptr;
     }
     ch["finish_reason"] = nullptr;
-    nlohmann::ordered_json o;
+    json o;
     o["id"] = r.id;
     o["object"] = r.endpoint == Endpoint::Chat ? "chat.completion.chunk" : "text_completion";
     o["created"] = r.created;
     o["model"] = r.model;
     if (!r.system_fingerprint.empty()) o["system_fingerprint"] = r.system_fingerprint;
-    o["choices"] = nlohmann::ordered_json::array({ch});
+    o["choices"] = json::array({ch});
     o["prompt_progress"] = std::move(pp);
     return sse_event(o.dump());
 }
@@ -1261,6 +1276,27 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
         }
 
         if (st->peer_closed && st->peer_closed()) {
+            return false;
+        }
+
+        /* The model is leaving (end_streams, retire). The stream ends here whether or not the
+         * step loop still answers, since the response's lease is what keeps this server alive, and
+         * with an error event: a silent end would pass a truncated answer as complete. */
+        if (self->stopping_.load()) {
+            self->cancel_all(st->gens, false);
+            const UsageOut u = usage_of(st->r, st->gens);
+            const ApiError e = err_overloaded(kLeaving);
+            for (auto& g : st->gens) {
+                const Sink* one = g.sink.get();
+                const TimingsOut gt = timings_of(&one, 1, st->r.t_received_ns);
+                if (st->r.endpoint == Endpoint::Chat) out += g.delta->error_chunk(e, gt, u);
+                else out += sse_error(e);
+            }
+            if (st->r.shape == ApiShape::OpenAI) out += SSE_DONE;
+            st->done_sent = true;
+            self->record(st->r, st->gens, Finish::Cancelled);
+            self->retire(st->gens);
+            if (!st->released) { st->released = true; self->release(st->r.n_choices()); }
             return false;
         }
 
@@ -1323,7 +1359,7 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
             } else if (st->r.shape == ApiShape::LlamaNative) {
                 /* llama-server's native chunk: the new text, the ids that made it, the counts. */
                 if (safe > g.emitted || g.tokens.size() > g.tokens_sent || lp_n) {
-                    nlohmann::ordered_json o;
+                    json o;
                     o["index"] = g.index;
                     o["content"] = g.text.substr(g.emitted, safe - g.emitted);
                     o["tokens"] = std::vector<int32_t>(g.tokens.begin() + (long)g.tokens_sent,
@@ -1335,7 +1371,7 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                         (int64_t)st->r.prompts[(size_t)g.prompt_index].tokens.size();
                     if (st->r.timings_per_token && now.valid) o["timings"] = timings_json(now);
                     if (lp_n)
-                        o["completion_probabilities"] = nlohmann::ordered_json::parse(
+                        o["completion_probabilities"] = json::parse(
                             "[" + logprobs_content(lp_at, lp_n) + "]");
                     out += sse_event(o.dump());
                     g.tokens_sent = g.tokens.size();
@@ -2279,7 +2315,8 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     std::vector<std::string> adapters;
     if (opt_.lora_names) adapters = opt_.lora_names();
     const bool is_adapter = !id.empty() && std::find(adapters.begin(), adapters.end(), id) != adapters.end();
-    if (!id.empty() && id != opt_.model_id && !is_adapter) {
+    const bool is_variant = !id.empty() && id == opt_.control_vector_variant;
+    if (!id.empty() && id != opt_.model_id && !is_adapter && !is_variant) {
         ApiError e;
         e.status = 404;
         e.type = "not_found_error";
@@ -2302,6 +2339,15 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     c.capabilities = capabilities().dump();
     metrics_.observe_http(200);
     std::vector<ModelCard> cards{ c };
+    /* The control-vector variant is listed as a child of the model, as an adapter is, so the front
+     * names it `base:name` and a client that only picks a model can find it. */
+    if (!opt_.control_vector_variant.empty()) {
+        ModelCard vc = c;
+        vc.id = opt_.control_vector_variant;
+        vc.parent = opt_.model_id;
+        cards.push_back(vc);
+        if (is_variant) return HttpResponse::json_body(200, model_body(vc));
+    }
     for (const std::string& a : adapters) {
         ModelCard ac = c;
         ac.id = a;
@@ -2317,7 +2363,6 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
  * ask, the rule /diagnostics follows. */
 /* A generator's adapter files: what `loras` and <lora:...> tags may name. */
 HttpResponse Server::handle_loras(const HttpRequest& req) {
-    using json = nlohmann::json;
     if (!opt_.gen_lora_names) {
         ApiError e;
         e.status = 404;
@@ -2361,6 +2406,10 @@ HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     const std::string name = j["lora_name"].get<std::string>();
     if (name.empty() || name == opt_.model_id)
         return fail(400, "invalid_request_error", "lora_name must be non-empty and not the served model's name");
+    if (load && !opt_.control_vector_variant.empty() && name == opt_.control_vector_variant)
+        return fail(400, "invalid_request_error",
+                    "lora_name '" + name + "' is this model's control-vector variant "
+                    "(--control-vector-variant), so a request naming it could mean either");
     std::string err;
     int s;
     int in_flight = 0;

@@ -542,9 +542,6 @@ extern "C" int r4d_rad_swiglu_step(const RadArgs* a, RadStream stream) {
 extern "C" int r4d_rad_router_sigmoid_group_topk(const RadArgs* a, RadStream stream) {
     return router_group_body(a, stream);
 }
-extern "C" int r4d_rad_swiglu_clamped_quant_fp8(const RadArgs* a, RadStream stream) {
-    return clamped_quant_body(a, stream);
-}
 extern "C" int r4d_rad_gemm_nt_f32(const RadArgs* a, RadStream stream) {
     return gemm_f32_body(a, stream);
 }

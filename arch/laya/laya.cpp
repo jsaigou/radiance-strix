@@ -74,7 +74,7 @@ struct Model {
     std::vector<HeadLayer> head;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
@@ -115,7 +115,8 @@ static int sliding_layers(const RadModelMeta* meta, int64_t n_layer, std::vector
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
     if (ctx->world_size > 1) {
         fprintf(stderr, "radiance: laya runs on one card (--tp 1); the largest checkpoint is "
                         "0.4B parameters\n");
@@ -124,7 +125,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RadArchProbe pr{};
     RAD_ARCH_TRY(probe(meta, &pr));
 
-    Model& m = g_model[ctx->rank];
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
@@ -409,7 +410,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
+    const Model& m = g_model[rad_slot(c)];
     const Geom& g = m.g;
     const int64_t T = batch->n_tok, S = batch->n_seq, E = g.n_embd, F = m.F;
     const int64_t P = RAD_LAYA_POOLED;
@@ -523,6 +524,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
 
 }  /* namespace laya */
 
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(laya, "laya", "", "0.1.0",
                 "Convai Innovations' Laya (laya, laya-typed-decisions, laya-multilingual): a "
                 "ModernBERT encoder and a decision head scoring each option at its [MASK], one "

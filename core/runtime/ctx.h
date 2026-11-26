@@ -21,6 +21,7 @@
 #include "rank_barrier.h"
 #include "residency.h"
 #include "stager.h"
+#include "wtab.h"
 #include "device/device.h"
 
 #include <atomic>
@@ -137,7 +138,8 @@ struct RouteSlot {
  * operand that is not rank 4 (paged) or rank 3 (conv), so it never arrives as a flat span.
  * Layouts, as libref/ref_ops.h defines them:
  *
- *     FULL / WINDOW  [n_blocks, n_head_kv, block_size, 2 * head_dim]   K then V inside a slot
+ *     FULL / WINDOW  [n_blocks, n_head_kv, block_size, 2 * head_dim]   K then V inside a slot;
+ *                    the int8 cache's last extent is 2 * head_dim + 4 (rad_kv_row_elems)
  *     LINEAR         [n_states, n_head_kv, state_dim[0], state_dim[1]]
  *     CONV           [n_states, n_head_kv * head_dim, conv_slots]      channel-major, then time
  */
@@ -187,6 +189,7 @@ int kvstage_run(Ctx* c, int group, int layer, bool after);
 struct CtxDesc {
     Program*        program     = nullptr;
     int             rank        = 0;
+    int             slot        = -1;       /* RadBuildCtx::slot_base + rank: rad_slot(); -1 is the rank */
     int             world_size  = 1;
     int             device      = 0;        /* the one device this rank owns */
     RadStream       stream      = nullptr;  /* null: the Ctx creates its own compute stream */
@@ -219,6 +222,8 @@ public:
 
     int  init(const CtxDesc& d);
     void shutdown();
+    /* Both compute lanes must finish before their operands may be reassigned. */
+    int quiesce();
 
     /* ---------------------------------------------------------- the hot path */
     int issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
@@ -242,6 +247,7 @@ public:
     /* ---------------------------------------------------------- run-phase queries */
     const RadBatch* batch()      const { return batch_; }
     int             rank()       const { return rank_; }
+    int             slot()       const { return slot_; }
     /* Whether repeated passes are recorded and played back (prepare() says when they are not). */
     bool            records_passes() const { return tape_on_; }
     /* Whether the pass being issued is being recorded. */
@@ -284,6 +290,32 @@ public:
     }
     KVPoolBinding* kv_binding(rad_kvgroup g) {
         return g < kv_.size() ? &kv_[(size_t)g] : nullptr;
+    }
+
+    /* ---------------------------------------------------------- a checkpoint inside the step
+     * (RadBatch::ckpt_cut, rad_ckpt_snap). The engine arms the rank before it releases such a
+     * step: `stage` is this rank's checkpoint stage (KVManager::ckpt_stage), laid out as a
+     * checkpoint slot; per KV group, the sequence's committed state slot (-1: not stateful), the
+     * group's offset in the stage and its bytes a layer. Disarmed (stage null) for every other
+     * step. */
+    void set_ckpt_snap(void* stage, const std::vector<int32_t>& slot,
+                       const std::vector<int64_t>& off, const std::vector<int64_t>& lb) {
+        snap_stage_ = stage;
+        snap_slot_ = slot;
+        snap_off_ = off;
+        snap_lb_ = lb;
+        snap_done_.resize(kv_.size());
+        for (size_t g = 0; g < kv_.size(); ++g) snap_done_[g].assign(kv_[g].layer_slot.size(), 0);
+    }
+    int ckpt_snap(rad_kvgroup g, int layer);
+    /* Whether the armed step snapshotted group `g`'s pool layer `li` (a group-local index, as the
+     * stage lays it out); a layer the step left alone holds the snapshot's state at the step's end
+     * and the engine copies it in (Engine::save_checkpoints). */
+    bool ckpt_snapped(size_t g, int64_t li) const {
+        if (g >= snap_done_.size()) return false;
+        for (size_t i = 0; i < kv_[g].layer_slot.size(); ++i)
+            if (kv_[g].layer_slot[i] == li && snap_done_[g][i]) return true;
+        return false;
     }
 
     /* ---------------------------------------------------------- routing (spec §5.5) */
@@ -352,6 +384,9 @@ public:
     void        dump_profile() const;      /* spec §16, opt-in, with its caveat printed */
     const char* step_error() const { return step_fail_.c_str(); }
     int64_t     stream_waits() const { return n_stream_waits_; }
+    /* Weight-table patch dispatches issued so far (runtime/wtab.h): one for an op's tables where
+     * their changed entries fit one block. Tests read it. */
+    int64_t     wtab_patches() const { return n_wtab_patches_; }
     /* Lane 1 has work lane 0 has not joined (lane1_pending_). */
     bool        lane1_pending() const { return lane1_pending_; }
     /* Host synchronisations on the step path. Always zero unless per-op timing is on (spec §16);
@@ -391,6 +426,7 @@ public:
         return c;
     }
     void*       arena_base()   const { return arena_.base(); }
+    int64_t     arena_bytes()  const { return arena_.bytes(); }
     void*       scratch()      const { return arena_.scratch(); }
 
     /* ---- the arena's levels ------------------------------------------------------------------
@@ -451,6 +487,7 @@ private:
         int64_t    n     = 0;
         void**     host  = nullptr;
         void*      dev   = nullptr;
+        bool       carved = false;    /* host and dev lie in wtab_host_ and wtab_dev_ */
         /* Entries' dtype, rank, shape and stride are checked against entry 0 once, at the first
          * issue; they are declaration facts and cannot change. */
         bool       checked = false;
@@ -458,6 +495,12 @@ private:
         std::vector<int32_t> pend;    /* entries a residency change named since the last issue */
         bool                 full = false;   /* every entry: the templates were rebound */
     };
+    /* The block every table declared at prepare is carved from, at the same offset in both; a
+     * table resolved later has arrays of its own. */
+    static constexpr int64_t kWtabAlign = 64;
+    void*   wtab_host_ = nullptr;
+    void*   wtab_dev_ = nullptr;
+    int64_t wtab_bytes_ = 0, wtab_used_ = 0;
     /* Which tables hold a weight, as a linked list per weight: `wmemb_head_[w]` indexes `wmemb_`,
      * -1 means none. Two ops may share a run, so a weight can be in several tables. */
     struct WMemb { int32_t slot, entry, next; };
@@ -474,6 +517,22 @@ private:
     /* Brings the table's device array up to date on the current stream: every entry on the first
      * issue, afterwards the queued ones. */
     int  table_refresh(rad_op h, int operand, WeightTable& t);
+    /* The patches of one op's tables, gathered (runtime/wtab.h). A routed GEMM names four to eight
+     * tables (a class of experts each, weights and scales), and in a pass the stager armed for
+     * each of them changes a few entries at every issue; a dispatch a table put four ordered
+     * launches in front of every routed GEMM of a prefill chunk (384 a chunk on Flash-Next at two
+     * ranks, each a packet the card's processor takes in turn). While `wtab_gather_` is set
+     * (issue_body, over its operands) table_refresh appends to `wtab_acc_` and dispatches only a
+     * full block; wtab_flush dispatches the rest on the current stream before the op is launched.
+     * The writes and their order against every reader are the same: they are behind the stream's
+     * earlier work and in front of the op that reads the tables, whichever dispatch carries them,
+     * and no two of them name one entry (an entry is patched once an issue).
+     *
+     * Not while recording: there a refresh is host work the tape names (kTapeTable) and replays
+     * per table, and a gathered dispatch would land on the tape as a packet. */
+    WtabPatch wtab_acc_;
+    bool      wtab_gather_ = false;
+    int  wtab_flush();
     /* ------------------------------------------------------------------ recorded passes
      *
      * A decode pass repeats step after step: same kernels, arguments and queues. The host work
@@ -517,6 +576,9 @@ private:
         RadTensor        t[MAX_OPERANDS] = {};
         int64_t          n = 0;
         bool             drain = false;    /* an operand the arena does not track: drain instead */
+        /* The lanes with a host-arena touch pending when the op joined: the device ops this
+         * pass issued before it among them, which a play submits again without passing issue(). */
+        bool             touch[2] = { false, false };
     };
     struct PassTape {
         uint64_t key = 0;
@@ -554,7 +616,7 @@ private:
                   int rec1);
     int  haz_mark(PassTape& t);
 
-    static constexpr size_t  kTapes      = 24;     /* recorded passes kept, least recently used out */
+    static constexpr size_t  kTapes      = 48;     /* recorded passes kept, least recently used out */
     static constexpr int64_t kAuditPlays = 1024;
 
     std::vector<PassTape> tapes_;
@@ -594,6 +656,12 @@ private:
 
     std::vector<WeightTable>              wtabs_;
     std::unordered_map<uint64_t, size_t>  wtab_of_;
+    /* A direct-mapped slot cache in front of wtab_of_: a WTAB operand's (op, operand) key
+     * repeats every step, and the map lookup was paid per issue. An entry counts only on a full
+     * key match (key 0 is empty: op handles start at 1, so a real key is >= 2^32); a miss falls
+     * back to the map and refills the entry. Slots are wtabs_ indices, stable as it grows. */
+    struct WtabSlotCache { uint64_t key = 0; size_t slot = 0; };
+    WtabSlotCache                  wtab_cache_[256] = {};
 
     /* Resolves the run, refreshes the table if it moved, and fills `out` with the tensor the
      * kernel sees: entry 0's dtype and trailing extents, `shape[0]` = n, `stride[0]` = 0.
@@ -651,6 +719,11 @@ private:
     Program*        program_   = nullptr;
     Registry*       registry_  = nullptr;   /* CtxDesc::registry */
     std::vector<KVPoolBinding> kv_;   /* by rad_kvgroup; RAD_OPK_KV resolves through it */
+    /* set_ckpt_snap */
+    void*                snap_stage_ = nullptr;
+    std::vector<int32_t> snap_slot_;
+    std::vector<int64_t> snap_off_, snap_lb_;
+    std::vector<std::vector<uint8_t>> snap_done_;   /* [group][model layer] snapshotted */
     ResidencyTable* residency_ = nullptr;
     OpStager*       stager_ = nullptr;
     bool            staging_ = false;     /* the stager armed for the pass being issued */
@@ -670,6 +743,7 @@ private:
     int  xp_step_run(int layer);
 
     int       rank_       = 0;
+    int       slot_       = 0;
     int       world_size_ = 1;
     int       device_     = 0;
     RadStream stream_     = nullptr;
@@ -755,6 +829,14 @@ private:
     std::vector<RadTensor> buf_tmpl_;
     std::vector<int32_t>   buf_bits_;
     std::vector<uint8_t>   buf_host_;   /* per handle: a RAD_DOMAIN_HOST buffer */
+    /* Per-handle element counts and planned lifetimes, snapshotted at bind (the builder writes
+     * first_def/last_use during planning only) so an issue's fit and lifetime checks read two
+     * compact arrays instead of recomputing the template's numel and chasing BufferInfo. A
+     * buffer's numel follows the active level's template; set_level refreshes it. */
+    std::vector<int64_t>   buf_numel_;
+    std::vector<int64_t>   w_numel_;
+    std::vector<int32_t>   buf_live0_, buf_live1_;   /* BufferInfo::first_def / last_use */
+    void refresh_buf_numel();
     /* Every level's templates; `buf_tmpl_` is a copy of the active one. */
     std::vector<std::vector<RadTensor>> level_tmpl_;
     int                    level_ = 0;
@@ -788,6 +870,8 @@ private:
      * route_report. */
     int32_t*               route_pool_     = nullptr;   /* host */
     int32_t*               route_dev_      = nullptr;   /* card */
+    /* The card rows are the plugin's buffer (rad_route_table), which the arena owns. */
+    bool                   route_dev_arena_ = false;
     RadEvent               route_done_[kRouteBanks] = {};
     /* The layers this pass reported into `route_bank_`, as [lo, hi]; lo > hi when none. */
     int                    route_bank_ = -1, route_lo_ = 1, route_hi_ = 0;
@@ -818,6 +902,7 @@ private:
 
     int64_t n_issues_ = 0;
     int64_t n_stream_waits_ = 0;
+    int64_t n_wtab_patches_ = 0;
     int64_t n_host_syncs_ = 0;
     std::atomic<int64_t> ar_calls_{0}, ar_bytes_{0};
     std::atomic<int64_t> pc_played_{0}, pc_recorded_{0}, pc_audited_{0};

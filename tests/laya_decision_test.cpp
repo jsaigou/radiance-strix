@@ -93,10 +93,10 @@ bool write_tiny_laya(const std::string& dir, uint64_t seed) {
     }
     if (!tiny::write_safetensors(dir + "/model.safetensors", ts)) return false;
 
-    nlohmann::ordered_json root;
+    Json root;
     root["model_type"] = "laya";
     root["architectures"] = { "LayaTypedDecisions" };
-    nlohmann::ordered_json enc;
+    Json enc;
     enc["architectures"] = { "ModernBertForMaskedLM" };
     enc["model_type"] = "modernbert";
     enc["hidden_size"] = E;
@@ -124,7 +124,7 @@ bool write_tiny_laya(const std::string& dir, uint64_t seed) {
     enc["bos_token_id"] = 259;
     enc["eos_token_id"] = 260;
     enc["tie_word_embeddings"] = true;
-    nlohmann::ordered_json rl;
+    Json rl;
     rl["encoder"] = "answerdotai/ModernBERT-large";
     rl["head_layers"] = HL;
     rl["max_len"] = 128;
@@ -135,7 +135,7 @@ bool write_tiny_laya(const std::string& dir, uint64_t seed) {
     rl["model_name"] = "laya-tiny";
     rl["temperature"] = { 1.3, 0.9, 1.7 };
     rl["temperature_by_options"] = { { "choice:3-5", 1.6 }, { "noul:2", 2.2 }, { "choice:11+", 0.1 } };
-    nlohmann::ordered_json tc;
+    Json tc;
     tc["cls_token"] = "[CLS]";
     tc["mask_token"] = "[MASK]";
     tc["pad_token"] = "[PAD]";

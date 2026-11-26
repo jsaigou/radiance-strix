@@ -64,8 +64,8 @@ static inline int r4d_prefill_splits_law(int bq, int tile, int q_len, int total_
 static int g_prefill_last_splits = 0;
 
 /* RadArgs::kv_used_max_h is the host maximum of the launch's seqused operand (Ctx::issue_body),
- * -1 where it cannot be proven, which uses max_ctx below. In a recorded pass of a plugin with no
- * pass-key callback (decode, verify, draft) it is the step's keyed context bound instead. Never
+ * -1 where it cannot be proven, which uses max_ctx below. In a decode, verify or draft pass, which is
+ * recorded, it is the step's keyed context bound instead. Never
  * synchronously copy device seqused from a HIP queue independent of the AQL upload queue. */
 
 /* The KV split's count before the scratch bound: the case's `splits` parameter when it names one

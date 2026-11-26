@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstdarg>
+#include <atomic>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -35,6 +36,25 @@ uint64_t log_last_line_ns();
  * Multi-byte UTF-8 is left alone; only control bytes are replaced. */
 std::string log_sanitize(const std::string& s);
 
+/* The once-log idiom: true on the first call for this flag, false forever after -- a warning
+ * that would otherwise repeat every step logs its first occurrence and stays quiet. Thread-safe
+ * by compare_exchange, so exactly one thread wins. */
+inline bool log_once(std::atomic<bool>& flag) {
+    bool expected = false;
+    return flag.compare_exchange_strong(expected, true);
+}
+
+/* The whole text of a file, refused before it is read when it is bigger than `cap`. Files a
+ * container supplies are screened by size as well as by JSON budget: the bounded parse counts
+ * values, not bytes, so without the size screen a multi-gigabyte tokenizer.json would be read
+ * into memory whole before anything refused it. RAD_E_IO when unreadable, RAD_E_FORMAT when past
+ * the cap; nothing is read then. */
+int read_text_file(const std::string& path, std::string& out, size_t cap);
+
+/* What one container-supplied JSON file may be: past the largest real tokenizer.json by wide
+ * margin, far below what turns a load into an OOM. Weight files are not read this way. */
+inline constexpr size_t kMaxContainerFile = 1u << 28;  /* 256 MiB */
+
 /* Rank tags on log lines. Per-rank components (pools, planner, mover, sampler) print the same
  * line once per rank, so under TP each line needs its rank. LogRank sets the tag as a scope
  * because the printers are several layers down, where threading a rank argument through every
@@ -49,6 +69,25 @@ public:
     LogRank& operator=(const LogRank&) = delete;
 private:
     int prev_;
+};
+
+/* The engine a thread works for, in a process serving several models (docs/MULTIMODEL.md §3.3):
+ * its log lines carry the model's name, [name] or [name/r0] with rank tags, and the device layer
+ * files the thread's device allocations under the engine's owner id so they can be parked with it
+ * (rad_dev_page_out). EngineScope sets both for a scope; every thread an engine starts opens one.
+ * Owner 0 is no engine. Names show only once log_model_tags(true): a process of one model prints
+ * as it always has. */
+void log_model_tags(bool on);
+int  engine_owner();
+class EngineScope {
+public:
+    EngineScope(int owner, const char* model);
+    ~EngineScope();
+    EngineScope(const EngineScope&) = delete;
+    EngineScope& operator=(const EngineScope&) = delete;
+private:
+    int         prev_owner_;
+    const char* prev_model_;
 };
 
 #define RAD_LOG(lvl, ...)                                                        \

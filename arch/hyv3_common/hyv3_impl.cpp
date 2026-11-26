@@ -56,7 +56,7 @@ struct Model {
     std::vector<Layer> layers;
 };
 
-static Model models[MAX_RANKS];
+static Model models[MAX_SLOTS];
 
 static int check_format(const RadModelMeta* meta) {
     const char* q = meta && meta->quant ? meta->quant : "";
@@ -153,8 +153,10 @@ static void block_slice_128(int64_t width, int world, int rank, int64_t* lo, int
 }
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
-    if (!b || !meta || !ctx || ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
-    Model& m = models[ctx->rank];
+    if (!b || !meta || !ctx || ctx->rank < 0 || ctx->rank >= MAX_RANKS ||
+        rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
+    Model& m = models[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     int status = check_format(meta);
@@ -173,19 +175,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     status = check_model_config(meta, g, m);
     if (status < 0) return status;
-#if HYV3_FP8_SOURCE
-    if ((ctx->kv_dtype != RAD_DT_INVALID && ctx->kv_dtype != RAD_BF16 &&
-         ctx->kv_dtype != RAD_F8E4M3) || ctx->kv_quant != RAD_KVQ_NONE) {
-        fprintf(stderr, "radiance: HYV3 FP8 supports BF16 or plain E4M3 KV cache, not this layout\n");
+    if (ctx->kv_dtype != RAD_DT_INVALID && ctx->kv_dtype != RAD_BF16 && ctx->kv_dtype != RAD_I8) {
+        fprintf(stderr, "radiance: HYV3 serves a bf16 or an int8 KV cache, not %s\n",
+                rad_dtype_name(ctx->kv_dtype));
         return RAD_E_UNSUPPORTED;
     }
-#else
-    if ((ctx->kv_dtype != RAD_DT_INVALID && ctx->kv_dtype != RAD_BF16) ||
-        ctx->kv_quant != RAD_KVQ_NONE) {
-        fprintf(stderr, "radiance: HYV3 BF16 supports a BF16 KV cache only\n");
-        return RAD_E_UNSUPPORTED;
-    }
-#endif
     status = yarn_from(g, meta, "", g.head_dim);
     if (status < 0) return status;
 
@@ -341,21 +335,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         as.k_norm = nm.ckpt("%s.self_attn.k_norm.weight", pre);
         as.o = nm.ckpt("%s.self_attn.o_proj.weight", pre);
 #endif
-#if HYV3_FP8_SOURCE
-        if (kd.dtype == RAD_F8E4M3) {
-            const std::string sk = "hyv3.kv_cache." + std::to_string(l) + ".k_scale";
-            const std::string sv = "hyv3.kv_cache." + std::to_string(l) + ".v_scale";
-            as.k_scale = meta_text_getf(meta, sk.c_str(), NAN);
-            as.v_scale = meta_text_getf(meta, sv.c_str(), NAN);
-            if (!std::isfinite(as.k_scale) || as.k_scale <= 0.0 ||
-                !std::isfinite(as.v_scale) || as.v_scale <= 0.0) {
-                fprintf(stderr, "radiance: hyv3_fp8: FP8 KV cache needs positive finite scales "
-                                "for layer %lld (metadata keys %s and %s)\n",
-                        (long long)l, sk.c_str(), sv.c_str());
-                return RAD_E_UNSUPPORTED;
-            }
-        }
-#endif
         RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
         // Each norm folds its predecessor's residual add. The first attention reads the
         // embedding directly; the final feed-forward keeps its add for the plain output norm.
@@ -462,7 +441,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    Model& m = models[rad_rank(c)];
+    Model& m = models[rad_slot(c)];
     RAD_ISSUE(c, m.embed,
               praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.token),
               brows(m.x, batch->n_tok));
@@ -529,6 +508,8 @@ extern "C" const RadChatFormat* rad_arch_chat_format(const RadModelMeta*) {
     return &kHyv3ChatFormat;
 }
 extern "C" const char* rad_arch_id(void) { return "hyv3"; }
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 extern "C" const char* rad_arch_quant(void) { return HYV3_QUANT; }
 extern "C" int rad_arch_declare(RadBuilder* b, const RadModelMeta* m, const RadBuildCtx* c) {
     return HYV3_NS::declare(b, m, c);

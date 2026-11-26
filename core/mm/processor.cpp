@@ -1,5 +1,7 @@
 /* processor.cpp -- see processor.h. */
 #include "mm/processor.h"
+#include "util/rowpool.h"
+#include "util/simd.h"
 #include "mm/imaging.h"
 
 #include "rad_internal.h"
@@ -13,7 +15,6 @@
 #include <cstring>
 #include <functional>
 #include <sstream>
-#include <thread>
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
 #include <immintrin.h>
@@ -48,6 +49,11 @@ static bool meta_bool(const RadModelMeta& m, const char* key, bool dflt) {
     if (!std::strcmp(v, "false")) return false;
     return std::strtol(v, nullptr, 10) != 0;
 }
+
+/* Muse Glimmer's shipped processor config (processor.image_mean, processor.image_std), over the
+ * reference class's IMAGENET_STANDARD defaults. */
+static const float kMuseDefaultMean[3] = { 0.5f, 0.5f, 0.5f };
+static const float kMuseDefaultStd[3]  = { 0.5f, 0.5f, 0.5f };
 
 int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
     /* Only the requested noncausal Mistral3/Ministral3 wrapper selects this new path. */
@@ -295,6 +301,64 @@ int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
         if (radio_min_patches <= 0 || radio_video_patches <= 0 || radio_max_len <= 0)
             bad = "min_num_patches, video_target_num_patches and max_model_len must be positive";
         if (bad.empty() && check(&bad) < 0) bad = "the container's Nemotron-H Omni processor "
+                                                  "configuration is inconsistent: " + bad;
+        if (!bad.empty()) {
+            if (why) *why = bad;
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
+    /* Meta's Muse Glimmer 30B: the vision tower states the patch geometry and the processor
+     * configs the token caps; the markers are numbered by config.json where they are numbered at
+     * all, and the vocabulary spells the rest (resolved at Processor::init). */
+    if (mt && !std::strcmp(mt, "muse_glimmer_vision")) {
+        family = Family::MuseGlimmer;
+        patch    = (int32_t)rad_meta_geti(&m, "vision_config.patch_size", 0);
+        temporal = (int32_t)rad_meta_geti(&m, "vision_config.patch_temporal",
+                                          rad_meta_geti(&m, "vision_config.temporal_patch_size", 0));
+        merge    = (int32_t)rad_meta_geti(&m, "vision_config.merge_size",
+                                          rad_meta_geti(&m, "vision_config.spatial_merge_size", 0));
+        if (patch <= 0 || temporal <= 0 || merge <= 0) {
+            if (why) *why = "the container states no vision tower geometry (vision_config."
+                            "patch_size, patch_temporal, merge_size)";
+            return RAD_E_NOTFOUND;
+        }
+        tok_image = (int32_t)rad_meta_geti(&m, "image_token_id", -1);
+        tok_video = (int32_t)rad_meta_geti(&m, "video_token_id", -1);
+        if (tok_image < 0 || tok_video < 0) {
+            if (why) *why = "the container states no media token ids (image_token_id, "
+                            "video_token_id)";
+            return RAD_E_NOTFOUND;
+        }
+        /* The markers: a container that numbers them wins; the rest the vocabulary resolves. */
+        tok_start        = (int32_t)rad_meta_geti(&m, "image_start_token_id", -1);
+        tok_end          = (int32_t)rad_meta_geti(&m, "image_end_token_id", -1);
+        tok_video_start  = (int32_t)rad_meta_geti(&m, "video_start_token_id", -1);
+        tok_video_end    = (int32_t)rad_meta_geti(&m, "video_end_token_id", -1);
+        tok_video_sep    = (int32_t)rad_meta_geti(&m, "video_frame_separator_token_id", -1);
+        /* The token caps, in merged tokens: one per picture and one per video frame. */
+        max_image_tokens = (int32_t)rad_meta_geti(&m, "processor.image_processor.max_image_tokens",
+                                                  4096);
+        max_frame_rows   = (int32_t)rad_meta_geti(&m, "processor.video_processor.max_video_frame_tokens",
+                                                  144);
+        max_frames       = (int32_t)rad_meta_geti(&m, "processor.video_processor.num_frames", 96);
+        fps              = rad_meta_getf(&m, "processor.video_processor.fps", 2.0);
+        min_frames       = temporal;
+        /* The shipped checkpoints (mean and deviation 0.5) over the reference class's
+         * IMAGENET_STANDARD defaults: the config wins, as it does for every family. */
+        if (!read_triple(m, "processor.image_mean", mean)) std::copy(std::begin(kMuseDefaultMean),
+                                                                     std::end(kMuseDefaultMean), mean);
+        if (!read_triple(m, "processor.image_std", stdv)) std::copy(std::begin(kMuseDefaultStd),
+                                                                    std::end(kMuseDefaultStd), stdv);
+        /* The pixel bands only have to be consistent for check(); the caps size by tokens. */
+        const int64_t f2 = (int64_t)factor() * factor();
+        image_min_pixels = video_min_pixels = f2;
+        image_max_pixels = std::max<int64_t>(f2, (int64_t)std::max(1, max_image_tokens) * f2);
+        video_max_pixels = std::max<int64_t>(f2, (int64_t)std::max(1, max_frame_rows) * f2);
+        std::string bad;
+        if (max_image_tokens < 1 || max_frame_rows < 1)
+            bad = "max_image_tokens and max_video_frame_tokens must be positive";
+        if (bad.empty() && check(&bad) < 0) bad = "the container's Muse Glimmer processor "
                                                   "configuration is inconsistent: " + bad;
         if (!bad.empty()) {
             if (why) *why = bad;
@@ -643,6 +707,125 @@ std::vector<int64_t> sample_frames_gemma4(const VideoInfo& info, double fps, int
     return idx;
 }
 
+/* CPython's tuple hash (tuplehash, the xxHash-based combination of 3.8 and later) for the
+ * candidates' (grid height, grid width) pairs. Lane = hash(int) = the value itself. */
+static inline uint64_t py_tuple_hash(int64_t a, int64_t b) {
+    constexpr uint64_t P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full,
+                       P5 = 0x27D4EB2F165667C5ull;
+    uint64_t acc = P5;
+    for (int64_t v : { a, b }) {
+        acc += (uint64_t)v * P2;
+        acc = (acc << 31) | (acc >> 33);
+        acc *= P1;
+    }
+    acc += (uint64_t)2 ^ (P5 ^ 3527539ull);
+    return acc;
+}
+
+/* CPython's set of those pairs, as an 8-slot open table (PySet_MINSIZE) with its probing, and
+ * iteration in slot order -- what `list(set(...))` gives, which fixes which of equally-near
+ * candidate grids Python's `min` keeps. */
+class PyCandidateSet {
+public:
+    void add(int64_t h, int64_t w) {
+        for (int32_t s = 0; s < 8; ++s)
+            if (slots_[s].used && slots_[s].h == h && slots_[s].w == w) return;
+        uint64_t hash = py_tuple_hash(h, w), perturb = hash;
+        int32_t i = (int32_t)(hash & 7);
+        for (;;) {
+            if (!slots_[i].used) {
+                slots_[i] = { true, h, w };
+                return;
+            }
+            if (slots_[i].h == h && slots_[i].w == w) return;
+            perturb >>= 5;
+            i = (int32_t)(((uint64_t)i * 5 + perturb + 1) & 7);
+        }
+    }
+    /* In slot order, i from 0 to 7: the next used slot's grid, or false at the end. */
+    bool next(int32_t* i, int64_t* h, int64_t* w) const {
+        for (; *i < 8; ++*i)
+            if (slots_[*i].used) {
+                *h = slots_[*i].h;
+                *w = slots_[*i].w;
+                ++*i;
+                return true;
+            }
+        return false;
+    }
+
+private:
+    struct Slot { bool used = false; int64_t h = 0, w = 0; };
+    Slot slots_[8];
+};
+
+/* MuseGlimmer{Image,Video}Processor.smart_resize, in Python's doubles: the ideal merged-token
+ * sides are capped to the token budget by area, then the whole grids at their floor and ceiling
+ * are candidates, and the one whose aspect is nearest the picture's own wins. Ties are real --
+ * every square picture's floor and ceiling grids are both exactly nearest -- and the reference
+ * resolves them by iterating the candidates in a CPython set's order, so the set's slot order is
+ * simulated above. The fallback for an empty candidate set is the reference's own, kept for
+ * parity; it cannot fire for a budget of at least one token. */
+int muse_size(int64_t h, int64_t w, int32_t factor, int64_t max_tokens, int64_t* oh, int64_t* ow,
+              std::string* why) {
+    if (h <= 0 || w <= 0) { if (why) *why = "the picture has no size"; return RAD_E_INVAL; }
+    if (max_tokens < 1) { if (why) *why = "the token budget is empty"; return RAD_E_INVAL; }
+    const double f = factor;
+    double ih = (double)h / f;
+    double iw = (double)w / f;
+    const double ratio = ih > 0.0 ? iw / ih : 1.0;
+    if (ih * iw > (double)max_tokens) {
+        ih = std::sqrt((double)max_tokens / ratio);
+        iw = ih * ratio;
+    }
+    const int64_t fh = (int64_t)std::floor(ih), ch = (int64_t)std::ceil(ih);
+    const int64_t fw = (int64_t)std::floor(iw), cw = (int64_t)std::ceil(iw);
+    PyCandidateSet cand;
+    cand.add(fh, fw);
+    cand.add(fh, cw);
+    cand.add(ch, fw);
+    cand.add(ch, cw);
+    const double aspect = (double)h / (double)w;
+    int64_t gh = -1, gw = -1;
+    double best = 0.0;
+    for (int32_t i = 0;;) {
+        int64_t ch2 = 0, cw2 = 0;
+        if (!cand.next(&i, &ch2, &cw2)) break;
+        if (ch2 < 1 || cw2 < 1 || (double)ch2 * (double)cw2 > (double)max_tokens) continue;
+        const double diff = std::fabs((double)ch2 / (double)cw2 - aspect);
+        if (gh < 0 || diff < best) {
+            best = diff;
+            gh = ch2;
+            gw = cw2;
+        }
+    }
+    if (gh < 0) {
+        gh = std::max<int64_t>(1, pyround(ih));
+        gw = std::max<int64_t>(1, pyround(iw));
+    }
+    *oh = gh * factor;
+    *ow = gw * factor;
+    return RAD_OK;
+}
+
+/* MuseGlimmerVideoProcessor.sample_frames: torch.linspace(0, total - 1, n).long(), which
+ * truncates, against the .long() of a float tensor (half ties go toward zero). */
+std::vector<int64_t> sample_frames_muse(const VideoInfo& info, double fps, int32_t temporal,
+                                        int32_t num_frames) {
+    const int64_t total = info.n_frames;
+    if (total <= 0) return {};
+    const double vfps = info.fps > 0.0 ? info.fps : 24.0;
+    int64_t n = (int64_t)((double)total * fps / vfps);   /* Python's int(): toward zero */
+    n = std::min<int64_t>(std::min<int64_t>(n, num_frames), total);
+    n = std::max<int64_t>(temporal, (n / temporal) * temporal);
+    n = std::min<int64_t>(n, total);
+    std::vector<int64_t> idx((size_t)n);
+    if (n == 1) { idx[0] = 0; return idx; }
+    const double step = (double)(total - 1) / (double)(n - 1);
+    for (int64_t i = 0; i < n; ++i) idx[(size_t)i] = (int64_t)((double)i * step);
+    return idx;
+}
+
 /* ================================================================== the resample
  *
  * Pillow's ImagingResample for 8-bit RGB: coefficients in double, normalised per output pixel and
@@ -662,6 +845,20 @@ inline double bicubic(double x) {
     return 0.0;
 }
 
+/* ATen's HelperInterpLanczos filter, which it credits to Pillow's Resample.c: sin(pi x) / (pi x)
+ * windowed by the same at a third. |x| >= 3 contributes nothing. */
+inline double sinc_lanczos(double x) {
+    if (x == 0.0) return 1.0;
+    x *= 3.14159265358979323846;
+    return std::sin(x) / x;
+}
+
+inline double lanczos(double x) {
+    if (x < 0.0) x = -x;
+    if (x >= 3.0) return 0.0;
+    return sinc_lanczos(x) * sinc_lanczos(x / 3.0);
+}
+
 inline uint8_t clip8(int32_t v, int prec) {
     const int32_t s = v >> prec;
     return (uint8_t)(s < 0 ? 0 : (s > 255 ? 255 : s));
@@ -671,10 +868,11 @@ inline uint8_t clip8(int32_t v, int prec) {
  * `ksize` per row; `*prec` gets their fraction bits. PIL uses a fixed 22; with `torch`, ATen's
  * per-axis choice: the most bits at which the largest weight still fits an int16. */
 int coeffs(int32_t in_size, int32_t out_size, std::vector<int32_t>* bounds,
-           std::vector<int32_t>* kk, bool torch, int* prec) {
+           std::vector<int32_t>* kk, bool torch, int* prec, double (*filter)(double),
+           double support_scale = 2.0) {
     const double scale = (double)in_size / (double)out_size;
     const double fscale = scale < 1.0 ? 1.0 : scale;
-    const double support = 2.0 * fscale;
+    const double support = support_scale * fscale;
     const int ksize = (int)std::ceil(support) * 2 + 1;
     std::vector<double> k((size_t)ksize), w((size_t)out_size * (size_t)ksize, 0.0);
     bounds->assign((size_t)out_size * 2, 0);
@@ -690,7 +888,7 @@ int coeffs(int32_t in_size, int32_t out_size, std::vector<int32_t>* bounds,
         double ww = 0.0;
         int x = 0;
         for (; x < xmax; ++x) {
-            const double w = bicubic((x + xmin - center + 0.5) * ss);
+            const double w = filter((x + xmin - center + 0.5) * ss);
             k[(size_t)x] = w;
             ww += w;
         }
@@ -895,17 +1093,7 @@ RAD_MM_AVX2 void patch_row(const uint8_t* row, uint16_t* dst, int32_t P, size_t 
  * its own output row, in the same per-tap order, so splitting the rows across threads is bit-exact
  * (the goldens pin it). */
 static void run_rows(int32_t rows, const std::function<void(int32_t)>& row) {
-    unsigned hw = std::thread::hardware_concurrency();
-    const int32_t nt = (int32_t)std::min<int32_t>(rows, (int32_t)std::min<unsigned>(hw ? hw : 1, 8));
-    if (nt <= 1) {
-        for (int32_t y = 0; y < rows; ++y) row(y);
-        return;
-    }
-    std::vector<std::thread> ts;
-    ts.reserve((size_t)nt);
-    for (int32_t t = 0; t < nt; ++t)
-        ts.emplace_back([&row, t, nt, rows] { for (int32_t y = t; y < rows; y += nt) row(y); });
-    for (std::thread& th : ts) th.join();
+    row_pool_run(rows, 8, [&row](int64_t y) { row((int32_t)y); });
 }
 
 static void pass_horizontal(const Frame& src, int32_t y0, int32_t rows, int32_t w,
@@ -991,12 +1179,13 @@ static void pass_vertical(const Frame& src, int32_t shift, int32_t h,
     });
 }
 
-static void resize_bicubic_impl(const Frame& in, int32_t w, int32_t h, Frame* out, bool torch) {
+static void resize_bicubic_impl(const Frame& in, int32_t w, int32_t h, Frame* out, bool torch,
+                                double (*filter)(double) = bicubic, double support_scale = 2.0) {
     if (in.w == w && in.h == h) { *out = in; return; }
     std::vector<int32_t> bh, kh, bv, kv;
     int ph = kPrec, pv = kPrec;
-    const int ksh = coeffs(in.w, w, &bh, &kh, torch, &ph);
-    const int ksv = coeffs(in.h, h, &bv, &kv, torch, &pv);
+    const int ksh = coeffs(in.w, w, &bh, &kh, torch, &ph, filter, support_scale);
+    const int ksv = coeffs(in.h, h, &bv, &kv, torch, &pv, filter, support_scale);
     const bool need_h = w != in.w, need_v = h != in.h;
 
     /* Pillow's pass order (libImaging/Resample.c): vertical first when the height shrinks and by
@@ -1035,9 +1224,19 @@ void resize_bicubic_torch(const Frame& in, int32_t w, int32_t h, Frame* out) {
     resize_bicubic_impl(in, w, h, out, true);
 }
 
-/* Python's round(): the nearest integer, a tie to the even one. The default floating-point
- * environment rounds that way, which nearbyint follows. */
-static inline int64_t py_round(double x) { return (int64_t)std::nearbyint(x); }
+/* The Muse Glimmer reference's resize filter: torchvision's tvF.resize on the uint8 pixels with
+ * InterpolationMode.LANCZOS and antialias=True, CPU (the TorchvisionBackend refuses it anywhere
+ * else and falls back to bicubic). On CPU torchvision sends a uint8 tensor to torch's native
+ * uint8 kernel, which is PIL's two-pass fixed-point scheme with ATen's parameter choices: weights
+ * in double, normalised, quantised to int16 at an adaptive precision (the most bits at which the
+ * largest weight still fits, at most 22), the horizontal pass first, its output rounded to eight
+ * bits and clamped, then the vertical pass; each pass rounds half up and clamps 0..255. That is
+ * resize_bicubic_impl's `torch` branch with the Lanczos filter in place of bicubic -- the same
+ * quantisation, pass order and rounding this file already implements for torchvision's bicubic
+ * (coeffs, kPrec, pass_horizontal, pass_vertical). */
+void resize_lanczos_torch(const Frame& in, int32_t w, int32_t h, Frame* out) {
+    resize_bicubic_impl(in, w, h, out, true, lanczos, 3.0);
+}
 
 void radio_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, int32_t* hp) {
     const int64_t div = c.merge, lo = c.radio_min_patches;
@@ -1046,8 +1245,8 @@ void radio_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, int32_
     const int64_t avail = std::max<int64_t>(std::min<int64_t>(budget, hi), lo);
     /* round(x + 0.5): x + 1 rounded down for a fraction, and for a whole x, x or x + 1 by parity
      * (Python's tie to even), which the reference's comment does not say but its code does. */
-    const int64_t ch = py_round((double)h / (double)c.patch + 0.5);
-    const int64_t cw = py_round((double)w / (double)c.patch + 0.5);
+    const int64_t ch = pyround((double)h / (double)c.patch + 0.5);
+    const int64_t cw = pyround((double)w / (double)c.patch + 0.5);
     const double factor = std::min(std::sqrt((double)avail / (double)(ch * cw)), 1.0);
     int64_t th = (int64_t)std::floor(factor * (double)ch);
     int64_t tw = (int64_t)std::floor(factor * (double)cw);
@@ -1067,8 +1266,8 @@ void radio_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, int32_
 void radio_video_size(int64_t w, int64_t h, const VisionConfig& c, int32_t* wp, int32_t* hp) {
     const int64_t div = c.merge, target = c.radio_video_patches;
     const double aspect = (double)w / (double)std::max<int64_t>(h, 1);
-    int64_t ph = std::max<int64_t>(py_round(std::sqrt((double)target / aspect)), 1);
-    int64_t pw = std::max<int64_t>(py_round(std::sqrt((double)target * aspect)), 1);
+    int64_t ph = std::max<int64_t>(pyround(std::sqrt((double)target / aspect)), 1);
+    int64_t pw = std::max<int64_t>(pyround(std::sqrt((double)target * aspect)), 1);
     if (div > 1) {
         const int64_t rh = ph % div, rw = pw % div;
         const int64_t phu = ph + (rh ? div - rh : 0), pwu = pw + (rw ? div - rw : 0);
@@ -1193,7 +1392,19 @@ void content_key(const Item& it, uint64_t* hi, uint64_t* lo) {
         a = mix64(a ^ ((uint64_t)(uint32_t)sg.h << 32 | (uint32_t)sg.w)) + (uint64_t)sg.patch0;
     const uint8_t* p = reinterpret_cast<const uint8_t*>(it.pixels.data());
     const size_t n = it.pixels.size() * sizeof(uint16_t);
-    size_t i = 0;
+    /* The pixels' whole 64-byte stripes through eight independent lanes (util/simd.h, XXH3's
+     * accumulation), which run in vector registers; a chain of mixes a word would hash at about
+     * a byte a cycle. The lanes fold into both halves; the tail mixes as below. */
+    uint64_t lane[8] = { 0xc2b2ae3d27d4eb4full, 0x9e3779b185ebca87ull, 0xc2b2ae3d27d4eb4full ^ n,
+                         0x165667b19e3779f9ull, 0x85ebca77c2b2ae63ull, 0x27d4eb2f165667c5ull,
+                         0x9e3779b97f4a7c15ull ^ n, 0x94d049bb133111ebull };
+    const size_t stripes = n / 64;
+    simd::stripe_acc_u64x8(lane, p, stripes);
+    for (int j = 0; j < 8; ++j) {
+        a = mix64(a ^ lane[j]) + (uint64_t)j;
+        b = mix64(b + lane[j]) ^ (uint64_t)(j + 8);
+    }
+    size_t i = stripes * 64;
     for (; i + 16 <= n; i += 16) {
         uint64_t w0, w1;
         std::memcpy(&w0, p + i, 8);
@@ -1255,6 +1466,47 @@ void patchify(const VisionConfig& c, const std::vector<const Frame*>& frames, It
                                 }
                             }
                     }
+}
+
+/* Muse Glimmer's patch rows, in raster order like the reference's processor emits them (row by
+ * row, not merge-block order): the tower's patch GEMM reads each row as one patch and its
+ * coordinate planes/merge op need the raster grid, and the merge is `pixtral_merge`, which packs
+ * each 2x2 block into one row of the reference's pixel_shuffle layout (channel-major). Each
+ * flattened patch is (temporal, channel), not (channel, temporal), and each value is normalised
+ * through the same per-(channel, byte) lookup as patchify's -- the fused (u - 255 mean) /
+ * (255 std) in f32 is the form the reference's rescale-and-normalise gives, byte for byte,
+ * rounded to bf16.
+ */
+void patchify_muse(const VisionConfig& c, const std::vector<const Frame*>& frames, Item* it) {
+    const int P = c.patch, T = c.temporal, M = c.merge;
+    const int gh = it->grid_h, gw = it->grid_w;
+    float m255[3], s255[3];
+    for (int ch = 0; ch < 3; ++ch) {
+        m255[ch] = c.mean[ch] * 255.0f;
+        s255[ch] = c.stdv[ch] * 255.0f;
+    }
+    uint16_t lut[3][256];
+    for (int ch = 0; ch < 3; ++ch)
+        for (int v = 0; v < 256; ++v)
+            lut[ch][v] = rad_f32_to_bf16(((float)v - m255[ch]) / s255[ch]);
+    const int64_t dim = it->patch_dim;
+    it->pixels.assign((size_t)it->n_patch * (size_t)dim, 0);
+    it->patch_raster = true;
+    uint16_t* dst = it->pixels.data();
+    for (int g = 0; g < it->grid_t; ++g)
+        for (int y = 0; y < gh; ++y)
+            for (int x = 0; x < gw; ++x) {
+                const int py0 = y * P, px0 = x * P;
+                for (int t = 0; t < T; ++t) {
+                    const Frame& f = *frames[(size_t)(g * T + t)];
+                    for (int ch = 0; ch < 3; ++ch)
+                        for (int yy = 0; yy < P; ++yy) {
+                            const uint8_t* row = f.rgb.data() +
+                                ((size_t)(py0 + yy) * f.w + px0) * 3 + ch;
+                            for (int xx = 0; xx < P; ++xx) *dst++ = lut[ch][row[xx * 3]];
+                        }
+                }
+            }
 }
 
 /* Gemma 4's patch rows, in merge-block order like patchify's: each pooling window's patches are
@@ -1430,6 +1682,33 @@ int Processor::init(const VisionConfig& cfg,
         if ((int64_t)cfg.image_soft_tokens * cfg.merge * cfg.merge > cfg.max_patches ||
             (int64_t)cfg.video_soft_tokens * cfg.merge * cfg.merge > cfg.max_patches)
             return RAD_E_INVAL;
+        encode_text_ = std::move(encode_text);
+        return RAD_OK;
+    }
+    if (cfg.family == Family::MuseGlimmer) {
+        /* The markers the container does not number are vocabulary words, refused here so a
+         * missing one fails at startup, not on the first media. An image and a video frame are
+         * one segment each of merged tokens, so the caps are lowered to what a pass holds. */
+        if (cfg_.tok_start < 0 || cfg_.tok_end < 0 || cfg_.tok_video_start < 0 ||
+            cfg_.tok_video_end < 0 || cfg_.tok_video_sep < 0) {
+            if (!token_id) return RAD_E_INVAL;
+            if (cfg_.tok_start < 0) cfg_.tok_start = token_id("<|image_start|>");
+            if (cfg_.tok_end < 0) cfg_.tok_end = token_id("<|image_end|>");
+            if (cfg_.tok_video_start < 0) cfg_.tok_video_start = token_id("<|vid_start|>");
+            if (cfg_.tok_video_end < 0) cfg_.tok_video_end = token_id("<|vid_end|>");
+            if (cfg_.tok_video_sep < 0) cfg_.tok_video_sep = token_id("<|vid_frame_separator|>");
+            if (cfg_.tok_start < 0 || cfg_.tok_end < 0 || cfg_.tok_video_start < 0 ||
+                cfg_.tok_video_end < 0 || cfg_.tok_video_sep < 0)
+                return RAD_E_NOTFOUND;
+        }
+        const int64_t pass_tok = cfg.max_patches / ((int64_t)cfg.merge * cfg.merge);
+        if (pass_tok < 1 || (int64_t)cfg_.max_frame_rows * cfg.merge * cfg.merge > cfg.max_patches)
+            return RAD_E_INVAL;
+        if (cfg_.max_image_tokens > pass_tok) cfg_.max_image_tokens = (int32_t)pass_tok;
+        if (cfg_.max_video_patches <= 0)
+            cfg_.max_video_patches =
+                (int64_t)((cfg.max_frames + cfg.temporal - 1) / cfg.temporal) *
+                (int64_t)cfg_.max_frame_rows * cfg.merge * cfg.merge;
         encode_text_ = std::move(encode_text);
         return RAD_OK;
     }
@@ -2068,6 +2347,96 @@ int Processor::video_radio(const Video& v, std::shared_ptr<Item>* out, std::stri
     return RAD_OK;
 }
 
+/* Meta's Muse Glimmer image processor (transformers' MuseGlimmerImageProcessor, Torchvision
+ * backend): the picture at muse_size's grid under the token cap, resized with torchvision's
+ * antialiased Lanczos on the uint8 pixels, values (u / 255 - mean) / std in bf16. One segment. */
+int Processor::image_muse(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
+    const VisionConfig& c = cfg_;
+    int64_t h = 0, w = 0;
+    RAD_TRY(muse_size(f.h, f.w, c.factor(), c.max_image_tokens, &h, &w, why));
+    Frame r;
+    resize_lanczos_torch(f, (int32_t)w, (int32_t)h, &r);
+    auto it = std::make_shared<Item>();
+    it->kind = Kind::Image;
+    it->grid_t = 1;
+    it->grid_h = (int32_t)(h / c.patch);
+    it->grid_w = (int32_t)(w / c.patch);
+    finish_item(c, it.get());
+    if (it->n_patch > c.max_patches) {
+        if (why) *why = "the image resizes to more patches than one encoder pass holds";
+        return RAD_E_INVAL;
+    }
+    /* An image fills the temporal depth by repetition, as the reference's expand does. */
+    std::vector<const Frame*> frames((size_t)c.temporal, &r);
+    patchify_muse(c, frames, it.get());
+    one_run(it.get(), c.tok_start, it->seg_rows, c.tok_image, c.tok_end);
+    *out = std::move(it);
+    return RAD_OK;
+}
+
+/* Its video processor: every frame at the first frame's muse_size grid under the per-frame token
+ * cap (the reference resizes the whole stack once), the frames padded to whole temporal groups by
+ * repeating the last, and per group one "Time: T s" stamp -- the group's first frame's time at
+ * the stream's rate, 24 fps when the stream states none -- between <|vid_start|> and
+ * <|vid_end|>, the groups separated by <|vid_frame_separator|>. */
+int Processor::video_muse(const Video& v, std::shared_ptr<Item>* out, std::string* why) const {
+    const VisionConfig& c = cfg_;
+    if (v.frames.empty()) { if (why) *why = "the video decoded to no frames"; return RAD_E_INVAL; }
+    int64_t h = 0, w = 0;
+    RAD_TRY(muse_size(v.frames[0].h, v.frames[0].w, c.factor(), c.max_frame_rows, &h, &w, why));
+
+    /* Pad the frames and their indices to whole temporal groups by repeating the last. */
+    std::vector<const Frame*> frames;
+    std::vector<int64_t> idx = v.index;
+    for (const Frame& f : v.frames) frames.push_back(&f);
+    while (frames.size() % (size_t)c.temporal != 0 || frames.size() < (size_t)c.temporal) {
+        frames.push_back(frames.back());
+        idx.push_back(idx.empty() ? 0 : idx.back());
+    }
+
+    auto it = std::make_shared<Item>();
+    it->kind = Kind::Video;
+    it->grid_t = (int32_t)(frames.size() / (size_t)c.temporal);
+    it->grid_h = (int32_t)(h / c.patch);
+    it->grid_w = (int32_t)(w / c.patch);
+    finish_item(c, it.get());
+    if ((int64_t)it->grid_h * it->grid_w > c.max_patches) {
+        if (why) *why = "a video frame resizes to more patches than one encoder pass holds";
+        return RAD_E_INVAL;
+    }
+    if (it->n_patch > c.max_video_patches) {
+        if (why) *why = "the video is over the server's patch budget for one video";
+        return RAD_E_INVAL;
+    }
+
+    /* Resize each distinct frame once; padding repeats share the resized copy. */
+    std::vector<Frame> resized(v.frames.size());
+    for (size_t i = 0; i < v.frames.size(); ++i)
+        resize_lanczos_torch(v.frames[i], (int32_t)w, (int32_t)h, &resized[i]);
+    std::vector<const Frame*> rframes;
+    for (const Frame* f : frames) rframes.push_back(&resized[(size_t)(f - v.frames.data())]);
+    patchify_muse(c, rframes, it.get());
+    content_key(*it, &it->key_hi, &it->key_lo);
+
+    const double vfps = v.info.fps > 0.0 ? v.info.fps : 24.0;
+    it->expand.push_back(c.tok_video_start);
+    for (int32_t g = 0; g < it->grid_t; ++g) {
+        char ts[64];
+        std::snprintf(ts, sizeof ts, "Time: %.1fs", (double)idx[(size_t)g * c.temporal] / vfps);
+        const std::vector<int32_t> tt = encode_text_ ? encode_text_(ts) : std::vector<int32_t>{};
+        if (tt.empty()) {
+            if (why) *why = "the tokenizer produced nothing for a video timestamp";
+            return RAD_E_STATE;
+        }
+        it->expand.insert(it->expand.end(), tt.begin(), tt.end());
+        it->seg_at.push_back((int32_t)it->expand.size());
+        it->expand.insert(it->expand.end(), (size_t)it->seg_rows, c.tok_video);
+        it->expand.push_back(g + 1 == it->grid_t ? c.tok_video_end : c.tok_video_sep);
+    }
+    *out = std::move(it);
+    return RAD_OK;
+}
+
 int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why,
                           const ImageMode& mode) const {
     const VisionConfig& c = cfg_;
@@ -2080,6 +2449,7 @@ int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::strin
     if (c.family == Family::Lfm2) return image_lfm2(f, out, why);
     if (c.family == Family::Glm5Next) return image_glm5next(f, out, why);
     if (c.family == Family::Radio) return image_radio(f, out, why);
+    if (c.family == Family::MuseGlimmer) return image_muse(f, out, why);
     if (c.family == Family::UnlimitedOcr) return image_unlimitedocr(f, mode, out, why);
     int64_t h = 0, w = 0;
     RAD_TRY(smart_resize_image(f.h, f.w, c.factor(), c.image_min_pixels, c.image_max_pixels,
@@ -2174,6 +2544,7 @@ int Processor::video_from(const Video& v, std::shared_ptr<Item>* out, std::strin
     const VisionConfig& c = cfg_;
     if (c.family == Family::Gemma4) return video_gemma4(v, out, why);
     if (c.family == Family::Radio) return video_radio(v, out, why);
+    if (c.family == Family::MuseGlimmer) return video_muse(v, out, why);
     if (c.family == Family::Glm5Next || c.family == Family::Pixtral) {
         if (why) *why = "this model's processor takes pictures, not video";
         return RAD_E_UNSUPPORTED;
@@ -2409,17 +2780,21 @@ int Processor::encoder_video(const uint8_t* bytes, size_t n, int32_t ratio, int3
     return RAD_OK;
 }
 
-int Processor::encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
-                             std::vector<float>* out, std::string* why) const {
-    return decode_audio(bytes, n, rate, max_samples, out, why);
+int Processor::encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int32_t channels,
+                             int64_t max_samples, std::vector<float>* out, std::string* why) const {
+    return decode_audio(bytes, n, rate, max_samples, out, why, channels);
 }
 
 namespace {
-struct SampleArgs { double fps; int32_t lo, hi; bool gemma4; };
+struct SampleArgs { double fps; int32_t lo, hi; bool gemma4; int32_t temporal; };
 std::vector<int64_t> sample_cb(const VideoInfo& info, const void* user) {
     const SampleArgs* a = static_cast<const SampleArgs*>(user);
     return a->gemma4 ? sample_frames_gemma4(info, a->fps, a->hi)
                      : sample_frames(info, a->fps, a->lo, a->hi);
+}
+std::vector<int64_t> muse_sample_cb(const VideoInfo& info, const void* user) {
+    const SampleArgs* a = static_cast<const SampleArgs*>(user);
+    return sample_frames_muse(info, a->fps, a->temporal, a->hi);
 }
 }  /* namespace */
 
@@ -2431,8 +2806,13 @@ int Processor::video(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out,
         return RAD_E_UNSUPPORTED;
     }
     Video v;
+    if (cfg_.family == Family::MuseGlimmer) {
+        const SampleArgs a{ cfg_.fps, cfg_.min_frames, cfg_.max_frames, false, cfg_.temporal };
+        RAD_TRY(decode_video(bytes, n, muse_sample_cb, &a, cfg_.max_source_pixels, &v, why));
+        return video_from(v, out, why);
+    }
     const SampleArgs a{ cfg_.fps, cfg_.min_frames, cfg_.max_frames,
-                        cfg_.family == Family::Gemma4 };
+                        cfg_.family == Family::Gemma4, cfg_.temporal };
     RAD_TRY(decode_video(bytes, n, sample_cb, &a, cfg_.max_source_pixels, &v, why));
     return video_from(v, out, why);
 }

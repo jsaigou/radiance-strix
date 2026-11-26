@@ -1,0 +1,38 @@
+# krea-2-iq8r.recipe -- Krea 2 (Raw or Turbo) with IQ8R linears.
+#
+#   rad-convert <Krea-2 pipeline directory> --recipe data/recipes/krea-2-iq8r.recipe -o krea-2-iq8r.rad
+#
+# Every linear of the text encoder's language model, of the text fusion and of the DiT's blocks
+# becomes rotated int8: codes in -127..127 in the 128-wide Hadamard domain with a u8 scale per
+# [1 x 256] of K under a bf16 scale a row, read at i8a8h against int8 activations quantised under
+# the same rotation with one scale per (token, 256). Round to nearest with a scale search; no
+# calibration data is read. The text fusion's down projection keeps one bf16 scale a 128 instead:
+# its 6912 columns are 3456 a rank on two cards, which whole 128s tile and whole 256s do not. The
+# casts below exist because the release stores its norms, embedders, modulations and output layer
+# f32.
+
+te.blk.*.attn_qkv.weight             rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.attn_output.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.ffn_gate_up.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.ffn_down.weight             rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+fuse.*.attn_qkv.weight               rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+fuse.*.attn_gate.weight              rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+fuse.*.attn_output.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+fuse.*.ffn_gate_up.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+fuse.*.ffn_down.weight               rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dit.blk.*.attn_qkv.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dit.blk.*.attn_gate.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dit.blk.*.attn_output.weight         rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dit.blk.*.ffn_gate_up.weight         rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dit.blk.*.ffn_down.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+fuse.*.norm1.weight                  cast dtype=f32
+fuse.*.norm2.weight                  cast dtype=f32
+fuse.*.q_norm.weight                 cast dtype=f32
+fuse.*.k_norm.weight                 cast dtype=f32
+dit.blk.*.q_norm.weight              cast dtype=f32
+dit.blk.*.k_norm.weight              cast dtype=f32
+txt.norm.weight                      cast dtype=f32
+fuse.*                               cast dtype=bf16
+txt.*                                cast dtype=bf16
+dit.*                                cast dtype=bf16
+vae.*                                cast dtype=bf16

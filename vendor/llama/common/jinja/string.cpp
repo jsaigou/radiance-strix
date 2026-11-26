@@ -2,6 +2,7 @@
 #include "jinja/value.h"
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
 #include <optional>
 #include <sstream>
@@ -46,11 +47,38 @@ std::string string::str() const {
     if (parts.size() == 1) {
         return parts[0].val;
     }
-    std::ostringstream oss;
+    std::string out;
+    out.reserve(length());
     for (const auto & part : parts) {
-        oss << part.val;
+        out += part.val;
     }
-    return oss.str();
+    return out;
+}
+
+bool string::equals(const string & other) const {
+    if (parts.size() == 1 && other.parts.size() == 1) {
+        return parts[0].val == other.parts[0].val;
+    }
+    if (length() != other.length()) {
+        return false;
+    }
+    size_t i = 0, j = 0;   // part cursors
+    size_t a = 0, b = 0;   // byte offsets within the cursors' parts
+    while (i < parts.size() && j < other.parts.size()) {
+        const std::string & pa = parts[i].val;
+        const std::string & pb = other.parts[j].val;
+        const size_t n = std::min(pa.size() - a, pb.size() - b);
+        if (n > 0 && std::memcmp(pa.data() + a, pb.data() + b, n) != 0) {
+            return false;
+        }
+        a += n;
+        b += n;
+        if (a == pa.size()) { ++i; a = 0; }
+        if (b == pb.size()) { ++j; b = 0; }
+    }
+    // The lengths are equal and every byte compared equal; what is left on either side is
+    // empty parts.
+    return true;
 }
 
 size_t string::length() const {
@@ -103,7 +131,8 @@ void string::mark_input_based_on(const string & other) {
     }
 }
 
-string string::append(const string & other) {
+string & string::append(const string & other) {
+    parts.reserve(parts.size() + other.parts.size());
     for (const auto & part : other.parts) {
         parts.push_back(part);
     }
@@ -113,29 +142,29 @@ string string::append(const string & other) {
 // in-place transformation
 
 using transform_fn = std::function<std::string(const std::string&)>;
-static string apply_transform(string & self, const transform_fn & fn) {
+static string apply_transform(string && self, const transform_fn & fn) {
     for (auto & part : self.parts) {
         part.val = fn(part.val);
     }
-    return self;
+    return std::move(self);
 }
 
 string string::uppercase() {
-    return apply_transform(*this, [](const std::string & s) {
+    return apply_transform(std::move(*this), [](const std::string & s) {
         std::string res = s;
         std::transform(res.begin(), res.end(), res.begin(), ::toupper);
         return res;
     });
 }
 string string::lowercase() {
-    return apply_transform(*this, [](const std::string & s) {
+    return apply_transform(std::move(*this), [](const std::string & s) {
         std::string res = s;
         std::transform(res.begin(), res.end(), res.begin(), ::tolower);
         return res;
     });
 }
 string string::capitalize() {
-    return apply_transform(*this, [](const std::string & s) {
+    return apply_transform(std::move(*this), [](const std::string & s) {
         if (s.empty()) return s;
         std::string res = s;
         res[0] = ::toupper(static_cast<unsigned char>(res[0]));
@@ -144,7 +173,7 @@ string string::capitalize() {
     });
 }
 string string::titlecase() {
-    return apply_transform(*this, [](const std::string & s) {
+    return apply_transform(std::move(*this), [](const std::string & s) {
         std::string res = s;
         bool capitalize_next = true;
         for (char &c : res) {
@@ -180,7 +209,7 @@ string string::strip(bool left, bool right, std::optional<const std::string_view
         return s.substr(start, end - start);
     };
     if (parts.empty()) {
-        return *this;
+        return std::move(*this);
     }
     if (left) {
         for (size_t i = 0; i < parts.size(); ++i) {
@@ -207,7 +236,7 @@ string string::strip(bool left, bool right, std::optional<const std::string_view
             }
         }
     }
-    return *this;
+    return std::move(*this);
 }
 
 } // namespace jinja

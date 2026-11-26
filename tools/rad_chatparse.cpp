@@ -28,7 +28,7 @@
  * ("new"), and the streaming parser alone at sizes the legacy path cannot reach; and the host cost
  * of one streamed token by component (decoder, server text bookkeeping, parser, reader bridge,
  * chunk JSON, and the tool-call grammar's accept_token / fill_mask), with every SSE event checked
- * against nlohmann's serialisation.
+ * against Json::dump's serialisation.
  *
  * Exit status is non-zero when any reply breaks the contract or a verdict is not allowed.
  *
@@ -46,7 +46,7 @@
 #include "text/token_view.h"
 #include "text/tokenizer.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <chrono>
@@ -198,9 +198,9 @@ void check_reply(const Bench& b, const Tok& t, const std::string& written, const
             ++ty->markers_lost;
             if (ty->shown++ < 5)
                 std::fprintf(stderr, "  the decoder lost the marker %s:\n    written: %s\n",
-                             nlohmann::json(m).dump().c_str(),
-                             nlohmann::json(written).dump(-1, ' ', false,
-                                                          nlohmann::json::error_handler_t::replace).c_str());
+                             Json(m).dump().c_str(),
+                             Json(written).dump(-1, ' ', false,
+                                                          Json::error_handler_t::replace).c_str());
             break;
         }
     }
@@ -211,8 +211,8 @@ void check_reply(const Bench& b, const Tok& t, const std::string& written, const
         ++ty->violations;
         std::fprintf(stderr, "  VIOLATION %s [%s, %s]: %s\n  reply: %s\n%s\n", what,
                      b.model().name.c_str(), describe(b.request()).c_str(), j.c_str(),
-                     nlohmann::json(text).dump(-1, ' ', false,
-                                               nlohmann::json::error_handler_t::replace).c_str(),
+                     Json(text).dump(-1, ' ', false,
+                                               Json::error_handler_t::replace).c_str(),
                      v.detail.c_str());
     }
     if (v.same) ++ty->same;
@@ -307,7 +307,7 @@ std::string per(const std::vector<double>& secs, size_t units) {
     return b;
 }
 
-/* Every SSE event in `out` must round-trip byte for byte through nlohmann parse and dump, which
+/* Every SSE event in `out` must round-trip byte for byte through Json parse and dump, which
  * holds the non-DOM chunk writer to the DOM's output. Returns the events that do not. */
 size_t sse_not_canonical(const std::string& out, size_t* events) {
     size_t bad = 0;

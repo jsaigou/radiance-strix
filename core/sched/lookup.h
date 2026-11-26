@@ -27,9 +27,10 @@
  * sequence starts each from its own prior: a long match is drafted at once, a short one waits for
  * evidence.
  *
- * T is measured online over pure decode steps, keyed by rows (StepCost). Before a row count is
- * timed, its cost is the nearest timed count's scaled by the prior shape 1 + kRowCost (R - 1),
- * which is optimistic on purpose: the first verify it lets through times the real cost.
+ * T is measured online over pure decode steps, keyed by rows (StepCost, step_cost.h). Before a
+ * row count is timed, its cost is the nearest timed count's scaled by the prior shape
+ * 1 + kRowCost (R - 1), which is optimistic on purpose: the first verify it lets through times
+ * the real cost.
  *
  * Only which proposals are verified changes, never what is emitted: output is the same as with
  * speculation off.
@@ -38,6 +39,7 @@
 #include <cstdint>
 
 #include "draft.h"
+#include "step_cost.h"
 #include "ngram.h"
 
 namespace rad {
@@ -88,14 +90,6 @@ public:
     static constexpr double kHalfLife = 8.0;
     /* The shape an untimed row count is priced on: each query row adds 6% to a step. */
     static constexpr double kRowCost = 0.06;
-    /* Step times: a running mean for the first samples, then a moving average with a half-life of
-     * 32 steps; once a key has 4 samples one step counts for at most 4x its mean (a step that
-     * waited on a recording or a host stall says nothing about its row count). As draft.cpp. */
-    static constexpr double kCostHalfLife = 32.0;
-    static constexpr double kCostOutlier = 4.0;
-    static constexpr int64_t kCostClipAfter = 4;
-    /* Row counts are kept exactly up to 128, then in bands of 32. */
-    enum { kCostExact = 128, kCostBand = 32, kCostKeys = 160 };
 
     void configure(int max_depth);
     int  max_depth() const { return max_depth_; }
@@ -138,13 +132,9 @@ public:
 private:
     int    max_depth_ = 0;
     double alpha_ = 0.0;
-    double cost_r_[kCostKeys] = {};    /* mean rows of the samples in each key */
-    double cost_ms_[kCostKeys] = {};
-    int64_t cost_n_[kCostKeys] = {};
+    StepCost cost_{kRowCost};
     mutable int64_t proposed_ = 0, held_ = 0, held_drafts_ = 0, held_hits_ = 0;
 
-    static int cost_key(int64_t rows);
-    static double prior(double rows) { return 1.0 + kRowCost * (rows - 1.0); }
     void start(LookupSeq& q) const;
     void fold(LookupSeq& q, int cls, int len, int hits) const;
 };

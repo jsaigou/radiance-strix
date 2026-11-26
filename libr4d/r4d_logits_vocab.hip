@@ -246,7 +246,7 @@ __device__ __forceinline__ void vocab_tile(const Head& h, const Cls& cl, uint32_
     for (uint32_t p = 0; p < kU; ++p) pf[p] = D::fetch(c.W, c.nkb, arow, p, lane, alive);
     /* the computed code's A and B, after its 2^16 values (kept for the unrelayout) */
     constexpr Form fm{ F::KIND, F::B, F::LV, F::L, F::LRB, F::SC, 0 };
-    const uint32_t* const ab = (const uint32_t*)(c.W + aux_off(fm, c.N, (int64_t)K) + (1 << 16));
+    const uint32_t* const ab = (const uint32_t*)(c.W + aux_off(fm, c.N, (int64_t)K));
     const uint32_t mA = ab[0], mB = ab[1];
 
     for (uint32_t k0 = 0; k0 < K; k0 += FK) {

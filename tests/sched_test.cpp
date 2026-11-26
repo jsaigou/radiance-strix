@@ -17,7 +17,6 @@
 #include <cstring>
 #include <new>
 #include <string>
-
 #include <unistd.h>
 
 using namespace rad;
@@ -170,6 +169,7 @@ struct Fixture {
         cfg.max_ctx = max_ctx;
         cfg.checkpoint_interval = 256;
         cfg.prefix_cache = true;
+        cfg.prefill_room_gate = false;
         /* The fixture runs --prefix-resume nearest (a tail snapshot at the last quantum
          * boundary, a hit at any snapshot or block); the exact-resume tests set prefix_exact
          * (--prefix-resume exact, the engine's default) themselves. */
@@ -296,6 +296,29 @@ TEST(the_device_fakes_are_the_ones_linked) {
     rad_dev_free(p, RAD_MEM_DEVICE);
 }
 
+/* THE STEP RECORD EXISTS ONLY FOR --diagnose. Sizing the ring at every init put 2.5 MiB and a
+ * record a step on the serving path for a report nobody asked for. Off: no ring, no record. On:
+ * the ring and one record each of the three steps. */
+TEST(the_step_record_exists_only_with_diagnose) {
+    for (const bool on : { false, true }) {
+        Fixture f;
+        f.build();
+        if (on) f.cfg.diagnose = "/tmp/radiance-diagnose-not-written";   /* Scheduler only reads it */
+        CHECK_OK(f.start());
+        CHECK_EQ(f.sch.step_record_capacity(), on ? (size_t)(1u << 16) : (size_t)0);
+        f.submit(64, 8);
+        for (int i = 0; i < 3; ++i) {
+            CHECK(f.sch.step() != nullptr);
+            f.commit_plain();
+            f.sch.step_finished();
+        }
+        CHECK_EQ(f.sch.step_record_count(), on ? (uint64_t)3 : (uint64_t)0);
+        std::vector<rad::diag::StepRecord> out;
+        CHECK_EQ(f.sch.step_records(0, &out), (uint64_t)0);
+        CHECK_EQ(out.size(), on ? (size_t)3 : (size_t)0);
+    }
+}
+
 /* ================================================================== geometry + chunking */
 TEST(chunk_geometry_is_computed_not_configured) {
     Fixture f;
@@ -354,6 +377,47 @@ TEST(chunk_geometry_snapshots_a_trunk_window_and_not_a_drafters) {
         cfg.prefix_cache = false;
         CHECK(!window_snapshots(prog, cfg));
     }
+}
+
+/* Gemma 4 exact group layout: a non-drafter RAD_KV_WINDOW trunk group (sliding layers) beside a
+ * non-drafter RAD_KV_FULL trunk group (full layers) and a drafter own RAD_KV_FULL group. The
+ * window group is what a prefix hit resumes from (scheduler.cpp trunk share clamp): it must
+ * still enable window checkpoints and a non zero interval even with a drafter riding a separate
+ * full group. A drafter own group is RAD_KV_FULL here so it never feeds has window; only the
+ * trunk window group does. */
+TEST(gemma4_layout_window_group_enables_prefix_cache_checkpoints) {
+    Program prog;
+    prog.meta.n_layers = 30;
+    prog.kv_groups.emplace_back();   /* index 0 sentinel */
+    KVGroupInfo swa;
+    swa.name = "kv_swa";
+    swa.decl.kind = RAD_KV_WINDOW;
+    swa.decl.window = 1024;
+    swa.block_size = 16;
+    swa.layers = { 0 };   /* trunk sliding layer < n_layers, not a drafter group */
+    prog.kv_groups.push_back(swa);
+    KVGroupInfo full;
+    full.name = "kv_full";
+    full.decl.kind = RAD_KV_FULL;
+    full.block_size = 16;
+    full.layers = { 1 };   /* trunk full layer < n_layers */
+    prog.kv_groups.push_back(full);
+    KVGroupInfo draft;
+    draft.name = "kv_draft";
+    draft.decl.kind = RAD_KV_FULL;
+    draft.block_size = 16;
+    draft.layers = { 30 };   /* drafter own group, bound at n_layers and above */
+    draft.drafter = true;
+    prog.kv_groups.push_back(draft);
+    Config cfg;
+    cfg.max_tok = 512;
+    cfg.checkpoint_interval = 2048;   /* the default (rad_core.h) */
+    cfg.prefix_cache = true;
+    ChunkGeometry g;
+    CHECK_OK(chunk_geometry_resolve(prog, cfg, &g));
+    CHECK(g.checkpoint_interval > 0);
+    CHECK(g.window_ckpt);
+    CHECK(window_snapshots(prog, cfg));
 }
 
 TEST(chunk_geometry_refuses_a_budget_it_cannot_serve) {
@@ -533,6 +597,20 @@ TEST(prefill_chunks_split_at_the_checkpoint_interval) {
     CHECK_EQ(f.sch.plan_chunk(768, 960, 512, &ck), 192);
     CHECK_EQ(ck, 960);
 
+    /* --prefill-tail-snapshot off: the last chunk runs to the prompt's end and writes no tail
+     * snapshot where that would cut it; the interval splits before it are the same, and a prompt
+     * ending on its tail keeps the snapshot, which costs no cut. */
+    Fixture o;
+    o.build();
+    o.cfg.prefill_tail_snapshot = false;
+    CHECK_OK(o.start());
+    CHECK_EQ(o.sch.plan_chunk(0, 1000, 512, &ck), 256);
+    CHECK_EQ(ck, 256);
+    CHECK_EQ(o.sch.plan_chunk(768, 1000, 512, &ck), 232);
+    CHECK_EQ(ck, -1);
+    CHECK_EQ(o.sch.plan_chunk(768, 960, 512, &ck), 192);
+    CHECK_EQ(ck, 960);
+
     /* A budget short of the interval still ends on a quantum, never in the middle of a tile. */
     CHECK_EQ(f.sch.plan_chunk(0, 1000, 100, &ck), 64);
     CHECK_EQ(ck, -1);
@@ -609,6 +687,146 @@ TEST(prefill_chunks_span_intervals_on_the_same_pieces) {
     /* Off the interval (a resume from a tail checkpoint) the chunk ends at the next boundary. */
     CHECK_EQ(f.sch.plan_chunk(960, 3000, 512, &ck), 64);
     CHECK_EQ(ck, 1024);
+
+    /* --prefill-span-first on: the first interval is spanned too; the rest is as above. */
+    Fixture s;
+    s.build();
+    s.cfg.prefill_span = 2;
+    s.cfg.prefill_span_first = true;
+    CHECK_OK(s.start());
+    CHECK_EQ(s.sch.plan_chunk(0, 2000, 512, &ck), 512);
+    CHECK_EQ(ck, 512);
+    CHECK_EQ(s.sch.plan_chunk(512, 2000, 512, &ck), 512);
+    CHECK_EQ(ck, 1024);
+    CHECK_EQ(s.sch.plan_chunk(0, 200, 512, &ck), 200);
+    CHECK_EQ(ck, -1);
+}
+
+/* A plugin that snapshots inside a step (Scheduler::set_ckpt_inside): a lone spanned prefill's
+ * last chunk runs to the prompt's end and carries the tail snapshot -- or, with none, the last
+ * boundary it crosses -- inside it, at the position the cut would have put it. Not for a step
+ * planned at the shared budget, and not under --prefill-tail-snapshot off. */
+TEST(a_lone_spanned_prefill_takes_its_tail_snapshot_inside_its_last_chunk) {
+    Fixture f;
+    f.build();                            /* interval 256, budget 512, quantum 64 */
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    f.sch.set_ckpt_inside(true);
+    int64_t ck = -1;
+    /* The tail: [512, 1000) with the snapshot at 960, where the cut ended the chunk. */
+    CHECK_EQ(f.sch.plan_chunk(512, 1000, 512, &ck), 488);
+    CHECK_EQ(ck, 960);
+    /* No tail snapshot: the last boundary crossed, 768, inside [512, 830). */
+    CHECK_EQ(f.sch.plan_chunk(512, 830, 512, &ck), 318);
+    CHECK_EQ(ck, 768);
+    /* Mid-prompt chunks and a prompt ending on its tail plan as without the cut. */
+    CHECK_EQ(f.sch.plan_chunk(256, 2000, 512, &ck), 512);
+    CHECK_EQ(ck, 768);
+    CHECK_EQ(f.sch.plan_chunk(768, 960, 512, &ck), 192);
+    CHECK_EQ(ck, 960);
+    /* Every position matches the cut schedule's (at this interval a quarter interval is one
+     * quantum, so the cut's tail floor takes the same positions; see the next case). */
+    Fixture g;
+    g.build();
+    g.cfg.prefill_span = 2;
+    CHECK_OK(g.start());
+    int bad = 0;
+    for (int64_t target = 300; target <= 2600; target += 7) {
+        std::vector<int64_t> a, b;
+        for (int64_t n = 0; n < target; ) {
+            int64_t c1 = -1;
+            const int64_t w = g.sch.plan_chunk(n, target, 512, &c1);
+            if (w <= 0) break;
+            n += w;
+            if (c1 >= 0) a.push_back(c1);
+        }
+        for (int64_t n = 0; n < target; ) {
+            int64_t c1 = -1;
+            const int64_t w = f.sch.plan_chunk(n, target, 512, &c1);
+            if (w <= 0) break;
+            n += w;
+            if (c1 >= 0) b.push_back(c1);
+        }
+        bad += a != b;
+    }
+    CHECK_EQ(bad, 0);
+
+    Fixture o;
+    o.build();
+    o.cfg.prefill_span = 2;
+    o.cfg.prefill_tail_snapshot = false;
+    CHECK_OK(o.start());
+    o.sch.set_ckpt_inside(true);
+    CHECK_EQ(o.sch.plan_chunk(512, 1000, 512, &ck), 488);
+    CHECK_EQ(ck, -1);
+}
+
+/* The quarter-interval floor of nearest's tail snapshot (tail_checkpoint) is for a cut, which costs
+ * the last tokens a step of their own. A snapshot taken inside the last chunk cuts nothing: it is at
+ * the prompt's last quantum boundary however few rows that is past the interval below it, so the
+ * next turn resumes there and not at the interval. */
+TEST(a_tail_snapshot_inside_the_last_chunk_has_no_quarter_interval_floor) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/2048);
+    f.cfg.checkpoint_interval = 1024;     /* quantum 64; a quarter interval is 256 */
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    f.sch.set_ckpt_inside(true);
+    int64_t ck = -1;
+    /* 2176 is 128 past the boundary at 2048: the cut schedule keeps 2048 and runs [2048, 2200) as
+     * a step of its own; inside, one chunk to the end with the snapshot at 2176. */
+    CHECK_EQ(f.sch.plan_chunk(1024, 2200, 2048, &ck), 1176);
+    CHECK_EQ(ck, 2176);
+    /* A last chunk that crosses no boundary, 3136 (64 past 3072), as well. */
+    CHECK_EQ(f.sch.plan_chunk(3072, 3150, 2048, &ck), 78);
+    CHECK_EQ(ck, 3136);
+    /* A tail on the boundary itself is that boundary's snapshot; so is one past a quarter
+     * interval. */
+    CHECK_EQ(f.sch.plan_chunk(1024, 2090, 2048, &ck), 1066);
+    CHECK_EQ(ck, 2048);
+    CHECK_EQ(f.sch.plan_chunk(1024, 2400, 2048, &ck), 1376);
+    CHECK_EQ(ck, 2368);
+    /* The first interval keeps none (a shorter prompt is cheap to redo). */
+    CHECK_EQ(f.sch.plan_chunk(0, 1000, 2048, &ck), 1000);
+    CHECK_EQ(ck, -1);
+
+    /* The step sequence: the first interval, then the rest of the prompt in one spanned step with
+     * the snapshot inside it, 128 rows past the interval. */
+    const uint64_t a = f.submit(2200, 2);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].seq, a);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 1024);
+    CHECK_EQ(f.sch.plan().e[0].ckpt_tok, 1023);
+    f.commit_plain();
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 1176);
+    CHECK_EQ(f.sch.plan().e[0].ckpt_tok, 2176 - 1024 - 1);
+    CHECK(f.sch.plan().e[0].produces_token);
+    f.commit_plain();
+
+    /* Where the snapshot cuts the chunk, the floor stays: 2048 and the rest a step of its own. */
+    Fixture g;
+    g.build(4096, 64, 2048);
+    g.cfg.checkpoint_interval = 1024;
+    g.cfg.prefill_span = 2;
+    CHECK_OK(g.start());
+    CHECK_EQ(g.sch.plan_chunk(1024, 2200, 2048, &ck), 1024);
+    CHECK_EQ(ck, 2048);
+    CHECK_EQ(g.sch.plan_chunk(2048, 2200, 2048, &ck), 152);
+    CHECK_EQ(ck, -1);
+    /* And so it does inside a shared step, which a span does not hold. */
+    g.sch.set_ckpt_inside(true);
+    const uint64_t b = g.submit(2200, 2);
+    const uint64_t c = g.submit(100, 40);
+    (void)c;
+    int64_t b_ck = -1;
+    for (int k = 0; k < 30; ++k) {
+        if (!g.sch.step()) break;
+        for (const StepEntry& e : g.sch.plan().e)
+            if (e.seq == b && e.is_prefill && e.ckpt_tok >= 0) b_ck = e.ctx_len + e.ckpt_tok + 1;
+        g.commit_plain();
+    }
+    CHECK_EQ(b_ck, 2048);
 }
 
 /* A span moves no checkpoint and no piece, from a prompt's start or from any checkpoint a turn
@@ -739,9 +957,10 @@ TEST(a_span_min_keeps_a_short_prompt_at_one_interval) {
     CHECK(last_pf > 0);
 }
 
-/* A shared step under a span is planned as a deployment without one plans it: with two requests
- * from the start, every step they share is the same, entry for entry, at budget 512 with a span of
- * two as at budget 256 with none, --busy-prefill-chunk's shares included. */
+/* A shared step under a span is planned as a deployment without one plans it: with one request
+ * decoding (b, its prompt a step of its own) and a long prompt beside it, every step they share is
+ * the same, entry for entry, at budget 512 with a span of two as at budget 256 with none,
+ * --busy-prefill-chunk's shares included. */
 TEST(a_shared_step_under_a_span_is_planned_as_without_one) {
     std::vector<std::vector<std::pair<uint64_t, int32_t>>> plans[2];
     for (int m = 0; m < 2; ++m) {
@@ -749,8 +968,12 @@ TEST(a_shared_step_under_a_span_is_planned_as_without_one) {
         f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/m == 0 ? 512 : 256);
         if (m == 0) f.cfg.prefill_span = 2;
         CHECK_OK(f.start());
+        const uint64_t b = f.submit(100, 12);
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ((int64_t)f.sch.plan().e.size(), 1ll);
+        CHECK_EQ(f.sch.plan().e[0].n_tokens, 100);
+        f.commit_plain();
         const uint64_t a = f.submit(3000, 4);
-        const uint64_t b = f.submit(300, 6);
         (void)a;
         for (int k = 0; k < 40; ++k) {
             if (!f.sch.step()) break;
@@ -767,6 +990,110 @@ TEST(a_shared_step_under_a_span_is_planned_as_without_one) {
     }
     CHECK(plans[0].size() >= 4);
     CHECK(plans[0] == plans[1]);
+}
+
+/* Prompts prefilling side by side with nothing decoding and no one to admit: each step is spanned
+ * and holds one of them, the one with the fewest prompt tokens left, and the others wait for it
+ * (they take no share of it). As soon as one decodes, the steps are shared again. */
+TEST(concurrent_prefills_with_nothing_decoding_span_one_at_a_time_shortest_first) {
+    Fixture f;
+    f.build();                            /* interval 256, budget 512, shared 256 */
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(3000, 3);
+    const uint64_t b = f.submit(1300, 3);
+    /* Both admitted in the first step, at the shared budget. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int64_t)f.sch.plan().e.size(), 2ll);
+    CHECK(f.sch.plan().n_tok <= 256);
+    f.commit_plain();
+    /* Then b, the shorter, alone in spanned steps up to its first token; a takes nothing. */
+    std::vector<int32_t> b_chunks;
+    int b_first = -1;
+    for (int k = 0; k < 20 && b_first < 0; ++k) {
+        CHECK(f.sch.step() != nullptr);
+        const StepPlan& p = f.sch.plan();
+        CHECK_EQ((int64_t)p.e.size(), 1ll);
+        CHECK_EQ(p.e[0].seq, b);
+        CHECK(p.e[0].is_prefill);
+        b_chunks.push_back(p.e[0].n_tokens);
+        if (p.e[0].produces_token) b_first = k;
+        f.commit_plain();
+    }
+    CHECK(b_first >= 0);
+    int wide = 0;
+    for (int32_t n : b_chunks) wide += n > 256;
+    CHECK(wide >= 1);
+    /* With b decoding, every step is shared: no entry and no step past 256 tokens, a's chunk beside
+     * b's row. */
+    int shared = 0, a_beside_b = 0;
+    for (int k = 0; k < 6; ++k) {
+        if (!f.sch.step()) break;
+        const StepPlan& p = f.sch.plan();
+        bool has_a = false, has_b = false;
+        for (const StepEntry& e : p.e) {
+            has_a = has_a || e.seq == a;
+            has_b = has_b || (e.seq == b && !e.is_prefill);
+        }
+        if (!has_b) break;
+        ++shared;
+        CHECK(p.n_tok <= 256);
+        a_beside_b += has_a;
+        f.commit_plain();
+    }
+    CHECK(shared >= 2);
+    CHECK_EQ(a_beside_b, shared);
+
+    /* A step wider than the shared budget never holds more than one sequence, over a run of three
+     * prompts arriving together (RadBuildCtx::max_mixed_tok). */
+    Fixture g;
+    g.build();
+    g.cfg.prefill_span = 2;
+    CHECK_OK(g.start());
+    g.submit(2500, 2);
+    g.submit(900, 2);
+    g.submit(1700, 2);
+    int bad = 0, spans = 0, done = 0;
+    for (int k = 0; k < 200; ++k) {
+        if (!g.sch.step()) break;
+        const StepPlan& p = g.sch.plan();
+        if (p.n_tok > 256) { ++spans; bad += p.e.size() != 1; }
+        g.commit_plain();
+        ++done;
+    }
+    CHECK(done < 200);
+    CHECK(spans >= 3);
+    CHECK_EQ(bad, 0);
+
+    /* The step after a request finishes beside a prefill is shared: a follow-up turn its client
+     * sends at once waits for that step, not for a span. Then the prefill spans again. */
+    Fixture h;
+    h.build();
+    h.cfg.prefill_span = 2;
+    CHECK_OK(h.start());
+    const uint64_t d = h.submit(100, 3);
+    CHECK(h.sch.step() != nullptr);
+    h.commit_plain();
+    const uint64_t p = h.submit(3000, 2);
+    std::vector<int64_t> after;           /* p's chunks from the step after d finished */
+    bool d_gone = false;
+    for (int k = 0; k < 40 && after.size() < 3; ++k) {
+        if (!h.sch.step()) break;
+        bool has_d = false;
+        int64_t p_tok = 0;
+        for (const StepEntry& e : h.sch.plan().e) {
+            has_d = has_d || e.seq == d;
+            if (e.seq == p) p_tok = e.n_tokens;
+        }
+        if (!has_d) { d_gone = true; after.push_back(p_tok); }
+        h.commit_plain();
+    }
+    CHECK(d_gone);
+    CHECK_EQ((int64_t)after.size(), 3ll);
+    if (after.size() == 3) {
+        CHECK(after[0] > 0 && after[0] <= 256);
+        CHECK(after[1] > 256 || after[2] > 256);
+    }
 }
 
 /* Window snapshots do not support spans, and a model without checkpoints has no interval.
@@ -1637,6 +1964,51 @@ TEST(the_cache_trim_over_mixed_block_sizes_asks_for_entries) {
     CHECK_EQ(f.pc.trims[0], 8ll);
 }
 
+/* The encoder's counters move while a pass runs, not only when it ends: take_encodes publishes the
+ * pass's start, both copies add the time since it, the item being encoded still counts as
+ * pending, and the end publishes a total no smaller than what a reader saw during the pass. */
+TEST(an_encoder_pass_reads_busy_while_it_runs) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    std::shared_ptr<mm::Item> ia;
+    f.submit_unencoded(160, 8, &ia);
+    f.sch.step();                                 /* asks for the item */
+    CHECK_EQ(f.sch.metrics().encode_pending, 1);
+    CHECK(f.sch.encodes_pending());
+
+    std::vector<std::shared_ptr<mm::Item>> items;
+    f.sch.take_encodes(&items);
+    REQUIRE_EQ(items.size(), 1u);
+    CHECK(!f.sch.encodes_pending());
+    const SchedMetrics o1 = f.sch.observed_metrics();    /* published without a step */
+    CHECK(o1.encode_started_ns > 0);
+    CHECK_EQ(o1.encode_pending, 1);
+    CHECK_EQ(o1.encode_items, 0);
+    usleep(5000);
+    const SchedMetrics o2 = f.sch.observed_metrics();
+    CHECK(o2.encode_ns >= 5000000);               /* the 5 ms so far, with no publication since */
+    CHECK(f.sch.metrics().encode_ns >= o2.encode_ns);
+
+    ia->encoded = true;
+    f.sch.encodes_done(1, 400);
+    const SchedMetrics o3 = f.sch.observed_metrics();
+    CHECK_EQ(o3.encode_started_ns, 0);
+    CHECK_EQ(o3.encode_pending, 0);
+    CHECK_EQ(o3.encode_items, 1);
+    CHECK_EQ(o3.encode_patches, 400);
+    CHECK(o3.encode_ns >= o2.encode_ns);
+    usleep(2000);
+    CHECK_EQ(f.sch.observed_metrics().encode_ns, o3.encode_ns);   /* flat once it has ended */
+    CHECK_EQ(f.sch.metrics().encode_ns, o3.encode_ns);
+
+    /* An end without a start (take_encodes found nothing) adds nothing. */
+    f.sch.take_encodes(&items);
+    CHECK(items.empty());
+    f.sch.encodes_done(0, 0);
+    CHECK_EQ(f.sch.metrics().encode_ns, o3.encode_ns);
+}
+
 /* A request whose media is not encoded yet waits, and only it does: it is not admitted without
  * its rows, and the request behind it is asked and runs. Once its items are encoded it is
  * admitted where it stood. */
@@ -1841,6 +2213,39 @@ TEST(an_idle_overdue_prefill_reclaims_a_leaked_state_slot) {
     f.commit_plain();
 }
 
+/* Two overdue preempted requests on an idle engine, admitted in one pass, with no room for the
+ * second's whole recompute beside the first. A request the pass has just admitted is not in
+ * running_ yet, so the engine still looked idle to the second, whose reclaim took the first's state
+ * slots: its chunk ran with no recurrent state and the next from zeros, and the model no longer knew
+ * the start of its conversation. */
+TEST(an_overdue_prefill_leaves_the_state_of_one_admitted_beside_it) {
+    Fixture f;
+    f.build(/*blocks=*/30, /*states=*/4);   /* 30 x 16 = 480 tokens */
+    f.cfg.preempt_wait_ms = 0;
+    f.cfg.max_seqs = 3;
+    f.cfg.max_tok = 128;
+    CHECK_OK(f.start());
+
+    const uint64_t b = f.submit(200, 8, /*priority=*/0);
+    const uint64_t c = f.submit(440, 8, /*priority=*/0);
+    for (int i = 0; i < 8 && f.sch.find(c)->state != ReqState::Running; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    REQUIRE_EQ((int)f.sch.find(c)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.preempt_until([] { return false; }), 2);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Preempted);
+
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    for (size_t g = 0; g < f.kv.gs.size(); ++g)
+        if (!f.kv.geom.g[g].paged) CHECK(f.kv.state_slot(b, (int32_t)g) >= 0);
+    /* The second waits for the room it asked for. */
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Preempted);
+    f.commit_plain();
+}
+
 /* can_grow on an id the manager has forgotten is false. That must not park an idle engine:
  * admit adds the sequence. */
 TEST(an_idle_overdue_prefill_is_admitted_when_its_kv_sequence_is_gone) {
@@ -1865,6 +2270,46 @@ TEST(an_idle_overdue_prefill_is_admitted_when_its_kv_sequence_is_gone) {
     CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
     CHECK(f.kv.has_sequence(b));
     f.commit_plain();
+}
+
+/* A waiter the idle engine cannot start must not park the queue. The room gate used to return
+ * kAdmitWait when the pool could ever hold the prompt but can_grow could not, and with nothing
+ * running the next step never freed a block. step() then returned null forever. */
+TEST(an_idle_engine_fails_a_waiter_it_cannot_start) {
+    Fixture f;
+    f.build(/*blocks=*/64, /*states=*/4);
+    f.cfg.prefill_room_gate = true;
+    f.cfg.prefix_cache = false;
+    CHECK_OK(f.start());
+    for (auto& fl : f.kv.freelist) fl.clear();
+
+    const uint64_t id = f.submit(64, 8);
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(id)->state, (int)ReqState::Failed);
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ(f.sch.metrics().queue_depth, 0);
+}
+
+/* The room gate counts the prompts this step already admitted, and a prompt it holds back holds
+ * the queue behind it. 40 blocks of 16 tokens: A's 350-token prompt takes 22, so B's needs 22 more
+ * than are left beside A (and the one past A), and C, a short prompt behind B, waits with B
+ * rather than taking the room B waits for. */
+TEST(the_room_gate_counts_this_steps_admissions_and_holds_the_queue_behind_a_long_prompt) {
+    Fixture f;
+    f.build(/*blocks=*/40, /*states=*/64, /*max_tok=*/512);
+    f.cfg.prefill_room_gate = true;
+    f.cfg.prefix_cache = false;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(350, 8);
+    const uint64_t b = f.submit(350, 8);
+    const uint64_t c = f.submit(20, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK(f.sch.find(a)->n_computed > 0);
+    CHECK_EQ(f.sch.find(b)->n_computed, (int64_t)0);
+    CHECK_EQ(f.sch.find(c)->n_computed, (int64_t)0);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Waiting);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
 }
 
 /* Two prefills that cannot both stay up. Resetting the higher-priority one so the lower one can
@@ -3091,6 +3536,40 @@ TEST(off_a_long_prefill_keeps_a_new_request_out_of_every_step) {
     CHECK_EQ(f.sch.metrics().prefill_chunks_capped, 0);
 }
 
+/* A prefill chunk held back for others and then refused KV is preempted with no entry in the plan.
+ * The growth pass at the end of the step must not take the next entry, or the slot past the last,
+ * for it: the slot past the last holds a stale entry from an earlier step, and growing it left the
+ * plan's token count above its entries, so the whole step was thrown away. */
+TEST(a_held_back_chunk_refused_kv_leaves_no_mark_on_the_plan) {
+    /* Decode rows ahead of long prefills on a pool too small for them all, across pool sizes and
+     * arrival orders, so a chunk is held back for the rows and then refused its blocks. */
+    for (int64_t blocks = 8; blocks <= 160; ++blocks)
+        for (int shape = 0; shape < 4; ++shape) {
+            Fixture f;
+            f.build(blocks, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/4096);
+            f.cfg.busy_prefill_chunk = -1;
+            CHECK_OK(f.start());
+            std::vector<uint64_t> ids;
+            for (int r = 0; r < 2 + shape; ++r) ids.push_back(f.submit(32 + 16 * r, 2000, 0, true));
+            for (int k = 0; k < 400; ++k) {
+                if (k % 6 == 5 && ids.size() < 12) ids.push_back(f.submit(400 + 96 * ((k + shape) % 7), 64));
+                const RadBatch* b = f.sch.step();
+                if (!b) {
+                    /* An empty step only ever means nothing could run. */
+                    bool running = false;
+                    for (uint64_t id : ids)
+                        if (const Request* q = f.sch.find(id)) running = running || q->state == ReqState::Running;
+                    CHECK(!running);
+                    break;
+                }
+                int64_t sum = 0;
+                for (const StepEntry& e : f.sch.plan().e) sum += e.n_tokens;
+                CHECK_EQ(b->n_tok, sum);
+                f.commit_plain();
+            }
+        }
+}
+
 /* auto: the same arrival is admitted in the next step, and its prompt finishes in two. */
 TEST(auto_a_request_arriving_during_a_long_prefill_is_admitted_at_once) {
     Fixture f;
@@ -3181,6 +3660,354 @@ TEST(an_explicit_busy_prefill_chunk_holds_the_chunk_to_it) {
     CHECK(f.sch.step() != nullptr);
     for (const StepEntry& e : f.sch.plan().e)
         if (e.seq == a) CHECK_EQ(e.n_tokens, 128);
+}
+
+TEST(the_mixed_step_target_controller_corrects_misses_and_grows_cautiously) {
+    MixedStepTarget d;
+    d.seed(300, 64, 2048);
+    CHECK_EQ(d.cap(), 256);
+    d.reset();
+    /* 1024 rows taking four times the 100 ms target predicts a 256-row cap. */
+    d.observe(1024, 400000000, 100000000, 64, 2048);
+    CHECK_EQ(d.cap(), 256);
+    CHECK_EQ(d.limit(2048, 64), 256);
+
+    /* A step in the dead band does not chase noise. */
+    d.observe(256, 80000000, 100000000, 64, 2048);
+    CHECK_EQ(d.cap(), 256);
+
+    /* Three comfortably fast full-cap steps grow toward the measured 512 rows, one quarter at a
+     * time and on the model's quantum. */
+    for (int i = 0; i < 3; ++i) d.observe(256, 50000000, 100000000, 64, 2048);
+    CHECK_EQ(d.cap(), 320);
+    /* A short tail cannot make the deployment's cap grow. */
+    d.observe(64, 10000000, 100000000, 64, 2048, /*representative=*/false);
+    CHECK_EQ(d.cap(), 320);
+    /* A later miss corrects immediately. */
+    d.observe(320, 200000000, 100000000, 64, 2048);
+    CHECK_EQ(d.cap(), 128);
+}
+
+TEST(the_mixed_step_target_recovers_from_fixed_cost_backoff_and_ignores_short_tails) {
+    MixedStepTarget d;
+    d.seed(64, 64, 2048);
+    /* Fixed decode cost makes proportional scaling round back to 64, but sustained 80%-of-target
+     * steps still earn a one-quantum probe. */
+    for (int i = 0; i < 3; ++i) d.observe(64, 160000000, 200000000, 64, 2048);
+    CHECK_EQ(d.cap(), 128);
+    /* A short tail can miss because of fixed cost; it did not exercise the cap and cannot lower
+     * the next full chunk. */
+    d.observe(32, 260000000, 200000000, 64, 2048, /*representative=*/false);
+    CHECK_EQ(d.cap(), 128);
+    /* The same short row count is representative when a fixed policy or checkpoint boundary,
+     * rather than the end of a prompt, limited it. Repeated slow work must be able to lower the
+     * controller below that other limit. */
+    d.seed(2048, 64, 8192);
+    d.observe(512, 400000000, 200000000, 64, 8192, /*representative=*/true);
+    CHECK_EQ(d.cap(), 256);
+    /* An impossible target bottoms out at one legal quantum without underflow. */
+    d.observe(128, 1000000000, 1000000, 64, 2048);
+    CHECK_EQ(d.cap(), 64);
+    d.observe(64, 1000000000, 1000000, 64, 2048);
+    CHECK_EQ(d.cap(), 64);
+}
+
+TEST(a_mixed_step_target_does_not_throttle_an_uncontended_prefill) {
+    Fixture f;
+    share_fixture(f, /*busy off=*/0);
+    f.cfg.mixed_step_target_ms = 200;
+    CHECK_OK(f.start());
+    f.submit(3500, 64);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.plan().e.size(), 1);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 512);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_steps, 0);
+}
+
+TEST(a_mixed_step_target_refuses_a_batch_that_cannot_mix_one_prefill_quantum) {
+    Fixture f;
+    share_fixture(f, /*busy off=*/0);
+    f.cfg.mixed_step_target_ms = 200;
+    f.cfg.max_seqs = 2;
+    f.cfg.max_tok = 64;                    /* quantum 64, no room for a decode row beside it */
+    CHECK_EQ(f.start(), RAD_E_INVAL);
+}
+
+TEST(a_mixed_step_target_validates_the_shared_budget_under_a_prefill_span) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/128, /*max_ctx=*/4096);
+    f.cfg.checkpoint_interval = 64;
+    f.cfg.prefill_span = 2;
+    f.cfg.max_seqs = 2;
+    f.cfg.mixed_step_target_ms = 200;
+    /* The lone-prefill budget is 128, but a mixed step uses shared_tok=64: too little for the
+     * 64-row quantum beside even one ordinary decode row. */
+    CHECK_EQ(f.start(), RAD_E_INVAL);
+}
+
+TEST(a_mixed_step_target_refuses_an_explicit_cap_below_the_prefill_quantum) {
+    Fixture f;
+    share_fixture(f, /*busy below the 64-row quantum=*/32);
+    f.cfg.mixed_step_target_ms = 200;
+    CHECK_EQ(f.start(), RAD_E_INVAL);
+}
+
+TEST(a_mixed_step_target_keeps_decode_rows_in_both_priority_orders_and_busy_modes) {
+    for (int64_t busy : { -1ll, 128ll }) {
+        for (int prefill_priority : { -1, 1 }) {
+            Fixture f;
+            share_fixture(f, busy);
+            f.cfg.mixed_step_target_ms = 200;
+            f.cfg.max_seqs = 2;
+            f.cfg.max_tok = 128;
+            f.cfg.checkpoint_interval = 128;
+            CHECK_OK(f.start());
+
+            const uint64_t d = f.submit(100, 512, /*priority=*/0);
+            CHECK(f.sch.step() != nullptr);
+            f.commit_plain(11);
+            const uint64_t p = f.submit(3500, 64, prefill_priority);
+            CHECK(f.sch.step() != nullptr);
+            CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+            bool saw_d = false, saw_p = false;
+            for (const StepEntry& e : f.sch.plan().e) {
+                if (e.seq == d && !e.is_prefill) saw_d = true;
+                if (e.seq == p && e.is_prefill) saw_p = true;
+            }
+            CHECK(saw_d);
+            CHECK(saw_p);
+        }
+    }
+}
+
+/* The scheduler feeds completed mixed-step timing into the controller. A deterministic timing
+ * sample stands in for step_finished's live bracket. The following step must use the learned cap
+ * even when --busy-prefill-chunk is off. */
+TEST(a_mixed_step_target_adapts_the_next_mixed_prefill_step) {
+    Fixture f;
+    share_fixture(f, /*busy off: the target controller stands on its own=*/0);
+    f.cfg.mixed_step_target_ms = 2;
+    CHECK_OK(f.start());
+
+    const uint64_t d = f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    const uint64_t p = f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    /* This fixture's 512-row mixed capacity seeds at one quarter, on its 64-row quantum. */
+    CHECK_EQ(f.sch.metrics().mixed_step_target_prefill_cap, 128);
+    int64_t first = 0;
+    for (const StepEntry& e : f.sch.plan().e) if (e.seq == p) first = e.n_tokens;
+    CHECK(first > 0);
+    f.commit_plain(12);
+    f.sch.note_mixed_step_cost(12000000);
+    const int64_t learned = f.sch.metrics().mixed_step_target_prefill_cap;
+    CHECK(learned >= 64);
+    CHECK(learned < first);
+
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    int64_t next = 0;
+    for (const StepEntry& e : f.sch.plan().e) if (e.seq == p) next = e.n_tokens;
+    CHECK(next > 0);
+    CHECK(next <= learned);
+    CHECK(f.sch.find(d) != nullptr);
+}
+
+/* The learned limit is a budget for the whole mixed step, not for each prefill independently.
+ * Otherwise a burst of N fresh requests can schedule N times the measured safe amount and miss
+ * the latency target precisely when the server is busiest. */
+TEST(a_mixed_step_target_caps_aggregate_mixed_prefill_rows) {
+    Fixture f;
+    share_fixture(f, /*busy off: the target controller stands on its own=*/0);
+    f.cfg.mixed_step_target_ms = 200;
+    f.cfg.max_seqs = 3;
+    CHECK_OK(f.start());
+
+    const uint64_t d = f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    f.submit(3500, 64, /*priority=*/1);
+    f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    CHECK(f.sch.find(d) != nullptr);
+
+    int64_t prefill_rows = 0;
+    int prefills = 0;
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (!e.is_prefill) continue;
+        prefill_rows += e.n_tokens;
+        ++prefills;
+    }
+    /* The 128-row seed is shared as one 64-row quantum apiece. */
+    CHECK_EQ(prefills, 2);
+    CHECK(prefill_rows <= f.sch.metrics().mixed_step_target_prefill_cap);
+    CHECK_EQ(f.sch.metrics().queue_depth, 0);
+}
+
+TEST(a_mixed_step_target_gives_each_burst_prefill_one_quantum_when_the_target_cannot) {
+    Fixture f;
+    share_fixture(f, /*busy off=*/0);
+    f.cfg.mixed_step_target_ms = 200;
+    f.cfg.max_seqs = 4;
+    CHECK_OK(f.start());
+
+    f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    for (int i = 0; i < 3; ++i) f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+
+    int prefills = 0;
+    int64_t rows = 0;
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (!e.is_prefill) continue;
+        ++prefills;
+        rows += e.n_tokens;
+        CHECK_EQ(e.n_tokens, 64);
+    }
+    CHECK_EQ(prefills, 3);
+    CHECK_EQ(rows, 192);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_prefill_cap, 128);
+    CHECK_EQ(f.sch.metrics().queue_depth, 0);
+}
+
+TEST(a_mixed_step_target_keeps_a_decoder_behind_a_bidirectional_text_prefill) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/128, /*max_ctx=*/4096);
+    f.cfg.checkpoint_interval = 64;
+    f.cfg.busy_prefill_chunk = 0;
+    f.cfg.mixed_step_target_ms = 200;
+    f.cfg.max_seqs = 2;
+    f.prog.encoder.bidirectional = 1;
+    CHECK_OK(f.start());
+
+    const uint64_t d = f.submit(40, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+
+    bool saw_decode = false, saw_prefill = false;
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (e.seq == d && !e.is_prefill) saw_decode = true;
+        if (e.seq == p && e.is_prefill) saw_prefill = true;
+    }
+    CHECK(saw_decode);
+    CHECK(saw_prefill);
+}
+
+TEST(a_cancelled_mixed_prefill_still_teaches_from_the_work_that_ran) {
+    Fixture f;
+    share_fixture(f, /*busy off=*/0);
+    f.cfg.mixed_step_target_ms = 2;
+    CHECK_OK(f.start());
+
+    f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    const int64_t before = f.sch.metrics().mixed_step_target_prefill_cap;
+    CHECK_OK(f.sch.cancel(p));
+    f.commit_plain(12);
+    f.sch.note_mixed_step_cost(12000000);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_steps, 1);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_misses, 1);
+    CHECK(f.sch.metrics().mixed_step_target_prefill_cap < before);
+    REQUIRE(f.sch.find(p) != nullptr);
+    CHECK_EQ((int)f.sch.find(p)->state, (int)ReqState::Cancelled);
+    if (f.sch.has_deferred()) f.sch.release_deferred();
+    CHECK(!f.kv.has_sequence(p));
+    CHECK_OK(f.sch.reap(p));
+    CHECK(f.sch.find(p) == nullptr);
+}
+
+TEST(a_mixed_step_target_preserves_speculative_verification_in_a_mixed_step) {
+    Fixture f;
+    share_fixture(f, /*busy off=*/0);
+    f.cfg.mixed_step_target_ms = 200;
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+
+    const uint64_t d = f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(d, draft, 4));
+    f.submit(3500, 64, /*priority=*/1);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->phase, RAD_PHASE_MIXED);
+    CHECK_EQ(b->n_spec, 4);
+    CHECK_EQ(b->n_seq_decode, 1);
+    CHECK_OK(f.commit(12, 0, [](const StepEntry& e) { return e.is_prefill ? 0 : 2; }));
+    f.sch.step_finished();
+    CHECK_EQ(f.sch.metrics().mixed_step_target_steps, 1);
+    const Request* rd = f.sch.find(d);
+    REQUIRE(rd != nullptr);
+    CHECK_EQ((int)rd->output.size(), 4);
+    CHECK_EQ(rd->output[1], 21);
+    CHECK_EQ(rd->output[2], 22);
+    CHECK_EQ(rd->output[3], 12);
+    CHECK_EQ(rd->n_computed, 103);
+    CHECK_EQ(rd->n_accepted, 2);
+}
+
+TEST(a_mixed_step_target_composes_with_auto_interleave_and_burst_prefills) {
+    Fixture f;
+    share_fixture(f, /*busy off: the target controller stands on its own=*/0);
+    f.cfg.mixed_step_target_ms = 2;
+    f.cfg.prefill_interleave = -1;
+    f.cfg.prefill_interleave_share = 1.0;
+    f.cfg.max_seqs = 3;
+    CHECK_OK(f.start());
+    /* One decode-only step after each mixed chunk, deterministically. */
+    f.sch.note_step_cost(true, 0.4);
+    f.sch.note_step_cost(false, 0.4);
+
+    const uint64_t d = f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    const uint64_t p1 = f.submit(3500, 64, /*priority=*/1);
+    const uint64_t p2 = f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    int first_prefills = 0;
+    for (const StepEntry& e : f.sch.plan().e)
+        if (e.is_prefill && (e.seq == p1 || e.seq == p2)) ++first_prefills;
+    CHECK_EQ(first_prefills, 2);
+    f.commit_plain(12);
+    f.sch.note_mixed_step_cost(12000000);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_steps, 1);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_prefill_cap, 64);
+
+    CHECK(f.sch.step() != nullptr);                     /* auto interleave: decoder alone */
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_DECODE);
+    CHECK_EQ((int)f.sch.plan().e.size(), 1);
+    CHECK_EQ(f.sch.plan().e[0].seq, d);
+    f.commit_plain(13);
+    f.sch.note_mixed_step_cost(12000000);               /* a held step teaches nothing */
+    CHECK_EQ(f.sch.metrics().mixed_step_target_steps, 1);
+    CHECK_EQ(f.sch.metrics().steps_held, 1);
+
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    int next_prefills = 0;
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (!e.is_prefill || (e.seq != p1 && e.seq != p2)) continue;
+        CHECK_EQ(e.n_tokens, 64);
+        ++next_prefills;
+    }
+    CHECK_EQ(next_prefills, 2);                         /* neither burst prompt starves */
+    CHECK(f.sch.find(d) != nullptr);
 }
 
 /* ================================================================== decode-only steps between chunks */
@@ -3654,65 +4481,62 @@ TEST(the_adaptive_window_moves_only_past_its_hold_and_never_below_one_draft) {
     CHECK_EQ(w.depth, 0);
     off.observe(5, 2);
     CHECK_EQ(off.verified_at(5), (int64_t)0);
-    off.step_time(3, 1, 12.0);                                  /* and no step is timed */
-    CHECK_EQ(off.cost_samples(3, 1), (int64_t)0);
+    off.step_time(4, 12.0);                                     /* and no step is timed */
+    CHECK_EQ(off.cost_samples(4), (int64_t)0);
 
     /* Adaptive with no speculation is no policy at all. */
     DraftController zero = adaptive_controller(0);
     CHECK(!zero.adaptive());
 }
 
-/* The step cost is measured. A key (the step's deepest window, its class of running sequences)
- * with samples is its own mean; one without borrows the nearest measured key's, scaled by the
- * prior's shape; with nothing measured it is the prior. Same times, same choice. */
+/* The step cost is measured by query rows (StepCost). A timed row count is its own mean; one
+ * between two timed counts lies on their line; one outside them is the nearest scaled by the
+ * prior's shape; with nothing timed it is the prior. Same times, same choice. */
 TEST(the_adaptive_window_prices_a_step_from_measured_step_times) {
     DraftController c = adaptive_controller(6);
-    CHECK_NEAR(c.step_cost(1, 1), 1.06, 1e-12);                /* the prior */
-    CHECK_NEAR(c.step_cost(6, 1), 1.36, 1e-12);
+    const double k = DraftController::kRowCost;
+    CHECK_NEAR(c.step_cost(1), 1.0, 1e-12);                    /* the prior */
+    CHECK_NEAR(c.step_cost(7), 1.0 + 6 * k, 1e-12);
 
-    for (int i = 0; i < 10; ++i) c.step_time(3, 1, 12.0);
-    CHECK_EQ(c.cost_samples(3, 1), (int64_t)10);
-    CHECK_NEAR(c.step_cost(3, 1), 12.0, 1e-9);
-    CHECK_NEAR(c.step_cost(5, 1), 12.0 * 1.30 / 1.18, 1e-9);   /* borrowed, the prior's shape */
-    CHECK_NEAR(c.step_cost(3, 9), 12.0, 1e-9);                 /* the nearest class */
-    CHECK_EQ(c.cost_samples(3, 9), (int64_t)0);
-    /* The classes: 1, 2-3, 4-7, 8-15, 16 and up. */
-    c.step_time(3, 2, 20.0);
-    CHECK_NEAR(c.step_cost(3, 3), 20.0, 1e-9);
-    CHECK_NEAR(c.step_cost(3, 4), 20.0, 1e-9);                 /* 4-7 borrows from 2-3 */
-    c.step_time(3, 16, 40.0);
-    CHECK_NEAR(c.step_cost(3, 1000), 40.0, 1e-9);
-    CHECK_NEAR(c.step_cost(3, 9), 40.0, 1e-9);                 /* 8-15: the nearest, 16 and up */
+    for (int i = 0; i < 10; ++i) c.step_time(4, 12.0);
+    CHECK_EQ(c.cost_samples(4), (int64_t)10);
+    CHECK_NEAR(c.step_cost(4), 12.0, 1e-9);
+    CHECK_NEAR(c.step_cost(6), 12.0 * (1 + 5 * k) / (1 + 3 * k), 1e-9);   /* outside: the shape */
+    CHECK_EQ(c.cost_samples(6), (int64_t)0);
+    for (int i = 0; i < 10; ++i) c.step_time(8, 16.0);
+    CHECK_NEAR(c.step_cost(6), 14.0, 1e-9);                    /* between: the line */
+    CHECK_NEAR(c.step_cost(3), 12.0 * (1 + 2 * k) / (1 + 3 * k), 1e-9);
+    CHECK_NEAR(c.step_cost(10), 16.0 * (1 + 9 * k) / (1 + 7 * k), 1e-9);
 
     /* A step that waited on something else counts for at most four times the mean. */
-    const double before = c.step_cost(3, 1);
-    c.step_time(3, 1, 1.0e6);
-    CHECK(c.step_cost(3, 1) <= before * 4.0);
-    CHECK(c.step_cost(3, 1) > before);
+    const double before = c.step_cost(4);
+    c.step_time(4, 1.0e6);
+    CHECK(c.step_cost(4) <= before * 4.0);
+    CHECK(c.step_cost(4) > before);
 
     /* Nonsense is not a sample. */
-    c.step_time(0, 1, 5.0);
-    c.step_time(7, 1, 5.0);
-    c.step_time(2, 1, -1.0);
-    c.step_time(2, 0, 5.0);
-    CHECK_EQ(c.cost_samples(2, 1), (int64_t)0);
+    c.step_time(0, 5.0);
+    c.step_time(2, -1.0);
+    CHECK_EQ(c.cost_samples(2), (int64_t)0);
+    CHECK_EQ(c.cost_samples(0), (int64_t)0);
 
     /* One sequence that accepts nearly everything: on the prior the whole window pays... */
     DraftController p = adaptive_controller(6);
     DraftAdapt s = estimate(p, 0.9, 0.9);
     DraftAdapt* one[1] = { &s };
     CHECK_EQ(p.plan_step(one, 1, 1), 6);
-    /* ...and where the steps past three were measured dear, three is what pays. */
+    /* ...and where the steps past three drafts (four rows) were measured dear, three is what
+     * pays. */
     DraftController m = adaptive_controller(6);
     const double t[7] = { 0, 10.0, 11.0, 12.0, 30.0, 30.0, 30.0 };
-    for (int d = 1; d <= 6; ++d) m.step_time(d, 1, t[d]);
+    for (int d = 1; d <= 6; ++d) m.step_time(1 + d, t[d]);
     DraftAdapt u = estimate(m, 0.9, 0.9);
     DraftAdapt* mu[1] = { &u };
     CHECK_EQ(m.plan_step(mu, 1, 1), 3);
     CHECK_EQ(m.window_for(u), 3);
     /* Deterministic: the same times and the same estimate give the same depth. */
     DraftController m2 = adaptive_controller(6);
-    for (int d = 1; d <= 6; ++d) m2.step_time(d, 1, t[d]);
+    for (int d = 1; d <= 6; ++d) m2.step_time(1 + d, t[d]);
     DraftAdapt u2 = estimate(m2, 0.9, 0.9);
     DraftAdapt* mu2[1] = { &u2 };
     CHECK_EQ(m2.plan_step(mu2, 1, 1), 3);
@@ -3735,36 +4559,37 @@ TEST(the_adaptive_window_chooses_the_head_depth_over_the_whole_batch) {
     CHECK_EQ(c.window_for(deep), 6);
     CHECK_EQ(c.window_for(shallow), 1);
 
-    /* The same deep sequence among seven shallow ones, at a class whose steps were measured to
-     * grow by three units per round: eight rows pay for the rounds, and the one that gains does not
-     * repay it. Every window comes down to one. */
+    /* The same deep sequence among seven shallow ones, where steps were measured to grow by
+     * three units per row past the fifteen the eight carry at one draft each: the one that gains
+     * does not repay its rows and rounds. Every window comes down to one. */
     DraftController b = adaptive_controller(6);
-    for (int d = 1; d <= 6; ++d) b.step_time(d, 8, 10.0 + 3.0 * d);
+    for (int d = 1; d <= 6; ++d) b.step_time(15 + d, 10.0 + 3.0 * d);
     DraftAdapt bd = estimate(b, 0.95, 0.95);
     DraftAdapt bs[7];
     DraftAdapt* eight[8] = { &bd };
     for (int i = 0; i < 7; ++i) { bs[i] = estimate(b, 0.5, 0.15); eight[i + 1] = &bs[i]; }
     CHECK_EQ(b.plan_step(eight, 8, 8), 1);
     CHECK_EQ(b.window_for(bd), 1);
-    /* Alone at its own class, unmeasured, the same sequence takes the whole window. */
+    /* Alone, at row counts far under any timed one (priced on the prior's shape), the same
+     * sequence drafts deeper. */
     DraftController a = adaptive_controller(6);
-    for (int d = 1; d <= 6; ++d) a.step_time(d, 8, 10.0 + 3.0 * d);
+    for (int d = 1; d <= 6; ++d) a.step_time(15 + d, 10.0 + 3.0 * d);
     DraftAdapt ad = estimate(a, 0.95, 0.95);
     DraftAdapt* lone[1] = { &ad };
     CHECK(a.plan_step(lone, 1, 1) > 1);
 
     /* Rows that do not draft are part of the step: they emit a token whatever D is and pay for
-     * every round. Here three plain rows beside one drafting row at the same measured class. */
+     * every round. Here three plain rows beside one drafting row, at the same measured times. */
     DraftController r = adaptive_controller(6);
-    for (int d = 1; d <= 6; ++d) r.step_time(d, 4, 10.0 + 3.0 * d);
+    for (int d = 1; d <= 6; ++d) r.step_time(4 + d, 10.0 + 3.0 * d);
     DraftAdapt rd = estimate(r, 0.95, 0.95);
     DraftAdapt* rone[1] = { &rd };
     const int with_plain = r.plan_step(rone, 1, 4);
     DraftController r2 = adaptive_controller(6);
-    for (int d = 1; d <= 6; ++d) r2.step_time(d, 4, 10.0 + 3.0 * d);
+    for (int d = 1; d <= 6; ++d) r2.step_time(4 + d, 10.0 + 3.0 * d);
     DraftAdapt rd2 = estimate(r2, 0.95, 0.95);
     DraftAdapt* rone2[1] = { &rd2 };
-    const int alone = r2.plan_step(rone2, 1, 1);    /* class 1 unmeasured: borrows class 4-7 */
+    const int alone = r2.plan_step(rone2, 1, 1);    /* two to seven rows: partly timed */
     CHECK(with_plain <= alone);
 
     /* D moves past a hold and a hysteresis. The first step that drafts takes the best outright;
@@ -3773,7 +4598,7 @@ TEST(the_adaptive_window_chooses_the_head_depth_over_the_whole_batch) {
     DraftAdapt hs = estimate(h, 0.95, 0.95);
     DraftAdapt* hone[1] = { &hs };
     CHECK_EQ(h.plan_step(hone, 1, 1), 6);
-    for (int d = 1; d <= 6; ++d) h.step_time(d, 1, d <= 2 ? 10.0 : 40.0);
+    for (int d = 1; d <= 6; ++d) h.step_time(1 + d, d <= 2 ? 10.0 : 40.0);
     for (int t = 0; t < DraftController::kHold - 1; ++t) CHECK_EQ(h.plan_step(hone, 1, 1), 6);
     CHECK_EQ(h.plan_step(hone, 1, 1), 2);
     /* No drafting sequence: D stays where it is. */
@@ -4472,9 +5297,9 @@ TEST(prompt_lookup_does_not_scan_the_context) {
     CHECK_EQ(ix.indexed(), (int64_t)seq.size() - 1);
 }
 
-/* The scheduler's half of the cost: a decode step that verified drafts is timed at its deepest
- * window and row count, and the next cycle's head depth reads it. Measured dear past one round at
- * two rows, both windows (and the rounds) come down to one. */
+/* The scheduler's half of the cost: a decode step that verified drafts is timed at its query
+ * rows, and the next cycle's head depth reads it. Measured dear past one draft a sequence, both
+ * windows (and the rounds) come down to one. */
 TEST(the_adaptive_window_times_its_steps_and_the_next_cycle_reads_them) {
     Fixture f;
     adaptive_fixture(f, 4);
@@ -4490,7 +5315,7 @@ TEST(the_adaptive_window_times_its_steps_and_the_next_cycle_reads_them) {
     REQUIRE(f.sch.step() != nullptr);                  /* both prompts */
     commit_all();
     f.sch.step_finished();                             /* a prefill step: not a sample */
-    for (int d = 1; d <= 4; ++d) CHECK_EQ(f.sch.draft().cost_samples(d, 2), (int64_t)0);
+    for (int d = 1; d <= 4; ++d) CHECK_EQ(f.sch.draft().cost_samples(2 + 2 * d), (int64_t)0);
 
     int32_t draft[4] = { 21, 22, 23, 24 };
     CHECK_OK(f.sch.set_draft(a, draft, 4));
@@ -4499,11 +5324,11 @@ TEST(the_adaptive_window_times_its_steps_and_the_next_cycle_reads_them) {
     CHECK_EQ(f.sch.plan().n_spec, 4);
     commit_all();
     f.sch.step_finished();
-    CHECK_EQ(f.sch.draft().cost_samples(4, 2), (int64_t)1);
+    CHECK_EQ(f.sch.draft().cost_samples(10), (int64_t)1);          /* two sequences, five rows each */
 
     /* The hold, then a cycle that reads steps past one round as four times dearer. */
     for (int d = 1; d <= 4; ++d)
-        for (int i = 0; i < 64; ++i) f.sch.draft().step_time(d, 2, d == 1 ? 10.0 : 40.0);
+        for (int i = 0; i < 64; ++i) f.sch.draft().step_time(2 + 2 * d, d == 1 ? 10.0 : 40.0);
     for (int t = 0; t < DraftController::kHold + 1; ++t) {
         CHECK_OK(f.sch.set_draft(a, draft, 4));
         CHECK_OK(f.sch.set_draft(b, draft, 4));
@@ -5607,6 +6432,36 @@ TEST(a_refused_lookahead_still_runs_the_history_pass) {
     f.sch.serial_end(0);
 }
 
+TEST(calibration_history_keeps_every_row_without_reserving_a_proposal) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.prog.drafter.kind = RAD_DRAFT_HISTORY;
+    f.cfg.n_spec = 0;
+    f.cfg.prefix_cache = false;
+    CHECK_OK(f.start());
+
+    REQUIRE(f.submit(160, /*max_tokens=*/1, /*priority=*/0, /*ignore_eos=*/true));
+    REQUIRE(f.submit(32, /*max_tokens=*/1, /*priority=*/0, /*ignore_eos=*/true));
+    const RadBatch* trunk = f.sch.step();
+    REQUIRE(trunk != nullptr);
+    const int64_t tokens = trunk->n_tok;
+    CHECK_EQ(tokens, 192);
+
+    // Like the engine, plan history after issuance but before either request commits.
+    int rounds = 1;
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 0);
+    const RadBatch* history = f.sch.serial_batch(0, 1);
+    REQUIRE(history != nullptr);
+    CHECK_EQ(history->draft_pass, -1);
+    CHECK_EQ(history->n_tok, tokens);
+    CHECK_EQ(history->n_out, tokens);
+    CHECK_EQ(history->n_draft_out, 0);
+    CHECK(f.sch.serial_batch(2, 1) == nullptr);
+    f.commit_plain();
+    f.sch.serial_end(0);
+}
+
 /* Draft round 1 rides the history pass. A drafting verifier owes the head's history at all
  * 1 + n_spec verified positions, and the card repeats the last committed one past it, so the
  * run's last row is round 1's input: the pass names that row, and round 1 has no pass of its own. */
@@ -5928,15 +6783,159 @@ TEST(a_refused_admission_holds_its_chain_until_the_request_goes) {
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);
     CHECK_OK(f.start());
+    f.submit(32, 64);                             /* a runner can still free capacity */
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
     f.pc.seed(240);
     f.pc.attn = 0;
     const uint64_t a = f.submit(160, 8);             /* the cache gives nothing back */
-    CHECK(f.sch.step() == nullptr);
+    CHECK(f.sch.step() != nullptr);
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Waiting);
     REQUIRE_EQ(f.pc.holds.size(), 1u);
     CHECK_EQ(f.pc.holds[0], a);
     CHECK_OK(f.sch.cancel(a));
     CHECK(std::find(f.pc.releases.begin(), f.pc.releases.end(), a) != f.pc.releases.end());
+}
+
+TEST(an_idle_capacity_blocked_head_fails_and_releases_its_hold_for_a_follower) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/4096,
+            /*windowed=*/false, /*linear=*/false);
+    CHECK_OK(f.start());
+    f.pc.seed(240);
+    f.pc.attn = 64;                              /* the head adopts four cached blocks */
+    const uint64_t head = f.submit(160, 8);
+    const uint64_t small = f.submit(16, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
+    CHECK_EQ((int)f.sch.find(small)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.find(head)->n_computed, 64);
+    CHECK(!f.kv.has_sequence(head));
+    CHECK_EQ(std::count(f.pc.holds.begin(), f.pc.holds.end(), head), 1);
+    CHECK_EQ(std::count(f.pc.releases.begin(), f.pc.releases.end(), head), 1);
+    for (int32_t block : f.pc.seeded[0]) CHECK_EQ(f.kv.refcnt[0][(size_t)block], 1);
+}
+
+TEST(a_fresh_idle_request_recovers_an_orphaned_state_slot) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/1);
+    CHECK_OK(f.start());
+    f.kv.state_free[1].clear();
+    const uint64_t head = f.submit(16, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Running);
+}
+
+TEST(an_admission_allocator_error_keeps_its_status_without_cache_eviction) {
+    server::Sink sink;
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit_to(&sink, 16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_STATE;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
+    CHECK_EQ(f.pc.evict_calls, 0);
+    CHECK_EQ(sink.status(), RAD_E_STATE);
+    CHECK(!f.kv.has_sequence(head));
+}
+
+TEST(an_allocator_error_after_passing_the_whole_prompt_gate_keeps_its_status) {
+    server::Sink sink;
+    Fixture f;
+    f.build();
+    f.cfg.prefill_room_gate = true;
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit_to(&sink, 16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_STATE;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
+    CHECK_EQ(f.pc.evict_calls, 0);
+    CHECK_EQ(sink.status(), RAD_E_STATE);
+    CHECK(!f.kv.has_sequence(head));
+}
+
+TEST(an_idle_request_waits_for_external_capacity_and_runs_when_it_arrives) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit(16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_FULL;
+    f.kv.waiting_for_fleet = true;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.pc.evict_calls, 1);
+    f.kv.ensure_error = RAD_OK;
+    f.kv.waiting_for_fleet = false;
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Running);
+}
+
+TEST(prefix_eviction_can_admit_an_external_waiter_without_a_broker_grant) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    f.pc.seed(240);
+    f.pc.attn = 0;
+    f.pc.evict_frees = true;
+    f.pc.evict_grant = 1 << 20;
+    f.kv.waiting_for_fleet = true;                 /* the broker allowance never changes */
+    const uint64_t head = f.submit(160, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Running);
+    CHECK(f.pc.evict_calls > 0);
+    CHECK(f.kv.waiting_for_fleet);
+}
+
+TEST(an_external_capacity_wait_can_be_cancelled_without_blocking_its_follower) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit(16, 8);
+    const uint64_t small = f.submit(16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_FULL;
+    f.kv.waiting_for_fleet = true;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(small)->state, (int)ReqState::Waiting);
+    CHECK_OK(f.sch.cancel(head));
+    f.kv.ensure_error = RAD_OK;
+    f.kv.waiting_for_fleet = false;
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(small)->state, (int)ReqState::Running);
+    CHECK(!f.kv.has_sequence(head));
+}
+
+TEST(a_backing_allocation_failure_does_not_evict_prefix_cache) {
+    server::Sink sink;
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit_to(&sink, 16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_NOMEM;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
+    CHECK_EQ(f.pc.evict_calls, 0);
+    CHECK_EQ(sink.status(), RAD_E_NOMEM);
+}
+
+TEST(an_idle_admission_still_reclaiming_cache_gets_another_pass) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    f.pc.seed(240);
+    f.pc.attn = 0;
+    f.pc.evict_grant = 256 * 256 + 1;
+    const uint64_t head = f.submit(160, 8);
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.pc.evict_calls, 256);
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
 }
 
 /* An engine that has stopped answers every request it held and refuses new ones, rather than
@@ -7298,8 +8297,9 @@ std::unique_ptr<Request> with_run(Fixture& f, int n_prompt, int tok, int n, mm::
     return req;
 }
 
-void media_fixture(Fixture& f, int64_t max_tok, int32_t bidi) {
-    f.build(/*blocks=*/4096, /*states=*/64, max_tok);
+void media_fixture(Fixture& f, int64_t max_tok, int32_t bidi, bool windowed = false) {
+    f.build(/*blocks=*/4096, /*states=*/64, max_tok, /*max_ctx=*/4096, windowed,
+            /*linear=*/!windowed);
     f.prog.encoder.modalities = RAD_MM_IMAGE;
     f.prog.encoder.n_embd = 4;
     f.prog.encoder.patch_dim = 4;
@@ -7371,6 +8371,36 @@ TEST(a_run_longer_than_a_step_is_cut_and_reads_up_to_the_cut) {
     CHECK_EQ(b->bidi_row[0], 8);
     CHECK_EQ(b->bidi_n[0], 56);
     CHECK_EQ(b->bidi_used[0], 256);
+}
+
+/* A run read both ways is attended on sliding layers, over the window group's block table, which
+ * starts at first_block_pos once the window has recycled the blocks below it. bidi_used counts from
+ * there, as that group's seqused does; the absolute end would point the run's rows past the keys
+ * the pass wrote, and a picture after the first chunk was read as nothing. Gemma 4's layout: a
+ * full group and a 64-token window group, no linear group. */
+TEST(a_run_in_a_later_chunk_counts_its_keys_from_the_recycled_window) {
+    Fixture f;
+    media_fixture(f, 256, 1, /*windowed=*/true);
+    CHECK_OK(f.start());
+    f.add(with_run(f, 400, 200, 100, mm::Kind::Image));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_bidi, (int64_t)0);
+    const int64_t c0 = b->n_tok;                      /* the chunk ends before the run */
+    f.commit_plain();
+    f.kv.first_pos[1] = 128;                          /* trim_window: the window slid past 0..127 */
+    b = f.sch.step();
+    REQUIRE(b != nullptr);
+    REQUIRE_EQ(b->n_bidi, (int64_t)1);
+    CHECK_EQ(b->bidi_row[0], (int32_t)(200 - c0));
+    CHECK_EQ(b->bidi_n[0], 100);
+    CHECK_EQ(b->bidi_used[0], 300 - 128);
+    /* The same count as the window group's own: its seqused less the rows past the run. */
+    const RadKVGroupBatch* win = nullptr;
+    for (int g = 0; g < b->n_kv_groups; ++g)
+        if (b->kv[g].group == 1) win = &b->kv[g];
+    REQUIRE(win != nullptr && win->seqused_h != nullptr);
+    CHECK_EQ(b->bidi_used[0], win->seqused_h[0] - (int32_t)(c0 + b->n_tok - 300));
 }
 
 TEST(runs_are_cut_anywhere_without_the_flag_and_for_audio) {
@@ -7592,6 +8622,152 @@ TEST(a_wider_state_index_row_is_the_managers_row_on_every_build) {
         CHECK_OK(f.commit(5, 0, [&](const StepEntry& e) { return random_accept(rng, e); }));
     }
     CHECK(checked > 100);
+}
+
+/* ================================================================== --draft-depth adaptive
+ *
+ * The engine's adaptive chain (core/sched/draft_depth.h) gives every sequence its own number of
+ * drafts each step: the drafter ran for the deepest row, expect_draft names each row's depth, the
+ * step issued ahead verifies exactly that many (1 + d rows, the card's ADV_TRUNK taking the first d
+ * proposals of the slot) and set_draft publishes the same d. That step must be the step the
+ * scheduler builds after the commit from a d-token proposal, row for row, on every step of a run
+ * whose depths change from step to step and differ between the sequences of one step. */
+namespace {
+int depth_at(uint64_t seq, int t, int n_spec) {
+    return 1 + (int)(ahead_mix(seq * 31 + 7, (uint64_t)t) % (uint32_t)n_spec);
+}
+
+void depth_publish(Fixture& f, const std::vector<uint64_t>& ids, int n_spec, int t) {
+    for (uint64_t id : ids) {
+        int32_t d[8];
+        const int dn = depth_at(id, t, n_spec);
+        for (int j = 0; j < dn; ++j) d[j] = ahead_draft(id, t, j);
+        CHECK_OK(f.sch.set_draft(id, d, dn));
+    }
+}
+
+AheadRun depth_reference(int n_spec, int steps) {
+    Fixture f;
+    std::vector<uint64_t> ids;
+    ahead_setup(f, n_spec, ids);
+    AheadRun run;
+    const RadBatch* b = f.sch.step();
+    if (!b) return run;
+    run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    for (int t = 0; t < steps; ++t) {
+        CHECK_OK(ahead_commit(f, t));
+        depth_publish(f, ids, n_spec, t + 1);
+        b = f.sch.step();
+        if (!b) break;
+        run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    }
+    ahead_finish(f, ids, run);
+    return run;
+}
+
+AheadRun depth_pipelined(int n_spec, int steps, std::vector<int>* rows_seen) {
+    Fixture f;
+    std::vector<uint64_t> ids;
+    ahead_setup(f, n_spec, ids);
+    AheadRun run;
+    std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
+    const RadBatch* b = f.sch.step();
+    if (!b) return run;
+    run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    for (int t = 0; t < steps; ++t) {
+        const StepPlan& p = f.sch.plan();
+        std::vector<int32_t> y((size_t)b->n_out + 1, -1);
+        for (const StepEntry& e : p.e) {
+            if (e.dev_out < 0) continue;
+            const int32_t a = ahead_acc(e.seq, t, e.n_spec);
+            for (int j = 0; j <= e.n_spec; ++j)
+                y[(size_t)(e.dev_out + j)] = j < a ? ahead_draft(e.seq, t, j) : ahead_tok(e.seq, t);
+        }
+        AdvanceArgs acc = f.sch.advance_args(0);
+        acc.mode = ADV_ACCEPT;
+        acc.st = slots.data();
+        acc.src = y.data();
+        for (int i = 0; i < acc.n_seq; ++i) adv_row(acc, i);
+        for (const StepEntry& e : p.e) {
+            const StepSlot& S = slots[(size_t)e.card];
+            if (S.acc != ahead_acc(e.seq, t, e.n_spec) || S.tok[0] != ahead_tok(e.seq, t))
+                ++run.card_host_disagree;
+            /* The head ran every round (the deepest row's); this row's chain is its first d. */
+            for (int j = 0; j < n_spec; ++j)
+                slots[(size_t)e.card].tok[1 + j] = ahead_draft(e.seq, t + 1, j);
+            f.sch.expect_draft(e.seq, depth_at(e.seq, t + 1, n_spec));
+        }
+        const RadBatch* nb = f.sch.step_next();
+        if (nb) {
+            AdvanceArgs tr = f.sch.advance_args(0);
+            tr.mode = ADV_TRUNK;
+            tr.st = slots.data();
+            for (int i = 0; i < tr.n_seq; ++i) adv_row(tr, i);
+            for (int64_t i = 0; i < nb->n_seq; ++i) rows_seen->push_back(nb->q_lens[i]);
+        }
+        CHECK_OK(ahead_commit(f, t));
+        depth_publish(f, ids, n_spec, t + 1);
+        if (nb) {
+            f.sch.promote_next();
+            b = nb;
+            ++run.ahead;
+        } else {
+            b = f.sch.step();
+            if (!b) break;
+        }
+        run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    }
+    ahead_finish(f, ids, run);
+    return run;
+}
+}  /* namespace */
+
+TEST(a_step_issued_ahead_with_each_rows_own_draft_depth_equals_the_step_built_after_the_commit) {
+    const int n_spec = 5, T = 32;
+    std::vector<int> rows;
+    const AheadRun a = depth_reference(n_spec, T);
+    const AheadRun b = depth_pipelined(n_spec, T, &rows);
+    CHECK_EQ(b.ahead, T);
+    CHECK_EQ(b.card_host_disagree, 0);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    REQUIRE_EQ(a.steps.size(), (size_t)T + 1);
+    for (size_t t = 0; t < a.steps.size(); ++t) {
+        const bool same = a.steps[t] == b.steps[t];
+        CHECK(same);
+        if (!same) std::fprintf(stderr, "    adaptive depth: step %zu differs\n", t);
+        CHECK_EQ(a.steps[t].bad_slots, 0);
+        CHECK_EQ(b.steps[t].bad_slots, 0);
+    }
+    CHECK(a.out == b.out);
+    /* every depth 1 .. n_spec was verified, as 1 + d rows */
+    for (int d = 1; d <= n_spec; ++d)
+        CHECK(std::count(rows.begin(), rows.end(), d + 1) > 0);
+    CHECK_EQ(std::count_if(rows.begin(), rows.end(), [&](int r) { return r < 2 || r > n_spec + 1; }),
+             (std::ptrdiff_t)0);
+    REQUIRE_EQ(a.held.size(), b.held.size());
+    for (size_t i = 0; i < a.held.size(); ++i) {
+        CHECK(b.held[i] >= a.held[i]);
+        CHECK(b.held[i] <= a.held[i] + 1);
+    }
+}
+
+/* The count a step issued ahead was planned with is binding: a proposal of another length for it is
+ * refused (the card verifies the planned rows), under a fixed window as under any other. */
+TEST(a_draft_of_another_depth_than_the_step_issued_ahead_was_planned_with_is_refused) {
+    Fixture f;
+    std::vector<uint64_t> ids;
+    ahead_setup(f, 5, ids);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    for (uint64_t id : ids) f.sch.expect_draft(id, 2);
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    for (int64_t i = 0; i < nb->n_seq; ++i) CHECK_EQ(nb->q_lens[i], 3);
+    CHECK_OK(ahead_commit(f, 0));
+    const int32_t d[5] = { 11, 12, 13, 14, 15 };
+    CHECK_EQ(f.sch.set_draft(ids[0], d, 3), RAD_E_STATE);
+    CHECK_EQ(f.sch.set_draft(ids[0], d, 1), RAD_E_STATE);
+    CHECK_OK(f.sch.set_draft(ids[0], d, 2));
 }
 
 RAD_TEST_MAIN()
@@ -7905,4 +9081,333 @@ TEST(sim_burst_of_long_prompts) {
                 (double)pf_tok / std::max(t_pf, 1e-9),
                 (double)N * (double)L / tt.back(), pct(0.5), pct(0.95), tt.back(),
                 dec_s > 0 ? (double)dec_tok / dec_s : 0.0, t);
+}
+
+/* ================================================================== --draft-suffix (SuffixDecoding as a step selector) */
+
+namespace {
+/* Commit the step in flight with `acc` accepted drafts and the final token `tok`. */
+void commit_one(Fixture& f, int32_t acc, int32_t tok) {
+    int32_t acc_n = acc, tk = tok;
+    uint8_t eos = 0;
+    Scheduler::StepResult res;
+    res.n_seq = (int)f.sch.plan().e.size();
+    res.n_accepted = &acc_n;
+    res.token = &tk;
+    res.eos = &eos;
+    CHECK_OK(f.sch.commit(res));
+}
+
+/* A request whose prompt repeats 100..107, so the lookup continues the cycle: after the commit of
+ * 100 it proposes 101 102 103 with the longest match the index counts. */
+uint64_t ngram_cycle_request(Fixture& f) {
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->max_tokens = 2000;
+    r->prompt.resize(160);
+    for (int i = 0; i < 160; ++i) r->prompt[(size_t)i] = 100 + i % 8;
+    const uint64_t a = r->id;
+    CHECK_OK(f.sch.add(std::move(r)));
+    return a;
+}
+}  // namespace
+
+namespace {
+/* A serial MTP head that drafts 3 rounds under a verify window of 8 rows (--draft-suffix on). */
+void suffix_setup(Fixture& f, int head = 3, int mx = 8, int min_match = 4, bool on = true) {
+    f.build(4096, 64);
+    f.cfg.n_spec = std::max(head, mx);
+    f.cfg.n_spec_head = on ? head : 0;
+    f.cfg.draft_suffix = on;
+    f.cfg.draft_suffix_min_match = min_match;
+    f.cfg.draft_suffix_max = mx;
+    f.cfg.draft_suffix_min_score = 0.3f;
+    if (!on) f.cfg.n_spec = head;
+    f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
+    f.prog.drafter.depth = f.cfg.n_spec;
+}
+const int32_t kHeadDraft[3] = { 21, 22, 23 };
+}  // namespace
+
+TEST(the_suffix_index_proposes_the_latest_recurrence_and_cuts_by_path_score) {
+    using namespace rad;
+    /* (1 2 3) was followed by 10, 11, 10: 10 two times in three. The longest recurring suffix of the
+     * history, (2 3 10 1 2 3), was followed by 11 at its earlier occurrence, which is what is
+     * proposed, at the frequency of 11 after (1 2 3): 1/3. */
+    const std::vector<int32_t> v = { 1, 2, 3, 10, 1, 2, 3, 11, 1, 2, 3, 10, 1, 2, 3 };
+    TokenSeq s;
+    s.a = v.data(); s.na = (int64_t)v.size();
+    SuffixIndex ix;
+    int32_t out[16];
+    SuffixIndex::Out o = ix.propose(s, 7, 3, 8, 0.3f, out);
+    CHECK(o.n >= 1);
+    CHECK_EQ(out[0], 11);
+    CHECK(o.match >= 6);
+    CHECK_NEAR(o.score, 1.0 / 3.0, 1e-4);
+    /* a stricter score keeps nothing: the first token's own path score is 1/3 */
+    SuffixIndex ix2;
+    CHECK_EQ(ix2.propose(s, 7, 3, 8, 0.4f, out).n, 0);
+    /* a context that never occurred before proposes nothing */
+    const std::vector<int32_t> u = { 5, 6, 7, 8, 9, 40, 41, 42 };
+    TokenSeq su;
+    su.a = u.data(); su.na = (int64_t)u.size();
+    SuffixIndex ix3;
+    CHECK_EQ(ix3.propose(su, 8, 3, 8, 0.3f, out).n, 0);
+    /* it is incremental: the sequence grows and the proposal follows */
+    std::vector<int32_t> w = { 5, 6, 7, 8, 9, 40, 41, 42, 5, 6, 7 };
+    TokenSeq sw;
+    sw.a = w.data(); sw.na = (int64_t)w.size();
+    const SuffixIndex::Out ow = ix3.propose(sw, 8, 3, 8, 0.3f, out);
+    CHECK(ow.n >= 3);
+    CHECK_EQ(out[0], 8); CHECK_EQ(out[1], 9); CHECK_EQ(out[2], 40);
+    CHECK_NEAR(ow.score, 1.0, 1e-4);   /* a pattern seen once, followed once: D = 1 */
+}
+
+TEST(a_recurring_history_selects_a_suffix_step_in_place_of_the_heads_draft) {
+    Fixture f;
+    suffix_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = ngram_cycle_request(f);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    /* the verify window is the suffix's: 1 + 8 rows, the head's 3 drafts replaced */
+    CHECK_EQ(b->n_spec, 8);
+    CHECK_EQ(b->n_tok, 9);
+    const StepEntry& e = f.sch.plan().e[0];
+    CHECK(e.suffix);
+    CHECK(e.ngram);
+    CHECK_EQ(e.n_spec, 8);
+    CHECK(e.draft_parent == nullptr);
+    const Request* rq = f.sch.find(a);
+    REQUIRE(rq != nullptr);
+    /* no coupled row: the request marks zero model nodes, so the sampler's child list is empty */
+    CHECK(rq->draft_suffix);
+    const int32_t want[8] = { 101, 102, 103, 104, 105, 106, 107, 100 };
+    for (int j = 0; j < 8; ++j) CHECK_EQ(rq->draft[j], want[j]);
+    commit_one(f, 5, 900);
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.suffix_steps, (int64_t)1);
+    CHECK_EQ(m.suffix_rows, (int64_t)8);
+    CHECK_EQ(m.suffix_accepted, (int64_t)5);
+    rq = f.sch.find(a);
+    REQUIRE(rq->output.size() >= 7);
+    for (int j = 0; j < 5; ++j) CHECK_EQ(rq->output[rq->output.size() - 6 + (size_t)j], want[j]);
+    CHECK_EQ(rq->output.back(), 900);
+    CHECK(!rq->draft_suffix);   /* nothing carries over */
+}
+
+TEST(without_a_recurrence_or_with_the_flag_off_the_heads_draft_is_verified_as_before) {
+    {   /* no recurrence in a prompt of distinct tokens */
+        Fixture f;
+        suffix_setup(f);
+        CHECK_OK(f.start());
+        const uint64_t a = f.submit(160, 2000);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(7);
+        CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        CHECK_EQ(b->n_spec, 3);
+        CHECK(!f.sch.plan().e[0].suffix);
+        CHECK(!f.sch.plan().e[0].ngram);
+        CHECK(!f.sch.find(a)->draft_suffix);
+        for (int j = 0; j < 3; ++j) CHECK_EQ(f.sch.find(a)->draft[j], kHeadDraft[j]);
+    }
+    {   /* the flag off: a recurring history changes nothing */
+        Fixture f;
+        suffix_setup(f, 3, 8, 4, /*on=*/false);
+        CHECK_OK(f.start());
+        const uint64_t a = ngram_cycle_request(f);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(100);
+        CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        CHECK_EQ(b->n_spec, 3);
+        CHECK(!f.sch.plan().e[0].suffix);
+        CHECK(!f.sch.find(a)->draft_suffix);
+        commit_one(f, 3, 900);
+        CHECK_EQ(f.sch.metrics().suffix_steps, (int64_t)0);
+        CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)0);
+    }
+}
+
+/* The head runs only its own 3 rounds after a suffix step, but its history pass covers every
+ * position the step verified (all 1 + 8), and the watermark moves to the commit, so the next
+ * step's pass owes only its own rows: the head's cache has no hole behind a suffix step. */
+TEST(the_head_catches_up_on_every_position_a_suffix_step_verified) {
+    Fixture f;
+    suffix_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = ngram_cycle_request(f);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    REQUIRE_EQ(b->n_spec, 8);
+    const int32_t ctx0 = f.sch.plan().e[0].ctx_len;
+
+    int rounds = 8;   /* the engine passes the declared depth; the scheduler clamps it to the head's */
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 1);
+    CHECK_EQ(rounds, 3);
+    const RadBatch* hb = f.sch.serial_batch(0, 1);
+    REQUIRE(hb != nullptr);
+    CHECK(hb->draft_pass < 0);
+    CHECK_EQ(hb->n_tok, 9);                  /* the bonus row and all 8 proposals' positions */
+    CHECK_EQ(hb->n_draft_out, 1);
+    CHECK_EQ(hb->draft_out_ids[0], 8);
+    CHECK_EQ(hb->ctx_lens[0], ctx0);         /* from the step's first position */
+    CHECK(f.sch.serial_batch(1, 1) == nullptr);
+    for (int rd = 2; rd <= rounds; ++rd) REQUIRE(f.sch.serial_batch(rd, 1) != nullptr);
+
+    /* the verify took all 8: the watermark is the commit */
+    commit_one(f, 8, 900);
+    f.sch.serial_end(rounds);
+    CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+    const RadBatch* b2 = f.sch.step();           /* 900 broke the cycle: the head's step */
+    REQUIRE(b2 != nullptr);
+    CHECK_EQ(b2->n_spec, 3);
+    CHECK(!f.sch.plan().e[0].suffix);
+    int rounds2 = 8;
+    CHECK_EQ(f.sch.serial_begin(&rounds2, rows, 4), 1);
+    CHECK_EQ(rounds2, 3);
+    const RadBatch* hb2 = f.sch.serial_batch(0, 1);
+    REQUIRE(hb2 != nullptr);
+    CHECK_EQ(hb2->n_tok, 4);                 /* its own 1 + 3 rows: nothing left owed */
+    CHECK_EQ(hb2->ctx_lens[0], ctx0 + 9);
+    f.sch.serial_end(rounds2);
+}
+
+/* A step issued ahead is made on the card from the head's drafts, before the previous commit: the
+ * lookup cannot run there. A sequence whose history ended in a recurring pattern at the last commit
+ * is not issued ahead (its next step is built after the commit, where the suffix selector reads the
+ * committed end); one whose history does not recur is, as before. */
+TEST(a_sequence_in_a_recurring_pattern_is_not_issued_ahead) {
+    for (int hot = 0; hot < 2; ++hot) {
+        Fixture f;
+        suffix_setup(f);
+        CHECK_OK(f.start());
+        const uint64_t a = hot ? ngram_cycle_request(f) : f.submit(160, 2000);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(hot ? 100 : 7);
+        CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+        REQUIRE(f.sch.step() != nullptr);
+        f.sch.find(a)->speculation_fixed = true;
+        f.sch.expect_draft(a, hot ? 8 : 3);
+        const RadBatch* nb = f.sch.step_next();
+        if (hot) {
+            CHECK(nb == nullptr);
+            CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)1);
+        } else {
+            CHECK(nb != nullptr);
+            CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)0);
+        }
+    }
+}
+
+/* Selection is a function of the committed text alone: the same history gives the same step whatever
+ * the head drafted, and a request that may not speculate (a constraining grammar) is never given a
+ * suffix chain. */
+TEST(the_suffix_choice_reads_the_history_only_and_respects_the_speculation_gate) {
+    for (int variant = 0; variant < 3; ++variant) {
+        Fixture f;
+        suffix_setup(f);
+        CHECK_OK(f.start());
+        const uint64_t a = ngram_cycle_request(f);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(100);
+        if (variant == 2) f.sch.find(a)->may_speculate = false;
+        const int32_t other[3] = { 77, 78, 79 };
+        CHECK_OK(f.sch.set_draft(a, variant == 1 ? other : kHeadDraft, 3));
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        if (variant == 2) {
+            CHECK_EQ(b->n_spec, 0);
+            CHECK(!f.sch.plan().e[0].suffix);
+        } else {
+            CHECK_EQ(b->n_spec, 8);
+            CHECK(f.sch.plan().e[0].suffix);
+            CHECK_EQ(f.sch.find(a)->draft[0], 101);
+        }
+    }
+}
+
+/* ================================================================== --draft-suffix beside --draft-depth adaptive */
+
+/* One step, two sequences: the one whose history recurs verifies its suffix chain (8 rows), the other
+ * the head's chain at the depth the adaptive rule gave it (set_draft's count, 2 of the head's 3
+ * rounds): the rows of the step differ per sequence, the window is the larger of the two. Only the
+ * suffix row carries the Request::draft_suffix mark; the adaptive row's coupled states stay bound. */
+TEST(a_suffix_row_and_an_adaptive_depth_row_share_a_step) {
+    Fixture f;
+    suffix_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = ngram_cycle_request(f);
+    const uint64_t b = f.submit(160, 2000);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+    CHECK_OK(f.sch.set_draft(b, kHeadDraft, 2));     /* the adaptive chain stopped after two rounds */
+    const RadBatch* bt = f.sch.step();
+    REQUIRE(bt != nullptr);
+    const StepPlan& p = f.sch.plan();
+    REQUIRE_EQ(p.e.size(), (size_t)2);
+    size_t ia = 0, ib = 1;
+    if (p.e[0].seq != a) { ia = 1; ib = 0; }
+    CHECK(p.e[ia].suffix);
+    CHECK_EQ(p.e[ia].n_spec, 8);
+    CHECK(p.e[ia].req->draft_suffix);
+    CHECK(!p.e[ib].suffix);
+    CHECK_EQ(p.e[ib].n_spec, 2);
+    CHECK(!p.e[ib].req->draft_suffix);
+    CHECK_EQ(bt->n_spec, 8);
+    CHECK_EQ(bt->n_tok, 9 + 3);
+    for (int j = 0; j < 2; ++j) CHECK_EQ(f.sch.find(b)->draft[j], kHeadDraft[j]);
+    /* A accepts 5 of its 8, B both: each is counted for what it carried */
+    CHECK_OK(f.commit(900, 0, [&](const StepEntry& e) { return e.seq == a ? 5 : 2; }));
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.suffix_steps, (int64_t)1);
+    CHECK_EQ(m.suffix_rows, (int64_t)8);
+    CHECK_EQ(m.suffix_accepted, (int64_t)5);
+    CHECK_EQ(m.draft_tokens, (int64_t)10);
+    CHECK_EQ(m.draft_accepted, (int64_t)7);
+}
+
+/* The host's order under the adaptive depth: sequences whose history is not in a pattern are issued
+ * ahead with their own row counts (expect_draft of the chain each drafted) in a suffix deployment's
+ * wider window; one in a pattern holds the whole step back and takes its suffix step after the commit. */
+TEST(adaptive_depth_rows_are_issued_ahead_in_a_suffix_deployment_unless_a_sequence_is_in_a_pattern) {
+    for (int hot = 0; hot < 2; ++hot) {
+        Fixture f;
+        suffix_setup(f);
+        CHECK_OK(f.start());
+        const uint64_t a = hot ? ngram_cycle_request(f) : f.submit(160, 2000);
+        const uint64_t b = f.submit(160, 2000);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(hot ? 100 : 7);
+        CHECK_OK(f.sch.set_draft(a, kHeadDraft, 3));
+        CHECK_OK(f.sch.set_draft(b, kHeadDraft, 2));
+        REQUIRE(f.sch.step() != nullptr);
+        f.sch.find(a)->speculation_fixed = true;
+        f.sch.find(b)->speculation_fixed = true;
+        f.sch.expect_draft(a, 3);
+        f.sch.expect_draft(b, 2);
+        const RadBatch* nb = f.sch.step_next();
+        if (hot) {
+            CHECK(nb == nullptr);
+        } else {
+            REQUIRE(nb != nullptr);
+            std::vector<int> q;
+            for (int64_t i = 0; i < nb->n_seq; ++i) q.push_back((int)nb->q_lens[i]);
+            std::sort(q.begin(), q.end());
+            REQUIRE_EQ(q.size(), (size_t)2);
+            CHECK_EQ(q[0], 3);   /* 1 + the 2 drafts of one chain */
+            CHECK_EQ(q[1], 4);   /* 1 + the 3 of the other */
+        }
+    }
 }

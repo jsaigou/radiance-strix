@@ -24,6 +24,7 @@ int Ctx::init(const CtxDesc& d) {
     if (!d.program) return RAD_E_INVAL;
     program_   = d.program;
     rank_      = d.rank;
+    slot_      = d.slot >= 0 ? d.slot : d.rank;
     world_size_= d.world_size < 1 ? 1 : d.world_size;
     device_    = d.device;
     record_passes_ = d.record_passes;
@@ -58,7 +59,15 @@ int Ctx::init(const CtxDesc& d) {
     return RAD_OK;
 }
 
+int Ctx::quiesce() {
+    if (stream_) RAD_TRY(rad_stream_sync(stream_));
+    if (lane1_) RAD_TRY(rad_stream_sync(lane1_));
+    return RAD_OK;
+}
+
 void Ctx::shutdown() {
+    if (quiesce() < 0)
+        fatal("refusing to free a runtime context whose compute streams did not drain");
     oracle_close();
     xp_close();
     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
@@ -80,7 +89,8 @@ void Ctx::shutdown() {
     route_.clear();
 
     if (route_pool_) { rad_dev_free(route_pool_, RAD_MEM_HOST_PINNED); route_pool_ = nullptr; }
-    if (route_dev_)  { rad_dev_free(route_dev_, RAD_MEM_DEVICE);        route_dev_  = nullptr; }
+    if (route_dev_ && !route_dev_arena_) rad_dev_free(route_dev_, RAD_MEM_DEVICE);
+    route_dev_ = nullptr;
 
     /* After the syncs: the device half is a grouped GEMM operand, the host half a copy source. */
     free_weight_tables();
@@ -197,11 +207,19 @@ int Ctx::bind_arena() {
     return RAD_OK;
 }
 
+void Ctx::refresh_buf_numel() {
+    buf_numel_.assign(buf_tmpl_.size(), 0);
+    for (size_t i = 1; i < buf_tmpl_.size(); ++i)
+        buf_numel_[i] = rad_tensor_numel(&buf_tmpl_[i]);
+}
+
 int Ctx::bind_buffers() {
     Program& P = *program_;
     buf_tmpl_.assign(P.buffers.size(), RadTensor{});
     buf_bits_.assign(P.buffers.size(), 0);
     buf_host_.assign(P.buffers.size(), 0);
+    buf_live0_.assign(P.buffers.size(), -1);
+    buf_live1_.assign(P.buffers.size(), -1);
 
     for (size_t i = 1; i < P.buffers.size(); ++i) {
         BufferInfo& bi = P.buffers[i];
@@ -231,9 +249,12 @@ int Ctx::bind_buffers() {
         bi.ptr  = t.data;
         buf_bits_[i] = rad_dtype_bits(bi.decl.dtype);
         buf_host_[i] = bi.decl.domain == RAD_DOMAIN_HOST ? 1 : 0;
+        buf_live0_[i] = bi.first_def;
+        buf_live1_[i] = bi.last_use;
     }
     level_tmpl_.assign(1, buf_tmpl_);
     level_ = 0;
+    refresh_buf_numel();
     return RAD_OK;
 }
 
@@ -275,6 +296,7 @@ int Ctx::set_level(int level) {
     if (level == level_) return RAD_OK;
     buf_tmpl_ = level_tmpl_[(size_t)level];
     level_ = level;
+    refresh_buf_numel();   /* a level's transient extents differ from level 0's */
     return RAD_OK;
 }
 
@@ -284,6 +306,7 @@ int Ctx::bind_weights() {
     Program& P = *program_;
     w_tmpl_.assign(P.weights.size(), RadTensor{});
     w_bits_.assign(P.weights.size(), 0);
+    w_numel_.assign(P.weights.size(), 0);
     for (auto& g : waited_gen_) g.assign(P.weights.size(), UINT32_MAX);
     w_direct_.assign(P.weights.size(), 0);
 
@@ -304,6 +327,7 @@ int Ctx::bind_weights() {
         rad_tensor_pack(&t);
         t.data  = wi.ptr;
         w_bits_[i] = rad_dtype_bits(t.dtype);
+        w_numel_[i] = rad_tensor_numel(&t);
     }
     return RAD_OK;
 }
@@ -566,19 +590,34 @@ int Ctx::bind_routing() {
      *
      * The card rows are not banked: reports and the end-of-pass flush are both on the compute
      * stream, so the next pass's reports queue behind the flush. A report's copy then targets the
-     * same address every step, so recorded passes replay unchanged. */
+     * same address every step, so recorded passes replay unchanged.
+     *
+     * The rows are the plugin's own buffer where it declared one (rad_route_table): its routers
+     * write them as declared operands and no report copies. */
     const int64_t elems = n_layer * kRouteBanks * n_expert;
     const int64_t bytes = elems * (int64_t)sizeof(int32_t);
     const int64_t dbytes = n_layer * n_expert * (int64_t)sizeof(int32_t);
+    void* tab = nullptr;
+    if (P.route_table != RAD_NULL_HANDLE) {
+        const BufferInfo& bi = P.buffers[P.route_table];
+        if (bi.bytes < dbytes) {
+            RAD_ERR("routing: the routing table '%s' holds %s, and %lld reporting layers of %lld "
+                    "experts need %s (rad_route_table)", bi.name.c_str(), humanb(bi.bytes).c_str(),
+                    (long long)n_layer, (long long)n_expert, humanb(dbytes).c_str());
+            return RAD_E_SHAPE;
+        }
+        tab = buf_tmpl_[P.route_table].data;   /* this context's, not the program's last */
+    }
     void* p = rad_dev_alloc(bytes, RAD_MEM_HOST_PINNED);
-    void* d = rad_dev_alloc(dbytes, RAD_MEM_DEVICE);
+    void* d = tab ? tab : rad_dev_alloc(dbytes, RAD_MEM_DEVICE);
     if (!p || !d) {
         RAD_ERR("routing: %s of %s staging failed: %s", humanb(p ? dbytes : bytes).c_str(),
                 p ? "device" : "pinned", rad_dev_last_error());
         if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
-        if (d) rad_dev_free(d, RAD_MEM_DEVICE);
+        if (d && !tab) rad_dev_free(d, RAD_MEM_DEVICE);
         return RAD_E_NOMEM;
     }
+    route_dev_arena_ = tab != nullptr;
     route_pool_ = static_cast<int32_t*>(p);
     route_dev_  = static_cast<int32_t*>(d);
     std::memset(route_pool_, 0, (size_t)elems * sizeof(int32_t));
@@ -967,8 +1006,9 @@ int Ctx::lane_join(int from, int to) {
  * size here. The ABI-35 host mirrors are used by issue-time split selection; unsupported dynamic
  * geometries fail closed via the pass-key contract, while Qwen keys its full-group maximum in the
  * architecture callback. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are
- * never recorded (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 480,
+ * never recorded (below). `ckpt_cut` and `ckpt_cu`: a pass carrying them is never recorded.
+ */
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 496,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 88,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -995,6 +1035,9 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* A generator pass is shaped by what RadBatch::gen_b, agen_b, vgen_b or sgen_b carries, which
      * no key below reads. */
     if (b->gen) return 0;
+    /* A step with a checkpoint inside it copies from addresses the engine armed for it
+     * (Ctx::set_ckpt_snap), which no recording could replay. */
+    if (b->ckpt_cut > 0) return 0;
     uint64_t h = 0x9e3779b97f4a7c15ull;
     auto mix = [&](uint64_t v) {
         h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
@@ -1216,6 +1259,7 @@ bool Ctx::tapes_agree(const PassTape& a, const PassTape& b, std::string* why) {
         const TapeHost& x = a.host[i];
         const TapeHost& y = b.host[i];
         bool same = x.h == y.h && x.launch == y.launch && x.n == y.n && x.drain == y.drain &&
+                    x.touch[0] == y.touch[0] && x.touch[1] == y.touch[1] &&
                     x.args.n_t == y.args.n_t && x.args.scratch == y.args.scratch;
         for (int k = 0; same && k < x.args.n_t; ++k)
             same = std::memcmp(&x.t[k], &y.t[k], sizeof(RadTensor)) == 0;
@@ -1270,6 +1314,14 @@ int Ctx::play_pass(PassTape& t) {
         case kTapeHost: {
             TapeHost& th = t.host[(size_t)st.a];
             lane_ = st.lane;
+            /* The join as the recording made it. The stretches played so far submitted the
+             * pass's device ops, their host-arena touches' event records among them, without
+             * passing issue(), which is where a touch is marked pending; the mark the pass was
+             * entered with says nothing about them. Without this a pass entered with no touch
+             * pending ran its host op at once, on what the previous step left in the host arena
+             * (a host gather on the previous step's row ids). */
+            host_touch_pending_[0] = host_touch_pending_[0] || th.touch[0];
+            host_touch_pending_[1] = host_touch_pending_[1] || th.touch[1];
             rc = host_join_wait(th.drain);
             if (rc >= 0) {
                 th.args.t = th.t;

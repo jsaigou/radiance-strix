@@ -11,13 +11,15 @@
 //                     caller's scratch, which the tile's blocks decode as they arrive, each value
 //                     once.
 //
-// The narrow tile above 16 tokens and the prefill tile compute what the int8 tiles compute over the
-// same int8 values (their split, staging, accumulation order and fold), so a weight decoded here
-// and the same weight's int8 values in the int8 kernels give the same output bytes. The GEMV and
+// The narrow tile above 16 tokens and the prefill tile compute what the int8 narrow and prefill
+// tiles compute over the same int8 values (their split, staging, accumulation order and fold), so
+// a weight decoded here and the same weight's int8 values in those tiles give the same output
+// bytes (the int8 rows' K-parallel tile, r4d_gemm_fp8a8.hip, sums in another order). The GEMV and
 // the 16-token tile sum per wave and then across waves: the product within f32 rounding.
 
 #include "r4d.h"
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "r4d_emit.h"
 #include "r4d_fp8_wmma.h"
 #include "r4d_iqr.h"
@@ -49,6 +51,29 @@ constexpr uint32_t kWave = 32, kBlock = 128, kFK = 256;
  * and stalls on its own decode. At 8 tokens, 2 / 4 / 6 bits: down (K = 8704) 74 -> 54 / 56 / 66 us,
  * the outputs (K = 3072) 29 -> 24 / 25 / 30 us; 1024 and more lose on the outputs. */
 constexpr uint32_t kIqrSplitWaves = 512;
+
+/* The forms are built in kIqrParts units, each this file under its own R4D_IQR_PART (the
+ * r4d_gemm_iqr_p<k>.hip wrappers; this unit is part 0), so their kernels compile in parallel. A
+ * form's part is its place in R4D_IQR_FORMS modulo the count, which spreads every family over all
+ * parts. Part 0 alone defines the rows' entry points and hands each call to its form's part. */
+#ifndef R4D_IQR_PART
+#define R4D_IQR_PART 0
+#endif
+constexpr int kIqrParts = 4;
+
+#define R4D_IQR_W(k, b, lv, l, lrb, sc) FormT<k, b, lv, l, lrb, sc>::word(),
+constexpr uint32_t kIqrWords[] = { R4D_IQR_FORMS(R4D_IQR_W) };
+#undef R4D_IQR_W
+
+/* The part building the form with kernel word `kw`; 0 for a word that is no form, whose call part 0
+ * then refuses as before. */
+constexpr int iqr_part(uint32_t kw) {
+    for (size_t i = 0; i < sizeof(kIqrWords) / sizeof(kIqrWords[0]); ++i)
+        if (kIqrWords[i] == kw) return (int)(i % kIqrParts);
+    return 0;
+}
+template <class F>
+constexpr bool in_part() { return iqr_part(F::word()) == R4D_IQR_PART; }
 
 #include "r4d_gemm_8a8_prefill.h"
 
@@ -124,11 +149,12 @@ __device__ __forceinline__ void gated_tail(const GatedOut& go, uint32_t M, uint3
  *
  * The fold order differs from the WMMA tile's (per lane, then across lanes and waves), so the
  * output is the product within f32 rounding rather than the int8 tile's bytes. */
-template <class F, uint32_t MT, uint32_t KW, bool GATED = false>
+template <class F, uint32_t MT, uint32_t KW, bool GATED, class CH>
 __global__ __launch_bounds__((GATED ? 2u : 1u) * KW * kWave) R4D_WAVES(6)
 void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restrict__ XS,
                      uint16_t* __restrict__ Y, uint32_t N, uint32_t x_ld, uint32_t xs_ld,
                      GatedOut go) {
+    if (CH::on) r4d_chain_wait();
     using D = Dec<F, true>;
     constexpr uint32_t NW = (GATED ? 2u : 1u) * KW;
     __shared__ __attribute__((aligned(16))) int8_t s_tab[D::kTab];
@@ -263,21 +289,24 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
         }
         cur = nxt;
     }
-    /* every lane's rows carry 12582912 times the factors once for each of its blocks */
+    /* every lane's rows carry 12582912 times the factors once for each of its blocks; a token's
+     * sixteen rows are summed over the wave together (red16), lane l left with row red16_row(l) */
+    float rv[MT];
 #pragma unroll
-    for (uint32_t q = 0; q < 16; ++q)
+    for (uint32_t m = 0; m < MT; ++m) {
+        float a16[16];
 #pragma unroll
-        for (uint32_t m = 0; m < MT; ++m) acc[q][m] = r4d_wave_sum(fmaf(-kRbBiasF, fsum[m], acc[q][m]));
-    if (lane == 0) {
+        for (uint32_t q = 0; q < 16; ++q) a16[q] = fmaf(-kRbBiasF, fsum[m], acc[q][m]);
+        rv[m] = red16(a16, lane);
+    }
+    if (lane < 16u) {
 #pragma unroll
-        for (uint32_t q = 0; q < 16; ++q)
-#pragma unroll
-            for (uint32_t m = 0; m < MT; ++m) s_red[wave0][q * MT + m] = acc[q][m];
+        for (uint32_t m = 0; m < MT; ++m) s_red[wave0][lane * MT + m] = rv[m];
     }
     __syncthreads();
     if constexpr (GATED) {
         if (tid < 16u * MT) {
-            const uint32_t q = tid / MT, m = tid % MT;
+            const uint32_t q = red16_row(tid / MT), m = tid % MT;
             float vg = 0.0f, vu = 0.0f;
 #pragma unroll
             for (uint32_t w = 0; w < KW; ++w) vg += s_red[w][tid];
@@ -290,7 +319,7 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
         gated_tail(go, MT, NW);
     } else {
         if (tid < 16u * MT) {
-            const uint32_t q = tid / MT, m = tid % MT;
+            const uint32_t q = red16_row(tid / MT), m = tid % MT;
             float v = 0.0f;
 #pragma unroll
             for (uint32_t w = 0; w < KW; ++w) v += s_red[w][tid];
@@ -299,6 +328,7 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
             Y[(size_t)m * N + rt * 16u + q] = f32_to_bf16(v);
         }
     }
+    if (CH::on) r4d_chain_done();
 }
 
 /* ---- the narrow tile at M <= 16 -------------------------------------------------------------
@@ -308,26 +338,37 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
  * fragment order through its own LDS tile (frag), then runs the unit's eight WMMA steps against
  * the activation's fragments read straight from global memory, where the M x K activation sits
  * in L2, so the loop has no block barrier and no shared staging. Rows of the token tile past M
- * read token M - 1; their outputs are not stored.
+ * read token M - 1; their outputs are not stored. NT token tiles a block (to 64 tokens): a unit
+ * is decoded and transposed once and multiplied against each tile in turn, the further tiles'
+ * fragments asked for a tile ahead. Measured cold against the narrow tile at the trunk's per-rank
+ * shapes, 6 bits, us a launch: 6144 x 2560 at 32 tokens 38.8 -> 30.4 and at 64 53.8 -> 34.6;
+ * 2560 x 3072 at 32 tokens 31.1 -> 20.4 and at 64 47.4 -> 24.6; 8192 x 2560 level (36.2 / 37.2
+ * at 32, 42.0 / 42.5 at 64).
  *
  * Under one f32 scale a row each unit's int32 sums start at 0x4B400000, so a slot read as an f32
  * is 12582912 plus its sum and one fma folds it (the prefill tile's RB 32 fold), flushed every
  * kRbFlush units; other scale forms fold the converted sum with their (row, block) scales. The
  * waves' partials are summed through LDS in ascending wave order, so the output is the product
  * within f32 rounding, not the int8 tile's bytes. */
-template <class F, uint32_t KW, bool GATED = false>
+template <class F, uint32_t KW, bool GATED, uint32_t NT, class CH>
 __global__ __launch_bounds__((GATED ? 2u : 1u) * KW * kWave) R4D_WAVES(6)
 void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restrict__ XS,
                     uint16_t* __restrict__ Y, uint32_t N, uint32_t M, uint32_t x_ld, uint32_t xs_ld,
                     GatedOut go) {
+    if (CH::on) r4d_chain_wait_vec();
     using D = Dec<F>;
+    static_assert(!GATED || NT == 1u, "the gated form serves one token tile");
     constexpr bool BIAS = F::SC == kRowF32;
     constexpr uint32_t NW = (GATED ? 2u : 1u) * KW;
     __shared__ __attribute__((aligned(16))) int8_t s_tab[D::kTab];
-    /* the waves' transpose tiles, then their partials (8 x 32 floats a wave, in its own tile) */
+    /* the waves' transpose tiles, then their partials (8 x 32 floats a wave): one token tile's
+     * in the wave's own transpose tile, several tiles' in s_nt */
     __shared__ __attribute__((aligned(16))) uint8_t s_tr[NW * kTrBytes];
+    __shared__ float s_nt[NT > 1u ? NW : 1u][NT > 1u ? NT : 1u][NT > 1u ? 8u * kWave : 1u];
     static_assert(8u * kWave * 4u <= kTrBytes, "a wave's partials in its transpose tile");
-    auto red = [&](uint32_t w) { return (float*)(s_tr + w * kTrBytes); };
+    auto red = [&](uint32_t w, uint32_t j) {
+        return NT > 1u ? &s_nt[w][j][0] : (float*)(s_tr + w * kTrBytes);
+    };
     const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1);
     const uint32_t wave0 = __builtin_amdgcn_readfirstlane(tid / kWave);
     Ctx c = c0;
@@ -339,52 +380,49 @@ void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restric
     /* Gated, waves KW and up take the up rows' tile, n rows below the gate rows'. */
     const uint32_t half = GATED ? wave0 / KW : 0u, wave = GATED ? wave0 % KW : wave0;
     const uint32_t rt = blockIdx.x + half * (N / 32u), row0 = rt * 16u;
-    const uint32_t tok = min(frag_c(lane), M - 1u);
-    const int8_t* const xrow = X + (size_t)tok * x_ld + frag_k0(lane);
+    /* Token tile j is tokens 16 j .. 16 j + 15; a column past M reads token M - 1. */
+    uint32_t tok[NT];
+    const int8_t* xrow[NT];
+#pragma unroll
+    for (uint32_t j = 0; j < NT; ++j) {
+        tok[j] = min(j * 16u + frag_c(lane), M - 1u);
+        xrow[j] = X + (size_t)tok[j] * x_ld + frag_k0(lane);
+    }
 
-    f8v out = acc_zero();
-    float corr = 0.0f;   /* BIAS: the units' fold factors since the last flush */
+    f8v out[NT];
+    float corr[NT];   /* BIAS: the units' fold factors since the last flush */
+#pragma unroll
+    for (uint32_t j = 0; j < NT; ++j) {
+        out[j] = acc_zero();
+        corr[j] = 0.0f;
+    }
     uint32_t nflush = 0;
-    auto bload = [&](uint32_t kb, i2v (&b)[8], bool live) {
+    auto bload = [&](uint32_t j, uint32_t kb, i2v (&b)[8], bool live) {
 #pragma unroll
         for (uint32_t ks = 0; ks < 8; ++ks) {
-            const uint2 v = live ? *(const uint2*)(xrow + kb * kBlock + ks * kK) : make_uint2(0u, 0u);
+            const uint2 v = live ? *(const uint2*)(xrow[j] + kb * kBlock + ks * kK)
+                                 : make_uint2(0u, 0u);
             b[ks][0] = (int)v.x;
             b[ks][1] = (int)v.y;
         }
     };
+    /* The weight and the first token tile are asked for a unit ahead of their WMMA steps, each
+     * further tile's fragments a tile ahead (gemm_i8_kpar_kernel's order). */
     typename D::Raw cur = D::fetch(c, rt, wave, lane, wave < c.nkb), nxt;
-    i2v bc[8], bn[8];
-    bload(wave, bc, wave < c.nkb);
+    i2v bc[8], bn[8], bq[2][8];
+    bload(0u, wave, bc, wave < c.nkb);
     for (uint32_t kb = wave; kb < c.nkb; kb += KW) {
         if (kb + KW < c.nkb) {
             nxt = D::fetch(c, rt, kb + KW, lane, true);
-            bload(kb + KW, bn, true);
+            bload(0u, kb + KW, bn, true);
         }
         uint32_t w[16];
         D::rows(cur, c, rb_ratio<F>(c, row0 + (lane & 15u), kb), w);
         D::unzero(c, rt, kb, w);
         Stage8 a8[2];
         frag(w, tr, lane, a8);
-        /* two chains of four steps, so a step does not wait on the one before it */
-        f8v raw = rb_first<BIAS ? 32 : 0>();
-#pragma unroll
-        for (uint32_t ks = 0; ks < kBlock / kK; ++ks)
-            raw = mma8<true>(frag_of(a8[ks / 4u], ks % 4u), bc[ks], raw);
-        const float as = XS[(size_t)tok * xs_ld + kb];
-        if constexpr (BIAS) {
-            const float sb = fold_f32<F>(c, row0, kb) * as;
-            corr += sb;
-#pragma unroll
-            for (uint32_t t = 0; t < 8; ++t) out[t] = __builtin_fmaf(raw[t], sb, out[t]);
-            if (++nflush == kRbFlush) {
-#pragma unroll
-                for (uint32_t t = 0; t < 8; ++t) out[t] = __builtin_fmaf(-kRbBiasF, corr, out[t]);
-                corr = 0.0f;
-                nflush = 0;
-            }
-        } else {
-            float wsr[8];
+        float wsr[8];   /* the lane's eight rows' (row, block) scales, where the form has them */
+        if constexpr (!BIAS) {
             if constexpr (F::SC == kBf16 && F::LRB == 0) {
                 /* A bf16 scale a (row, 128): the lane's eight rows are consecutive in the tile's
                  * scale run (own_scale's order), 16 aligned bytes, one load. */
@@ -400,9 +438,42 @@ void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restric
 #pragma unroll
                 for (uint32_t t = 0; t < 8; ++t) wsr[t] = fold_f32<F>(c, row0 + acc_row(lane, t), kb);
             }
+        }
+        float sbw = 0.0f;   /* BIAS: the unit's fold factor before the token's scale */
+        if constexpr (BIAS) sbw = fold_f32<F>(c, row0, kb);
 #pragma unroll
-            for (uint32_t t = 0; t < 8; ++t)
-                out[t] = __builtin_fmaf(acc_val<true>(raw[t]), wsr[t] * as, out[t]);
+        for (uint32_t ks = 0; ks < 8; ++ks) bq[0][ks] = bc[ks];
+#pragma unroll
+        for (uint32_t j = 0; j < NT; ++j) {
+            if (j + 1u < NT) bload(j + 1u, kb, bq[(j + 1u) & 1u], true);
+            /* two chains of four steps, so a step does not wait on the one before it */
+            f8v raw = rb_first<BIAS ? 32 : 0>();
+#pragma unroll
+            for (uint32_t ks = 0; ks < kBlock / kK; ++ks)
+                raw = mma8<true>(frag_of(a8[ks / 4u], ks % 4u), bq[j & 1u][ks], raw);
+            const float as = XS[(size_t)tok[j] * xs_ld + kb];
+            if constexpr (BIAS) {
+                const float sb = sbw * as;
+                corr[j] += sb;
+#pragma unroll
+                for (uint32_t t = 0; t < 8; ++t) out[j][t] = __builtin_fmaf(raw[t], sb, out[j][t]);
+            } else {
+#pragma unroll
+                for (uint32_t t = 0; t < 8; ++t)
+                    out[j][t] = __builtin_fmaf(acc_val<true>(raw[t]), wsr[t] * as, out[j][t]);
+            }
+        }
+        if constexpr (BIAS) {
+            if (++nflush == kRbFlush) {
+#pragma unroll
+                for (uint32_t j = 0; j < NT; ++j) {
+#pragma unroll
+                    for (uint32_t t = 0; t < 8; ++t)
+                        out[j][t] = __builtin_fmaf(-kRbBiasF, corr[j], out[j][t]);
+                    corr[j] = 0.0f;
+                }
+                nflush = 0;
+            }
         }
         cur = nxt;
 #pragma unroll
@@ -412,7 +483,11 @@ void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restric
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
     __builtin_amdgcn_wave_barrier();
 #pragma unroll
-    for (uint32_t t = 0; t < 8; ++t) red(wave0)[t * kWave + lane] = BIAS ? __builtin_fmaf(-kRbBiasF, corr, out[t]) : out[t];
+    for (uint32_t j = 0; j < NT; ++j)
+#pragma unroll
+        for (uint32_t t = 0; t < 8; ++t)
+            red(wave0, j)[t * kWave + lane] =
+                BIAS ? __builtin_fmaf(-kRbBiasF, corr[j], out[j][t]) : out[j][t];
     __syncthreads();
     if constexpr (GATED) {
         if (wave0 == 0) {
@@ -422,9 +497,9 @@ void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restric
             for (uint32_t t = 0; t < 8; ++t) {
                 float ag = 0.0f, au = 0.0f;
 #pragma unroll
-                for (uint32_t w = 0; w < KW; ++w) ag += red(w)[t * kWave + lane];
+                for (uint32_t w = 0; w < KW; ++w) ag += red(w, 0u)[t * kWave + lane];
 #pragma unroll
-                for (uint32_t w = 0; w < KW; ++w) au += red(KW + w)[t * kWave + lane];
+                for (uint32_t w = 0; w < KW; ++w) au += red(KW + w, 0u)[t * kWave + lane];
                 ag *= row_scale<F>(c, blockIdx.x * 16u + r0 + t);
                 au *= row_scale<F>(c, (blockIdx.x + N / 32u) * 16u + r0 + t);
                 if (col < M) gated_put(go, col, blockIdx.x * 16u + r0 + t, ag, au);
@@ -432,20 +507,28 @@ void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restric
         }
         gated_tail(go, M, NW);
     } else if (wave == 0) {
-        const uint32_t col = frag_c(lane);
         const uint32_t r0 = row0 + acc_row(lane, 0);
-        float v[8];
+        float rs[8];
 #pragma unroll
-        for (uint32_t t = 0; t < 8; ++t) {
-            float a = 0.0f;
+        for (uint32_t t = 0; t < 8; ++t) rs[t] = row_scale<F>(c, r0 + t);
 #pragma unroll
-            for (uint32_t w = 0; w < KW; ++w) a += red(w)[t * kWave + lane];
-            v[t] = a * row_scale<F>(c, r0 + t);
+        for (uint32_t j = 0; j < NT; ++j) {
+            const uint32_t col = j * 16u + frag_c(lane);
+            float v[8];
+#pragma unroll
+            for (uint32_t t = 0; t < 8; ++t) {
+                float a = 0.0f;
+#pragma unroll
+                for (uint32_t w = 0; w < KW; ++w) a += red(w, j)[t * kWave + lane];
+                v[t] = a * rs[t];
+            }
+            if (col < M)
+                *(uint4*)(Y + (size_t)col * N + r0) =
+                    make_uint4(bf16x2_rne(v[0], v[1]), bf16x2_rne(v[2], v[3]),
+                               bf16x2_rne(v[4], v[5]), bf16x2_rne(v[6], v[7]));
         }
-        if (col < M)
-            *(uint4*)(Y + (size_t)col * N + r0) = make_uint4(bf16x2_rne(v[0], v[1]), bf16x2_rne(v[2], v[3]),
-                                                              bf16x2_rne(v[4], v[5]), bf16x2_rne(v[6], v[7]));
     }
+    if (CH::on) r4d_chain_done();
 }
 
 /* ---- the narrow tile: 16 < M <= 64 -----------------------------------------------------------
@@ -455,12 +538,12 @@ void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restric
  * last z block reducing. Only the weight operand's source differs: each 128-K block's unit is
  * decoded and transposed into fragment order through the wave's LDS tile (r4d_iqr_dec.h), its two
  * supertiles just before their eight WMMA steps. The int8 tile's arithmetic, so its bytes. */
+#define R4D_IQR_M64_PARAMS                                                                        \
+    Ctx c0, const uint8_t* __restrict__ Bp, const float* __restrict__ Sb, void* __restrict__ Y,   \
+    uint16_t* __restrict__ C, unsigned int* __restrict__ Ctr, uint32_t rows, uint32_t cols,       \
+    uint32_t nb, uint32_t b_ld, uint32_t sb_ld, uint32_t ck
 template <class F, uint32_t NT, uint32_t MW>
-__global__ __launch_bounds__(MW * kWave) R4D_WAVES(MW >= 8u ? 4u : 6u)
-void iqr_m64_kernel(Ctx c0, const uint8_t* __restrict__ Bp, const float* __restrict__ Sb,
-                    void* __restrict__ Y, uint16_t* __restrict__ C, unsigned int* __restrict__ Ctr,
-                    uint32_t rows, uint32_t cols, uint32_t nb, uint32_t b_ld, uint32_t sb_ld,
-                    uint32_t ck) {
+__device__ __forceinline__ void iqr_m64_body(R4D_IQR_M64_PARAMS) {
     using D = Dec<F>;
     constexpr uint32_t FK = kFK, FN = NT * 16, FM = MW * 16, kU = FK / kBlock;
     __shared__ uint8_t s_b[FN * lds_pitch<FK>()];
@@ -657,6 +740,17 @@ void iqr_m64_kernel(Ctx c0, const uint8_t* __restrict__ Bp, const float* __restr
     }
 }
 
+/* The kernel around the body, whose blocks past the split's K return at once: CH `r4dchain` is
+ * the chained form (r4d_chain.h). */
+template <class F, uint32_t NT, uint32_t MW, class CH>
+__global__ __launch_bounds__(MW * kWave) R4D_WAVES(MW >= 8u ? 4u : 6u)
+void iqr_m64_kernel(R4D_IQR_M64_PARAMS) {
+    if (CH::on) r4d_chain_wait_vec();
+    iqr_m64_body<F, NT, MW>(c0, Bp, Sb, Y, C, Ctr, rows, cols, nb, b_ld, sb_ld, ck);
+    if (CH::on) r4d_chain_done();
+}
+#undef R4D_IQR_M64_PARAMS
+
 /* The split's separate reduce, for a split with no counter block (r4d_gemm_fp8a8.hip's). */
 __global__ void iqr_splitk_reduce(const float* __restrict__ ws, uint16_t* __restrict__ y,
                                   uint32_t n_out, uint32_t ksplit) {
@@ -792,7 +886,17 @@ struct Operands {
     const RadTensor *a, *as, *b, *bs, *y;
     long long M, N, K, nkb, a_ld, sa_ld;
     uint32_t word;
+    bool chain;   /* the row's `chain` parameter: the chained forms (r4d_chain.h) */
 };
+
+/* The forms whose GEMV and 16-token tile have chained instantiations: the computed trellises, and
+ * the plain 4-bit table a DFlash2 drafter's linears are held in. Every other form's launch stays
+ * plain, which keeps the instantiations to the forms a decode step meets. */
+template <class F>
+constexpr bool chained_form() {
+    return F::KIND == kTrellisMad ||
+           (F::KIND == kTable && F::B == 4 && F::LV == 0 && F::L == 0 && F::LRB == 0 && F::SC == 0);
+}
 
 int operands(const RadArgs* a, Operands* g) {
     g->a = r4d_opt(a, 0);
@@ -800,6 +904,7 @@ int operands(const RadArgs* a, Operands* g) {
     g->b = r4d_opt(a, 2);
     g->bs = r4d_opt(a, 3);
     g->y = r4d_opt(a, 4);
+    g->chain = r4d_geti_or(a, "chain", 0) != 0;
     if (!g->a || !g->as || !g->b || !g->bs || !g->y) return R4D_NO(RAD_E_INVAL);
     if (!is_weight_dtype(g->b->dtype) || !is_scale_dtype(g->bs->dtype)) return R4D_NO(RAD_E_DTYPE);
     g->word = g->b->dtype & kWordMask;
@@ -850,13 +955,20 @@ int gemv_launch(const Operands& g, RadStream stream, const GatedOut* go = nullpt
     const GatedOut gz = go ? *go : GatedOut{};
     uint16_t* const y = go ? nullptr : (uint16_t*)g.y->data;
     int rc = RAD_E_SHAPE;
-#define R4D_IQR_GV(mt_, kw_)                                                                     \
-    rc = go ? R4D_EMIT(stream, (iqr_gemv_kernel<F, mt_, kw_, true>), dim3(N / 32u),              \
+#define R4D_IQR_GV_E(mt_, kw_, ch_)                                                              \
+    rc = go ? R4D_EMIT(stream, (iqr_gemv_kernel<F, mt_, kw_, true, ch_>), dim3(N / 32u),         \
                        dim3(2u * kw_ * kWave), 0, c, (const int8_t*)g.a->data,                    \
                        (const float*)g.as->data, y, N, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz)   \
-            : R4D_EMIT(stream, (iqr_gemv_kernel<F, mt_, kw_>), dim3(N / 16u), dim3(kw_ * kWave), \
-                       0, c, (const int8_t*)g.a->data, (const float*)g.as->data, y, N,           \
-                       (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz)
+            : R4D_EMIT(stream, (iqr_gemv_kernel<F, mt_, kw_, false, ch_>), dim3(N / 16u),        \
+                       dim3(kw_ * kWave), 0, c, (const int8_t*)g.a->data,                         \
+                       (const float*)g.as->data, y, N, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz)
+#define R4D_IQR_GV(mt_, kw_)                                                                     \
+    do { if constexpr (chained_form<F>()) {                                                      \
+             if (g.chain) R4D_IQR_GV_E(mt_, kw_, r4dchain);                                      \
+             else         R4D_IQR_GV_E(mt_, kw_, R4dUnchained);                                  \
+         } else {                                                                                \
+             R4D_IQR_GV_E(mt_, kw_, R4dUnchained);                                               \
+         } } while (0)
 #define R4D_IQR_GVK(mt_) do { if (kw == 4u) R4D_IQR_GV(mt_, 4u); else R4D_IQR_GV(mt_, 8u); } while (0)
     switch (M) {
         case 1u: R4D_IQR_GVK(1u); break;
@@ -871,27 +983,57 @@ int gemv_launch(const Operands& g, RadStream stream, const GatedOut* go = nullpt
     }
 #undef R4D_IQR_GVK
 #undef R4D_IQR_GV
+#undef R4D_IQR_GV_E
     return rc == RAD_OK && hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }
 
-/* The 16-token tile, plain into `g.y` or gated as gemv_launch. */
+/* The forms whose 16-token tile also serves two to four token tiles a block: the computed
+ * trellis under one f32 scale a row or a bf16 scale a (row, 128), the trunk's two. */
+template <class F>
+constexpr bool tiles_form() {
+    return F::KIND == kTrellisMad && F::LRB == 0 && (F::SC == kRowF32 || F::SC == kBf16);
+}
+
+/* The 16-token tile, plain into `g.y` or gated as gemv_launch; plain, a tiles_form serves up to 64
+ * tokens with it, a block multiplying its decoded weight tile against each token tile in turn. */
 template <class F>
 int m16_launch(const Operands& g, RadStream stream, const GatedOut* go = nullptr) {
     const uint32_t N = (uint32_t)g.N, M = (uint32_t)g.M;
     const Ctx c = ctx_of(g);
     const GatedOut gz = go ? *go : GatedOut{};
     uint16_t* const y = go ? nullptr : (uint16_t*)g.y->data;
-    int rc;
+    const uint32_t nt = (M + 15u) / 16u;
+    if (nt > (go || !tiles_form<F>() ? 1u : 4u)) return R4D_NO(RAD_E_SHAPE);
+    int rc = RAD_E_SHAPE;
+#define R4D_IQR_M16_G(kw_, ch_)                                                                  \
+    rc = R4D_EMIT(stream, (iqr_m16_kernel<F, kw_, true, 1u, ch_>), dim3(N / 32u),                \
+                  dim3(2u * kw_ * kWave), 0, c, (const int8_t*)g.a->data,                         \
+                  (const float*)g.as->data, y, N, M, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz)
+#define R4D_IQR_M16_P(kw_, nt_, ch_)                                                             \
+    rc = R4D_EMIT(stream, (iqr_m16_kernel<F, kw_, false, nt_, ch_>), dim3(N / 16u),              \
+                  dim3(kw_ * kWave), 0, c, (const int8_t*)g.a->data,                              \
+                  (const float*)g.as->data, y, N, M, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz)
+#define R4D_IQR_M16_E(kw_, ch_)                                                                  \
+    do { if (go) R4D_IQR_M16_G(kw_, ch_);                                                        \
+         else if (nt == 1u) R4D_IQR_M16_P(kw_, 1u, ch_);                                         \
+         else if constexpr (tiles_form<F>()) {                                                   \
+             if (nt == 2u) R4D_IQR_M16_P(kw_, 2u, ch_);                                          \
+             else if (nt == 3u) R4D_IQR_M16_P(kw_, 3u, ch_);                                     \
+             else R4D_IQR_M16_P(kw_, 4u, ch_);                                                   \
+         } } while (0)
 #define R4D_IQR_M16(kw_)                                                                         \
-    rc = go ? R4D_EMIT(stream, (iqr_m16_kernel<F, kw_, true>), dim3(N / 32u),                    \
-                       dim3(2u * kw_ * kWave), 0, c, (const int8_t*)g.a->data,                    \
-                       (const float*)g.as->data, y, N, M, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz) \
-            : R4D_EMIT(stream, (iqr_m16_kernel<F, kw_>), dim3(N / 16u), dim3(kw_ * kWave), 0, c,  \
-                       (const int8_t*)g.a->data, (const float*)g.as->data, y, N, M,               \
-                       (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz)
+    do { if constexpr (chained_form<F>()) {                                                      \
+             if (g.chain) R4D_IQR_M16_E(kw_, r4dchain);                                          \
+             else         R4D_IQR_M16_E(kw_, R4dUnchained);                                      \
+         } else {                                                                                \
+             R4D_IQR_M16_E(kw_, R4dUnchained);                                                   \
+         } } while (0)
     if (N >= 4096u) R4D_IQR_M16(4u);
     else R4D_IQR_M16(8u);
 #undef R4D_IQR_M16
+#undef R4D_IQR_M16_E
+#undef R4D_IQR_M16_P
+#undef R4D_IQR_M16_G
     return rc == RAD_OK && hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }
 
@@ -911,7 +1053,8 @@ int m64_launch(const Operands& g, void* scratch, long long scratch_bytes, int sp
                RadStream stream) {
     const uint32_t N = (uint32_t)g.N, K = (uint32_t)g.K, M = (uint32_t)g.M;
     if (M <= gemv_max<F>()) return gemv_launch<F>(g, stream);
-    if (M <= 16u && ((uintptr_t)g.y->data & 15u) == 0u) return m16_launch<F>(g, stream);
+    if (M <= (tiles_form<F>() ? 64u : 16u) && ((uintptr_t)g.y->data & 15u) == 0u)
+        return m16_launch<F>(g, stream);
     /* At most eight waves a block: each has its own transpose tile in LDS. The wave count changes
      * no output bit (r4d_gemm_fp8a8.hip's narrow_mw). */
     const uint32_t mw = std::min(r4d_8a8_narrow_mw(N, M), 8u);
@@ -928,10 +1071,17 @@ int m64_launch(const Operands& g, void* scratch, long long scratch_bytes, int sp
     const Ctx c = ctx_of(g);
     const dim3 grid(gx, 1, ksplit);
     int rc = RAD_E_SHAPE;
-#define R4D_IQR_M64(mw_, nt_)                                                                    \
-    rc = R4D_EMIT(stream, (iqr_m64_kernel<F, nt_, mw_>), grid, dim3(mw_ * kWave), 0, c,          \
+#define R4D_IQR_M64_E(mw_, nt_, ch_)                                                             \
+    rc = R4D_EMIT(stream, (iqr_m64_kernel<F, nt_, mw_, ch_>), grid, dim3(mw_ * kWave), 0, c,     \
                   (const uint8_t*)g.a->data, (const float*)g.as->data, dst, (uint16_t*)g.y->data, \
                   ctr, N, K, M, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, ck)
+#define R4D_IQR_M64(mw_, nt_)                                                                    \
+    do { if constexpr (chained_form<F>()) {                                                      \
+             if (g.chain) R4D_IQR_M64_E(mw_, nt_, r4dchain);                                     \
+             else         R4D_IQR_M64_E(mw_, nt_, R4dUnchained);                                 \
+         } else {                                                                                \
+             R4D_IQR_M64_E(mw_, nt_, R4dUnchained);                                              \
+         } } while (0)
 #define R4D_IQR_M64_NT(mw_)                                                                      \
     do { if (nt == 4u) R4D_IQR_M64(mw_, 4u); else if (nt == 3u) R4D_IQR_M64(mw_, 3u);           \
          else if (nt == 2u) R4D_IQR_M64(mw_, 2u); else R4D_IQR_M64(mw_, 1u); } while (0)
@@ -940,6 +1090,7 @@ int m64_launch(const Operands& g, void* scratch, long long scratch_bytes, int sp
     else return R4D_NO(RAD_E_SHAPE);
 #undef R4D_IQR_M64_NT
 #undef R4D_IQR_M64
+#undef R4D_IQR_M64_E
     if (rc != RAD_OK || hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
     if (ksplit > 1 && !ctr) {
         const uint32_t n = M * N;
@@ -980,8 +1131,9 @@ int tiled_launch(const Operands& g, void* scratch, long long scratch_bytes, RadS
                   (const uint8_t*)g.a->data, (const float*)g.as->data, (const uint8_t*)pre.fragp, \
                   ws, (uint16_t*)g.y->data, (uint32_t)g.M, (uint32_t)g.K, (uint32_t)g.N,          \
                   (uint32_t)g.a_ld, (uint32_t)g.sa_ld, (uint32_t)g.nkb)
-    if (f.lrb >= 5) R4D_IQR_PF(32);
-    else if (f.lrb >= 3) R4D_IQR_PF(8);
+    /* F's own lrb is the word's (kernel_word keeps it), so one tile form is built a form. */
+    if constexpr (F::LRB >= 5) R4D_IQR_PF(32);
+    else if constexpr (F::LRB >= 3) R4D_IQR_PF(8);
     else R4D_IQR_PF(0);
 #undef R4D_IQR_PF
     return rc == RAD_OK && hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
@@ -989,6 +1141,7 @@ int tiled_launch(const Operands& g, void* scratch, long long scratch_bytes, RadS
 
 }  // namespace
 
+#if R4D_IQR_PART == 0
 extern "C" int64_t r4d_rad_gemm_iqr_m64_scratch(const RadArgs* a) {
     const long long M = r4d_geti_or(a, "M", 0), N = r4d_geti_or(a, "N", 0),
                     K = r4d_geti_or(a, "K", 0), sn = r4d_geti_or(a, "split_n", 0);
@@ -998,8 +1151,24 @@ extern "C" int64_t r4d_rad_gemm_iqr_m64_scratch(const RadArgs* a) {
                                               (uint32_t)M, &ck, kIqrSplitWaves);
     return k2 > 1 ? (int64_t)k2 * M * N * 4 : 0;
 }
+#endif
 
-extern "C" int r4d_rad_gemm_iqr_m64(const RadArgs* a, RadStream s) {
+#define R4D_IQR_CAT2(a, b) a##b
+#define R4D_IQR_CAT(a, b) R4D_IQR_CAT2(a, b)
+
+namespace {
+
+/* A form's launch where this part builds it, else a refusal no call reaches: iqr_part sends each
+ * word to the one part whose chain holds it. */
+template <class F>
+int m64_part(const Operands& g, void* scratch, long long scratch_bytes, int split_n, RadStream s) {
+    if constexpr (in_part<F>()) return m64_launch<F>(g, scratch, scratch_bytes, split_n, s);
+    else return R4D_NO(RAD_E_UNSUPPORTED);
+}
+
+}  // namespace
+
+extern "C" int R4D_IQR_CAT(r4d_iqr_m64_p, R4D_IQR_PART)(const RadArgs* a, RadStream s) {
     Operands g;
     const int rc = operands(a, &g);
     if (rc != RAD_OK) return rc;
@@ -1007,8 +1176,8 @@ extern "C" int r4d_rad_gemm_iqr_m64(const RadArgs* a, RadStream s) {
     const uint32_t kw = kernel_word(g.word);
     const int sn = (int)r4d_geti_or(a, "split_n", 0);
 #define R4D_IQR_GO(...)                                                                          \
-    if (kw == R4D_IQR_T(__VA_ARGS__)::word())                                                    \
-        return m64_launch<R4D_IQR_T(__VA_ARGS__)>(g, a->scratch, (long long)a->scratch_bytes, sn, s);
+    if (in_part<R4D_IQR_T(__VA_ARGS__)>() && kw == R4D_IQR_T(__VA_ARGS__)::word())                \
+        return m64_part<R4D_IQR_T(__VA_ARGS__)>(g, a->scratch, (long long)a->scratch_bytes, sn, s);
     R4D_IQR_FORMS(R4D_IQR_GO)
 #undef R4D_IQR_GO
     return R4D_NO(RAD_E_UNSUPPORTED);
@@ -1067,19 +1236,31 @@ int gated_operands(const RadArgs* a, Operands* g, GatedOut* go) {
 
 template <class F>
 int gated_launch(const Operands& g, const GatedOut& go, RadStream stream) {
-    if (g.M <= gemv_max<F>()) return gemv_launch<F>(g, stream, &go);
-    return m16_launch<F>(g, stream, &go);
+    if constexpr (in_part<F>()) {
+        if (g.M <= gemv_max<F>()) return gemv_launch<F>(g, stream, &go);
+        return m16_launch<F>(g, stream, &go);
+    } else {
+        return R4D_NO(RAD_E_UNSUPPORTED);
+    }
+}
+
+template <class F>
+int tiled_part(const Operands& g, void* scratch, long long scratch_bytes, RadStream s) {
+    if constexpr (in_part<F>()) return tiled_launch<F>(g, scratch, scratch_bytes, s);
+    else return R4D_NO(RAD_E_UNSUPPORTED);
 }
 
 }  // namespace
 
+#if R4D_IQR_PART == 0
 extern "C" int64_t r4d_rad_gemm_iqr_gated_scratch(const RadArgs* a) {
     const long long M = r4d_geti_or(a, "M", 0), N = r4d_geti_or(a, "N", 0);
     if (M < 1 || N < 2) return 0;
     return (int64_t)align256(M * (N / 2) * 2);
 }
+#endif
 
-extern "C" int r4d_rad_gemm_iqr_gated(const RadArgs* a, RadStream s) {
+extern "C" int R4D_IQR_CAT(r4d_iqr_gated_p, R4D_IQR_PART)(const RadArgs* a, RadStream s) {
     Operands g;
     GatedOut go;
     const int rc = gated_operands(a, &g, &go);
@@ -1091,12 +1272,14 @@ extern "C" int r4d_rad_gemm_iqr_gated(const RadArgs* a, RadStream s) {
     if (!go.cnt || go.n / 128u > 8192u) return R4D_NO(RAD_E_DEVICE);
     const uint32_t kw = kernel_word(g.word);
 #define R4D_IQR_GO(...)                                                                          \
-    if (kw == R4D_IQR_T(__VA_ARGS__)::word()) return gated_launch<R4D_IQR_T(__VA_ARGS__)>(g, go, s);
+    if (in_part<R4D_IQR_T(__VA_ARGS__)>() && kw == R4D_IQR_T(__VA_ARGS__)::word())                \
+        return gated_launch<R4D_IQR_T(__VA_ARGS__)>(g, go, s);
     R4D_IQR_FORMS(R4D_IQR_GO)
 #undef R4D_IQR_GO
     return R4D_NO(RAD_E_UNSUPPORTED);
 }
 
+#if R4D_IQR_PART == 0
 extern "C" int64_t r4d_rad_gemm_iqr_tiled_scratch(const RadArgs* a) {
     const long long N = r4d_geti_or(a, "N", 0), K = r4d_geti_or(a, "K", 0);
     if (N < 1 || K < 1) return 0;
@@ -1105,17 +1288,56 @@ extern "C" int64_t r4d_rad_gemm_iqr_tiled_scratch(const RadArgs* a) {
     f.scale = kE4m3Tensor;
     return (int64_t)tiled_scratch(f, N, K);
 }
+#endif
 
-extern "C" int r4d_rad_gemm_iqr_tiled(const RadArgs* a, RadStream s) {
+extern "C" int R4D_IQR_CAT(r4d_iqr_tiled_p, R4D_IQR_PART)(const RadArgs* a, RadStream s) {
     Operands g;
     const int rc = operands(a, &g);
     if (rc != RAD_OK) return rc;
     if (g.N % kBlock) return R4D_NO(RAD_E_SHAPE);
     const uint32_t kw = kernel_word(g.word);
 #define R4D_IQR_GO(...)                                                                          \
-    if (kw == R4D_IQR_T(__VA_ARGS__)::word())                                                    \
-        return tiled_launch<R4D_IQR_T(__VA_ARGS__)>(g, a->scratch, (long long)a->scratch_bytes, s);
+    if (in_part<R4D_IQR_T(__VA_ARGS__)>() && kw == R4D_IQR_T(__VA_ARGS__)::word())                \
+        return tiled_part<R4D_IQR_T(__VA_ARGS__)>(g, a->scratch, (long long)a->scratch_bytes, s);
     R4D_IQR_FORMS(R4D_IQR_GO)
 #undef R4D_IQR_GO
     return R4D_NO(RAD_E_UNSUPPORTED);
 }
+
+#if R4D_IQR_PART == 0
+/* The rows' entry points: each call goes to the part that builds its weight's form, which parses
+ * and checks the operands itself. */
+using IqrPartFn = int (*)(const RadArgs*, RadStream);
+#define R4D_IQR_PARTS_OF(row)                                                                    \
+    extern "C" int row##1(const RadArgs*, RadStream);                                            \
+    extern "C" int row##2(const RadArgs*, RadStream);                                            \
+    extern "C" int row##3(const RadArgs*, RadStream);
+R4D_IQR_PARTS_OF(r4d_iqr_m64_p)
+R4D_IQR_PARTS_OF(r4d_iqr_gated_p)
+R4D_IQR_PARTS_OF(r4d_iqr_tiled_p)
+#undef R4D_IQR_PARTS_OF
+static_assert(kIqrParts == 4, "the entry points below name every part");
+
+static int iqr_by_part(const IqrPartFn (&fn)[kIqrParts], const RadArgs* a, RadStream s) {
+    const RadTensor* b = r4d_opt(a, 2);
+    return fn[b ? iqr_part(kernel_word(b->dtype & kWordMask)) : 0](a, s);
+}
+
+extern "C" int r4d_rad_gemm_iqr_m64(const RadArgs* a, RadStream s) {
+    static constexpr IqrPartFn fn[] = { r4d_iqr_m64_p0, r4d_iqr_m64_p1, r4d_iqr_m64_p2,
+                                        r4d_iqr_m64_p3 };
+    return iqr_by_part(fn, a, s);
+}
+
+extern "C" int r4d_rad_gemm_iqr_gated(const RadArgs* a, RadStream s) {
+    static constexpr IqrPartFn fn[] = { r4d_iqr_gated_p0, r4d_iqr_gated_p1, r4d_iqr_gated_p2,
+                                        r4d_iqr_gated_p3 };
+    return iqr_by_part(fn, a, s);
+}
+
+extern "C" int r4d_rad_gemm_iqr_tiled(const RadArgs* a, RadStream s) {
+    static constexpr IqrPartFn fn[] = { r4d_iqr_tiled_p0, r4d_iqr_tiled_p1, r4d_iqr_tiled_p2,
+                                        r4d_iqr_tiled_p3 };
+    return iqr_by_part(fn, a, s);
+}
+#endif

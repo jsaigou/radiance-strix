@@ -74,10 +74,18 @@ set(R3D_UNITS
   # The w8a8 wave-matrix arm at prefill heights (17 <= M <= 127): two 16-row tiles a wave, the
   # weight column reused over the tiles, the group term the reference.
   "r3d_gemm_w8a8_nt_m64|"
+  # The int8 trunk GEMM (i8a8, i8a8h): the same wave-matrix walk over row-major codes, the
+  # activation's scale per (row, group) and a bf16 weight scale, at every M.
+  "r3d_gemm_i8a8|"
   # Paged attention at head_dim 128: the decode leg (one head group a workgroup, 16-token tiles,
   # split-KV) and the prefill leg (a 16-token query tile staged in LDS), over a bf16 or an E4M3
   # cache. The walk is shared; the tile is what a workgroup stages once and every wave consumes.
   "r3d_attn_paged_h128|"
+  # Absorbed MLA: the per-head projections (absorb/expand through the shared latent weight).
+  "r3d_mla_project|"
+  # Dense causal latent attention over a paged [latent | rope] cache: a wave a (row, head), the
+  # score one wave sum, split history with an f32 partial merge, the optional head gate.
+  "r3d_mla_attn_paged|"
   # The sampler's spine: the row's top-R in one scan, and the stages that turn the candidate plane
   # the top-R produces into one token -- argmax, temp, top-k, the draw, and the four narrowings.
   "r3d_sample_f32|"
@@ -124,10 +132,21 @@ set(R3D_UNITS
   "r3d_gdn_gated_rmsnorm_h128|"
   "r3d_gdn_gated_norm_had_quant_i8|"
   "r3d_gdn_conv_w4_h128|"
+  # GLM's per-channel KDA recurrence over the paged f32 state cache, with the speculative
+  # candidate snapshots (the state in registers, no LDS).
+  "r3d_kda_update|"
+  # PLE's dilated depthwise convolution (taps `dilation` apart), its silu and the residual add:
+  # one thread a channel walking a 32-token tile, with the conv window's write-back fused in.
+  "r3d_ple_conv|"
   # Mixture of experts: each routing weight times its expert's own scale, in place.
   "r3d_expert_scale_bf16|"
   # The router: softmax over the expert logits, the top_k by value, renormalised if `norm`.
   "r3d_moe_router_topk_bf16|"
+  # The router's F32 projection: a bf16 activation against an f32 weight, f32 out.
+  "r3d_gemm_nt_f32|"
+  # The group-limited sigmoid router (Ling-3.0's noaux_tc): the groups ranked by their two best
+  # p + bias, selection over the kept groups' experts, one wave a row.
+  "r3d_router_group_topk|"
   # The routed slots' stable counting sort (the small form, one workgroup).
   "r3d_moe_scatter|"
   # Fold the expert outputs back to the token (the gather, and the inverse-table form).
@@ -206,6 +225,9 @@ add_executable(r3d_selftest ${CMAKE_CURRENT_SOURCE_DIR}/r3d_selftest.cpp)
 # Links the HIP runtime to allocate the device buffers it feeds the kernels.
 target_link_libraries(r3d_selftest PRIVATE radiance::abi ${CMAKE_DL_LIBS} ${RAD_HIP_RUNTIME})
 target_include_directories(r3d_selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# The by-value cases mirror libref's arithmetic on the host and compare bit for bit, so the mirrors
+# must round where libref rounds: no fused multiply-add from this compiler either.
+target_compile_options(r3d_selftest PRIVATE -ffp-contract=off)
 # The selftest's device phase (the per-row launch) needs the HIP runtime, which this build has.
 target_compile_definitions(r3d_selftest PRIVATE RAD_HAVE_HIP)
 set_target_properties(r3d_selftest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

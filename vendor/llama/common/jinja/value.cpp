@@ -3,7 +3,7 @@
 #include "value.h"
 
 // for converting from JSON to jinja values
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <sstream>
 #include <string>
@@ -247,14 +247,12 @@ static value tojson(const func_args & args) {
     if (is_val<value_int>(val_indent)) {
         indent = static_cast<int>(val_indent->as_int());
     }
-    if (val_sort->as_bool()) { // undefined == false
-        throw not_implemented_exception("tojson sort_keys=true not implemented");
-    }
+    const bool sort_keys = val_sort->as_bool(); // undefined == false
     const bool ensure_ascii = val_ascii->as_bool(); // undefined == false
     auto separators = (is_val<value_array>(val_separators) ? val_separators : mk_val<value_array>())->as_array();
     std::string item_sep = separators.size() > 0 ? separators[0]->as_string().str() : (indent < 0 ? ", " : ",");
     std::string key_sep = separators.size() > 1 ? separators[1]->as_string().str() : ": ";
-    std::string json_str = value_to_json(args.get_pos(0), indent, item_sep, key_sep);
+    std::string json_str = value_to_json(args.get_pos(0), indent, item_sep, key_sep, sort_keys);
     if (ensure_ascii) {
         json_str = json_ensure_ascii_preserving_format(json_str);
     }
@@ -297,6 +295,58 @@ static value minmax_fn(const func_args & args) {
         }
     }
     return best;
+}
+
+/* jinja2's unique() over a sequence: the first occurrence of each item, in order, compared by
+ * `attribute` where one is given. Strings compare lowercased unless `case_sensitive` is true
+ * (jinja2's default is false). A tuple stays a tuple. */
+static value unique_fn(const func_args & args) {
+    args.ensure_count(1, 3);
+    if (!is_val<value_array>(args.get_pos(0))) {
+        throw raised_exception("unique: first argument must be an array");
+    }
+    value val       = args.get_pos(0);
+    value cs        = args.get_kwarg_or_pos("case_sensitive", 1);
+    value attribute = args.get_kwarg_or_pos("attribute", 2);
+    const bool case_sensitive = !cs->is_undefined() && cs->as_bool();
+    const bool attr_is_int = is_val<value_int>(attribute);
+    const int64_t attr_int = attr_is_int ? attribute->as_int() : 0;
+    const std::vector<value> & arr = val->as_array();
+    auto key = [&](const value & v) -> value {
+        value k = v;
+        if (!attribute->is_undefined()) {
+            if (attr_is_int && is_val<value_array>(v)) {
+                k = v->at(attr_int);
+            } else if (!attr_is_int && is_val<value_object>(v)) {
+                k = v->at(attribute);
+            } else {
+                throw raised_exception("unique: unsupported object attribute comparison on " + v->type());
+            }
+        }
+        if (!case_sensitive && is_val<value_string>(k)) {
+            jinja::string low = k->as_string().lowercase();
+            return mk_val<value_string>(low);
+        }
+        return k;
+    };
+    std::vector<value> keys, out;
+    for (const auto & item : arr) {
+        value k = key(item);
+        bool seen = false;
+        for (const auto & have : keys) {
+            /* value_compare reads a number against a string as text; jinja2 keeps 1 and "1" apart */
+            if (is_val<value_string>(k) == is_val<value_string>(have) &&
+                value_compare(k, have, value_compare_op::eq)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            keys.push_back(std::move(k));
+            out.push_back(item);
+        }
+    }
+    return is_val<value_tuple>(val) ? mk_val<value_tuple>(std::move(out)) : mk_val<value_array>(std::move(out));
 }
 
 template<bool is_reject>
@@ -443,6 +493,17 @@ const func_builtins & global_builtins() {
             auto out = mk_val<value_array>();
             if (step == 0) {
                 throw raised_exception("range() step argument must not be zero");
+            }
+            // RADIANCE: a container template is server-side attacker data, and range() emitted
+            // one element per step with no bound: {{ range(4000000000) }} OOMed the process per
+            // render. No real chat template counts past a handful; 65536 is far past plausible
+            // and small enough that even the join of the whole range is transient, not fatal.
+            {
+                const __int128 span = step > 0 ? (__int128)stop - start : (__int128)start - stop;
+                const __int128 abs_step = step > 0 ? step : -(__int128)step;
+                if (span > 0 && (span + abs_step - 1) / abs_step > 65536) {
+                    throw raised_exception("range() would produce more than 65536 values");
+                }
             }
             if (step > 0) {
                 for (int64_t i = start; i < stop; i += step) {
@@ -924,10 +985,6 @@ const func_builtins & value_bool_t::get_builtins() const {
     return builtins;
 }
 
-[[noreturn]] static value array_unique_not_implemented(const func_args &) {
-    throw not_implemented_exception("Array unique builtin not implemented");
-}
-
 const func_builtins & value_array_t::get_builtins() const {
     static const func_builtins builtins = {
         {"default", default_value},
@@ -1133,7 +1190,10 @@ const func_builtins & value_array_t::get_builtins() const {
             std::reverse(arr.begin(), arr.end());
             return is_val<value_tuple>(val) ? mk_val<value_tuple>(std::move(arr)) : mk_val<value_array>(std::move(arr));
         }},
-        {"unique", array_unique_not_implemented},
+        /* RADIANCE: upstream leaves `unique` a stub that throws, with the same result as a
+         * missing min or max above: GLM-5.3-Flash's template checks its tool-call ids with it,
+         * and the model was reported as having no tool support. */
+        {"unique", unique_fn},
     };
     return builtins;
 }
@@ -1297,7 +1357,7 @@ const func_builtins & value_undefined_t::get_builtins() const {
 //////////////////////////////////
 
 
-static value from_json(const nlohmann::ordered_json & j, bool mark_input) {
+static value from_json(const rad::Json & j, bool mark_input) {
     if (j.is_null()) {
         return mk_val<value_none>();
     } else if (j.is_boolean()) {
@@ -1307,7 +1367,7 @@ static value from_json(const nlohmann::ordered_json & j, bool mark_input) {
     } else if (j.is_number_float()) {
         return mk_val<value_float>(j.get<double>());
     } else if (j.is_string()) {
-        auto str = mk_val<value_string>(j.get<std::string>());
+        auto str = mk_val<value_string>(j.get_ref<const std::string &>());
         if (mark_input) {
             str->mark_input();
         }
@@ -1394,7 +1454,7 @@ bool value_compare(const value & a, const value & b, value_compare_op op) {
 }
 
 template<>
-void global_from_json(context & ctx, const nlohmann::ordered_json & json_obj, bool mark_input) {
+void global_from_json(context & ctx, const rad::Json & json_obj, bool mark_input) {
     // printf("global_from_json: %s\n" , json_obj.dump(2).c_str());
     if (json_obj.is_null() || !json_obj.is_object()) {
         throw std::runtime_error("global_from_json: input JSON value must be an object");
@@ -1405,9 +1465,14 @@ void global_from_json(context & ctx, const nlohmann::ordered_json & json_obj, bo
     }
 }
 
+void global_set_from_json(context & ctx, const std::string & key,
+                          const rad::Json & j, bool mark_input) {
+    ctx.set_val(key, from_json(j, mark_input));
+}
+
 // recursively convert value to JSON string
 // TODO: avoid circular references
-static void value_to_json_internal(std::ostringstream & oss, const value & val, int curr_lvl, int indent, const std::string_view item_sep, const std::string_view key_sep) {
+static void value_to_json_internal(std::ostringstream & oss, const value & val, int curr_lvl, int indent, const std::string_view item_sep, const std::string_view key_sep, bool sort_keys) {
     auto indent_str = [indent, curr_lvl]() -> std::string {
         return (indent > 0) ? std::string(curr_lvl * indent, ' ') : "";
     };
@@ -1452,7 +1517,7 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
             oss << newline();
             for (size_t i = 0; i < arr.size(); ++i) {
                 oss << indent_str() << (indent > 0 ? std::string(indent, ' ') : "");
-                value_to_json_internal(oss, arr[i], curr_lvl + 1, indent, item_sep, key_sep);
+                value_to_json_internal(oss, arr[i], curr_lvl + 1, indent, item_sep, key_sep, sort_keys);
                 if (i < arr.size() - 1) {
                     oss << item_sep;
                 }
@@ -1463,16 +1528,25 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
         oss << "]";
     } else if (is_val<value_object>(val)) {
         const auto & obj = val->as_ordered_object(); // IMPORTANT: need to keep exact order
+        std::vector<std::pair<std::string, value>> items;
+        items.reserve(obj.size());
+        for (const auto & pair : obj) {
+            items.emplace_back(pair.first->as_string().str(), pair.second);
+        }
+        if (sort_keys) {
+            // same order as python json.dumps(sort_keys=True): utf-8 byte order is code point order
+            std::stable_sort(items.begin(), items.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+        }
         oss << "{";
-        if (!obj.empty()) {
+        if (!items.empty()) {
             oss << newline();
             size_t i = 0;
-            for (const auto & pair : obj) {
+            for (const auto & [key, item] : items) {
                 oss << indent_str() << (indent > 0 ? std::string(indent, ' ') : "");
-                value_to_json_internal(oss, mk_val<value_string>(pair.first->as_string().str()), curr_lvl + 1, indent, item_sep, key_sep);
+                value_to_json_internal(oss, mk_val<value_string>(key), curr_lvl + 1, indent, item_sep, key_sep, sort_keys);
                 oss << key_sep;
-                value_to_json_internal(oss, pair.second, curr_lvl + 1, indent, item_sep, key_sep);
-                if (i < obj.size() - 1) {
+                value_to_json_internal(oss, item, curr_lvl + 1, indent, item_sep, key_sep, sort_keys);
+                if (i < items.size() - 1) {
                     oss << item_sep;
                 }
                 oss << newline();
@@ -1486,9 +1560,9 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
     }
 }
 
-std::string value_to_json(const value & val, int indent, const std::string_view item_sep, const std::string_view key_sep) {
+std::string value_to_json(const value & val, int indent, const std::string_view item_sep, const std::string_view key_sep, bool sort_keys) {
     std::ostringstream oss;
-    value_to_json_internal(oss, val, 0, indent, item_sep, key_sep);
+    value_to_json_internal(oss, val, 0, indent, item_sep, key_sep, sort_keys);
     JJ_DEBUG("value_to_json: result=%s", oss.str().c_str());
     return oss.str();
 }

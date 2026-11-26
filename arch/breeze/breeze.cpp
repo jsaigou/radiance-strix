@@ -1,8 +1,9 @@
-/* breeze -- Breeze-TTS-2: speech from text, with an optional description of the voice; 24 kHz mono.
+/* breeze -- Breeze-TTS-2: speech from text, voice design or a reference recording; 24 kHz mono.
  *
  * ============================== THE MODEL ==============================
  *
- * Four networks (BreezeBlue's BreezeForConditionalGeneration and its audio tokenizer):
+ * Four generation networks (BreezeBlue's BreezeForConditionalGeneration and its audio tokenizer),
+ * plus the reference-audio encoder in reference.h for voice cloning:
  *
  *   Text encoder: T5Gemma 2's text encoder, Gemma 3 1B's shape (26 layers of 1152, 4 query heads
  *   over one KV head of 256, gelu-tanh GLU 6912, sandwich RMS norms with a (1 + w) gain), read
@@ -85,6 +86,8 @@ constexpr int64_t kVocChunk = 4, kConvCtx = 12, kAttnWin = 72;
 constexpr int64_t kVocContext = 2 + (kAttnWin - 1) + kConvCtx;
 constexpr int64_t kConvFrames = kConvCtx + kVocChunk;
 constexpr int64_t kCbBins = 2048, kCbDim = 256;
+/* One clean reference of at most ten seconds (rounded to complete codec frames). */
+constexpr int64_t kMaxRefFrames = 125, kMaxRefSamples = kMaxRefFrames * kSamplesPerFrame;
 /* The codec's sequence rates, rows a frame: the transformer's frames, the convolutions' frames,
  * the two upsamplings', and each decoder block's output (8, 5, 4, 3 times). */
 constexpr int kRates = 8;
@@ -160,7 +163,34 @@ struct Llama3 {
     double factor = 0, low = 0, high = 0, orig = 0;
 };
 
+struct RefConv {
+    rad_weight w = 0, b = 0;
+    rad_op op = 0;
+};
+struct RefLayer {
+    rad_weight n1 = 0, b1 = 0, n2 = 0, b2 = 0, qkv = 0, o = 0, fc1 = 0, fc2 = 0;
+    rad_weight ls1 = 0, ls2 = 0;
+    rad_op norm1 = 0, norm2 = 0, proj = 0, rope = 0, attn = 0, out = 0;
+    rad_op f1 = 0, act = 0, f2 = 0, scale1 = 0, scale2 = 0, add1 = 0, add2 = 0;
+};
+struct Reference {
+    RefConv first{}, res1[4]{}, res2[4]{}, down[4]{}, last{}, sample{};
+    rad_buf x[5]{}, a[5]{}, h[4]{}, z = 0, pad = 0, sampled = 0;
+    rad_op elu[5]{}, elu_h[4]{};
+    rad_buf th = 0, qkv = 0, attn = 0, o = 0, ff = 0, act = 0;
+    RefLayer layer[8]{};
+    rad_buf index = 0, cu = 0, text_pos = 0, text_cu = 0;
+    rad_op indices = 0, copy_i = 0, copy_f = 0, text_indices = 0;
+    rad_buf q[2]{}, codes = 0, eos_codes = 0;
+    rad_weight qi[2]{}, cb[16]{};
+    rad_op project[2]{}, quant[16]{}, embed = 0, eos = 0;
+};
+
 struct Model {
+    Reference ref{};
+    /* The model holds the reference encoder (reference_stored), whose first weight is then already
+     * in the name map. */
+    bool  ref_stored = false;
     Names nm{""};
     Llama3 l3{};
     Geom  ge{}, gl{}, gd{};         /* the text encoder's, the backbone's, the depth decoder's */
@@ -225,7 +255,7 @@ struct Model {
     rad_buf b_vout = 0, b_audio = 0;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* ================================================================== declare helpers */
 static rad_op norm_op(RadBuilder* b, int64_t rows, int64_t n, double eps, rad_weight w, rad_buf x,
@@ -1183,10 +1213,13 @@ static int check_format(const RadModelMeta* meta) {
     return RAD_OK;
 }
 
+#include "reference.h"
+
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
-    Model& m = g_model[ctx->rank];
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(check_format(meta));
@@ -1213,6 +1246,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     RAD_ARCH_TRY(declare_encoder(b, meta, m));
     RAD_ARCH_TRY(declare_frame(b, meta, m));
     RAD_ARCH_TRY(declare_codec(b, meta, m));
+    /* A container converted before the reference encoder was in the recipe holds the generator
+     * alone: it serves speech as before, and with no reference templates declared below the
+     * server refuses a request that brings references, saying the model clones no voice. */
+    m.ref_stored = reference_stored(b, m);
+    if (m.ref_stored) RAD_ARCH_TRY(declare_reference(b, meta, m));
 
     if (!ctx->shape_probe) {
         RadAudioGenDecl d{};
@@ -1220,6 +1258,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         d.tmpl = kTemplate;
         d.tmpl_plain = kPlain;
         d.neg_tmpl = kPlain;
+        d.branches = 2;
+        if (m.ref_stored) {
+            d.tmpl_ref = "{references}<bos>[S0]{input}";
+            d.tmpl_ref_instruct = "{references}<bos>[S0]<ins_bos>{instructions}<ins_eos>{input}";
+            d.neg_tmpl_ref = d.tmpl_ref;
+            d.ref_item = "<bos>[S0]{text}{audio}<|audio_eos|>";
+            d.ref_rate = kSampleRate;
+            d.ref_hop = kSamplesPerFrame;
+            d.ref_max_samples = kMaxRefSamples;
+            d.ref_max = 1;
+        }
         d.prompt_whole = 1;
         d.first_frame = 0;
         d.max_prompt = kMaxPrompt;
@@ -1266,34 +1315,91 @@ static void step_backbone(RadCtx* c, const RadBatch* batch, const Model& m) {
                    m.b_h2, m.b_gu, m.b_ff, pos, cu, layer++);
 }
 
+static void step_text(RadCtx* c, const Model& m, int64_t T, RadOperand tokens,
+                       RadOperand pos, RadOperand cu, RadOperand output) {
+    const int64_t qd = m.ge.n_head * m.ge.head_dim, kd = m.ge.n_head_kv * m.ge.head_dim;
+    /* The encoder over each branch's prompt, bidirectional within it; its projection is the
+     * backbone's input. */
+    RAD_ISSUE_N(c, m.op_eembed, T, tokens, RAD_W(m.w_etok),
+              brows(m.b_ex, T));
+    for (const EncLayer& L : m.enc) {
+        RAD_ISSUE_N(c, L.op_n1, T, brows(m.b_ex, T), RAD_W(L.w_n1), brows(m.b_eh, T));
+        RAD_ISSUE_N(c, L.op_qkv, T, brows(m.b_eh, T), RAD_W(L.w_qkv), brows(m.b_eqkv, T));
+        RAD_ISSUE_N(c, L.op_qknr, T, brows(m.b_eqkv, T), pos, RAD_W(L.w_qn), RAD_W(L.w_kn));
+        RAD_ISSUE_N(c, L.op_attn, T, bcol(m.b_eqkv, 0, qd, T), bcol(m.b_eqkv, qd, kd, T),
+                    bcol(m.b_eqkv, qd + kd, kd, T), cu, brows(m.b_eattn, T));
+        RAD_ISSUE_N(c, L.op_o, T, brows(m.b_eattn, T), RAD_W(L.w_o), brows(m.b_eo, T));
+        RAD_ISSUE_N(c, L.op_n2, T, brows(m.b_eo, T), RAD_W(L.w_n2), brows(m.b_eh, T));
+        RAD_ISSUE_N(c, L.op_add1, T, brows(m.b_ex, T), brows(m.b_eh, T), brows(m.b_ex, T));
+        RAD_ISSUE_N(c, L.op_n3, T, brows(m.b_ex, T), RAD_W(L.w_n3), brows(m.b_eh, T));
+        RAD_ISSUE_N(c, L.op_gu, T, brows(m.b_eh, T), RAD_W(L.w_gu), brows(m.b_egu, T));
+        RAD_ISSUE_N(c, L.op_act, T, brows(m.b_egu, T), brows(m.b_eff, T));
+        RAD_ISSUE_N(c, L.op_down, T, brows(m.b_eff, T), RAD_W(L.w_down), brows(m.b_eo, T));
+        RAD_ISSUE_N(c, L.op_n4, T, brows(m.b_eo, T), RAD_W(L.w_n4), brows(m.b_eh, T));
+        RAD_ISSUE_N(c, L.op_add2, T, brows(m.b_ex, T), brows(m.b_eh, T), brows(m.b_ex, T));
+    }
+    RAD_ISSUE_N(c, m.op_enorm, T, brows(m.b_ex, T), RAD_W(m.w_enorm), brows(m.b_eh, T));
+    RAD_ISSUE_N(c, m.op_eproj, T, brows(m.b_eh, T), RAD_W(m.w_eproj), output);
+}
+
+/* rvq_embed reads codebook 0 from its first table and codebooks 1..15 from its
+ * second table, whose row zero must therefore be the start of codebook 1. */
+static RadOperand residual_codebooks(const Model& m) {
+    RadOperand t = RAD_W(m.w_cb);
+    t.offset = (int64_t)kVocab * m.gl.n_embd;
+    t.rows = (int64_t)(kCodes - 1) * kVocab;
+    return t;
+}
+
 static void step_prompt(RadCtx* c, const RadBatch* batch, const Model& m) {
     const RadAudioGenBatch* A = batch->agen_b;
     const int64_t T = batch->n_tok;
-    const int64_t qd = m.ge.n_head * m.ge.head_dim, kd = m.ge.n_head_kv * m.ge.head_dim;
-    const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1);
-    const RadOperand pos = praw(batch->positions, RAD_I32, T);
-    /* The encoder over each branch's prompt, bidirectional within it; its projection is the
-     * backbone's input. */
-    RAD_ISSUE(c, m.op_eembed, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_etok),
-              brows(m.b_ex, T));
-    for (const EncLayer& L : m.enc) {
-        RAD_ISSUE(c, L.op_n1, brows(m.b_ex, T), RAD_W(L.w_n1), brows(m.b_eh, T));
-        RAD_ISSUE(c, L.op_qkv, brows(m.b_eh, T), RAD_W(L.w_qkv), brows(m.b_eqkv, T));
-        RAD_ISSUE(c, L.op_qknr, brows(m.b_eqkv, T), pos, RAD_W(L.w_qn), RAD_W(L.w_kn));
-        RAD_ISSUE_N(c, L.op_attn, T, bcol(m.b_eqkv, 0, qd, T), bcol(m.b_eqkv, qd, kd, T),
-                    bcol(m.b_eqkv, qd + kd, kd, T), cu, brows(m.b_eattn, T));
-        RAD_ISSUE(c, L.op_o, brows(m.b_eattn, T), RAD_W(L.w_o), brows(m.b_eo, T));
-        RAD_ISSUE(c, L.op_n2, brows(m.b_eo, T), RAD_W(L.w_n2), brows(m.b_eh, T));
-        RAD_ISSUE(c, L.op_add1, brows(m.b_ex, T), brows(m.b_eh, T), brows(m.b_ex, T));
-        RAD_ISSUE(c, L.op_n3, brows(m.b_ex, T), RAD_W(L.w_n3), brows(m.b_eh, T));
-        RAD_ISSUE(c, L.op_gu, brows(m.b_eh, T), RAD_W(L.w_gu), brows(m.b_egu, T));
-        RAD_ISSUE(c, L.op_act, brows(m.b_egu, T), brows(m.b_eff, T));
-        RAD_ISSUE(c, L.op_down, brows(m.b_eff, T), RAD_W(L.w_down), brows(m.b_eo, T));
-        RAD_ISSUE(c, L.op_n4, brows(m.b_eo, T), RAD_W(L.w_n4), brows(m.b_eh, T));
-        RAD_ISSUE(c, L.op_add2, brows(m.b_ex, T), brows(m.b_eh, T), brows(m.b_ex, T));
+    if (A->n_ref) {
+        if (!A->prompt_cu_h || A->prompt_cu_h[0] != 0 ||
+            A->prompt_cu_h[batch->n_seq] != T) {
+            rad_step_fail(c, "breeze: reference prompt needs its host branch boundaries");
+            return;
+        }
+        step_reference(c, batch, m);
+        const Reference& E = m.ref;
+        RAD_ISSUE_N(c, E.text_indices, kMaxPrompt, brows(E.text_pos, kMaxPrompt));
+        RAD_ISSUE_N(c, E.eos, 16, brows(E.eos_codes, 16));
+        /* Each branch has two independent text-encoder segments around its audio. The
+         * backbone alone attends across the concatenation. Never encode audio placeholders
+         * or the audio EOS as text, and reset rotary positions for each text segment. */
+        for (int64_t branch = 0; branch < batch->n_seq; ++branch) {
+            const int64_t end = A->prompt_cu_h[branch + 1];
+            for (int64_t t = A->prompt_cu_h[branch]; t < end;) {
+                const int32_t f = A->ref_frame_h[t];
+                if (f >= 0) {
+                    int64_t n = 1;
+                    while (t + n < end && A->ref_frame_h[t + n] == f + n) ++n;
+                    if (t + n >= end) {
+                        rad_step_fail(c, "breeze: reference frames need their audio EOS row");
+                        return;
+                    }
+                    RAD_ISSUE_N(c, E.embed, n, bcol(E.codes, f, n, 16), RAD_W(m.w_cb),
+                                residual_codebooks(m), brow_slice(m.b_x, t, n, m.gl.n_embd));
+                    t += n;
+                    RAD_ISSUE_N(c, E.embed, 1, brows(E.eos_codes, 16), RAD_W(m.w_cb),
+                                residual_codebooks(m), brow_slice(m.b_x, t, 1, m.gl.n_embd));
+                    ++t;
+                } else {
+                    int64_t n = 1;
+                    while (t + n < end && A->ref_frame_h[t + n] < 0) ++n;
+                    ref_bounds(c, E, E.text_cu, n);
+                    step_text(c, m, n, praw(batch->token_ids + t, RAD_I32, n),
+                              brows(E.text_pos, n), brows(E.text_cu, 2),
+                              brow_slice(m.b_x, t, n, m.gl.n_embd));
+                    t += n;
+                }
+            }
+        }
+    } else {
+        step_text(c, m, T, praw(batch->token_ids, RAD_I32, T),
+                  praw(batch->positions, RAD_I32, T),
+                  praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1), brows(m.b_x, T));
     }
-    RAD_ISSUE(c, m.op_enorm, brows(m.b_ex, T), RAD_W(m.w_enorm), brows(m.b_eh, T));
-    RAD_ISSUE(c, m.op_eproj, brows(m.b_eh, T), RAD_W(m.w_eproj), brows(m.b_x, T));
     step_backbone(c, batch, m);
     bool any_last = false;
     for (int64_t i = 0; i < A->n_lane; ++i) any_last = any_last || A->last_h[i];
@@ -1357,10 +1463,8 @@ static void step_frame(RadCtx* c, const RadBatch* batch, const Model& m) {
     /* 3. the frame into its lane's history, and the backbone over the frame's embedding */
     RAD_ISSUE_N(c, m.op_store, n, brows(m.b_codes, kCodes), lanes, frame,
                 brows(m.b_status, m.lanes), brows(m.b_codes_all, m.lanes * kCodes));
-    RadOperand t1 = RAD_W(m.w_cb);
-    t1.offset = (int64_t)kVocab * D;
-    t1.rows = (int64_t)(kCodes - 1) * kVocab;
-    RAD_ISSUE_N(c, m.op_fb, S, brows(m.b_codes, kCodes), RAD_W(m.w_cb), t1, brows(m.b_x, S));
+    RAD_ISSUE_N(c, m.op_fb, S, brows(m.b_codes, kCodes), RAD_W(m.w_cb), residual_codebooks(m),
+                brows(m.b_x, S));
     step_backbone(c, batch, m);
     store_hidden(c, m, A, S, A->last_row, S);
 }
@@ -1475,7 +1579,7 @@ static void step_vocode(RadCtx* c, const RadBatch* batch, const Model& m) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
+    const Model& m = g_model[rad_slot(c)];
     if (!batch->gen || !batch->agen_b) {
         rad_step_fail(c, "breeze is an audio generator and runs generator passes only");
         return;
@@ -1503,6 +1607,11 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 static int64_t text_prepare(int field, const char* in, char* out, int64_t cap) {
     if (!in) return RAD_E_INVAL;
     std::string r = in;
+    if (field == RAD_TEXT_REFERENCE) {
+        for (const char* marker : {"<bos>", "<eos>", "<|AUDIO|>", "<|audio_eos|>",
+                                   "<ins_bos>", "<ins_eos>"})
+            if (r.find(marker) != std::string::npos) return RAD_E_INVAL;
+    }
     if (field == RAD_TEXT_INSTRUCTIONS) {
         const size_t a = r.find_first_not_of(" \t\r\n"), z = r.find_last_not_of(" \t\r\n");
         r = a == std::string::npos ? std::string() : r.substr(a, z - a + 1);
@@ -1521,6 +1630,8 @@ RAD_ARCH_PROBE(breeze)
 extern "C" int64_t rad_arch_text_prepare(int field, const char* in, char* out, int64_t cap) {
     return breeze::text_prepare(field, in, out, cap);
 }
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(breeze, "breeze", "", "0.1.0",
                 "Breeze-TTS-2: a T5Gemma 2 text encoder over a Qwen3 backbone with a 16-codebook "
                 "depth decoder and the Qwen3-TTS 12 Hz codec; 24 kHz mono speech")

@@ -72,8 +72,12 @@ int ref_hc_project         (const RadArgs*, RadStream);
 int ref_mtp_enter          (const RadArgs*, RadStream);
 int ref_layernorm          (const RadArgs*, RadStream);
 int ref_grid_embed         (const RadArgs*, RadStream);
+int ref_grid_embed_pad     (const RadArgs*, RadStream);
 int ref_grid_embed_aa      (const RadArgs*, RadStream);
 int ref_grid_embed_cpe     (const RadArgs*, RadStream);
+int ref_window_order       (const RadArgs*, RadStream);
+int ref_attn_res_mix      (const RadArgs*, RadStream);
+int ref_situ_mul          (const RadArgs*, RadStream);
 int ref_lili_cand          (const RadArgs*, RadStream);
 int ref_lili_attn          (const RadArgs*, RadStream);
 int ref_lili_factor        (const RadArgs*, RadStream);
@@ -122,6 +126,7 @@ int ref_ple_gate           (const RadArgs*, RadStream);
 int ref_ple_conv           (const RadArgs*, RadStream);
 int ref_ple_conv_bias      (const RadArgs*, RadStream);
 int ref_causal_conv1d      (const RadArgs*, RadStream);
+int ref_sconv_res          (const RadArgs*, RadStream);
 int ref_cast               (const RadArgs*, RadStream);
 int ref_softmax            (const RadArgs*, RadStream);
 
@@ -131,10 +136,7 @@ int ref_quant_act_i8g      (const RadArgs*, RadStream);
 int ref_had_quant_act_i8   (const RadArgs*, RadStream);
 int ref_quant_act_fp8      (const RadArgs*, RadStream);
 int ref_quant_cols_fp8     (const RadArgs*, RadStream);
-int ref_had_quant_act_fp8  (const RadArgs*, RadStream);
 int ref_had_quant_act_i8g  (const RadArgs*, RadStream);
-int ref_givens_dense_quant(const RadArgs*, RadStream);
-int ref_givens_rotate(const RadArgs*, RadStream);
 int ref_rmsnorm_quant_fp8  (const RadArgs*, RadStream);
 int ref_gated_quant_fp8    (const RadArgs*, RadStream);
 int ref_gemm_nt_q_gated    (const RadArgs*, RadStream);
@@ -145,6 +147,7 @@ int ref_dflash_tree        (const RadArgs*, RadStream);
 int ref_gram_accum         (const RadArgs*, RadStream);
 int ref_rmsnorm_had_quant_i8(const RadArgs*, RadStream);
 int ref_gated_had_quant_i8 (const RadArgs*, RadStream);
+int ref_gated_quant_i8    (const RadArgs*, RadStream);
 int ref_dequant            (const RadArgs*, RadStream);
 int ref_dequant_w4         (const RadArgs*, RadStream);
 
@@ -167,6 +170,7 @@ int ref_attn_paged         (const RadArgs*, RadStream);
 int ref_attn_paged_anchor_window(const RadArgs*, RadStream);
 int ref_attn_paged_tree    (const RadArgs*, RadStream);
 int ref_attn_paged_sink    (const RadArgs*, RadStream);
+int ref_attn_paged_rel     (const RadArgs*, RadStream);
 int ref_attn_dense         (const RadArgs*, RadStream);
 int ref_attn_cross         (const RadArgs*, RadStream);
 int ref_table_add          (const RadArgs*, RadStream);
@@ -187,7 +191,6 @@ int ref_rope_table         (const RadArgs*, RadStream);
 int ref_qk_norm_rope       (const RadArgs*, RadStream);
 /* image generation (ref_gen.cpp) */
 int ref_ln_mod(const RadArgs*, RadStream);
-int ref_ln_mod_quant_fp8(const RadArgs*, RadStream);
 int ref_gate_add(const RadArgs*, RadStream);
 int ref_timestep_embed(const RadArgs*, RadStream);
 int ref_gather_rows2(const RadArgs*, RadStream);
@@ -198,7 +201,6 @@ int ref_flow_euler(const RadArgs*, RadStream);
 int ref_kd_input(const RadArgs*, RadStream);
 int ref_kd_step(const RadArgs*, RadStream);
 int ref_rms_mod(const RadArgs*, RadStream);
-int ref_rms_mod_quant_fp8(const RadArgs*, RadStream);
 int ref_flow_x0_step(const RadArgs*, RadStream);
 int ref_flow_res_multistep(const RadArgs*, RadStream);
 /* ref_video.cpp */
@@ -238,6 +240,10 @@ int ref_vsa_select(const RadArgs*, RadStream);
 int ref_attn_vsa(const RadArgs*, RadStream);
 /* ref_audio.cpp */
 int ref_conv1d(const RadArgs*, RadStream);
+int ref_elu(const RadArgs*, RadStream);
+int ref_vq_euclidean(const RadArgs*, RadStream);
+int ref_elu_shape(const RadParam*, int, int, RadOpdDesc*);
+int ref_vq_euclidean_shape(const RadParam*, int, int, RadOpdDesc*);
 int ref_conv_t1d(const RadArgs*, RadStream);
 int ref_snake(const RadArgs*, RadStream);
 int ref_snake_aa(const RadArgs*, RadStream);
@@ -299,6 +305,7 @@ int ref_moe_cb_relayout    (const RadParam*, int, int, const RadEncoding*, const
 int ref_moe_cb_unrelayout  (const RadParam*, int, int, const RadEncoding*, const int*,
                             const void*, int64_t, const RadTensor*, int);
 int ref_scale_rows         (const RadArgs*, RadStream);
+int ref_l2_clip            (const RadArgs*, RadStream);
 int ref_moe_gather         (const RadArgs*, RadStream);
 int ref_row_topk           (const RadArgs*, RadStream);
 int ref_row_topk_merge     (const RadArgs*, RadStream);
@@ -368,8 +375,12 @@ REF_SHAPE_FN(ref_hc_project);
 REF_SHAPE_FN(ref_mtp_enter);
 REF_SHAPE_FN(ref_layernorm);
 REF_SHAPE_FN(ref_grid_embed);
+REF_SHAPE_FN(ref_grid_embed_pad);
 REF_SHAPE_FN(ref_grid_embed_aa);
 REF_SHAPE_FN(ref_grid_embed_cpe);
+REF_SHAPE_FN(ref_window_order);
+REF_SHAPE_FN(ref_attn_res_mix);
+REF_SHAPE_FN(ref_situ_mul);
 REF_SHAPE_FN(ref_lili_cand);
 REF_SHAPE_FN(ref_lili_attn);
 REF_SHAPE_FN(ref_lili_factor);
@@ -418,6 +429,7 @@ REF_SHAPE_FN(ref_ple_gate);
 REF_SHAPE_FN(ref_ple_conv);
 REF_SHAPE_FN(ref_ple_conv_bias);
 REF_SHAPE_FN(ref_causal_conv1d);
+REF_SHAPE_FN(ref_sconv_res);
 REF_SHAPE_FN(ref_cast);
 REF_SHAPE_FN(ref_softmax);
 
@@ -426,10 +438,7 @@ REF_SHAPE_FN(ref_quant_act_i8g);
 REF_SHAPE_FN(ref_had_quant_act_i8);
 REF_SHAPE_FN(ref_quant_act_fp8);
 REF_SHAPE_FN(ref_quant_cols_fp8);
-REF_SHAPE_FN(ref_had_quant_act_fp8);
 REF_SHAPE_FN(ref_had_quant_act_i8g);
-REF_SHAPE_FN(ref_givens_dense_quant);
-REF_SHAPE_FN(ref_givens_rotate);
 REF_SHAPE_FN(ref_rmsnorm_quant_fp8);
 REF_SHAPE_FN(ref_gated_quant_fp8);
 REF_SHAPE_FN(ref_gemm_nt_q_gated);
@@ -440,6 +449,7 @@ REF_SHAPE_FN(ref_dflash_tree);
 REF_SHAPE_FN(ref_gram_accum);
 REF_SHAPE_FN(ref_rmsnorm_had_quant_i8);
 REF_SHAPE_FN(ref_gated_had_quant_i8);
+REF_SHAPE_FN(ref_gated_quant_i8);
 REF_SHAPE_FN(ref_dequant);
 REF_SHAPE_FN(ref_dequant_w4);
 
@@ -459,6 +469,7 @@ REF_SHAPE_FN(ref_attn_paged);
 REF_SHAPE_FN(ref_attn_paged_anchor_window);
 REF_SHAPE_FN(ref_attn_paged_tree);
 REF_SHAPE_FN(ref_attn_paged_sink);
+REF_SHAPE_FN(ref_attn_paged_rel);
 REF_SHAPE_FN(ref_attn_dense);
 REF_SHAPE_FN(ref_attn_cross);
 REF_SHAPE_FN(ref_table_add);
@@ -476,7 +487,6 @@ REF_SHAPE_FN(ref_pixtral_merge);
 REF_SHAPE_FN(ref_rope_table);
 REF_SHAPE_FN(ref_qk_norm_rope);
 REF_SHAPE_FN(ref_ln_mod);
-REF_SHAPE_FN(ref_ln_mod_quant_fp8);
 REF_SHAPE_FN(ref_gate_add);
 REF_SHAPE_FN(ref_timestep_embed);
 REF_SHAPE_FN(ref_gather_rows2);
@@ -487,7 +497,6 @@ REF_SHAPE_FN(ref_flow_euler);
 REF_SHAPE_FN(ref_kd_input);
 REF_SHAPE_FN(ref_kd_step);
 REF_SHAPE_FN(ref_rms_mod);
-REF_SHAPE_FN(ref_rms_mod_quant_fp8);
 REF_SHAPE_FN(ref_flow_x0_step);
 REF_SHAPE_FN(ref_flow_res_multistep);
 REF_SHAPE_FN(ref_patch_unfold);
@@ -571,6 +580,7 @@ REF_SHAPE_FN(ref_moe_gemm_q_mod4);
 REF_SHAPE_FN(ref_moe_gemm_w4a8);
 REF_SHAPE_FN(ref_moe_gemm_w4a4);
 REF_SHAPE_FN(ref_scale_rows);
+REF_SHAPE_FN(ref_l2_clip);
 REF_SHAPE_FN(ref_moe_gather);
 REF_SHAPE_FN(ref_row_topk);
 REF_SHAPE_FN(ref_row_topk_merge);
@@ -602,6 +612,51 @@ REF_SHAPE_FN(ref_sample_mask);
 REF_SHAPE_FN(ref_sample_pick);
 REF_SHAPE_FN(ref_sample_argmax);
 REF_SHAPE_FN(ref_sample_logprobs);
+
+int ref_attn_umt5(const RadArgs*, RadStream);
+int ref_gelu_umt5(const RadArgs*, RadStream);
+REF_SHAPE_FN(ref_attn_umt5);
+REF_SHAPE_FN(ref_gelu_umt5);
+
+int ref_wan_rope_table(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_rope_table);
+
+int ref_wan_rope(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_rope);
+
+int ref_wan_mod_norm(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_mod_norm);
+
+int ref_wan_gated_add(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_gated_add);
+
+int ref_wan_unpatch(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_unpatch);
+
+int ref_wan_vae_frame_cu(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_vae_frame_cu);
+
+int ref_wan_vae_history(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_vae_history);
+
+int ref_wan_vae_expand(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_wan_vae_expand);
+
+int ref_timestep_embed_f64(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_timestep_embed_f64);
+
+int ref_flow_unipc_step(const RadArgs*, RadStream);
+
+REF_SHAPE_FN(ref_flow_unipc_step);
 
 }  /* extern "C" */
 #endif /* RAD_REF_OPS_H */

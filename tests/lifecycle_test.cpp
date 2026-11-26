@@ -119,7 +119,7 @@ TEST(a_dropped_request_is_reaped_once_whether_buffered_or_streamed) {
     finish_and_check_reaped(f);
 }
 
-/* A server stopping under a buffered request answers it 429 "shutting down" and still reaps
+/* A server stopping under a buffered request answers it 429 "stopping" and still reaps
  * what it had submitted. */
 TEST(a_request_waiting_when_the_server_stops_is_reaped_once) {
     Fixture f;
@@ -133,7 +133,7 @@ TEST(a_request_waiting_when_the_server_stops_is_reaped_once) {
     f.srv->stop();
     client.join();
     CHECK_EQ(r.status, 429);
-    CHECK(has(r.body, "shutting down"));
+    CHECK(has(r.body, "stopping"));
     finish_and_check_reaped(f);
 }
 

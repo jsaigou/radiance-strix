@@ -40,7 +40,7 @@ void bind_kv_pools(const Program& p, const std::function<const KVGroupPlan*(int3
             b.shape[0] = gp->pool_blocks();
             b.shape[1] = d.n_head_kv;
             b.shape[2] = gp->block_size;
-            b.shape[3] = 2 * d.head_dim;
+            b.shape[3] = rad_kv_row_elems(d.dtype, d.head_dim);
             kv_bind_views(*gp, &b);
             break;
         case RAD_KV_LINEAR:

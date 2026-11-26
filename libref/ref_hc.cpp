@@ -122,8 +122,8 @@ int ref_hc_read(const RadArgs* a, RadStream) {
         if (numel(q) < rows * n || !s || !s->data || numel(s) < rows * ngrp) return RAD_E_SHAPE;
     }
     /* The rotated form rotates each scale group whole, so the group must be a power of two that
-     * tiles the row; no weight block was rotated across padding. The result equals
-     * had_quant_act_fp8 of the stored `x`. */
+     * tiles the row; no weight block was rotated across padding. The result is the
+     * rotated quantiser's (had_quant_act_i8g's at int8 codes) of the stored `x`. */
     int64_t rg = 0;
     if (rq) {
         rg = p_int(a, "group", 0);
@@ -198,12 +198,14 @@ int ref_hc_read(const RadArgs* a, RadStream) {
             for (int64_t gi = 0; gi < ngrp; ++gi) {
                 const int64_t k0 = gi * g, k1 = (k0 + g < n) ? k0 + g : n;
                 const float sc = q8_group([&](int64_t i) { return ldt(x, xb + (k0 + i) * xs); },
-                                           k1 - k0, 448.0f, q, qb + k0 * qs, qs);
+                                           k1 - k0, q->dtype == RAD_I8 ? 127.0f : 448.0f, q,
+                                           qb + k0 * qs, qs);
                 stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
             }
         }
 
-        /* ---- optional rotated fp8 form of x, from the same stored values. */
+        /* ---- optional rotated form of x, from the same stored values: E4M3 codes, or int8
+         * (had_quant_act_i8g's) where the buffer is. */
         if (rq) {
             float buf[REF_HAD_MAX];
             const int64_t qb = rowoff(rq, r, n), qs = laststride(rq), rgrp = n / rg;
@@ -211,7 +213,8 @@ int ref_hc_read(const RadArgs* a, RadStream) {
                 const int64_t k0 = gi * rg;
                 for (int64_t i = 0; i < rg; ++i) buf[i] = ldt(x, xb + (k0 + i) * xs);
                 fwht(buf, rg);
-                const float sc = q8_group([&](int64_t i) { return buf[i]; }, rg, 448.0f, rq,
+                const float sc = q8_group([&](int64_t i) { return buf[i]; }, rg,
+                                           rq->dtype == RAD_I8 ? 127.0f : 448.0f, rq,
                                            qb + k0 * qs, qs);
                 stt(rs, rowoff(rs, r, rgrp) + gi * laststride(rs), sc);
             }

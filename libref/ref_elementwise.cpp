@@ -316,6 +316,178 @@ int ref_grid_embed_cpe(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ grid_embed_pad */
+/* The same learned table and operands as grid_embed's, resampled in the half-pixel-centre form
+ * (align_corners=False) with grid_sample's padding_mode="zeros": taps whose UNCLAMPED index falls
+ * outside [0, side-1) contribute nothing rather than reading the edge. Per axis,
+ * src = (i + 0.5) * side / size - 0.5; floor(src) and floor(src) + 1, each carrying the linear hat
+ * weight (1 - |src - tap|)+ masked to zero off the table. For grids no larger than the table the
+ * mask never fires and the op agrees with grid_embed_aa's centre positions (not grid_embed's
+ * corners-aligned ones); it differs from them only when a grid upsamples past the table, which is
+ * the common case for Muse. The four products are summed in f32 in grid_embed's order (top-left,
+ * top-right, bottom-left, bottom-right), rounded to x's dtype, then added and rounded again. */
+int ref_grid_embed_pad(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *tab = &a->t[1], *crd = &a->t[2];
+    const int64_t n = p_int(a, "n", tab->rank ? tab->shape[tab->rank - 1] : 0);
+    const int64_t side = p_int(a, "side", 0);
+    if (n <= 0 || side <= 0 || numel(tab) < side * side * n) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0 || crd->rank != 2 || crd->shape[0] < 4 || crd->shape[1] < rows)
+        return RAD_E_SHAPE;
+    const int64_t cs = crd->stride[0], ms = crd->stride[1];
+    const int64_t ts = laststride(tab);
+
+    REF_PAR_FOR(rows * n * 4)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t gr = ld_int(crd->dtype, crd->data, 0 * cs + r * ms);
+        const int64_t gc = ld_int(crd->dtype, crd->data, 1 * cs + r * ms);
+        const int64_t gh = ld_int(crd->dtype, crd->data, 2 * cs + r * ms);
+        const int64_t gw = ld_int(crd->dtype, crd->data, 3 * cs + r * ms);
+        int64_t th[2], tw[2];
+        float wh[2], ww[2];
+        auto axis = [&](int64_t idx, int64_t size, int64_t* t, float* w) {
+            if (size < 1) size = 1;
+            const float src = (float)side / (float)size * ((float)idx + 0.5f) - 0.5f;
+            const float fl = std::floor(src);
+            for (int k = 0; k < 2; ++k) {
+                const int64_t raw = (int64_t)fl + k;
+                t[k] = raw < 0 ? 0 : (raw > side - 1 ? side - 1 : raw);
+                const float d = std::fabs(src - fl - (float)k);
+                const float u = 1.0f - d > 0.0f ? 1.0f - d : 0.0f;
+                w[k] = raw >= 0 && raw <= side - 1 ? u : 0.0f;
+            }
+        };
+        axis(gr, gh, th, wh);
+        axis(gc, gw, tw, ww);
+        const int64_t xb = rowoff(x, r, n), xs = laststride(x);
+        for (int64_t i = 0; i < n; ++i) {
+            float acc = 0.0f;
+            for (int ki = 0; ki < 2; ++ki)
+                for (int kj = 0; kj < 2; ++kj)
+                    acc += ldt(tab, rowoff(tab, th[ki] * side + tw[kj], n) + i * ts) *
+                           (wh[ki] * ww[kj]);
+            const float pe = round_dt(x->dtype, acc);
+            stt(x, xb + i * xs, ldt(x, xb + i * xs) + pe);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ window_order */
+/* The window-attention permutation of one encoder pass, computed entirely from the on-device
+ * coordinate planes: HF's get_vision_window_index as a gather-index computation. Windows partition
+ * each segment (one segment == one frame): window row = row/window, window col = col/window,
+ * windows scanned window-row-major and ragged at the segment's right and bottom edges; within a
+ * window patches keep raster order, and windows never span segments.
+ *
+ * `crd` is [4, P] i32 -- row, column, segment height, segment width per patch -- and `cu` is [S+1]
+ * i32, the per-frame segment boundaries in patches. Outputs, all i32: `idx` [P], slot -> source
+ * patch (the gather index); `inv` [P], source patch -> slot; `pos` [2, P], each slot's rope
+ * positions (col + 1, row + 1) -- Muse's rotary wants the axes swapped and offset by one relative
+ * to the coordinate planes (HF's position_ids.flip(-1) + 1) -- laid out component-major like the
+ * planes; and `cuw` [P+1], the cumulative window boundaries in the permuted order, n_windows + 1
+ * entries used, the rest holding the total. `M` is the patches this pass covers, 1..P: slots past
+ * M are the identity, so a caller may reuse buffers sized for a bigger pass. `window` <= 0 makes
+ * the permutation the identity and cuw = cu. */
+int ref_window_order(const RadArgs* a, RadStream) {
+    if (!have(a, 6)) return RAD_E_INVAL;
+    const RadTensor *crd = &a->t[0], *cu = &a->t[1];
+    RadTensor *idx = const_cast<RadTensor*>(&a->t[2]), *inv = const_cast<RadTensor*>(&a->t[3]),
+              *pos = const_cast<RadTensor*>(&a->t[4]), *cuw = const_cast<RadTensor*>(&a->t[5]);
+    const int64_t M = p_int(a, "M", 0);
+    const int64_t win = p_int(a, "window", 0);
+    if (M <= 0 || crd->rank != 2 || crd->shape[0] < 4 || crd->shape[1] < M) return RAD_E_SHAPE;
+    if (numel(cu) < 2 || numel(idx) < M || numel(inv) < M || numel(pos) < 2 * M ||
+        numel(cuw) < M + 1)
+        return RAD_E_SHAPE;
+    const int64_t P = crd->shape[1];
+    const int64_t cs = crd->stride[0], ms = crd->stride[1];
+    auto gx = [&](int c, int64_t p) {
+        return ld_int(crd->dtype, crd->data, (int64_t)c * cs + p * ms);
+    };
+
+    /* The identity: every slot its own patch, cuw = cu, the tail padded with the last boundary. */
+    auto identity = [&]() {
+        for (int64_t p = 0; p < P; ++p) {
+            st_int(idx->dtype, idx->data, p, p);
+            st_int(inv->dtype, inv->data, p, p);
+            if (p < M) {
+                st_int(pos->dtype, pos->data, p, gx(1, p) + 1);
+                st_int(pos->dtype, pos->data, P + p, gx(0, p) + 1);
+            } else {
+                st_int(pos->dtype, pos->data, p, 1);
+                st_int(pos->dtype, pos->data, P + p, 1);
+            }
+        }
+        int64_t last = 0;
+        const int64_t k = numel(cu) < M + 1 ? numel(cu) : M + 1;
+        for (int64_t i = 0; i < k; ++i) {
+            last = ld_int(cu->dtype, cu->data, i);
+            st_int(cuw->dtype, cuw->data, i, last);
+        }
+        for (int64_t i = k; i < M + 1; ++i) st_int(cuw->dtype, cuw->data, i, last);
+    };
+    if (win <= 0) {
+        identity();
+        return RAD_OK;
+    }
+
+    /* Slot arithmetic: patch p's segment, its window and its rank in the window follow from the
+     * coordinates alone, so a first walk writes the window boundaries and a second scatters. */
+    std::vector<int64_t> seg(M), seg_nw, seg_first_win;
+    std::vector<int64_t> wbase((size_t)M);      /* each window's base slot; windows <= M */
+    int64_t s = 0, slot = 0, nwin = 0;
+    const int64_t S = numel(cu) - 1;
+    while (s < S) {
+        const int64_t start = ld_int(cu->dtype, cu->data, s);
+        if (start >= M) break;
+        int64_t end = ld_int(cu->dtype, cu->data, s + 1);
+        if (end > M) end = M;
+        const int64_t gh = start < end ? gx(2, start) : 1;
+        const int64_t gw = start < end ? gx(3, start) : 1;
+        const int64_t nh = (gh + win - 1) / win, nw = (gw + win - 1) / win;
+        seg_first_win.push_back(nwin);
+        seg_nw.push_back(nw);
+        for (int64_t p = start; p < end; ++p) seg[p] = (int64_t)seg_first_win.size() - 1;
+        for (int64_t wr = 0; wr < nh; ++wr)
+            for (int64_t wc = 0; wc < nw; ++wc) {
+                const int64_t rows_in = std::min(win, gh - wr * win);
+                const int64_t cols_in = std::min(win, gw - wc * win);
+                st_int(cuw->dtype, cuw->data, nwin, slot);
+                wbase[(size_t)nwin] = slot;
+                ++nwin;
+                slot += rows_in * cols_in;
+            }
+        ++s;
+    }
+    st_int(cuw->dtype, cuw->data, nwin, slot);
+    for (int64_t i = nwin + 1; i < M + 1; ++i) st_int(cuw->dtype, cuw->data, i, slot);
+
+    for (int64_t p = 0; p < P; ++p) {
+        if (p >= M) {
+            st_int(idx->dtype, idx->data, p, p);
+            st_int(inv->dtype, inv->data, p, p);
+            st_int(pos->dtype, pos->data, p, 1);
+            st_int(pos->dtype, pos->data, P + p, 1);
+            continue;
+        }
+        const int64_t r = gx(0, p), c = gx(1, p);
+        const int64_t gw = gx(3, p);
+        int64_t wr = r / win, wc = c / win;
+        if (wr < 0) wr = 0;
+        if (wc < 0) wc = 0;
+        const int64_t cols_in = std::min(win, gw - wc * win);
+        const int64_t wid = seg_first_win[(size_t)seg[p]] + wr * seg_nw[(size_t)seg[p]] + wc;
+        const int64_t at = wbase[(size_t)wid] + (r - wr * win) * cols_in + (c - wc * win);
+        st_int(idx->dtype, idx->data, at, p);
+        st_int(inv->dtype, inv->data, p, at);
+        st_int(pos->dtype, pos->data, at, c + 1);
+        st_int(pos->dtype, pos->data, P + at, r + 1);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ add / mul */
 /* Elementwise over the output's extent. `b` may be a single row of exactly `n` elements, which
  * broadcasts along rows (a bias add); nothing else broadcasts, so a shape bug cannot pass as a
@@ -420,6 +592,51 @@ int ref_scale_rows(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ l2_clip */
+/* y[r, i] = v[r, i] * f[r, g] * tau[r], with v = x * w (w [n], optional, read per column), g the
+ * group of column i (n / group groups of `group` columns), f = min(1, threshold / (||v_g|| + 1e-6))
+ * and tau = 1 + alpha * ln(max(1, (pos + 1) / floor)) from positions[r] (1 with no positions).
+ * This is the QK and relative-bias clip of Inkling 2 (tests/mkinkling2golden.py's l2clip after the
+ * per-channel scale). Each group's norm is taken before any of its outputs are written, and each
+ * element is read before it is stored, so y may alias x. */
+int ref_l2_clip(const RadArgs* a, RadStream) {
+    if (a->n_t < 4 || !t_in(a, 0) || !t_in(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *w = t_in(a, 1), *pos = t_in(a, 2), *y = &a->t[3];
+    const int64_t n = p_int(a, "n", 0), g = p_int(a, "group", n);
+    if (n <= 0 || g <= 0 || n % g != 0) return RAD_E_SHAPE;
+    const float thr = p_f32(a, "threshold", 0.0f);
+    const float flr = p_f32(a, "floor", 1.0f), alpha = p_f32(a, "alpha", 0.0f);
+    if (!(thr > 0.0f) || !(flr > 0.0f)) return RAD_E_INVAL;
+    const int64_t rows = rows_of(y, n);
+    if (rows <= 0 || numel(x) < rows * n || numel(y) < rows * n) return RAD_E_SHAPE;
+    if (w && numel(w) < n) return RAD_E_SHAPE;
+    if (pos && numel(pos) < rows) return RAD_E_SHAPE;
+
+    const int64_t xs = laststride(x), ys = laststride(y), ws = w ? laststride(w) : 0;
+    REF_PAR_FOR(rows * n)
+    for (int64_t r = 0; r < rows; ++r) {
+        float tau = 1.0f;
+        if (pos) {
+            const double p = (double)ld_int(pos->dtype, pos->data, offlin(pos, r));
+            tau = 1.0f + alpha * (float)std::log(std::fmax(1.0, (p + 1.0) / (double)flr));
+        }
+        const int64_t xb = rowoff(x, r, n), yb = rowoff(y, r, n);
+        for (int64_t g0 = 0; g0 < n; g0 += g) {
+            double ss = 0.0;
+            for (int64_t i = g0; i < g0 + g; ++i) {
+                const double v = (double)ldt(x, xb + i * xs) * (w ? (double)ldt(w, i * ws) : 1.0);
+                ss += v * v;
+            }
+            const double f = std::fmin(1.0, (double)thr / (std::sqrt(ss) + 1e-6));
+            for (int64_t i = g0; i < g0 + g; ++i) {
+                const float v = ldt(x, xb + i * xs) * (w ? ldt(w, i * ws) : 1.0f);
+                stt(y, yb + i * ys, (float)(v * f) * tau);
+            }
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ silu_mul */
 /* y[.., i] = silu(gate_up[.., i]) * gate_up[.., n + i]. The gate is the first half, the order in
  * which rad-convert fuses gate and up. */
@@ -437,6 +654,32 @@ int ref_silu_mul(const RadArgs* a, RadStream) {
         const int64_t gs = laststride(gu), ys = laststride(y);
         for (int64_t i = 0; i < n; ++i)
             stt(y, yb + i * ys, act_silu(ldt(gu, gb + i * gs)) * ldt(gu, gb + (n + i) * gs));
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ situ_mul */
+/* y[.., i] = situ(gate_up[.., i], gate_up[.., n + i]) with the gate first, as silu_mul. The two
+ * caps are read as f64 and used in f32; a cap of 0 is no softcap on that side. */
+int ref_situ_mul(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *gu = &a->t[0], *y = &a->t[1];
+    const int64_t n = p_int(a, "n", numel(y));
+    const float gcap = p_f32(a, "gate_cap", 0.0f), ucap = p_f32(a, "up_cap", 0.0f);
+    if (n <= 0) return RAD_E_SHAPE;
+    if (!(gcap >= 0.0f) || !(ucap >= 0.0f) || !std::isfinite(gcap) || !std::isfinite(ucap))
+        return RAD_E_INVAL;
+    const int64_t rows = rows_of(y, n);
+    if (rows <= 0 || numel(gu) < rows * 2 * n) return RAD_E_SHAPE;
+
+    REF_PAR_FOR(rows * n)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t gb = rowoff(gu, r, 2 * n), yb = rowoff(y, r, n);
+        const int64_t gs = laststride(gu), ys = laststride(y);
+        for (int64_t i = 0; i < n; ++i) {
+            const float g = ldt(gu, gb + i * gs), u = ldt(gu, gb + (n + i) * gs);
+            stt(y, yb + i * ys, act_situ_gate(g, gcap) * act_situ_up(u, ucap));
+        }
     }
     return RAD_OK;
 }

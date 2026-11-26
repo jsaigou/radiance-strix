@@ -85,6 +85,7 @@ struct ChatReply {
 
 ChatReply chat_stream(const std::string& body) {
     ChatReply a;
+    std::string reasoning_alias;
     int bad = 0;
     for (const std::string& p : sse_payloads(body, &bad)) {
         if (p == "[DONE]") continue;
@@ -96,6 +97,7 @@ ChatReply chat_stream(const std::string& body) {
         if (d.contains("content") && d["content"].is_string())
             a.content += d["content"].get<std::string>();
         if (d.contains("reasoning_content")) a.reasoning += d["reasoning_content"].get<std::string>();
+        if (d.contains("reasoning")) reasoning_alias += d["reasoning"].get<std::string>();
         if (!d.contains("tool_calls")) continue;
         for (const json& tc : d["tool_calls"]) {
             const size_t k = tc["index"].get<size_t>();
@@ -106,6 +108,7 @@ ChatReply chat_stream(const std::string& body) {
         }
     }
     CHECK_EQ(bad, 0);
+    CHECK_EQ(reasoning_alias, a.reasoning);
     return a;
 }
 
@@ -116,6 +119,7 @@ ChatReply chat_buffered(const std::string& body) {
     const json& m = c["message"];
     if (m["content"].is_string()) a.content = m["content"].get<std::string>();
     if (m.contains("reasoning_content")) a.reasoning = m["reasoning_content"].get<std::string>();
+    CHECK_EQ(m.value("reasoning", std::string()), a.reasoning);
     if (m.contains("tool_calls"))
         for (const json& tc : m["tool_calls"])
             a.calls.emplace_back(tc["function"]["name"].get<std::string>(),

@@ -68,8 +68,14 @@ public:
 
     /* Drop the blob from the page cache and this process's page tables, so a container larger
      * than RAM does not leave the cache full of pages nothing will read. Only the blob: the tables
-     * are small and read constantly. Advisory; the kernel may decline. */
+     * are small and read constantly. The ranges named to keep_cached() are left alone, on whole
+     * pages. Advisory; the kernel may decline either way. */
     void drop_blob_cache() const;
+    /* Names [p, p + n) as read through the mapping for the engine's life (the mapped tier: an
+     * n-gram table), so no drop_blob_cache() frees its pages: a gather from dropped pages starts
+     * cold, from the drive. An address outside the container is ignored (a copy in RAM, or a
+     * table read from its own file). Returns the bytes now kept. */
+    int64_t keep_cached(const void* p, int64_t n);
 
     /* Drop one range of the blob behind a single forward cursor. A buffered front-to-back read of
      * a container larger than RAM otherwise builds reclaim pressure that slows the read itself.
@@ -153,6 +159,7 @@ private:
     std::string path_;
     uint8_t*    base_ = nullptr;
     int64_t     size_ = 0;
+    std::vector<std::pair<int64_t, int64_t>> keep_;   /* keep_cached: (blob offset, bytes) */
     int         fd_   = -1;
 
     const RadFileHeader*  hdr_  = nullptr;
@@ -167,6 +174,21 @@ private:
     std::vector<ExpertGroup>                      groups_;
     std::unordered_map<std::string_view, int64_t> by_name_;
 };
+
+/* The blob range [*off, *off + *len) a pointer covers, when it lies wholly inside the container
+ * [base, base + size): what a load records for the mapped tier. False when the address is not in
+ * the blob (a copy in RAM under `ngram-placement: ram`, or a table read from its own file under
+ * `disk=DIR`), where keeping it would name bytes that belong to something else. */
+bool rad_blob_range(const uint8_t* base, int64_t size, const void* p, int64_t n,
+                    int64_t* off, int64_t* len);
+
+/* The ranges of [tables, size) a page-cache drop must free when `keep` stays: the complement of
+ * the keep ranges as (offset, bytes), the same convention `keep` uses. Page-rounded the way the
+ * drop needs it -- a gap's start rounds up and its end down, so a page holding kept bytes is never
+ * dropped. Unsorted, overlapping and out-of-range input is merged and clamped; a keep list covering
+ * the whole blob gives no ranges. */
+std::vector<std::pair<int64_t, int64_t>> rad_keep_complement(
+    int64_t tables, int64_t size, std::vector<std::pair<int64_t, int64_t>> keep);
 
 /* ================================================================== writer */
 /* Streaming writer: the blob is never held in RAM (a checkpoint may be 100 GB). The tables
@@ -220,9 +242,12 @@ public:
      * afterwards the old tables are dead bytes. finish() leaves `<path>.pre-append` (the old
      * header and length) to restore it.
      *
-     * New expert weights are refused: a layer's experts sit at a fixed stride and cannot be
-     * extended. The caller must be the file's only user, since a process mapping it would see the
-     * header change under it. */
+     * A layer's experts sit at a fixed stride, so a layer whose experts are kept (add_existing)
+     * takes no further one. A layer none of whose experts is kept takes its whole table, written
+     * as in a new file: experts 0..n-1 in order, each one's slots in order -- a layer `old` holds
+     * none of, or one whose old table the caller leaves behind as dead bytes. An old weight the
+     * caller neither keeps nor writes again is dead bytes too. The caller must be the file's only
+     * user, since a process mapping it would see the header change under it. */
     int  begin_append(const char* path, const RadFile& old);
     /* A weight `old` already holds, recorded at the offsets it has there. Its encoding and planes
      * are the old entry's; its name, provenance and movement group are `w`'s. */
@@ -288,6 +313,9 @@ private:
     uint64_t old_data_off_ = 0;
     RadFileHeader old_hdr_{};
     std::vector<uint8_t> dir_abs_;
+    /* While extending in place: the layers an expert was kept in (add_existing) and the layers a
+     * new expert was reserved in. A layer is in one of them only. */
+    std::unordered_set<int32_t> kept_expert_layers_, new_expert_layers_;
 
     std::string arch_, model_, quant_, recipe_, created_by_;
 

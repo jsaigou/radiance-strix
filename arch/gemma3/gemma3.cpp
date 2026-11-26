@@ -85,7 +85,8 @@ struct ClassGeom {
  *   - `mx`: OCP-MXFP4 (e2m1 codes, an E8M0 exponent per [1 x 32]), gemm_nt_q at mxfp4a8 over
  *     quant_act_fp8's E4M3 codes, an f32 scale per (row, 128); the exponent plane is passed twice,
  *     as b_scale and as b_ref (arch/common/rad_fp8.h LinearFP8 says why).
- * Neither has a fused norm/quantiser here, so the junctions stay off for them. */
+ * The i8g grid takes the `_i8g` twins of the fused junction and of the GELU quantiser, as
+ * gemma4_bf16's does; MXFP4 has its own junction (G3JunctionFP8). */
 struct G3Linear {
     rad_weight w = 0, ws = 0, wref = 0;
     rad_op     op = 0, op_q = 0;
@@ -192,6 +193,7 @@ inline int G3Linear::declare(RadBuilder* b, Names& nm, const Geom& g, const char
 
     i8g = known && linear_is_w8(enc);
     mx  = known && linear_is_mxfp4(enc);
+    if (mx) return linear_refuse_retired(wn, "MXFP4");
     /* Asymmetric int4 (libquant `codes=u4 zero=u8 group=128 scale=f16`), unrotated: gemm_nt_q at
      * w4a8i8_asym over the same per-(row, 128) int8 activation as i8g. LinearFP8 serves this grid
      * only under ParoQuant's rotation, which a tensor-parallel shard cannot cut; unrotated it shards
@@ -698,8 +700,9 @@ int Gemma3Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const 
                RAD_NOWEIGHTS),
               {w.gu}, {w.ffn});
     // Not under calibration: the tap reads the bf16 activation this fusion never writes.
-    if (ln_down.quant && !ln_down.shared_in && !calib_dir() && rad_op_declared(b, "gelu_mul_quant_i8"))
-        op_gq = rw(b, RAD_OP(b, "gelu_mul_quant_i8",
+    const char* gq = ln_down.quant ? "gelu_mul_quant_i8" : ln_down.i8g ? "gelu_mul_quant_i8g" : nullptr;
+    if (gq && !ln_down.shared_in && !calib_dir() && rad_op_declared(b, gq))
+        op_gq = rw(b, RAD_OP(b, gq,
                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_ff), RAD_STR("dtype", g.dtype)),
                      RAD_NOWEIGHTS),
                    {w.gu}, {ln_down.q8, ln_down.s8});
@@ -782,7 +785,8 @@ void Gemma3Mlp::step(RadCtx* c, const RadBatch* batch, bool entry_done, bool tai
     RAD_ISSUE(c, op_add,   brows(w.x, T),   brows(w.h, T),  brows(w.x, T));
 }
 
-/* ---- one residual junction as one op (libr4d `rmsnorm_quant_i8`): [post-norm of the branch,
+/* ---- one residual junction as one op (libr4d `rmsnorm_quant_i8`, on quant_act_i8g's grid
+ * `rmsnorm_quant_i8g`): [post-norm of the branch,
  * the add into the stream,] the next block's norm and its int8 quantiser. gemma4_bf16's
  * G4Junction without the layer scalar. */
 struct G3Junction {
@@ -794,25 +798,27 @@ struct G3Junction {
     int declare(RadBuilder* b, const Geom& g, rad_buf x_, rad_buf res_, rad_weight w_,
                 rad_weight wp_, const G3Linear& into) {
         x = x_; res = res_; w = w_; wp = wp_; q8 = into.q8; s8 = into.s8;
-        if (!into.quant || into.shared_in || !q8 || !s8 || !w || (wp && !res))
+        if (!(into.quant || into.i8g) || into.shared_in || !q8 || !s8 || !w || (wp && !res))
             return RAD_E_INVAL;
+        const char* rq  = into.i8g ? "rmsnorm_quant_i8g" : "rmsnorm_quant_i8";
+        const char* arq = into.i8g ? "ar_rmsnorm_quant_i8g" : "ar_rmsnorm_quant_i8";
         const RadParam p[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype),
                                RAD_F64("wadd", g.wadd) };
         const rad_weight ws[2] = { w, wp };
         const int nw = wp ? 2 : 1;
-        if (rad_op_declared(b, "rmsnorm_quant_i8"))
-            op = rad_decl_op(b, "rmsnorm_quant_i8", p, (int)(sizeof p / sizeof p[0]), ws, nw);
+        if (rad_op_declared(b, rq))
+            op = rad_decl_op(b, rq, p, (int)(sizeof p / sizeof p[0]), ws, nw);
         if (!op) return RAD_OK;
         const rad_buf rd[2] = { x, res };
         const rad_buf wr[3] = { q8, s8, res };
         rad_op_reads (b, op, rd, res ? 2 : 1);
         rad_op_writes(b, op, wr, res ? 3 : 2);
-        if (res && g.world == 2 && rad_op_declared(b, "ar_rmsnorm_quant_i8")) {
+        if (res && g.world == 2 && rad_op_declared(b, arq)) {
             const RadParam pa[] = { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                     RAD_F64("eps", g.eps), RAD_INT("world_size", g.world),
                                     RAD_STR("dtype", g.dtype), RAD_F64("wadd", g.wadd) };
-            op_ar = rad_decl_op(b, "ar_rmsnorm_quant_i8", pa, (int)(sizeof pa / sizeof pa[0]), ws, nw);
+            op_ar = rad_decl_op(b, arq, pa, (int)(sizeof pa / sizeof pa[0]), ws, nw);
             if (op_ar) {
                 const rad_buf wa[4] = { x, q8, s8, res };
                 rad_op_reads (b, op_ar, rd, 2);
@@ -1002,7 +1008,7 @@ struct Model {
     bool       pipe_serial_noted = false;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* The narrowest step the pipelined prefill takes, and its first piece: half the step rounded up
  * to 64 rows (qwen35_fp8 says why). */
@@ -1149,9 +1155,10 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
 
-    Model& m = g_model[ctx->rank];
+    Model& m = g_model[rad_build_slot(ctx)];
     if (m.pipe_tbl) rad_dev_free(m.pipe_tbl, RAD_MEM_HOST_PINNED);
     m = Model{};
     m.nm = Names(ctx->scope);
@@ -1322,8 +1329,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (g.n_layer > 0 && !calib_dir()) {
         bool ok = true;
         for (const Layer& lay : m.layers)
-            ok = ok && lay.attn.ln_q.quant && lay.attn.ln_k.shared_in && lay.attn.ln_v.shared_in &&
-                 lay.mlp.ln_gu.quant;
+            ok = ok && (lay.attn.ln_q.quant || lay.attn.ln_q.i8g) && lay.attn.ln_k.shared_in &&
+                 lay.attn.ln_v.shared_in && (lay.mlp.ln_gu.quant || lay.mlp.ln_gu.i8g);
         if (ok) {
             RAD_ARCH_TRY(m.j0.declare(b, g, m.b_x, 0, m.layers[0].attn.w_norm, 0, m.layers[0].attn.ln_q));
             ok = m.j0.op != 0;
@@ -1665,7 +1672,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    Model& m = g_model[rad_rank(c)];
+    Model& m = g_model[rad_slot(c)];
     if (batch->enc) {
         rad_step_fail(c, "gemma3 serves text only");
         return;
@@ -1800,11 +1807,19 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         out->draft_depth = bs > 1 ? (int)(bs - 1) : 7;
         out->draft_depth_fixed = 1;   /* as qwen35_fp8: the trained block */
     }
+    /* Chained launches pay with a drafter and without one: the decode kernels of the int8 trunk
+     * have chained forms (libr4d's rad_kernel_chain), and the weight reads beside the reductions
+     * then stay on lane 0 instead of a second queue. TranslateGemma 27B int8 on two R9700, ms a
+     * decode step unchained / chained: 31.9 / 24.1 at one sequence, 32.2 / 24.8 at four (with
+     * the junctions unfused, 40.9 / 26.4 and 41.2 / 27.0). */
+    out->chain_pays = RAD_CHAIN_ALWAYS;
     return RAD_OK;
 }
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PROBE(gemma3)
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(gemma3, "gemma3", "", "0.1.0",
                 "Gemma 3 dense text trunk (TranslateGemma), bf16 or w4a8 at convert: sliding-window "
                 "and linearly-scaled global attention over a (1 + w) RMSNorm stream with GELU "

@@ -75,6 +75,9 @@
 #include "r3d_launch.h"
 
 #include <cstring>
+#include <mutex>
+#include <set>
+#include <utility>
 #include <cstdio>
 #include <cstdlib>
 
@@ -530,17 +533,21 @@ extern "C" int r3d_gemm_nt_q_mxfp4a8_tiled(long a, long a_scale, long b_codes, l
  * weight at a stable address. The host must be able to read the plane (the mapped tier's
  * placement); a plane it cannot see is not scanned, and the kernel's e8 guard handles reserved
  * values there. */
-struct E8ScanKey { const void* p; long long n; };
+/* VRAM is not scanned: hipHostGetDevicePointer succeeds for device memory on a large-BAR dGPU, which made
+ * the host loop read the plane byte by byte over PCIe (multi-second issue stalls), and a 16-entry cache was
+ * smaller than a DFlash2 drafter's planes. The kernel's e8 guard maps reserved values to scale 0. */
 static bool e8_scan_once(const void* p, long long n)
 {
-    static E8ScanKey seen[16];
-    static int ns = 0;
-    for (int i = 0; i < ns; ++i)
-        if (seen[i].p == p && seen[i].n == n) return true;
-    if (ns < 16) seen[ns++] = E8ScanKey{ p, n };
-    void* dev = nullptr;
-    if (hipHostGetDevicePointer(&dev, (void*)p, 0) != hipSuccess) return true;
-    const uint8_t* e8 = (const uint8_t*)p;
+    static std::mutex mu;
+    static std::set<std::pair<const void*, long long>> seen;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!seen.insert({ p, n }).second) return true;
+    }
+    hipPointerAttribute_t at{};
+    if (hipPointerGetAttributes(&at, p) != hipSuccess) { (void)hipGetLastError(); return true; }
+    if (at.type != hipMemoryTypeHost) return true;     /* device / managed: not scanned */
+    const uint8_t* e8 = (const uint8_t*)(at.hostPointer ? at.hostPointer : p);
     for (long long i = 0; i < n; ++i)
         if (e8[i] == 0 || e8[i] == 255) return false;
     return true;

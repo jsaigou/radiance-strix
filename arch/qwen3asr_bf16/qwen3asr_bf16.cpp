@@ -411,12 +411,13 @@ struct Model {
     std::vector<Layer> layers;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
-    Model& m = g_model[ctx->rank];
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
@@ -548,7 +549,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    Model& m = g_model[rad_rank(c)];
+    Model& m = g_model[rad_slot(c)];
     /* An encoder pass runs the audio tower and nothing else (RadBatch::enc). */
     if (batch->enc) {
         m.aud.step(c, batch);
@@ -615,6 +616,8 @@ static const RadAudioFormat* audio_format(const RadModelMeta* meta) {
 }  /* namespace qwen3asr_bf16 */
 
 #ifndef RAD_ARCH_NO_EXPORTS
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(qwen3asr_bf16, "qwen3asr", "", "0.1.0",
                 "Qwen3-ASR: a Whisper-style audio encoder over a dense Qwen3 decoder; bf16 weights "
                 "and activations")

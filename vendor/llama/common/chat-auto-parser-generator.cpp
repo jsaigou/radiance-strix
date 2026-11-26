@@ -5,13 +5,13 @@
 #include "common.h"
 #include "json-schema-to-grammar.h"
 #include "log.h"
-#include "nlohmann/json.hpp"
+#include "util/json.h"
 #include "peg-parser.h"
 
 #include <stdexcept>
 #include <string>
 
-using json = nlohmann::ordered_json;
+using json = rad::Json;
 
 // Helper to iterate over tools/functions
 static void foreach_function(const json & tools, const std::function<void(const json &)> & fn) {
@@ -44,7 +44,7 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
     // Create the result structure
     common_chat_params data;
     data.prompt            = common_chat_template_direct_apply(tmpl, inputs);
-    data.generation_prompt = common_chat_template_generation_prompt(tmpl, inputs);
+    data.generation_prompt = common_chat_template_generation_prompt_with_rendered(tmpl, inputs, data.prompt);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.preserved_tokens  = autoparser.preserved_tokens;
 

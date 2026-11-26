@@ -27,8 +27,15 @@
  *   is keyed on the declaration, never on a name, so bundled libraries load like third-party ones.
  *
  * Lifetime: a Resolved, a Band and a KernelRow point into a plugin's static tables and are valid
- * only as long as the Registry that loaded them; close() dlcloses. The core keeps one Registry for
- * the process; a tool that loads two kernel sets in turn must finish with the first.
+ * only as long as the plugin set that holds them; the last close() of a set dlcloses it. The core
+ * keeps one Registry for the process (rad_tools_registry); a tool that loads two kernel sets in
+ * turn must finish with the first.
+ *
+ * Sharing: several engines in one process (docs/MULTIMODEL.md §3.3) select from one loaded set,
+ * because a plugin's .so can be loaded once per process and its rows and schemas are the same for
+ * every model. What differs per engine is held per Registry object: the facts its cards report
+ * (P2P), its selection table and the kernel instances it initialised. share() makes such an object
+ * over the same set; its close() finis only its own instances and leaves the set to the others.
  *
  * Threading: loading is single-threaded, before the rank threads exist. select() and
  * init_instance() run on every rank thread during declare, so the selection log and instance list
@@ -42,6 +49,7 @@
 #include <deque>
 #include <mutex>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -98,12 +106,16 @@ struct Plugin {
     /* Optional (rad_builder.h, rad_arch_serves_imports); absent is true. False keeps the plugin
      * out of the pick for an imported checkpoint (startup.h). */
     bool arch_serves_imports = true;
+    /* Optional (rad_builder.h, rad_arch_multi_instance); absent is false: the plugin backs one
+     * engine at a time (rad_engine_claim). */
+    bool arch_multi_instance = false;
     /* A video generator's reference conditioning (rad_builder.h); null for one without. */
     int64_t (*arch_video_pack)(const RadVideoGeom*, const int32_t*, int32_t*, int32_t*, int32_t*,
                                int32_t*, float*, int64_t) = nullptr;
     int64_t (*arch_encode_geom)(int32_t, const int64_t*, int32_t*, int64_t) = nullptr;
 
     RadPluginCloseFn close = nullptr;
+    RadPluginFreedFn freed = nullptr;   /* rad_plugin_freed, optional */
 };
 
 /* ------------------------------------------------------------------ one selection question */
@@ -146,8 +158,15 @@ struct SelectionTrace {
 /* ------------------------------------------------------------------ the registry */
 class Registry {
 public:
-    Registry() = default;
+    Registry();
     ~Registry();
+
+    /* A registry over this one's loaded set, with its own device facts, selection table and
+     * instances (see Sharing above). The set stays loaded while any registry sharing it lives.
+     * Loading into a set that is shared is refused, so every sharer sees the same plugins. */
+    std::unique_ptr<Registry> share() const;
+    /* True while another registry shares this one's set. */
+    bool shared() const { return set_.use_count() > 1; }
     Registry(const Registry&) = delete;
     Registry& operator=(const Registry&) = delete;
 
@@ -179,23 +198,25 @@ public:
 
     /* The device a kernel library's device code is checked against at load: the first card the
      * caller will run on. Default 0; the engine sets it after choosing its cards, before loading. */
-    void set_code_device(int device) { code_device_ = device; }
+    void set_code_device(int device) { set_->code_device = device; }
 
     /* Set by the engine when serving on the host backend, where no GPU code object runs: device
      * rows are left out at load and every op takes its host kernel. Only the engine sets it; tools
      * that select without serving (rad-convert's recipe check, rad-kbench, constraint tests) see
      * every row, as on the serving machine. */
-    void set_no_device_code(bool v) { no_device_code_ = v; }
+    void set_no_device_code(bool v) { set_->no_device_code = v; }
     /* Measured facts about the ranks' devices, for constraints on "device." keys (rad_types.h).
      * Set before the first selection by whoever chose the devices; without a fact, a kernel
      * constrained on it is not selected. */
     void set_device_fact(std::string_view key, long long v) { device_facts_.set_i(key, v); }
 
-    void close();                       /* fini instances, close hooks, dlclose, forget everything */
+    /* Fini this registry's instances and forget its selections. The last registry holding the
+     * set also runs the plugins' close hooks, dlcloses them and forgets everything. */
+    void close();
 
-    const std::vector<Plugin>&      plugins() const { return plugins_; }
+    const std::vector<Plugin>&      plugins() const { return set_->plugins; }
     const Plugin*                   plugin(std::string_view name) const;
-    const std::vector<std::string>& load_errors() const { return load_errors_; }
+    const std::vector<std::string>& load_errors() const { return set_->load_errors; }
 
     /* Every quantiser the loaded quantiser plugins offer, in load order. Names are unique (a
      * duplicate is refused at load); quantizer() is null when nothing offers the name. */
@@ -203,11 +224,11 @@ public:
         const RadQuantizerInfo* info = nullptr;
         std::string             plugin;
     };
-    const std::deque<QuantRow>& quantizers() const { return quants_; }
+    const std::deque<QuantRow>& quantizers() const { return set_->quants; }
     const QuantRow*             quantizer(std::string_view name) const;
 
     /* Every kernel row, in (hierarchy order, declaration order). rad-info prints this. */
-    const std::deque<KernelRow>&    rows() const { return rows_; }
+    const std::deque<KernelRow>&    rows() const { return set_->rows; }
     /* The rows implementing one op, in the order select() considers them. Empty if none. */
     const std::vector<const KernelRow*>* rows_for(std::string_view op) const;
 
@@ -232,7 +253,7 @@ public:
      *
      * Returns the number of rows loaded, or a negative status. */
     int  load_tune(const std::string& radiance_home, const std::string& machine = std::string());
-    const TuneCache& tune() const { return tune_; }
+    const TuneCache& tune() const { return set_->tune; }
 
     /* ---------------------------------------------------------- selection (§2.1) */
     /* The first plugin in hierarchy order with any matching row supplies the kernel; within that
@@ -292,6 +313,11 @@ public:
      * rank and world size, off the hot path: e.g. libr4d's all-reduce sets up peer signal buffers
      * and IPC handles here. A negative return aborts startup; the caller names the kernel. */
     int  init_instance(Resolved& r, int rank, int world_size);
+    /* The tensor-parallel group this registry's engine is (its first instance slot,
+     * rad_engine_claim). Set, init_instance hands it to every kernel's init as the `tp_group`
+     * parameter, so a collective's ranks rendezvous only with their own engine's; unset (-1), as
+     * for the tools, no parameter is added. */
+    void set_tp_group(long long g) { tp_group_ = g; }
     void fini_instances();
     size_t n_instances() const;
 
@@ -328,10 +354,23 @@ private:
         long long   count = 1;
     };
 
-    int code_device_ = 0;
-    bool no_device_code_ = false;
+    /* What loading produced: shared by every registry made with share(). */
+    struct Set {
+        int                      code_device = 0;
+        bool                     no_device_code = false;
+        TuneCache                tune;
+        std::vector<Plugin>      plugins;
+        std::deque<KernelRow>    rows;          /* deque: KernelRow* handed out must stay valid */
+        std::deque<QuantRow>     quants;
+        std::unordered_map<std::string, std::vector<const KernelRow*>> by_op;
+        std::unordered_map<std::string, SchemaEntry> schemas;
+        std::vector<std::string> load_errors;
+    };
+    explicit Registry(std::shared_ptr<Set> set) : set_(std::move(set)) {}
+    std::shared_ptr<Set> set_;
+
     Geometry device_facts_;
-    TuneCache tune_;
+    long long tp_group_ = -1;
 
     int  stage_(const std::string& path, Staged* out);
     int  commit_(Staged& s, int order);
@@ -340,17 +379,11 @@ private:
     void record_(const std::string& op, int domain, const Geometry& g, const SelectionTrace& t);
     void err_(const char* fmt, ...) __attribute__((format(printf, 2, 3)));
 
-    std::vector<Plugin>      plugins_;
-    std::deque<KernelRow>    rows_;          /* deque: KernelRow* handed out must stay valid */
-    std::deque<QuantRow>     quants_;
-    std::unordered_map<std::string, std::vector<const KernelRow*>> by_op_;
-    std::unordered_map<std::string, SchemaEntry> schemas_;
-    std::vector<std::string> load_errors_;
-
     mutable std::mutex           mu_;
     std::vector<SelectionRecord> log_;
     std::unordered_map<std::string, size_t> log_at_;   /* SelectionRecord::key -> index in log_ */
     std::vector<std::pair<const RadKernelInfo*, void*>> instances_;
+    std::deque<Geometry> init_geoms_;   /* deque: init may keep pointers into an entry */
 };
 
 /* The value a kernel's own constraints place on one key, e.g. the paged block size the resolved

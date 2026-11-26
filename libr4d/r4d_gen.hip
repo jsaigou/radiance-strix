@@ -1,3 +1,4 @@
+#include "rad_umt5_gelu.h"
 // R4D -- the image generator's ops (docs/OPS.md, "Image generation"): a diffusion transformer's
 // adaptive norm and gated residual, the timestep embedding, the per-image latent lanes and the
 // flow-matching sampler over them, and the image decoder's convolution, channel norm, resampling
@@ -13,6 +14,7 @@
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
+#include "r4d_fwht.h"
 #include "r4d_gdn_wmma.h"
 #include "r4d_q8.h"
 #include "rad_philox.h"
@@ -184,9 +186,16 @@ __global__ __launch_bounds__(kT) void chan_stats_kernel(
 // ln_mod_kernel's order through the same block_sum, the norm output is rounded to bf16 before
 // quantising, and the codes are r4d_q8.h's. A 128-column group is sixteen consecutive lanes, so its
 // amax is a half-wave reduction.
+//
+// HI8 is ln_mod_had_quant_i8g: had_quant_act_i8g's quantiser in place of quant_act_fp8's. The
+// bf16-rounded norm output is rotated by the 128-wide Hadamard where it lies, eight columns a lane
+// and sixteen lanes a block (strides 1, 2, 4 in the lane, then 8 to 64 across lanes, the order
+// r4d_fwht_wave takes them in, so the sums are the standalone kernel's), then int8 codes under
+// one scale per (row, 128 * SUB): SUB 2 is IQ8R's 256-wide group, a whole wave. `z` receives the
+// unrotated norm output. Byte-identical to gate_add, ln_mod and had_quant_act_i8g.
 constexpr int kLnqChunks = 4;   // 8-wide chunks a thread keeps: n <= kT * 8 * 4 = 8192
 
-template <bool GATED>
+template <bool GATED, bool HI8 = false, int SUB = 1>
 __global__ __launch_bounds__(kT) void ln_mod_quant_kernel(
     const uint16_t* __restrict__ yd, const uint16_t* __restrict__ g, const uint16_t* __restrict__ s,
     const int* __restrict__ cu, uint16_t* __restrict__ x, uint8_t* __restrict__ q,
@@ -237,6 +246,23 @@ __global__ __launch_bounds__(kT) void ln_mod_quant_kernel(
         #pragma unroll
         for (int j = 0; j < 8; ++j) o[j] = bfr(bfr((v[k][j] - mean) * rs) * bfr(1.0f + gs[j]));
         if (z) st8(z + (size_t)r * z_ld + i, o);
+        if constexpr (HI8) {
+            #pragma unroll
+            for (int h = 1; h < 8; h <<= 1) {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    if ((j & h) == 0) {
+                        const float a = o[j], b = o[j + h];
+                        o[j] = a + b;
+                        o[j + h] = a - b;
+                    }
+            }
+            const int lane = (int)threadIdx.x & 31;
+            r4d_fwht_xstage<8, 1>(o, lane);
+            r4d_fwht_xstage<8, 2>(o, lane);
+            r4d_fwht_xstage<8, 4>(o, lane);
+            r4d_fwht_xstage<8, 8>(o, lane);
+        }
         float m = 0.0f;
         #pragma unroll
         for (int j = 0; j < 8; ++j) m = fmaxf(m, fabsf(o[j]));
@@ -244,12 +270,13 @@ __global__ __launch_bounds__(kT) void ln_mod_quant_kernel(
         m = fmaxf(m, r4d_xor_lane<4>(m));
         m = fmaxf(m, r4d_xor_lane<2>(m));
         m = fmaxf(m, r4d_xor_lane<1>(m));
-        const float sc = m > 0.0f ? m * (1.0f / q8_top<false>()) : 1.0f;
+        if constexpr (SUB == 2) m = fmaxf(m, r4d_xor_lane<16>(m));
+        const float sc = m > 0.0f ? m * (1.0f / q8_top<HI8>()) : 1.0f;
         const float inv = 1.0f / sc;
-        if ((threadIdx.x & 15) == 0) qs[(size_t)r * qs_ld + i / 128] = sc;
+        if ((threadIdx.x & (16 * SUB - 1)) == 0) qs[(size_t)r * qs_ld + i / (128 * SUB)] = sc;
         *(uint2*)(q + (size_t)r * q_ld + i) =
-            make_uint2(q8_pack4<false>(o[0], o[1], o[2], o[3], inv),
-                       q8_pack4<false>(o[4], o[5], o[6], o[7], inv));
+            make_uint2(q8_pack4<HI8>(o[0], o[1], o[2], o[3], inv),
+                       q8_pack4<HI8>(o[4], o[5], o[6], o[7], inv));
     }
 }
 
@@ -564,7 +591,7 @@ __global__ __launch_bounds__(kT) void chan_affine_kernel(
 // A wave a pixel: the sum of squares over its channels, then the three roundings.
 __global__ __launch_bounds__(kT) void l2norm_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ g, uint16_t* __restrict__ y,
-    int64_t rows, int n, float sq, int silu) {
+    int64_t rows, int n, float sq, bool silu, bool round_length) {
     const int64_t r = (int64_t)blockIdx.x * (kT / 32) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     if (r >= rows) return;
@@ -576,7 +603,10 @@ __global__ __launch_bounds__(kT) void l2norm_kernel(
         #pragma unroll
         for (int j = 0; j < 8; ++j) ss += f[j] * f[j];
     }
-    const float nrm = fmaxf(sqrtf(r4d_wave_sum(ss)), 1e-12f);
+    const float length = sqrtf(r4d_wave_sum(ss));
+    const float clamped = round_length ? (length < 1e-12f ? 1e-12f : length)
+                                       : fmaxf(length, 1e-12f);
+    const float nrm = round_length ? bfr(clamped) : clamped;
     uint16_t* yr = y + (size_t)r * n;
     for (int c = lane * 8; c < n; c += 256) {
         float f[8], gg[8];
@@ -651,6 +681,7 @@ __global__ __launch_bounds__(kT) void gelu_quick_kernel(const T* __restrict__ x,
     }
 }
 
+template<bool Umt5>
 __global__ __launch_bounds__(kT) void gelu_tanh_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y, int n, int x_ld, int y_ld) {
     const int r = blockIdx.x;
@@ -660,7 +691,8 @@ __global__ __launch_bounds__(kT) void gelu_tanh_kernel(
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const float v = f[j];
-            f[j] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+            if constexpr (Umt5) f[j] = rad_umt5::gelu(v, bfr);
+            else f[j] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
         }
         st8(y + (size_t)r * y_ld + c, f);
     }
@@ -976,6 +1008,18 @@ int parse_bf16_list(const char* s, float* out, int max, bool bf16 = true) {
     return n;
 }
 
+__global__ __launch_bounds__(kT) void timestep_f64_kernel(
+    const float* __restrict__ t, float* __restrict__ y, int half, double max_period, int64_t y_ld) {
+    const int m = blockIdx.x;
+    const double position = t[m];
+    float* out = y + static_cast<int64_t>(m) * y_ld;
+    for (int i = threadIdx.x; i < half; i += kT) {
+        const double angle = position * pow(max_period, -static_cast<double>(i) / half);
+        out[i] = static_cast<float>(cos(angle));
+        out[half + i] = static_cast<float>(sin(angle));
+    }
+}
+
 }  // namespace
 
 // ============================================================== the plugin ABI entry points
@@ -999,7 +1043,9 @@ extern "C" int r4d_rad_ln_mod(const RadArgs* a, RadStream s) {
     return st_of(hipGetLastError());
 }
 
-extern "C" int r4d_rad_ln_mod_quant_fp8(const RadArgs* a, RadStream s) {
+/* ln_mod_quant_fp8 (E4M3 codes, group 128) and with `hi8` ln_mod_had_quant_i8g (rotated int8
+ * codes, group 128 or 256). */
+static int ln_mod_quant_launch(const RadArgs* a, RadStream s, bool hi8) {
     const RadTensor *y = r4d_opt(a, 0), *g = r4d_opt(a, 1), *sc = r4d_opt(a, 2);
     const RadTensor *cu = r4d_opt(a, 3), *x = r4d_opt(a, 4), *q = r4d_opt(a, 5);
     const RadTensor *qs = r4d_opt(a, 6), *z = r4d_opt(a, 7);
@@ -1007,10 +1053,11 @@ extern "C" int r4d_rad_ln_mod_quant_fp8(const RadArgs* a, RadStream s) {
     const bool gated = r4d_geti_or(a, "gated", 0) != 0;
     if (gated && (!y || !g)) return R4D_NO(RAD_E_INVAL);
     if (!is_bf16(x) || !is_bf16(sc) || (gated && (!is_bf16(y) || !is_bf16(g))) ||
-        (z && !is_bf16(z)) || q->dtype != RAD_F8E4M3 || qs->dtype != RAD_F32)
+        (z && !is_bf16(z)) || q->dtype != (hi8 ? RAD_I8 : RAD_F8E4M3) || qs->dtype != RAD_F32)
         return R4D_NO(RAD_E_DTYPE);
     const long long n = r4d_geti_or(a, "n", 0);
-    if (n <= 0 || n % 128 || r4d_geti_or(a, "group", 0) != 128 ||
+    const long long grp = r4d_geti_or(a, "group", 0);
+    if (n <= 0 || (grp != 128 && !(hi8 && grp == 256)) || n % grp ||
         n > (long long)kT * 8 * kLnqChunks)
         return R4D_NO(RAD_E_SHAPE);
     long long rx = 0, xl = 0, ry = 0, yl = 0, rg = 0, gl = 0, rs = 0, sl = 0, rz = 0, zl = 0;
@@ -1019,24 +1066,37 @@ extern "C" int r4d_rad_ln_mod_quant_fp8(const RadArgs* a, RadStream s) {
         (gated && (!rows8(y, n, &ry, &yl) || !rows8(g, n, &rg, &gl))) ||
         (z && !rows8(z, n, &rz, &zl)))
         return R4D_NO(RAD_E_STRIDE);
-    const long long ql = r4d_rows_pitch(q, n, &rq), qsl = r4d_rows_pitch(qs, n / 128, &rqs);
+    const long long ql = r4d_rows_pitch(q, n, &rq), qsl = r4d_rows_pitch(qs, n / grp, &rqs);
     if (ql < 0 || (ql & 7) || ((uintptr_t)q->data & 7) || qsl < 0) return R4D_NO(RAD_E_STRIDE);
     const long long n_seq = r4d_numel(cu) - 1, rows = rq;
     if (rows <= 0 || n_seq <= 0 || rx < rows || rqs < rows || rs < n_seq ||
         (gated && (ry < rows || rg < n_seq)) || (z && rz < rows))
         return R4D_NO(RAD_E_SHAPE);
     const float eps = (float)r4d_getf(a, "eps", 1e-6);
-#define R4D_LNQ(G)                                                                                \
-    hipLaunchKernelGGL(ln_mod_quant_kernel<G>, dim3((unsigned)rows), dim3(kT), 0, (hipStream_t)s, \
+#define R4D_LNQ(G, ...)                                                                           \
+    hipLaunchKernelGGL((ln_mod_quant_kernel<G, ##__VA_ARGS__>), dim3((unsigned)rows), dim3(kT), 0, \
+                       (hipStream_t)s,                                                           \
                        G ? (const uint16_t*)y->data : nullptr,                                   \
                        G ? (const uint16_t*)g->data : nullptr, (const uint16_t*)sc->data,        \
                        (const int*)cu->data, (uint16_t*)x->data, (uint8_t*)q->data,              \
                        (float*)qs->data, z ? (uint16_t*)z->data : nullptr, (int)n, (int)n_seq,   \
                        eps, (int)yl, (int)gl, (int)sl, (int)xl, (int)ql, (int)qsl, (int)zl)
-    if (gated) R4D_LNQ(true);
-    else       R4D_LNQ(false);
+    if (!hi8) {
+        if (gated) R4D_LNQ(true);
+        else       R4D_LNQ(false);
+    } else if (grp == 256) {
+        if (gated) R4D_LNQ(true, true, 2);
+        else       R4D_LNQ(false, true, 2);
+    } else {
+        if (gated) R4D_LNQ(true, true, 1);
+        else       R4D_LNQ(false, true, 1);
+    }
 #undef R4D_LNQ
     return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_ln_mod_had_quant_i8g(const RadArgs* a, RadStream s) {
+    return ln_mod_quant_launch(a, s, true);
 }
 
 extern "C" int r4d_rad_gate_add(const RadArgs* a, RadStream s) {
@@ -1560,10 +1620,11 @@ extern "C" int r4d_rad_l2norm_chan(const RadArgs* a, RadStream s) {
         return R4D_NO(RAD_E_STRIDE);
     const long long rows = r4d_numel(y) / n;
     if (rows <= 0 || r4d_numel(x) < rows * n) return R4D_NO(RAD_E_SHAPE);
+    const bool round_length = r4d_geti_or(a, "round_length", 0) != 0;
     hipLaunchKernelGGL(l2norm_kernel, dim3((unsigned)((rows + kT / 32 - 1) / (kT / 32))), dim3(kT),
                        0, (hipStream_t)s, (const uint16_t*)x->data, (const uint16_t*)g->data,
                        (uint16_t*)y->data, (int64_t)rows, (int)n,
-                       (float)std::sqrt((double)n), silu);
+                       (float)std::sqrt((double)n), silu, round_length);
     return st_of(hipGetLastError());
 }
 
@@ -1638,7 +1699,8 @@ extern "C" int r4d_rad_gelu_quick(const RadArgs* a, RadStream s) {
     return st_of(hipGetLastError());
 }
 
-extern "C" int r4d_rad_gelu_tanh(const RadArgs* a, RadStream s) {
+template<bool Umt5>
+static int launch_gelu_tanh(const RadArgs* a, RadStream s) {
     const RadTensor *x = r4d_opt(a, 0), *y = r4d_opt(a, 1);
     if (!x || !y) return R4D_NO(RAD_E_INVAL);
     if (!is_bf16(x) || !is_bf16(y)) return R4D_NO(RAD_E_DTYPE);
@@ -1646,10 +1708,13 @@ extern "C" int r4d_rad_gelu_tanh(const RadArgs* a, RadStream s) {
     long long rx = 0, xl = 0, ry = 0, yl = 0;
     if (!rows8(x, n, &rx, &xl) || !rows8(y, n, &ry, &yl)) return R4D_NO(RAD_E_STRIDE);
     if (ry <= 0 || rx < ry) return R4D_NO(RAD_E_SHAPE);
-    hipLaunchKernelGGL(gelu_tanh_kernel, dim3((unsigned)ry), dim3(kT), 0, (hipStream_t)s,
+    hipLaunchKernelGGL(gelu_tanh_kernel<Umt5>, dim3((unsigned)ry), dim3(kT), 0, (hipStream_t)s,
                        (const uint16_t*)x->data, (uint16_t*)y->data, (int)n, (int)xl, (int)yl);
     return st_of(hipGetLastError());
 }
+
+extern "C" int r4d_rad_gelu_tanh(const RadArgs* a, RadStream s) { return launch_gelu_tanh<false>(a, s); }
+extern "C" int r4d_rad_gelu_umt5(const RadArgs* a, RadStream s) { return launch_gelu_tanh<true>(a, s); }
 
 extern "C" int r4d_rad_scatter_add_rows(const RadArgs* a, RadStream s) {
     const RadTensor *v = r4d_opt(a, 0), *idx = r4d_opt(a, 1), *x = r4d_opt(a, 2);
@@ -1663,5 +1728,24 @@ extern "C" int r4d_rad_scatter_add_rows(const RadArgs* a, RadStream s) {
     hipLaunchKernelGGL(scatter_add_kernel, dim3((unsigned)rv), dim3(kT), 0, (hipStream_t)s,
                        (const uint16_t*)v->data, (const int*)idx->data, (uint16_t*)x->data, (int)n,
                        (int)vl, (int)xl);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_timestep_embed_f64(const RadArgs* a, RadStream s) {
+    const RadTensor *t = r4d_opt(a, 0), *y = r4d_opt(a, 1);
+    if (!t || !y) return R4D_NO(RAD_E_INVAL);
+    if (t->dtype != RAD_F32 || y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    const int64_t n = r4d_geti_or(a, "n", 0);
+    const double period = r4d_getf(a, "max_period", 10000.0);
+    const int64_t rows = y->shape[0], pitch = y->stride[0];
+    if (n <= 0 || n > INT32_MAX || (n & 1) || !(period > 0.0) || !std::isfinite(period) ||
+        y->rank != 2 || y->shape[1] != n || rows <= 0 || rows > INT32_MAX ||
+        (t->rank != 1 && (t->rank != 2 || t->shape[1] != 1)) || t->shape[0] < rows)
+        return R4D_NO(RAD_E_SHAPE);
+    if ((rows > 1 && t->stride[0] != 1) || y->stride[1] != 1 || pitch < n ||
+        pitch > (INT64_MAX / 4 - n) / rows) return R4D_NO(RAD_E_STRIDE);
+    hipLaunchKernelGGL(timestep_f64_kernel, dim3(static_cast<unsigned>(rows)), dim3(kT), 0,
+                       (hipStream_t)s, static_cast<const float*>(t->data), static_cast<float*>(y->data),
+                       static_cast<int>(n / 2), period, pitch);
     return st_of(hipGetLastError());
 }

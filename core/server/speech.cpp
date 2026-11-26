@@ -26,7 +26,7 @@
 #include "mm/processor.h"
 #include "rad_internal.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cctype>
@@ -409,7 +409,7 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
         return t;
     };
     auto usage = [job]() {
-        nlohmann::ordered_json u;
+        json u;
         u["type"] = "tokens";
         u["input_tokens"] = job->n_prompt;
         u["output_tokens"] = job->n_gen;
@@ -457,7 +457,7 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
         const std::string text = joined();
         metrics_.observe_http(200);
         if (fmt == "text") return HttpResponse::text(200, text + "\n");
-        nlohmann::ordered_json o;
+        json o;
         if (fmt == "verbose_json") {
             std::string lang = forced;
             for (const Heard& h : job->heard)
@@ -466,9 +466,9 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
             o["language"] = lower(lang);
             o["duration"] = (double)job->samples.size() / rate;
             o["text"] = text;
-            nlohmann::ordered_json segs = nlohmann::ordered_json::array();
+            json segs = json::array();
             for (size_t i = 0; i < job->heard.size(); ++i) {
-                nlohmann::ordered_json s;
+                json s;
                 s["id"] = (int64_t)i;
                 s["start"] = (double)job->cuts[i].first / rate;
                 s["end"] = (double)job->cuts[i].second / rate;
@@ -506,7 +506,7 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
         if (peer_closed && peer_closed()) return false;
         auto delta = [&](const std::string& d) {
             if (d.empty()) return;
-            nlohmann::ordered_json o;
+            json o;
             o["type"] = "transcript.text.delta";
             o["delta"] = d;
             out += sse_event(json_dump(o));
@@ -560,7 +560,7 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
         }
         if (!job->running && job->stream_clip >= job->cuts.size()) {
             release_job();
-            nlohmann::ordered_json o;
+            json o;
             o["type"] = "transcript.text.done";
             o["text"] = joined();
             o["usage"] = usage();

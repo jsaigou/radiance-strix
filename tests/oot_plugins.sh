@@ -1,5 +1,6 @@
 #!/bin/sh
-# oot_plugins.sh BUILD SOURCE WORK [HIP_COMPILER HIP_TARGETS [VOPD_REPEATABLE [CXX_COMPILER]]]
+# oot_plugins.sh BUILD SOURCE WORK [HIP_COMPILER HIP_TARGETS [VOPD_REPEATABLE [CXX_COMPILER
+#                 [BUILD_TYPE]]]]
 #
 # THE PLUGINS RADIANCE SHIPS, BUILT THE WAY A THIRD PARTY BUILDS THEIRS. The tree's build is
 # installed into a prefix; then every plugin directory -- the kernel libraries, the quantisers,
@@ -26,11 +27,15 @@
 #      has already checked what the out-of-tree build produced.
 set -eu
 B=$1; S=$2; W=$3
-HIPC=${4:-}; HIPT=${5:-}; VOPD=${6:-OFF}; CXXC=${7:-}
+HIPC=${4:-}; HIPT=${5:-}; VOPD=${6:-OFF}; CXXC=${7:-}; BT=${8:-}
 # The tree's own C++ compiler, so the out-of-tree build does not depend on the host's default
 # (`c++` may be a different GCC than the one the installed ABI headers require).
 CCXX=""
 [ -n "$CXXC" ] && CCXX="-DCMAKE_CXX_COMPILER=$CXXC"
+# The tree's build type too: a plugin configured without one takes RelWithDebInfo
+# (rad_plugin_defaults), and a tree configured as anything else would then be compared with device
+# code compiled at other flags.
+[ -n "$BT" ] && CCXX="$CCXX -DCMAKE_BUILD_TYPE=$BT"
 GEN=${CMAKE_GENERATOR:-Ninja}
 J=${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc 2>/dev/null || echo 4)}
 
@@ -49,10 +54,18 @@ run() {   # run LOG CMD... -- quiet unless it fails
 say "installing $B into $P"
 run "$W/logs/install.log" cmake --install "$B" --prefix "$P"
 
+# The libraries have many sources and build one at a time at the build's full width. An
+# architecture or a bundled plugin is one or two large translation units, which no -j speeds up, and
+# there are dozens of them: those are built several at a time (`small`, below).
 dirs="libref libquant"
 [ -d "$S/libavx" ] && [ -f "$B/radiance_home/kernels/libavx.so" ] && dirs="$dirs libavx"
+small=""
 for d in "$S"/arch/*/ "$S"/plugin/*/; do
-  [ -f "$d/CMakeLists.txt" ] && dirs="$dirs $(basename "$(dirname "$d")")/$(basename "$d")"
+  [ -f "$d/CMakeLists.txt" ] || continue
+  # A plugin under plugin/ that the tree's build does not make (a source drop, built by hand) is
+  # not compared: the tree's home has no copy of it.
+  case "$d" in "$S"/plugin/*) [ -f "$B/radiance_home/kernels/$(basename "$d").so" ] || continue ;; esac
+  small="$small $(basename "$(dirname "$d")")/$(basename "$d")"
 done
 # The device libraries: built out of tree only with the tree's HIP compiler, and left out of every
 # comparison below without it. Each declares the family it serves, so a tree built for one family
@@ -62,30 +75,74 @@ devlibs=""
 for d in libr4d libr3d; do
   [ -f "$S/$d/CMakeLists.txt" ] && [ -f "$B/radiance_home/kernels/$d.so" ] && devlibs="$devlibs $d"
 done
-[ -n "$HIPC" ] && dirs="$dirs $devlibs"
+devdirs=""
+[ -n "$HIPC" ] && devdirs="$devlibs"
 is_dev() { case " $devlibs " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # Each plugin installs its plugin file under $H and anything else it ships (libr4d's r4d_selftest)
 # under the package's prefix, as a third party installing into that radiance would.
-for d in $dirs; do
-  n=$(basename "$d")
-  say "building $d against the installed package"
+#
+# The ROCm the environment names (the test sets ROCM_PATH to the one the tree links) goes on the
+# prefix path beside the package: CMake otherwise takes the HIP runtime from wherever the HIP
+# compiler sits, and a tree whose compiler comes from another ROCm build than its runtime would
+# get a libr4d linked against that build's runtime, which then fails to load.
+PP="$P"
+[ -n "${ROCM_PATH:-}" ] && PP="$P;$ROCM_PATH"
+build_one() {   # build_one DIR JOBS -- configure and build one plugin directory
+  d=$1; n=$(basename "$d")
   extra="$CCXX"
   is_dev "$n" && extra="$extra -DCMAKE_HIP_COMPILER=$HIPC -DRAD_GPU_TARGETS=$HIPT
                         -DRAD_HIP_VOPD_REPEATABLE=$VOPD"
   # A bundled plugin under plugin/ may carry device rows beside its host ones; it gets the tree's
   # HIP compiler as a third party would pass theirs.
-  case "$d" in plugin/*) [ -n "$HIPC" ] && extra="-DCMAKE_HIP_COMPILER=$HIPC" ;; esac
+  case "$d" in plugin/*) [ -n "$HIPC" ] && extra="$extra -DCMAKE_HIP_COMPILER=$HIPC" ;; esac
   # shellcheck disable=SC2086
   run "$W/logs/$n.configure.log" cmake -S "$S/$d" -B "$W/b/$n" -G "$GEN" \
-      -DCMAKE_PREFIX_PATH="$P" -DCMAKE_INSTALL_PREFIX="$P" -DRAD_PLUGIN_INSTALL_HOME="$H" $extra
-  run "$W/logs/$n.build.log" cmake --build "$W/b/$n" -j "$J"
+      -DCMAKE_PREFIX_PATH="$PP" -DCMAKE_INSTALL_PREFIX="$P" -DRAD_PLUGIN_INSTALL_HOME="$H" $extra
+  run "$W/logs/$n.build.log" cmake --build "$W/b/$n" -j "$2"
+}
+install_one() {   # install_one DIR
+  n=$(basename "$1")
   # --prefix for the same reason as the tree install above: a plugin's own CMakeLists may install
   # companions (libr4d ships r4d_selftest) to relative destinations under CMAKE_INSTALL_PREFIX, and
   # the test must not need root. The plugins themselves ignore the prefix -- rad_add_plugin installs
   # them under the absolute RAD_PLUGIN_INSTALL_HOME given at configure time -- so the checks below,
   # which look in $H, are unaffected.
   run "$W/logs/$n.install.log" cmake --install "$W/b/$n" --prefix "$W/i"
+}
+for d in $dirs; do
+  say "building $d against the installed package"
+  build_one "$d" "$J"
+  install_one "$d"
+done
+
+# OOT_JOBS of the small ones at a time (default half the build's width, at most 16: a plugin's
+# compile holds about half a GiB), two compile jobs each; installed one after another, in order.
+PJ=${OOT_JOBS:-$((J / 2))}
+[ "$PJ" -gt 16 ] && PJ=16
+[ "$PJ" -lt 1 ] && PJ=1
+# shellcheck disable=SC2086
+set -- $small
+say "building $# architectures and bundled plugins against the installed package, $PJ at a time"
+while [ $# -gt 0 ]; do
+  batch=""; nb=0
+  while [ $# -gt 0 ] && [ "$nb" -lt "$PJ" ]; do
+    batch="$batch $1"; nb=$((nb + 1))
+    ( build_one "$1" 2 && : > "$W/logs/$(basename "$1").built" ) &
+    shift
+  done
+  wait
+  for d in $batch; do
+    [ -f "$W/logs/$(basename "$d").built" ] ||
+      fail "$d did not build out of tree (logs: $W/logs/$(basename "$d").*.log)"
+    install_one "$d"
+  done
+done
+
+for d in $devdirs; do
+  say "building $d against the installed package"
+  build_one "$d" "$J"
+  install_one "$d"
 done
 
 # 1. The same plugins, file for file.

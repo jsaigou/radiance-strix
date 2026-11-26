@@ -939,12 +939,20 @@ extern "C" int r3dh_gdn_recurrent_update_k128_v128_bf16_fp32state(
 // stream sharing an output are ordered by their dependency.
 constexpr unsigned kMaxConvCtr = 4096;
 
+// The blocks live as long as their output's memory: the core reports each device range it frees
+// (rad_plugin_freed below), and the blocks of outputs inside it go, since nothing launched against
+// that memory runs any more. A process that loads and unloads models would otherwise keep every
+// engine's blocks.
+struct ConvBlock { unsigned int* p; int dev; };
+static std::mutex g_conv_mu;
+static std::map<std::pair<RadStream, const char*>, ConvBlock> g_conv;
+
 static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
-  static std::mutex m;
-  static std::map<std::pair<RadStream, const void*>, unsigned int*> blocks;
-  std::lock_guard<std::mutex> lk(m);
-  const auto key = std::make_pair(s, out);
-  if (auto it = blocks.find(key); it != blocks.end()) return it->second;
+  std::lock_guard<std::mutex> lk(g_conv_mu);
+  const auto key = std::make_pair(s, static_cast<const char*>(out));
+  if (auto it = g_conv.find(key); it != g_conv.end()) return it->second.p;
+  int dev = 0;
+  if (hipGetDevice(&dev) != hipSuccess) return nullptr;
   void* p = nullptr;
   if (hipMalloc(&p, (size_t)kMaxConvCtr * sizeof(unsigned int)) != hipSuccess) return nullptr;
   // Zero before any launch reads it. In the engine hipMemset is the AQL backend's and has finished
@@ -955,8 +963,26 @@ static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
     (void)hipFree(p);
     return nullptr;
   }
-  blocks.emplace(key, (unsigned int*)p);
+  g_conv.emplace(key, ConvBlock{ (unsigned int*)p, dev });
   return (unsigned int*)p;
+}
+
+extern "C" void rad_plugin_freed(const void* base, int64_t bytes) {
+  const char* lo = static_cast<const char*>(base);
+  const char* hi = lo + bytes;
+  std::lock_guard<std::mutex> lk(g_conv_mu);
+  int was = 0;
+  (void)hipGetDevice(&was);
+  for (auto it = g_conv.begin(); it != g_conv.end();) {
+    if (it->first.second >= lo && it->first.second < hi) {
+      (void)hipSetDevice(it->second.dev);
+      (void)hipFree(it->second.p);
+      it = g_conv.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  (void)hipSetDevice(was);
 }
 
 // The recurrent update with gdn_conv_update folded in, decode shape only (bf16 a/b, fused row

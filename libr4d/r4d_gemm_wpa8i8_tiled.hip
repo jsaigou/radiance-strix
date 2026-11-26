@@ -47,14 +47,18 @@
 #include <cstdint>
 #include <stdexcept>
 
-#define R4D_WPT_TM    4         // 16-row fragments per wave
-#define R4D_WPT_TN    2         // 16-column fragments per wave
-#define R4D_WPT_WM    4         // waves along M
-#define R4D_WPT_WN    2         // waves along N
 #define R4D_WPT_PAD   8         // LDS row pad: 16 lanes reading rows 136 B apart
-#define R4D_WPT_NTHR  (R4D_WPT_WM * R4D_WPT_WN * 32)
-#define R4D_WPT_BMF   (R4D_WPT_WM * R4D_WPT_TM * 16)
 #define R4D_WPT_LBK   128       // one scale group a slab
+
+// Tile arms (the row's `arm` axis): TM x TN fragments a wave, WM x WN waves a block. Arm 0 is the
+// prefill tile (256 x 64, eight waves). A prefill chunk fills it; a decode step of 32..256 rows does
+// not: its time is the weight's trip through the block, flat in M, and a 256-row block over 128 rows
+// computes half padding. The smaller arms cut BM to the batch and BN with it, multiplying the blocks a
+// narrow N gets (N / 64 = 80 at N = 5120 is a third of the card). Each arm needs 2 * TN % WM == 0
+// (the weight slab splits evenly over the block's threads).
+#define WPT_ARMS(X) \
+  X(0, 4, 2, 4, 2) X(1, 4, 2, 2, 4) X(2, 4, 2, 2, 2) X(3, 4, 1, 2, 2) \
+  X(4, 2, 2, 2, 4) X(5, 2, 2, 2, 2) X(6, 2, 1, 2, 2) X(7, 2, 2, 1, 4) X(8, 2, 1, 1, 2)
 
 typedef int      wpt_v2i  __attribute__((ext_vector_type(2)));
 typedef int      wpt_v8i  __attribute__((ext_vector_type(8)));
@@ -70,12 +74,12 @@ static __device__ __forceinline__ unsigned wpt_sub_zero(unsigned codes4, unsigne
   return ((codes4 | 0x80808080u) - zz) ^ 0x80808080u;
 }
 
-template <int BITS>
-__global__ __launch_bounds__(R4D_WPT_NTHR) void r4d_gemm_wpa8i8_tiled_kernel(
+template <int BITS, int TM, int TN, int WM, int WN>
+__global__ __launch_bounds__(WM * WN * 32) void r4d_gemm_wpa8i8_tiled_kernel(
     const unsigned char* __restrict__ AT, const float* __restrict__ As,
     const unsigned* __restrict__ Wq, const unsigned* __restrict__ Whi, const unsigned* __restrict__ Wsz,
     __hip_bfloat16* __restrict__ C, int M, int K, int N, int as_rs, int ldc) {
-  constexpr int TM = R4D_WPT_TM, TN = R4D_WPT_TN, WN = R4D_WPT_WN, NTHR = R4D_WPT_NTHR, BMF = R4D_WPT_BMF;
+  constexpr int NTHR = WM * WN * 32, BMF = WM * TM * 16;
   constexpr int LBK = R4D_WPT_LBK, NS = LBK / 16, STR = LBK + R4D_WPT_PAD, BNF = WN * TN * 16;
   constexpr int NTILES_T = BNF / 16, TOT_SLOTS = NTILES_T * NS * 32;
   // A thread stages one lane's 16 bytes of a 64-wide k block (four k steps of one weight row, as the
@@ -243,17 +247,33 @@ __global__ __launch_bounds__(R4D_WPT_NTHR) void r4d_gemm_wpa8i8_tiled_kernel(
   }
 }
 
+static bool wpa8i8_arm_ok(int arm) {
+#define X(id, tm, tn, wm, wn) if (arm == id) return true;
+  WPT_ARMS(X)
+#undef X
+  return false;
+}
+
 template <int BITS>
 static void wpa8i8_launch(long at, long ascale, long wq, long whi, long wsz, long c, int M, int K, int N,
-                          int as_rs, long stream, int ldc) {
+                          int as_rs, long stream, int ldc, int arm) {
   if (M < 1) throw std::runtime_error("r4d gemm_wpa8i8_tiled: M must be >= 1");
   if (N < 16 || N % 16) throw std::runtime_error("r4d gemm_wpa8i8_tiled: N must be a multiple of 16");
   if (K % R4D_WPT_LBK) throw std::runtime_error("r4d gemm_wpa8i8_tiled: K must be a multiple of 128");
-  const int bnf = R4D_WPT_WN * R4D_WPT_TN * 16;
-  dim3 grid((N + bnf - 1) / bnf, (M + R4D_WPT_BMF - 1) / R4D_WPT_BMF), block(R4D_WPT_NTHR);
-  hipLaunchKernelGGL((r4d_gemm_wpa8i8_tiled_kernel<BITS>), grid, block, 0, (hipStream_t)stream,
-                     (const unsigned char*)at, (const float*)ascale, (const unsigned*)wq,
-                     (const unsigned*)whi, (const unsigned*)wsz, (__hip_bfloat16*)c, M, K, N, as_rs, ldc);
+  if (!wpa8i8_arm_ok(arm)) throw std::runtime_error("r4d gemm_wpa8i8_tiled: no such tile arm");
+  hipStream_t st = (hipStream_t)stream;
+#define X(id, tm, tn, wm, wn)                                                                         \
+  if (arm == id) {                                                                                     \
+    static_assert((2 * tn) % wm == 0, "arm " #id ": the weight slab must split over the block");       \
+    const int bnf = wn * tn * 16, bmf = wm * tm * 16;                                                  \
+    dim3 grid((N + bnf - 1) / bnf, (M + bmf - 1) / bmf), block(wm * wn * 32);                          \
+    hipLaunchKernelGGL((r4d_gemm_wpa8i8_tiled_kernel<BITS, tm, tn, wm, wn>), grid, block, 0, st,       \
+                       (const unsigned char*)at, (const float*)ascale, (const unsigned*)wq,            \
+                       (const unsigned*)whi, (const unsigned*)wsz, (__hip_bfloat16*)c, M, K, N, as_rs, \
+                       ldc);                                                                            \
+  }
+  WPT_ARMS(X)
+#undef X
 }
 
 // ============================================================== the plugin ABI entry points
@@ -274,6 +294,9 @@ static int wpa8i8_dispatch(const RadArgs* a, RadStream s) {
     rc = mx_ascale_grid(g, &as_group, &as_rs, mp.n);
     if (rc != RAD_OK) return rc;
     if (as_group != 128) return R4D_NO(RAD_E_SHAPE);       // one scale a (row, 128): the slab
+    R4dWpaCfg cfg;
+    r4d_cfg_wpa8i8(a, &cfg);
+    if (!wpa8i8_arm_ok(cfg.arm)) return R4D_NO(RAD_E_INVAL);
     const long long slab = r4d_mxfp4a8_tile_a_bytes((int)g.M, (int)g.K);
     if (!a->scratch || a->scratch_bytes < slab) return R4D_NO(RAD_E_INVAL);
     const long long kb = g.K / 128;
@@ -288,7 +311,7 @@ static int wpa8i8_dispatch(const RadArgs* a, RadStream s) {
                                 BITS == 5 ? r4d_addr(g.b) + g.N * g.K / 2 + n0 * g.K / 8 : 0L,
                                 r4d_addr(g.bscale) + (n0 / 16) * kb * 16 * 4,
                                 r4d_addr(g.y) + n0 * 2, (int)g.M, (int)g.K, (int)np, as_rs,
-                                (long)(uintptr_t)s, (int)g.N));
+                                (long)(uintptr_t)s, (int)g.N, cfg.arm));
     }
     return RAD_OK;
 }

@@ -82,7 +82,7 @@ env GPU_MAX_ALLOC_PERCENT=100 GPU_MAX_HEAP_SIZE=100 \
     RADIANCE_OP_ORACLE_FROM="${FROM:-0}" \
     RADIANCE_OP_ORACLE_TOL="${TOL:-0.02}" \
     ${TO:+RADIANCE_OP_ORACLE_TO=$TO} \
-nohup ./bin/radiance --model "$M" \
+nohup "$ROOT/scripts/radiance-flags" ./bin/radiance --model "$M" \
     --radiance-home radiance_home \
     --host 127.0.0.1 --port "$P" \
     --max-num-seqs 1 --max-model-len "${MLEN:-8192}" --tp "${TP:-1}" \

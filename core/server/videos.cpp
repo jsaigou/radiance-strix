@@ -20,6 +20,10 @@
  * most 9), `ref_video_N` (3) with a soundtrack `ref_video_audio_N` and `ref_audio_N` (3), N from 1
  * without gaps within each kind. The parts carry the bytes: `input_reference` (but for i2va on a
  * model that starts from a picture) and non-empty `conditions` are refused.
+ * A model with the audio VAE's encoder also takes a song guide (ComfyUI's MiniMaxH3AddGuide): a
+ * file part `guide_audio` pinned as the soundtrack from frame `guide_frame` on (0 by default,
+ * negative from the end) and cut where the video ends, with any task. It is not named in the
+ * prompt. Keyframes and reference media still exclude each other.
  * A model with a length head (LTX-2.5's duration head) chooses the length of a request that names
  * none, or says `"seconds": "auto"`; the video object reports it once chosen. A model with more
  * than one decoder takes `decoder`, one of their names (LTX-2.5: `vae`, the default, or
@@ -44,6 +48,9 @@
  * The prompt is the model's template with `{prompt}` filled; the template is tokenised with its
  * special tokens and the prompt without, so a caller cannot write control tokens into it.
  */
+#include <atomic>
+
+#include "front.h"
 #include "server.h"
 #include "loras.h"
 #include "oai.h"
@@ -54,7 +61,7 @@
 #include "mm/mp4.h"
 #include "rad_internal.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <chrono>
@@ -100,6 +107,8 @@ struct Server::VideoJob {
     /* A guided model's terms as resolved against its defaults, the negative prompt when a scale
      * used it, and whether the video started from a picture. */
     bool        guided = false;
+    bool        has_soundtrack = false;
+    bool        cfg_only = false;
     double      guidance[8] = {};
     std::string negative;
     bool        has_negative = false;
@@ -107,6 +116,8 @@ struct Server::VideoJob {
     std::string decoder;          /* a decoder the request named other than the default */
     int32_t     w = 0, h = 0;
     bool        worker_done = false;   /* its thread has nothing left to do but return */
+    /* Deleted, by the server or through the Front: nothing answers for it from here on. */
+    std::atomic<bool> deleted{false};
 };
 
 namespace {
@@ -203,7 +214,8 @@ int validate_refs(std::vector<gen::VideoRefMedia>& refs, const VideoGenInfo& inf
         { "ref_video",       gen::VideoRefMedia::VIDEO,
           std::min(kMaxRefVideos, (int32_t)info.max_ref_videos) },
         { "ref_video_audio", gen::VideoRefMedia::VIDEO_AUDIO,
-          std::min(kMaxRefVideos, (int32_t)info.max_ref_videos) },
+          (info.sample_rate > 0 && info.channels > 0 && info.max_enc_samples > 0)
+              ? std::min(kMaxRefVideos, (int32_t)info.max_ref_videos) : 0 },
         { "ref_audio",       gen::VideoRefMedia::AUDIO,
           std::min(kMaxRefAudios, (int32_t)info.max_ref_audios) },
     };
@@ -253,16 +265,17 @@ int validate_refs(std::vector<gen::VideoRefMedia>& refs, const VideoGenInfo& inf
 }  /* namespace */
 
 /* A video model's capabilities on /v1/models and /server_info: the counts validate_refs applies,
- * the samplers and the model's shifts. */
+ * whether it takes a song guide, the samplers and the model's shifts. */
 void Server::video_caps(json& caps, const IVideoGen* gen) {
     const VideoGenInfo& info = gen->info();
     caps["video_max_text"]       = info.max_text;
     caps["video_max_ref_images"] = std::min(kMaxRefImages, (int32_t)info.max_ref_images);
     caps["video_max_ref_videos"] = std::min(kMaxRefVideos, (int32_t)info.max_ref_videos);
     caps["video_max_ref_audios"] = std::min(kMaxRefAudios, (int32_t)info.max_ref_audios);
-    caps["video_samplers"] = json::array({ "euler", "res_multistep" });
+    caps["video_guide_audio"]    = info.max_enc_samples > 0;
+    caps["video_samplers"] = info.unipc_only ? json::array({"unipc"}) : json::array({ "euler", "res_multistep" });
     caps["video_shift"]       = info.shift_video;
-    caps["video_audio_shift"] = info.shift_audio;
+    if (info.channels > 0) caps["video_audio_shift"] = info.shift_audio;
 }
 
 HttpResponse Server::handle_video_create(const HttpRequest& req) {
@@ -278,8 +291,8 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
      * since it may carry a file). Reference media and keyframes are file parts, collected here and
      * checked once the task is known. */
     std::vector<gen::VideoRefMedia> refs;
-    /* The keyframes, `first_frame` and `last_frame`. */
-    std::vector<gen::VideoRefMedia> keys;
+    /* The keyframes, `first_frame` and `last_frame`, and the song guide, `guide_audio`. */
+    std::vector<gen::VideoRefMedia> keys, guides;
     json body = json::object();
     std::vector<uint8_t> ref_bytes;
     bool has_ref = false;
@@ -288,6 +301,23 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             if (p.name == "input_reference" && !p.filename.empty()) {
                 ref_bytes.assign(p.data.begin(), p.data.end());
                 has_ref = true;
+                continue;
+            }
+            if (p.name == "guide_audio") {
+                if (p.filename.empty())
+                    return error_response(err_bad(p.name, "'guide_audio' must carry an audio "
+                                                          "file"), req.peer);
+                if (!guides.empty())
+                    return error_response(err_bad(p.name, "at most one guide_audio part"),
+                                          req.peer);
+                gen::VideoRefMedia m;
+                m.kind = gen::VideoRefMedia::GUIDE_AUDIO;
+                m.index = 1;
+                m.name = p.name;
+                m.filename = p.filename;
+                m.content_type = p.content_type;
+                m.data = p.data;
+                guides.push_back(std::move(m));
                 continue;
             }
             if (p.name == "first_frame" || p.name == "last_frame") {
@@ -339,7 +369,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         "model", "prompt", "seconds", "size", "input_reference", "seed", "num_inference_steps",
         "task", "target", "conditions", "user", "latent_upscale", "upscale_refine_steps",
         "sampler", "shift", "audio_shift", "first_frame_mode",
-        "negative_prompt", "decoder", "loras", "lora",
+        "negative_prompt", "decoder", "loras", "lora", "guide_frame",
         /* RadVideoGenBatch::guidance_h's order */
         "guidance_scale", "stg_scale", "modality_scale", "guidance_rescale",
         "audio_guidance_scale", "audio_stg_scale", "audio_modality_scale", "audio_guidance_rescale",
@@ -479,6 +509,16 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                                          "last_frame part");
         }
     }
+    /* The song guide needs the audio VAE's encoder; it goes with keyframes or reference media. */
+    if (has(body, "guide_frame") && guides.empty())
+        return bad("guide_frame", "guide_frame places a song guide: give a guide_audio part "
+                                  "with it");
+    if (!guides.empty()) {
+        if (info.max_enc_samples <= 0)
+            return bad("guide_audio", "this model has no audio encoder, so it cannot pin a song "
+                                      "guide");
+        if (guides[0].data.empty()) return bad("guide_audio", "'guide_audio' carries an empty file");
+    }
     /* How the first frame is fitted to the video: stretched, as ComfyUI does, or `center`, scaled
      * to cover it and cropped. The last frame is always cropped, as ComfyUI does. */
     bool first_center = false;
@@ -577,6 +617,19 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     /* The length the job reports until the model has chosen one. */
     const int64_t frames =
         info.frames_per_chunk * (chunks > 0 ? chunks : info.default_chunks) + info.frames_tail;
+    /* The song guide's first frame, a negative one counted from the end, as ComfyUI's frame_idx. */
+    if (!guides.empty() && has(body, "guide_frame")) {
+        double v = 0;
+        if (!number(body["guide_frame"], &v) || v != std::floor(v) || std::fabs(v) > 1e9)
+            return bad("guide_frame", "expected an integer, the video's frame the song starts at");
+        const int64_t at = v < 0 ? frames + (int64_t)v : (int64_t)v;
+        if (at < 0 || at >= frames)
+            return bad("guide_frame", "frame " + std::to_string((int64_t)v) + " is outside the "
+                                      "video's " + std::to_string(frames) + " frames: 0 to " +
+                                      std::to_string(frames - 1) + ", or -1 to -" +
+                                      std::to_string(frames) + " from the end");
+        guides[0].frame = (int32_t)at;
+    }
 
     std::unique_ptr<gen::VideoRequest> r = std::make_unique<gen::VideoRequest>();
     r->width = (int32_t)W;
@@ -622,9 +675,16 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                                                   (unit + 1) + ")");
         r->steps = (int32_t)v;
     }
+    r->sampler = info.unipc_only ? RAD_SAMPLER_UNIPC : RAD_SAMPLER_EULER;
     if (has(body, "sampler")) {
         const std::string sm = body["sampler"].is_string() ? body["sampler"].get<std::string>() : "";
-        if (sm.empty() || sm == "euler") r->sampler = RAD_SAMPLER_EULER;
+        if (info.unipc_only) {
+            if (sm != "unipc") {
+                ApiError e = err_unsupported("sampler", "this model uses the UniPC sampler");
+                e.supported = { "unipc" };
+                return error_response(e, req.peer);
+            }
+        } else if (sm.empty() || sm == "euler") r->sampler = RAD_SAMPLER_EULER;
         else if (sm == "res_multistep") r->sampler = RAD_SAMPLER_RES_MULTISTEP;
         else {
             ApiError e = err_unsupported("sampler", "the sampler is euler (first order) or "
@@ -643,6 +703,9 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         r->shift_video = v;
     }
     if (has(body, "audio_shift")) {
+        if (info.channels == 0)
+            return error_response(err_unsupported("audio_shift", "this model has no soundtrack"),
+                                  req.peer);
         double v = 0;
         if (!number(body["audio_shift"], &v) || !(v > 0.0) || v > 100.0)
             return bad("audio_shift", "the soundtrack schedule shift: a number in (0, 100], or "
@@ -657,8 +720,14 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     };
     for (int i = 0; i < 8; ++i) {
         if (!has(body, kGuide[i])) continue;
+        if (i >= 4 && info.channels == 0)
+            return error_response(err_unsupported(kGuide[i], "this model has no soundtrack"),
+                                  req.peer);
         if (!info.guidance)
             return error_response(err_unsupported(kGuide[i], "this model takes no guidance"),
+                                  req.peer);
+        if (info.guidance_cfg_only && i % 4 != 0)
+            return error_response(err_unsupported(kGuide[i], "this model supports only classifier-free guidance"),
                                   req.peer);
         double v = 0;
         const bool rescale = i % 4 == 3;
@@ -716,6 +785,8 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     });
     r->refs.insert(r->refs.end(), keys.begin(), keys.end());
     const bool has_keys = !keys.empty();
+    /* The song guide last, as its kind sorts. */
+    r->refs.insert(r->refs.end(), guides.begin(), guides.end());
 
     /* Pixels as the VAE encoders take them: RGB in 0..255, frame after frame. */
     auto pixels = [](gen::VideoRefMedia& m, const std::vector<mm::Frame>& fr) {
@@ -908,9 +979,11 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     }
 
     /* ---- every reference as its VAE encoder takes it (the keyframes are done above): pictures and
-     * video frames fitted to the encoder's bounds, soundtracks as mono samples at the model's rate,
-     * one copy a channel. The driver pads both to the encoders' clips and hops. */
-    if ((ref2va || !keys.empty()) && deps_.mm) {
+     * video frames fitted to the encoder's bounds, soundtracks at the model's rate, at most the
+     * encoder's: the song guide in stereo as ComfyUI's guide takes it (a mono song copied to both
+     * channels), the reference soundtracks mono, one copy a channel. The driver pads both to the
+     * encoders' clips and hops. */
+    if ((ref2va || !keys.empty() || !guides.empty()) && deps_.mm) {
         for (gen::VideoRefMedia& m : r->refs) {
             std::string why;
             const uint8_t* p = (const uint8_t*)m.data.data();
@@ -927,15 +1000,18 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                                              (int32_t)info.max_enc_side,
                                              (int32_t)info.max_enc_frames, &fr, &why);
             else {
-                std::vector<float> mono;
-                if (deps_.mm->encoder_audio(p, n, (int32_t)info.sample_rate, info.max_enc_samples,
-                                            &mono, &why) < 0 || mono.empty())
+                const int32_t ch = (int32_t)info.channels;
+                const int32_t got =
+                    m.kind == gen::VideoRefMedia::GUIDE_AUDIO ? std::max(ch, 1) : 1;
+                std::vector<float> s;
+                if (deps_.mm->encoder_audio(p, n, (int32_t)info.sample_rate, got,
+                                            info.max_enc_samples, &s, &why) < 0 || s.empty())
                     return bad(m.name.c_str(), "'" + m.name + "' could not be decoded: " + why);
-                m.enc_channels = (int32_t)info.channels;
-                m.enc_n = (int64_t)mono.size();
+                m.enc_channels = ch;
+                m.enc_n = (int64_t)s.size() / got;
                 m.enc_samples.clear();
-                for (int32_t c = 0; c < m.enc_channels; ++c)
-                    m.enc_samples.insert(m.enc_samples.end(), mono.begin(), mono.end());
+                for (int32_t c = 0; c < ch; c += got)   /* `got` channels a copy */
+                    m.enc_samples.insert(m.enc_samples.end(), s.begin(), s.end());
                 continue;
             }
             if (st < 0 || fr.empty())
@@ -972,18 +1048,22 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     else if (keys.size() == 2) j->task = "fl2va";
     else if (!keys.empty())
         j->task = keys[0].kind == gen::VideoRefMedia::FIRST_FRAME ? "i2va" : "l2va";
+    else if (!guides.empty()) j->task = "t2va";
     j->ticket = std::make_shared<gen::VideoTicket>();
     r->ticket = j->ticket;
     const int64_t n_tok = (int64_t)r->tokens.size();
     const int32_t steps = r->steps;
     j->guided = info.guidance;
+    j->cfg_only = info.guidance_cfg_only;
+    j->has_soundtrack = info.channels > 0;
     for (int i = 0; i < 8; ++i)
         j->guidance[i] = std::isnan(r->guidance[i]) ? info.guidance_default[i] : r->guidance[i];
-    j->has_negative = info.guidance && (j->guidance[0] != 1.0 || j->guidance[4] != 1.0);
+    j->has_negative = info.guidance && (j->guidance[0] != 1.0 || (j->has_soundtrack && j->guidance[4] != 1.0));
     if (j->has_negative) j->negative = negative;
     j->from_image = !r->image.empty();
     j->decoder = decoder;
     const double upscale = r->upscale;
+    auto model_lease = deps_.front ? deps_.front->hold_active_job(this) : nullptr;
     {
         std::string w;
         const int s = deps_.videos->submit(std::move(r), &w);
@@ -1014,7 +1094,12 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     std::lock_guard<std::mutex> lk(videos_m_);
     sweep_videos_locked(unix_now());
     videos_.push_back(j);
-    j->worker = std::thread([this, j] { video_work(j); });
+    if (deps_.background) deps_.background->fetch_add(1);
+    j->worker = std::thread([this, j, model_lease = std::move(model_lease)]() mutable {
+        video_work(j);
+        if (deps_.background) deps_.background->fetch_sub(1);
+        model_lease.reset();
+    });
     return HttpResponse::json_body(200, json_dump(video_json(*j)));
 }
 
@@ -1111,7 +1196,7 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
             j->err_message = "the video could not be written: " + why;
         } else if (aborted || t.status() == RAD_E_CANCELLED) {
             j->err_code = "cancelled";
-            j->err_message = aborted ? "the server is shutting down" : "the video was cancelled";
+            j->err_message = aborted ? "this model is stopping" : "the video was cancelled";
         } else {
             j->err_code = t.status() == RAD_E_INVAL ? "invalid_request" : "generation_failed";
             j->err_message = t.why().empty() ? std::string(rad_strerror(t.status())) : t.why();
@@ -1119,6 +1204,23 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
         RAD_WARN("video %s: failed: %s", j->id.c_str(), j->err_message.c_str());
     }
     j->worker_done = true;
+    /* A finished job no longer changes, so it can be read without this server, which may be gone
+     * by the time its client comes for it. */
+    if (deps_.front && !j->deleted.load())
+        deps_.front->keep_job(j->id, j->expires_at ? j->expires_at : now + opt_.video_ttl_s,
+                              opt_.max_videos, [j](const HttpRequest& q) -> HttpResponse {
+            if (q.method == "DELETE") {
+                j->deleted.store(true);
+                return video_deleted(j->id);
+            }
+            if (q.path.size() > 8 && q.path.compare(q.path.size() - 8, 8, "/content") == 0) {
+                HttpResponse res;
+                ApiError e;
+                if (video_content(*j, q, &res, &e)) return res;
+                return HttpResponse::json_body(e.status, error_body(q.path, e.status, e.type.c_str(), e.message));
+            }
+            return HttpResponse::json_body(200, json_dump(video_json(*j)));
+        });
 }
 
 void Server::sweep_videos_locked(int64_t now) {
@@ -1137,7 +1239,8 @@ void Server::sweep_videos_locked(int64_t now) {
     for (size_t i = 0; i < videos_.size();) {
         const VideoJob& j = *videos_[i];
         const bool done = j.status == "completed" || j.status == "failed";
-        if (done && j.expires_at > 0 && j.expires_at <= now) drop(i);
+        if (done && j.deleted.load()) drop(i);
+        else if (done && j.expires_at > 0 && j.expires_at <= now) drop(i);
         else if (done && j.failed && j.completed_at + opt_.video_ttl_s <= now) drop(i);
         else ++i;
     }
@@ -1185,7 +1288,11 @@ json Server::video_json(const VideoJob& j) {
     o["seconds"] = j.seconds;
     o["size"] = j.size;
     o["seed"] = j.seed;
-    o["sampler"] = j.sampler == RAD_SAMPLER_RES_MULTISTEP ? "res_multistep" : "euler";
+    switch (j.sampler) {
+    case RAD_SAMPLER_UNIPC: o["sampler"] = "unipc"; break;
+    case RAD_SAMPLER_RES_MULTISTEP: o["sampler"] = "res_multistep"; break;
+    default: o["sampler"] = "euler"; break;
+    }
     if (j.shift_video > 0.0) o["shift"] = j.shift_video;
     if (j.shift_audio > 0.0) o["audio_shift"] = j.shift_audio;
     if (j.refine > 0) {
@@ -1203,7 +1310,8 @@ json Server::video_json(const VideoJob& j) {
             "audio_guidance_scale", "audio_stg_scale", "audio_modality_scale",
             "audio_guidance_rescale",
         };
-        for (int i = 0; i < 8; ++i) o[kGuide[i]] = j.guidance[i];
+        for (int i = 0; i < (j.has_soundtrack ? 8 : 4); ++i)
+            if (!j.cfg_only || i % 4 == 0) o[kGuide[i]] = j.guidance[i];
         if (j.has_negative) o["negative_prompt"] = j.negative;
     }
     if (j.from_image) o["input_reference"] = true;
@@ -1227,7 +1335,8 @@ HttpResponse Server::handle_video_get(const HttpRequest& req) {
     const std::string id = req.param("id");
     std::lock_guard<std::mutex> lk(videos_m_);
     for (const auto& j : videos_)
-        if (j->id == id) return HttpResponse::json_body(200, json_dump(video_json(*j)));
+        if (j->id == id && !j->deleted.load())
+            return HttpResponse::json_body(200, json_dump(video_json(*j)));
     ApiError e = err_bad("id", "no video '" + id + "'; it may have expired");
     e.status = 404;
     e.type = "not_found_error";
@@ -1295,8 +1404,13 @@ HttpResponse Server::handle_video_delete(const HttpRequest& req) {
     /* A running job is cancelled, and its thread ends once the driver has seen that (at its next
      * pass, which may be seconds away); it is joined then. */
     j->ticket->cancel.store(true);
+    j->deleted.store(true);
     videos_gone_.push_back(j);
     sweep_videos_locked(unix_now());
+    return video_deleted(id);
+}
+
+HttpResponse Server::video_deleted(const std::string& id) {
     json o;
     o["id"] = id;
     o["object"] = "video.deleted";
@@ -1304,44 +1418,51 @@ HttpResponse Server::handle_video_delete(const HttpRequest& req) {
     return HttpResponse::json_body(200, json_dump(o));
 }
 
+bool Server::video_content(const VideoJob& j, const HttpRequest& req, HttpResponse* res, ApiError* err) {
+    std::string variant = "video";
+    if (auto it = req.query.find("variant"); it != req.query.end()) variant = it->second;
+    if (variant != "video" && variant != "thumbnail") {
+        *err = err_unsupported("variant", "this server gives the video or its thumbnail");
+        err->supported = { "video", "thumbnail" };
+        return false;
+    }
+    if (variant == "thumbnail") {
+        if (j.first.empty()) {
+            *err = err_bad("id", "video '" + j.id + "' has no frames yet");
+            return false;
+        }
+        std::vector<uint8_t> file;
+        std::string why;
+        if (mm::encode_image(j.first.data(), j.w, j.h, 3, "webp", 90, &file, &why) < 0) {
+            *err = err_internal("the thumbnail could not be encoded: " + why);
+            return false;
+        }
+        res->content_type = "image/webp";
+        res->body.assign((const char*)file.data(), file.size());
+        return true;
+    }
+    if (j.status != "completed") {
+        *err = err_bad("id", "video '" + j.id + "' is " + j.status +
+                                 (j.failed ? ": " + j.err_message : ""));
+        return false;
+    }
+    res->content_type = "video/mp4";
+    res->body = j.mp4;
+    return true;
+}
+
 HttpResponse Server::handle_video_content(const HttpRequest& req) {
     if (!deps_.videos)
         return error_response(err_not_implemented("/v1/videos requires a video generation model"),
                               req.peer);
     const std::string id = req.param("id");
-    std::string variant = "video";
-    if (auto it = req.query.find("variant"); it != req.query.end()) variant = it->second;
-    if (variant != "video" && variant != "thumbnail") {
-        ApiError e = err_unsupported("variant", "this server gives the video or its thumbnail");
-        e.supported = { "video", "thumbnail" };
-        return error_response(e, req.peer);
-    }
     std::lock_guard<std::mutex> lk(videos_m_);
-    for (const auto& j : videos_) {
-        if (j->id != id) continue;
-        if (variant == "thumbnail") {
-            if (j->first.empty())
-                return error_response(err_bad("id", "video '" + id + "' has no frames yet"),
-                                      req.peer);
-            std::vector<uint8_t> file;
-            std::string why;
-            if (mm::encode_image(j->first.data(), j->w, j->h, 3, "webp", 90, &file, &why) < 0)
-                return error_response(err_internal("the thumbnail could not be encoded: " + why),
-                                      req.peer);
+    for (const auto& j : videos_)
+        if (j->id == id && !j->deleted.load()) {
             HttpResponse res;
-            res.content_type = "image/webp";
-            res.body.assign((const char*)file.data(), file.size());
-            return res;
+            ApiError e;
+            return video_content(*j, req, &res, &e) ? res : error_response(e, req.peer);
         }
-        if (j->status != "completed")
-            return error_response(err_bad("id", "video '" + id + "' is " + j->status +
-                                                    (j->failed ? ": " + j->err_message : "")),
-                                  req.peer);
-        HttpResponse res;
-        res.content_type = "video/mp4";
-        res.body = j->mp4;
-        return res;
-    }
     ApiError e = err_bad("id", "no video '" + id + "'; it may have expired");
     e.status = 404;
     e.type = "not_found_error";

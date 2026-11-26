@@ -1,13 +1,13 @@
 # KV streaming: host-authoritative KV with a resident VRAM window
 
 A streamed group keeps its whole context in pinned host RAM and only a ring of blocks in VRAM; the
-VRAM that frees up goes to experts. `--max-model-len` and `--max-num-seqs` size the host side,
-`--kv-resident` the ring. The operator's view is [GUIDE.md](GUIDE.md) §4.4.1; source comments cite
+VRAM that frees up goes to experts. `max-model-len` and `max-num-seqs` size the host side,
+`kv-resident` the ring. The operator's view is [GUIDE.md](GUIDE.md) §4.4.1; source comments cite
 the section numbers below.
 
 Streaming pays only when a step reads far less than the context, which is true of radiance's
 indexer-selected attention (the QSA family and GLM-5.3's MLA block) and false of dense attention
-(§2). An architecture with no streamed path ignores the flag with one warning (§4.5).
+(§2). An architecture with no streamed path ignores the key with one warning (§4.5).
 
 Two views sit over one allocation: the **ring**, `n_slots` blocks deep and `n_layers` stripes,
 addressed through a residency map, and the **stage**, the group's context deep and one stripe,
@@ -30,12 +30,12 @@ order copies with events, not syncs (`spec.md` §5.4).
 
 ## 2. What bounds a step's read
 
-Qwen3.8-Flash-Next (`arch/qwen4exp_fp8`) at `--tp 2`, fp8 KV, per rank; 12 QSA layers plus the
+Qwen3.8-Flash-Next (`arch/qwen4exp_fp8`) at `tp: 2`, int8 KV, per rank; 12 QSA layers plus the
 MTP head bind `kv_attn`:
 
 | group | per 4-token block | per token | at 262 144 tokens |
 |---|---|---|---|
-| `kv_attn` (fp8, 2 kv heads, head_dim 256, 13 layers) | 26.00 KiB | 6.50 KiB | 1.66 GiB |
+| `kv_attn` (i8, 2 kv heads, head_dim 256, 13 layers) | 26.20 KiB | 6.55 KiB | 1.67 GiB |
 | `kv_qsa_bkey` (bf16, 1 head, head_dim 16) | 3.25 KiB | 0.83 KiB | 208 MiB |
 
 Decode is sparse at every context: the selection keeps `topk = budget / ratio = 512` blocks a row
@@ -43,8 +43,8 @@ Decode is sparse at every context: the selection keeps `topk = budget / ratio = 
 different: `qsa_score` reads every complete block of `kv_qsa_bkey` each step (208 MiB at 262K), so
 that group is dense-read and stays resident (§3.1).
 
-A dense family (Qwen3.8-27B, `arch/qwen35_*`) reads the whole context every step, 16 KiB a token per
-rank at fp8, so a ring only subtracts from a read that is already link-bound. It declares no
+A dense family (Qwen3.8-27B, `arch/qwen35_*`) reads the whole context every step, 16.1 KiB a token per
+rank at i8, so a ring only subtracts from a read that is already link-bound. It declares no
 streamed path.
 
 ---
@@ -68,7 +68,7 @@ its id space from the context (`kv_context_blocks`) rather than the pool split, 
 compete for VRAM; it never lends to the expert slab, and the idle tiers never gather it (§4.1).
 Refused or charged by name:
 
-- **a window that does not fit** the budget is refused against `--kv-resident` before the split
+- **a window that does not fit** the budget is refused against `kv-resident` before the split
   (`kvstream_window_fit`), rather than leaving a neighbour with zero blocks;
 - **a streamed `RAD_KV_WINDOW` group** is refused: a window bounds its own history;
 - **the dense-read floor**: a group read over its whole history every step
@@ -101,7 +101,7 @@ resolve, seeing it resident, would not copy it. `res` is written by `kv_resolve`
 
 A layer's order is **store, then resolve, then attention**, so a block copied in from the mirror
 carries this step's tokens; the indexer runs before the store and so cannot resolve. The streamed
-store has E4M3 and bf16 rows; a packed cache (`fp8_v4`, `k6_v4`) has none and is ignored (§4.5).
+store has int8, E4M3 and bf16 rows.
 
 ### 3.4 The resolve
 
@@ -148,7 +148,7 @@ refusals).
 ### 3.5 Prefill: the union, and the stage
 
 Above `qsa_exact_to = budget + ratio - 1 = 2051`, prefill is per-query sparse: every row of a chunk
-selects its own 512 blocks. One launch's union (`scripts/kv-union.sh`, Flash-Next `--tp 2`):
+selects its own 512 blocks. One launch's union (`scripts/kv-union.sh`, Flash-Next `tp: 2`):
 
 | prompt tokens | ring that held | largest union | largest misses of one call |
 |---|---|---|---|
@@ -210,11 +210,11 @@ side is `rad_kv_layer_index`, `rad_kv_stage_layer` and `rad_kv_stage_next`, with
 `kv_stream_layer`, `kv_resolve_declare`, `kv_resolve_issue` and `kv_stage_*` helpers in
 `arch/common/rad_arch.h`.
 
-### 3.7 Flags, report, metrics
+### 3.7 Key, report, metrics
 
-`--kv-resident N` is the only switch. The KV report gains the streamed group's two-tier line, and the
+`kv-resident: N` is the only setting. The KV report gains the streamed group's two-tier line, and the
 startup lines name the ring (and why it was raised), the host mirror, the stage, or which context a
-covering flag spans. Metrics: `radiance:kv_resident_blocks`, `radiance:kv_stream_misses_total` and
+covering value spans. Metrics: `radiance:kv_resident_blocks`, `radiance:kv_stream_misses_total` and
 `radiance:kv_stream_bytes_total{dir="in"}`. A request's end logs each group's cumulative resolves,
 lookups and misses with the largest union, misses and claims of one launch (`ctl[10..12]`).
 
@@ -223,21 +223,21 @@ lookups and misses with the largest union, misses and claims of one launch (`ctl
 The mirror is the largest host allocation after the experts' pool: 4.69 GiB a rank for four
 204 800-token sequences of Flash-Next. `kvstream_host_gate` checks the mirrors once, before any rank
 pins one, against the host tiers still to be pinned after them (the activation arenas and, when
-sized, the checkpoint store) plus `--host-headroom-mib`. A refusal names `--max-model-len` and
-`--max-num-seqs`, which size the mirror; `--host-pool-mib` sizes the experts' tier and cannot make
+sized, the checkpoint store) plus `memory.host-headroom-mib`. A refusal names `max-model-len` and
+`max-num-seqs`, which size the mirror; `host-pool-mib` sizes the experts' tier and cannot make
 room.
 
-The prefix cache's host tier (`--prefix-cache-mib`) is turned off when a group streams, before
+The prefix cache's host tier (`prefix-cache-mib`) is turned off when a group streams, before
 anything is sized from it: an entry covers every cached group, and a streamed group's rows are
 addressed by the block ids its sequence used, so the entry cannot move to a host slot
 (`PrefixCache::demotable`). Prefix hits still work from VRAM; a conversation evicted from VRAM is
-prefilled again rather than restored. "Streams" is the engine's answer (`cfg.kv_streams`): the flag
-set, the architecture's streamed ops declared and linked for the group with an fp8 or bf16 cache,
+prefilled again rather than restored. "Streams" is the engine's answer (`cfg.kv_streams`): the key
+set, the architecture's streamed ops declared and linked for the group at its cache dtype,
 and a ring under the context. In every other case the host tier is as configured.
 
 ### 3.9 What it costs
 
-`--kv-resident` has two floors, applied in `kvstream_ring_shape`/`kvstream_ring` and clamped to the
+`kv-resident` has two floors, applied in `kvstream_ring_shape`/`kvstream_ring` and clamped to the
 context, and the carve takes the larger:
 
 - **correctness**: one decode step's selection, `max_seqs x (1 + n_spec) x 513` blocks (16 416
@@ -247,16 +247,17 @@ context, and the carve takes the larger:
   than the VRAM the ring frees (at 64k of history: 24 576 runs 37.9 tok/s, 8 192 runs 37.1 with 75 %
   more misses), and a ring larger than the history buys nothing.
 
-A flag under either is raised with one warning. The raised number is what
+A value under either is raised with one warning. The raised number is what
 `RadBuildCtx::kv_resident_blocks` carries into the declare, since `kv_resolve` sizes its table from
 it. A context under 32 768 tokens cannot stream.
 
 Decode: a miss costs about 0.8 us, and a resolve launch about 4 us of device time, flat across ring
 sizes; the twelve a step cannot merge (each follows its layer's store), so streaming costs about 3 %
-of decode at `--tp 2` and nothing at `--tp 1`. The identity placement is worth +2 % at 16k. Warming
+of decode at `tp: 2` and nothing at `tp: 1`. The identity placement is worth +2 % at 16k. Warming
 the ring from the last prefill chunk made decode 3.8 % slower, through slot order.
 
-Capacity is bought in host RAM. Flash-Next fp8, two ranks, `--kv-resident 24576`:
+Capacity is bought in host RAM. Flash-Next, two ranks, `kv-resident: 24576`, measured with a
+one-byte E4M3 cache (512 bytes a token and head where the int8 row is 516):
 
 | configuration | VRAM KV per card | host RAM per rank |
 |---|---|---|
@@ -270,7 +271,7 @@ only the ring does not scale. Prefill comes out 3-5 % above the resident arm, be
 cache no longer holds goes to experts that would otherwise be read over the link. The stage copy's
 cost is its volume (0.6 GiB a pass at 16k and 45 GiB at 160k, within 0.3 % of the live KV, a
 figure the step's own ranges keep however much the prefix cache retains), not its overlap, since it shares the link as an equal (§6.1). Capacity is bought with
-`--max-num-seqs`, inside the trained window, so no rope change is needed. Perplexity: 3.994 resident,
+`max-num-seqs`, inside the trained window, so no rope change is needed. Perplexity: 3.994 resident,
 4.015 with a covering window, 4.014 with a fraction of it.
 
 ---
@@ -304,17 +305,17 @@ times; the mirror is the tier); the prefix cache's host tier (§3.8); the expert
    gated by `lockable_room`.
 3. **The maps**: device `res`, `slot_block`, `slot_state` per layer and a control block, from the KV
    pool, carried in the batch.
-4. **Report, flag, metrics** (§3.7).
+4. **Report, key, metrics** (§3.7).
 
 ### 4.3 Device changes
 
 1. `kv_resolve`: a libr4d kernel, a libavx form and the libref oracle (§3.4).
-2. `kv_store_streamed` and its prologue fold (§3.3), E4M3 and bf16.
+2. `kv_store_streamed` (int8, E4M3 and bf16) and its prologue fold (§3.3; int8 and bf16).
 3. The stage copy, a DMA list per layer (§5.3); no kernel.
 
 ### 4.4 Arch changes
 
-The gated fp8 attention block (`arch/common/rad_block_attn_gated_fp8.h`) declares the streamed store
+The gated attention block (`arch/common/rad_block_attn_gated_fp8.h`) declares the streamed store
 beside `kv_store`, issues it instead when the batch hands the group a stream, and issues the resolve
 after the store and before each sparse launch. GLM-5.3's MLA block (`rad_block_glm_mla.h`) declares
 the same pair and resolves at finish, after its indexer selects.
@@ -324,17 +325,16 @@ the same pair and resolves at finish, after its indexer selects.
 A plugin states once, in `RadArchProbe::kv_stream_ok`, that its architecture can stream; the engine
 carries it into every declare as `RadBuildCtx::kv_stream_ok`. `qwen4exp_fp8` and `glm5next` set it.
 The three streamed-only ops (`kv_store_streamed`, its fold, `kv_resolve`) are declared only when the
-architecture can stream and `--kv-resident` asks for a ring (`kvstream_op_gated`, consulted by
+architecture can stream and `kv-resident` asks for a ring (`kvstream_op_gated`, consulted by
 `Builder::op_declared`), so a model file never knows whether the operator asked, and every
 `rad_op_declared` check falls through to the resident path. Fail-safe, with one warning each:
 
 - a group with no `kv_resolve` or no streamed store for its geometry is ignored: without the resolve
   the attention would read block ids past the ring; without the store a miss would read zeros. A
   declaration with no kernel, or one stating another group's geometry, does not count;
-- a packed cache (`fp8_v4`, `k6_v4`) is ignored the same way, naming the layout;
-- an architecture whose probe says no turns the flag off at startup.
+- an architecture whose probe says no turns the key off at startup.
 
-Without the flag no streamed op is declared and no budget changes. The graph is not byte-identical
+Without the key no streamed op is declared and no budget changes. The graph is not byte-identical
 to a build without the feature, though: `qsa_select` writes its entry count (`qsa_nsel`,
 `selected_count`), an i32 a token, whether or not anything streams.
 
@@ -344,7 +344,7 @@ to a build without the feature, though: `qsa_select` writes its entry count (`qs
 
 ### 5.1 The ring's depth
 
-`--kv-resident` is off by default. When set it is never carved below 32 768 tokens, nor below one
+`kv-resident` is off by default. When set it is never carved below 32 768 tokens, nor below one
 decode step's selection when that is larger (§3.9), and never above the context; one function,
 `kvstream_ring_shape`, gives the budget probe, the carve and the declared `kv_resolve` the same
 depth.
@@ -355,9 +355,9 @@ the serial drafter's history pass over a prefill chunk) takes the stage.
 
 ### 5.2 There is no streaming switch
 
-`--kv-resident N` is the feature: absent or 0 and nothing streams, set and the ring is N tokens. A
+`kv-resident: N` is the feature: absent or 0 and nothing streams, set and the ring is N tokens. A
 ring that covers the context does not stream at all (§3.1), so a configuration whose context fits
-runs the same path as without the flag.
+runs the same path as without the key.
 
 ### 5.3 The transport
 
@@ -410,7 +410,7 @@ whole context resident during prefill (the group would still carve `n_layers x c
 
 ### 6.1 The link, the lanes, and the hold
 
-At `--tp 2` the all-reduce, the stage copies and the prefill expert stager share the link. DMA lists
+At `tp: 2` the all-reduce, the stage copies and the prefill expert stager share the link. DMA lists
 take their share at full rate without a CU slot; an ordinary stream copy would hold one and starve
 the kernels. Because the stage list must not yield, it competes as an equal, which is why overlap
 recovers only part of its cost (§3.9). A stage moved to lane 1 needs `rad_lane_join(1, 0)` before
@@ -418,14 +418,14 @@ its reader.
 
 ### 6.2 The first in-place device write to mapped host memory
 
-`r4d_selftest --case kv_store_streamed_fp8` and `--case kv_store_streamed_bf16` put the mirror in
+`r4d_selftest --case kv_store_streamed_i8`, `_fp8` and `_bf16` put the mirror in
 mapped pinned memory, run the kernel and compare the bytes the host reads after the sync with
 libref's; `scripts/kv-stage-parity-64k.sh` exercises the same write in the served path.
 
 ### 6.3 Rank coverage
 
 Every rank resolves the same shared block ids through identically built maps of its own. Only
-`--tp 1` and `--tp 2` have run; `--tp 3` and `--tp 4`, the uneven split, the attention-zero ranks
+`tp: 1` and `tp: 2` have run; `tp: 3` and `tp: 4`, the uneven split, the attention-zero ranks
 and the four-card selftest cases are untested, and the per-rank view (`kvstream_step_view`) is the
 path to check first.
 

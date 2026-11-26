@@ -356,11 +356,27 @@ const RadBatch* ShapeDriver::build_query(Job& j, int step) {
     const int64_t n = std::min<int64_t>(decl_.max_query, j.n_pts - j.next);
     const int64_t side = (int64_t)j.levels[j.level] + 1;
     float* q = hptr<float>(R_QUERY);
-    for (int64_t i = 0; i < n; ++i) {
-        const int64_t p = j.all ? j.next + i : (int64_t)j.pts[(size_t)(j.next + i)];
-        q[3 * i]     = j.axis[(size_t)(p / (side * side))];
-        q[3 * i + 1] = j.axis[(size_t)(p / side % side)];
-        q[3 * i + 2] = j.axis[(size_t)(p % side)];
+    const float* ax = j.axis.data();
+    if (j.all) {
+        /* Consecutive points: the grid coordinates count up like an odometer, with no division
+         * past the first point's. */
+        int64_t z = j.next / (side * side), y = j.next / side % side, x = j.next % side;
+        for (int64_t i = 0; i < n; ++i) {
+            q[3 * i]     = ax[z];
+            q[3 * i + 1] = ax[y];
+            q[3 * i + 2] = ax[x];
+            if (++x == side) {
+                x = 0;
+                if (++y == side) { y = 0; ++z; }
+            }
+        }
+    } else {
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t p = (int64_t)j.pts[(size_t)(j.next + i)];
+            q[3 * i]     = ax[p / (side * side)];
+            q[3 * i + 1] = ax[p / side % side];
+            q[3 * i + 2] = ax[p % side];
+        }
     }
     reg_[R_QUERY].used = n * 3 * 4;
     const int32_t qcu[2] = { 0, (int32_t)n };
@@ -397,9 +413,11 @@ int ShapeDriver::done() {
         break;
     case RAD_GEN_PASS_SQUERY: {
         const int64_t n = pass_.n_query;
-        for (int64_t i = 0; i < n; ++i) {
-            const int64_t p = j->all ? j->next + i : (int64_t)j->pts[(size_t)(j->next + i)];
-            j->field[(size_t)p] = field_host_[i];
+        if (j->all) {
+            std::memcpy(j->field.data() + j->next, field_host_, (size_t)n * sizeof(float));
+        } else {
+            for (int64_t i = 0; i < n; ++i)
+                j->field[(size_t)j->pts[(size_t)(j->next + i)]] = field_host_[i];
         }
         j->next += n;
         j->points += n;

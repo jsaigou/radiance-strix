@@ -146,10 +146,18 @@ static std::vector<float> flow_sigmas(const RadVideoGenDecl& d, int32_t n, int64
 
 VideoSchedule video_schedule(const RadVideoGenDecl& d, int32_t steps, int64_t video_tokens,
                              bool refine, double shift_video, double shift_audio) {
-    /* A request's shift replaces the declaration's, form 0 only. */
+    /* A request's shift replaces the declaration's for form 0 and UniPC. */
     const double sv = shift_video > 0.0 ? shift_video : d.shift_video;
-    const double sa = shift_audio > 0.0 ? shift_audio : d.shift_audio;
+    const double sa = d.audio_channels == 0 ? sv
+                    : shift_audio > 0.0 ? shift_audio : d.shift_audio;
     VideoSchedule v;
+    if (d.sched_kind == RAD_VIDEO_SCHEDULE_UNIPC) {
+        v.unipc = wan::unipc_plan(steps, sv);
+        v.steps = static_cast<int32_t>(v.unipc.size());
+        for (const auto& step : v.unipc) v.sig_v.push_back(step.sigma);
+        if (v.steps > 0) v.sig_v.push_back(0.0f);
+        return v;
+    }
     if (d.sched_kind == 1) {
         if (d.n_rungs > 0) {
             if (steps != d.n_rungs) return v;
@@ -237,12 +245,13 @@ int64_t carve(const RadVideoGenDecl& d, int64_t max_tok, int64_t ep, int64_t pd,
 }
 
 int64_t frames_bytes_of(const RadVideoGenDecl& d) {
-    return (d.frames_per_chunk + d.frames_tail) * d.max_area * 3;
+    return (d.frames_per_chunk + (d.max_chunks == 1 ? d.frames_tail : std::max<int64_t>(0, d.frames_tail))) * d.max_area * 3;
 }
 
 /* The samples a channel of a soundtrack under `frames` frames: its latents rounded up, which
  * bounds the rounding video_shape does. */
 int64_t samples_of(const RadVideoGenDecl& d, int32_t frames) {
+    if (d.audio_channels == 0) return 0;
     const int64_t num = (int64_t)frames * d.fps_den * d.audio_rate;
     return (num / d.fps_num + 1) * (d.sample_rate / d.audio_rate);
 }
@@ -304,9 +313,10 @@ int VideoDriver::init(const Program& prog, PositionsFn positions,
                    decl_.audio_channels * 4;
     host_ = static_cast<char*>(rad_dev_alloc(bytes_, RAD_MEM_HOST_PINNED));
     frames_host_ = static_cast<uint8_t*>(rad_dev_alloc(frames_bytes_, RAD_MEM_HOST_PINNED));
-    audio_host_ = static_cast<float*>(rad_dev_alloc(audio_bytes_, RAD_MEM_HOST_PINNED));
+    if (audio_bytes_ > 0)
+        audio_host_ = static_cast<float*>(rad_dev_alloc(audio_bytes_, RAD_MEM_HOST_PINNED));
     duration_host_ = static_cast<float*>(rad_dev_alloc(64, RAD_MEM_HOST_PINNED));
-    if (!host_ || !frames_host_ || !audio_host_ || !duration_host_) {
+    if (!host_ || !frames_host_ || (audio_bytes_ > 0 && !audio_host_) || !duration_host_) {
         RAD_ERR("video generator: no pinned host memory for the pass staging and outputs (%lld + "
                 "%lld + %lld bytes)", (long long)bytes_, (long long)frames_bytes_,
                 (long long)audio_bytes_);
@@ -399,9 +409,13 @@ int VideoDriver::plan_refs(Job& j, const VideoRequest& r, int32_t frames, std::s
     if (!pack_ || !enc_geom_)
         return no("this model conditions on no reference media");
     int32_t eg[kEncGeomCap];
+    auto is_audio = [](const VideoRefMedia& m) {
+        return m.kind == VideoRefMedia::AUDIO || m.kind == VideoRefMedia::VIDEO_AUDIO ||
+               m.kind == VideoRefMedia::GUIDE_AUDIO;
+    };
     /* A picture's or video's latent frames or a soundtrack's latents, -1 for media refused. */
     auto latents = [&](const VideoRefMedia& m) -> int64_t {
-        const bool audio = m.kind == VideoRefMedia::AUDIO || m.kind == VideoRefMedia::VIDEO_AUDIO;
+        const bool audio = is_audio(m);
         if (audio ? d.max_enc_samples <= 0 : d.max_enc_side <= 0) return -1;
         if (audio ? m.enc_samples.empty() : m.enc_pixels.empty()) return -1;
         const int64_t in[4] = { audio ? m.enc_n : m.enc_frames, audio ? 0 : m.enc_h,
@@ -412,7 +426,7 @@ int VideoDriver::plan_refs(Job& j, const VideoRequest& r, int32_t frames, std::s
     };
     auto refused = [&](const VideoRefMedia& m) {
         return no("'" + m.name + "' is not media this model's encoders take (" +
-                  (m.kind == VideoRefMedia::AUDIO || m.kind == VideoRefMedia::VIDEO_AUDIO
+                  (is_audio(m)
                        ? std::to_string(m.enc_n) + " samples"
                        : std::to_string(m.enc_w) + "x" + std::to_string(m.enc_h) + ", " +
                              std::to_string(m.enc_frames) + " frames") + ")");
@@ -423,14 +437,28 @@ int VideoDriver::plan_refs(Job& j, const VideoRequest& r, int32_t frames, std::s
         *lw = m.enc_w / d.enc_ratio;
         return true;
     };
-    std::vector<int32_t> keys;
+    std::vector<int32_t> keys, guide;
     j.ref_tab.assign(2, 0);
     for (size_t i = 0; i < r.refs.size(); ++i) {
         const VideoRefMedia& m = r.refs[i];
         if (m.kind == VideoRefMedia::VIDEO_AUDIO) continue;
         const int64_t t = latents(m);
         int32_t lh = 0, lw = 0;
-        if (t < 1 || (m.kind != VideoRefMedia::AUDIO && !grid(m, &lh, &lw))) return refused(m);
+        if (t < 1 || (!is_audio(m) && !grid(m, &lh, &lw))) return refused(m);
+        if (m.kind == VideoRefMedia::GUIDE_AUDIO) {
+            /* ComfyUI's MiniMaxH3AddGuide: the song's latents from its frame on, cut where the
+             * video's soundtrack ends. The streams share one clock, audio_rate / fps soundtrack
+             * latents a frame, in ComfyUI's double arithmetic. */
+            const double per_frame = (double)d.audio_rate * (double)d.fps_den / (double)d.fps_num;
+            const double room = std::floor((double)j.geom.n_audio - per_frame * m.frame);
+            if (m.frame < 0 || m.frame >= frames || room < 1.0)
+                return no("'" + m.name + "' starts at frame " + std::to_string(m.frame) +
+                          ", outside the video's " + std::to_string(frames) + " frames");
+            if (!guide.empty()) return no("a request carries one song guide");
+            j.enc_q.push_back({ RAD_ENC_GUIDE, 1, (int32_t)i });
+            guide = { m.frame, 0, (int32_t)std::min<double>((double)t, room) };
+            continue;
+        }
         if (m.kind == VideoRefMedia::FIRST_FRAME || m.kind == VideoRefMedia::LAST_FRAME) {
             if (lh != j.geom.lat_h || lw != j.geom.lat_w)
                 return no("'" + m.name + "' is not the video's size");
@@ -468,6 +496,8 @@ int VideoDriver::plan_refs(Job& j, const VideoRequest& r, int32_t frames, std::s
                          { kind, m.index, lh, lw, kind == RAD_VREF_AUDIO ? 0 : (int32_t)t,
                            kind == RAD_VREF_AUDIO ? (int32_t)t : sound });
     }
+    /* The guide is the last keyframe, as ComfyUI appends it after the first and last frames. */
+    keys.insert(keys.end(), guide.begin(), guide.end());
     j.ref_tab[1] = (int32_t)keys.size() / 3;
     j.ref_tab.insert(j.ref_tab.end(), keys.begin(), keys.end());
     j.enc_pre = j.enc_q.size();
@@ -536,8 +566,12 @@ int VideoDriver::plan_small_keys(Job& j, const VideoRequest& r, std::string* why
         }
         q.push_back({ it.kind, it.slot, it.ref, true });
     }
+    /* The references and the song guide do not depend on the size: once, before the prompt. */
+    for (const Job::EncItem& it : j.enc_q)
+        if (it.kind != RAD_ENC_KEYFRAME) q.push_back(it);
     j.enc_pre = q.size();
-    q.insert(q.end(), j.enc_q.begin(), j.enc_q.end());
+    for (const Job::EncItem& it : j.enc_q)
+        if (it.kind == RAD_ENC_KEYFRAME) q.push_back(it);
     j.enc_q = std::move(q);
     return RAD_OK;
 }
@@ -651,7 +685,7 @@ int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_
                       std::to_string(first_h) + " RGB");
     }
     j.n_chunks = chunks;
-    j.n_samples = (int64_t)s.n_audio * (d.sample_rate / d.audio_rate);
+    j.n_samples = d.audio_channels > 0 ? (int64_t)s.n_audio * (d.sample_rate / d.audio_rate) : 0;
     VideoTicket& t = *r.ticket;
     t.frames = s.frames;
     t.steps = j.sched.steps;
@@ -697,7 +731,7 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
                   " pixels, the long side at most " + std::to_string(d.max_aspect) +
                   " times the short");
     const int32_t steps = r->steps > 0 ? r->steps : (int32_t)d.default_steps;
-    const bool evals = d.sched_kind == 1;   /* form 1 counts evaluations, form 0 grid points */
+    const bool evals = d.sched_kind != 0;   /* form 0 counts grid points */
     const int32_t rung_steps = evals ? d.n_rungs : d.n_rungs + 1;
     if (d.n_rungs > 0 && steps != rung_steps)
         return no("num_inference_steps must be " + std::to_string(rung_steps) + ": this model "
@@ -708,11 +742,22 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
                   std::to_string(d.max_steps) + (evals ? " (model evaluations)" :
                   " (sigma grid points, the last one 0)"));
 
+    const bool unipc = d.sched_kind == RAD_VIDEO_SCHEDULE_UNIPC;
+    if (r->sampler == -1) r->sampler = unipc ? RAD_SAMPLER_UNIPC : RAD_SAMPLER_EULER;
+    if (unipc ? r->sampler != RAD_SAMPLER_UNIPC
+              : r->sampler != RAD_SAMPLER_EULER && r->sampler != RAD_SAMPLER_RES_MULTISTEP)
+        return no("this model does not support the requested sampler");
     auto j = std::make_unique<Job>();
+    if (d.audio_channels == 0 && r->shift_audio != 0.0)
+        return no("this model has no soundtrack schedule");
     /* Guidance: the request's terms over the model's defaults; a negative prompt only when a
      * scale asks for the unconditional branch. */
     bool named = r->has_neg;
     for (int i = 0; i < 8; ++i) {
+        if (i >= 4 && d.audio_channels == 0 && !std::isnan(r->guidance[i]))
+            return no("this model has no soundtrack guidance");
+        if (d.guidance == RAD_VIDEO_GUIDANCE_CFG && i % 4 != 0 && !std::isnan(r->guidance[i]))
+            return no("this model supports only classifier-free guidance");
         named = named || !std::isnan(r->guidance[i]);
         j->guidance[i] = (float)(std::isnan(r->guidance[i]) ? d.guidance_default[i] : r->guidance[i]);
         if (!(j->guidance[i] >= 0.0f) || !std::isfinite(j->guidance[i]))
@@ -721,7 +766,8 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
     if (!d.guidance && named)
         return no("this model takes no guidance or negative prompt");
     j->n_neg = 0;
-    if (d.guidance && (j->guidance[0] != 1.0f || j->guidance[4] != 1.0f)) {
+    if (d.guidance && (j->guidance[0] != 1.0f ||
+                       (d.audio_channels > 0 && j->guidance[4] != 1.0f))) {
         const int64_t N = (int64_t)r->neg_tokens.size();
         if (N < 1 || N > d.max_text)
             return no("the negative prompt is " + std::to_string(N) + " tokens; this model takes "
@@ -954,7 +1000,7 @@ const RadBatch* VideoDriver::next(int step) {
     for (auto& jp : jobs_) {
         Job& j = *jp;
         if (!j.admitted || j.failed || j.step < j.sched.steps) continue;
-        if (!j.audio_done) return build_audio(j, step);
+        if (decl_.audio_channels > 0 && !j.audio_done) return build_audio(j, step);
         if (j.chunk < j.n_chunks) return build_chunk(j, step);
     }
     /* 2. The encodes of an admitted request's media, before its prompt. */
@@ -1019,8 +1065,13 @@ const RadBatch* VideoDriver::build_cond(Job& j, int step) {
     float* tv = hptr<float>(R_TV);
     float* ta = hptr<float>(R_TA);
     for (int32_t i = 0; i < j.sched.steps; ++i) {
-        tv[i] = 1.0f - j.sched.sig_v[(size_t)i];
-        ta[i] = 1.0f - j.sched.sig_a[(size_t)i];
+        if (j.sched.unipc.empty()) {
+            tv[i] = 1.0f - j.sched.sig_v[(size_t)i];
+            ta[i] = 1.0f - j.sched.sig_a[(size_t)i];
+        } else {
+            tv[i] = static_cast<float>(j.sched.unipc[i].timestep);
+            ta[i] = 0.0f;
+        }
     }
     reg_[R_TOK].used = (T + N) * 4;
     reg_[R_POS].used = (T + N) * 4;
@@ -1094,6 +1145,17 @@ const RadBatch* VideoDriver::build_cond(Job& j, int step) {
  * upscale (i == split) and one to sigma 0. */
 void VideoDriver::stage_sched(const Job& j, int32_t i, bool to_clean) {
     float* s = hptr<float>(R_SCHED);
+    if (!j.sched.unipc.empty()) {
+        const auto& step = j.sched.unipc[i];
+        std::fill_n(s, 16, 0.0f);
+        s[0] = static_cast<float>(step.timestep);
+        s[1] = step.sigma;
+        s[2] = j.sched.sig_v[i + 1];
+        static_assert(RAD_VIDEO_UNIPC_COEFF_OFFSET + rad_unipc::COUNT <= 16);
+        step.coefficients(s + RAD_VIDEO_UNIPC_COEFF_OFFSET);
+        reg_[R_SCHED].used = 16 * 4;
+        return;
+    }
     s[0] = 1.0f - j.sched.sig_v[(size_t)i];
     s[1] = j.sched.sig_v[(size_t)i];
     s[2] = to_clean ? 0.0f : j.sched.sig_v[(size_t)i + 1];
@@ -1201,8 +1263,8 @@ const RadBatch* VideoDriver::build_chunk(Job& j, int step) {
     stage_seed(j);   /* a decoder that denoises draws from the request's seed */
     if (upload() < 0) return nullptr;
     base_batches(j, j.geom, j.dec_rows, step);
-    const bool last = j.chunk == j.n_chunks - 1;
-    const int32_t n = (int32_t)(decl_.frames_per_chunk + (last ? decl_.frames_tail : 0));
+    const bool boundary = decl_.frames_tail < 0 ? j.chunk == 0 : j.chunk == j.n_chunks - 1;
+    const int32_t n = (int32_t)(decl_.frames_per_chunk + (boundary ? decl_.frames_tail : 0));
     for (size_t r = 0; r < out_.size(); ++r) {
         out_[r].gen = RAD_GEN_PASS_VDECODE;
         vout_[r].n_frames_out = n;
@@ -1221,7 +1283,8 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
     for (int g = 0; g < R_N; ++g) reg_[g].used = 0;
     const Job::EncItem& it = j.enc_q[j.enc_next];
     const VideoRefMedia& m = j.req->refs[(size_t)it.ref];
-    const bool audio = it.kind == RAD_ENC_VAUDIO || it.kind == RAD_ENC_AUDIO;
+    const bool audio = it.kind == RAD_ENC_VAUDIO || it.kind == RAD_ENC_AUDIO ||
+                       it.kind == RAD_ENC_GUIDE;
     /* A keyframe at an upscale's small size is the media's second picture. */
     const std::vector<float>& pix = it.small ? m.small_pixels : m.enc_pixels;
     const int32_t eh = it.small ? m.small_h : m.enc_h, ew = it.small ? m.small_w : m.enc_w;
@@ -1264,7 +1327,11 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
     for (size_t r = 0; r < ranks_.size(); ++r) {
         const int ri = (int)r;
         RadVideoGenBatch& V = vout_[(size_t)r];
-        V.enc_geom_d = dptr<int32_t>(ri, R_ENCG);
+        /* The encoder mixes device kernels with host-only k=1 convolutions and snake
+         * activations. Those host ops dereference their raw geometry operand directly;
+         * a rank's VRAM copy segfaults on discrete GPUs. The pinned staging table is
+         * readable by both execution sites and lives until this pass has completed. */
+        V.enc_geom_d = hptr<int32_t>(R_ENCG);
         V.enc_kind = it.kind;
         V.enc_slot = it.slot;
         if (audio) {

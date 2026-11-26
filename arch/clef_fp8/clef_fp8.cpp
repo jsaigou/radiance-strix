@@ -21,11 +21,12 @@ namespace clef_fp8 {
 
 using namespace rad::arch;
 
-static ClefHead g_head[MAX_RANKS];
+static ClefHead g_head[MAX_SLOTS];
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
     if (!ClefHead::present(meta)) {
         std::fprintf(stderr, "radiance: clef_fp8 serves a container converted with "
                              "--set decision.type=clef and the head added (--add "
@@ -33,13 +34,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_INVAL;
     }
     RAD_ARCH_TRY(qwen35_clef_fp8::declare(b, meta, ctx));
-    qwen35_clef_fp8::Model& m = qwen35_clef_fp8::g_model[ctx->rank];
+    qwen35_clef_fp8::Model& m = qwen35_clef_fp8::g_model[rad_build_slot(ctx)];
     /* The lm_head's row would be sampled once and discarded: with this fill declared, the trunk
      * skips the lm_head on a step every sampled row of which carries a request's words
      * (plugin_words_cover_rows) and leaves zero rows instead. */
     m.op_logits_fill = clef_logits_fill(b, m.nm, m.g, m.b_logits);
     if (!m.op_logits_fill) return RAD_E_INVAL;
-    ClefHead& h = g_head[ctx->rank];
+    ClefHead& h = g_head[rad_build_slot(ctx)];
     h = ClefHead{};
     return h.declare(b, meta, ctx, m.nm, m.g, m.a_h.x, m.b_logits, m.w_lm_head, m.kv_full,
                      (int)m.g.n_layer + 256);
@@ -49,8 +50,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
     qwen35_clef_fp8::step(c, batch);
     /* An encoder pass leaves no rows for the head, and a drafter's pass is not a trunk step. */
     if (batch->enc || batch->draft_pass != 0) return;
-    qwen35_clef_fp8::Model& m = qwen35_clef_fp8::g_model[rad_rank(c)];
-    ClefHead& h = g_head[rad_rank(c)];
+    qwen35_clef_fp8::Model& m = qwen35_clef_fp8::g_model[rad_slot(c)];
+    ClefHead& h = g_head[rad_slot(c)];
     /* The final norm's rows are in `a_h.x` after either of the trunk's step paths. */
     h.step_tokens(c, batch, m.a_h.x);
     if (batch->n_out > 0) h.step_heads(c, batch, m.b_logits, m.w_lm_head);
@@ -59,6 +60,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
 }  /* namespace clef_fp8 */
 
 RAD_ARCH_PROBE(qwen35_clef_fp8)
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(clef_fp8, "clef", "fp8_e4m3", "0.1.0",
                 "Cloudflare's clef / clef-flash (9B, 27B): the Qwen3.5 trunk of qwen35_fp8, "
                 "block-scaled fp8, with the joint schema head on the card for /v1/systemone")

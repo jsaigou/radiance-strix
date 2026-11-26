@@ -71,13 +71,72 @@ int RadFile::read_at(void* dst, int64_t bytes, int64_t off) const {
     return RAD_OK;
 }
 
+bool rad_blob_range(const uint8_t* base, int64_t size, const void* p, int64_t n,
+                    int64_t* off, int64_t* len) {
+    if (!base || size <= 0 || !p || n <= 0) return false;
+    const uintptr_t lo = (uintptr_t)base, a = (uintptr_t)p;
+    const uint64_t hi = (uint64_t)lo + (uint64_t)size, end = (uint64_t)a + (uint64_t)n;
+    if (a < lo || end > hi || end < (uint64_t)a) return false;   /* outside, or wraps */
+    if (off) *off = (int64_t)(a - lo);
+    if (len) *len = n;
+    return true;
+}
+
+std::vector<std::pair<int64_t, int64_t>> rad_keep_complement(
+    int64_t tables, int64_t size, std::vector<std::pair<int64_t, int64_t>> keep) {
+    /* Clamp to the blob, drop empties, sort and merge: the caller may hand in one range per rank,
+     * and every rank publishes the same table. */
+    std::vector<std::pair<int64_t, int64_t>> k;
+    k.reserve(keep.size());
+    for (const auto& r : keep) {
+        const int64_t a = std::max(r.first, tables), b = std::min(r.first + r.second, size);
+        if (b > a) k.emplace_back(a, b);
+    }
+    std::sort(k.begin(), k.end());
+    size_t m = 0;
+    for (size_t i = 0; i < k.size(); ++i) {
+        if (m && k[i].first <= k[m - 1].second) k[m - 1].second = std::max(k[m - 1].second, k[i].second);
+        else k[m++] = k[i];
+    }
+    k.resize(m);
+    /* Whole pages only, so a page that holds kept bytes stays: a gap's start rounds up and its
+     * end rounds down (the blob's own end is the mapping's). */
+    const int64_t pg = 4096;
+    std::vector<std::pair<int64_t, int64_t>> out;
+    auto gap = [&](int64_t a, int64_t b) {
+        a = (a + pg - 1) / pg * pg;
+        if (b < size) b = b / pg * pg;
+        if (b > a) out.emplace_back(a, b - a);      /* (offset, bytes), as `keep` is written */
+    };
+    int64_t cur = tables;
+    for (const auto& r : k) {
+        if (r.first > cur) gap(cur, r.first);
+        cur = std::max(cur, r.second);
+    }
+    if (cur < size) gap(cur, size);
+    return out;
+}
+
+int64_t RadFile::keep_cached(const void* p, int64_t n) {
+    int64_t off = 0, len = 0;
+    if (rad_blob_range(base_, size_, p, n, &off, &len) &&
+        std::find(keep_.begin(), keep_.end(), std::make_pair(off, len)) == keep_.end())
+        keep_.emplace_back(off, len);
+    int64_t kept = 0;
+    for (const auto& r : keep_) kept += r.second;
+    return kept;
+}
+
 void RadFile::drop_blob_cache() const {
     if (!base_ || !hdr_ || fd_ < 0) return;
     const int64_t tables = (int64_t)hdr_->data_off < size_ ? (int64_t)hdr_->data_off : size_;
     if (tables >= size_) return;
-    /* Unmap first, then drop the cache: the kernel cannot drop a page still mapped here. */
-    ::madvise(base_ + tables, (size_t)(size_ - tables), MADV_DONTNEED);
-    ::posix_fadvise(fd_, (off_t)tables, (off_t)(size_ - tables), POSIX_FADV_DONTNEED);
+    /* Unmap first, then drop the cache: the kernel cannot drop a page still mapped here. Only the
+     * ranges that are not kept (keep_cached); with none kept this is the whole blob. */
+    for (const auto& r : rad_keep_complement(tables, size_, keep_)) {
+        ::madvise(base_ + r.first, (size_t)r.second, MADV_DONTNEED);
+        ::posix_fadvise(fd_, (off_t)r.first, (off_t)r.second, POSIX_FADV_DONTNEED);
+    }
 }
 
 /* Advisory, with no madvise: the load reads with pread and never maps these pages. The one region
@@ -711,6 +770,8 @@ int RadWriter::begin_append(const char* path, const RadFile& old) {
         fd_out_ = fd_spill_ = -1;
         return RAD_E_IO;
     }
+    kept_expert_layers_.clear();
+    new_expert_layers_.clear();
     append_ = true;
     began_  = true;
     return RAD_OK;
@@ -721,6 +782,16 @@ int64_t RadWriter::add_existing(const Weight& w, const RadFile& old, const RadFi
     if (w.name.empty() || names_.count(w.name)) {
         RAD_ERR("'%s': the container already holds a weight of this name", w.name.c_str());
         return RAD_E_INVAL;
+    }
+    if (w.expert >= 0) {
+        if (new_expert_layers_.count(w.layer)) {
+            RAD_ERR("'%s' is layer %d's expert %d, kept where it is, and this run writes other "
+                    "experts of that layer past the end: a layer's experts sit at a fixed stride "
+                    "from each other, so a layer is kept whole or written whole.",
+                    w.name.c_str(), w.layer, w.expert);
+            return RAD_E_INVAL;
+        }
+        kept_expert_layers_.insert(w.layer);
     }
     /* Bytes and encoding are the old entry's; provenance and movement group are the caller's. */
     RadFileEntry n = e;
@@ -886,11 +957,14 @@ int64_t RadWriter::add_weight(const Weight& w) {
             return RAD_E_INVAL;
         }
     if (append_ && w.expert >= 0) {
-        RAD_ERR("'%s' is layer %d's expert %d, and a container extended in place cannot take a "
-                "new expert: a layer's experts sit at a fixed stride from each other, and one "
-                "written past the end joins no layer. Convert to a new file instead.",
-                w.name.c_str(), w.layer, w.expert);
-        return RAD_E_INVAL;
+        if (kept_expert_layers_.count(w.layer)) {
+            RAD_ERR("'%s' is layer %d's expert %d, and the container extended in place keeps "
+                    "experts of that layer: a layer's experts sit at a fixed stride from each "
+                    "other, and one written past the end joins no layer. Write the layer's whole "
+                    "table again, or convert to a new file.", w.name.c_str(), w.layer, w.expert);
+            return RAD_E_INVAL;
+        }
+        new_expert_layers_.insert(w.layer);
     }
 
     /* Every entry starts on a movement-unit boundary (up to 4 KiB padding per matrix, tens of MB on

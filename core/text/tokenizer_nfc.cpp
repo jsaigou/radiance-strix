@@ -1,5 +1,6 @@
 #include "text/tokenizer_nfc.h"
 #include "text/unicode_norm.h"
+#include "util/simd.h"
 
 #include <algorithm>
 #include <cstring>
@@ -47,11 +48,9 @@ public:
         size_t boundary = 0;        /* start of the last boundary codepoint seen */
         uint32_t last = 0;          /* combining class of the previous codepoint */
         for (size_t i = 0; i < n; ) {
-            if (i + 8 <= n) {
-                uint64_t w;
-                std::memcpy(&w, p + i, 8);
-                if (!(w & 0x8080808080808080ull)) { last = 0; boundary = i + 7; i += 8; continue; }
-            }
+            /* ASCII codepoints are all boundaries: skip a run at vector width. */
+            const size_t run = simd::first_non_ascii((const char*)p + i, n - i);
+            if (run) { last = 0; boundary = i + run - 1; i += run; continue; }
             uint32_t len, ccc;
             const int k = classify(p + i, n - i, &len, &ccc);
             if (k == kBoundary) { last = 0; boundary = i; i += len; continue; }

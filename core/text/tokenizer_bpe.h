@@ -103,8 +103,26 @@ struct BpeSym { uint32_t start, len; int32_t id; };
 /* Words up to this many symbols are merged by linear scan; longer ones by heap. */
 constexpr size_t kBpeLinearMax = 64;
 
+/* Reusable storage for the heap merge's linked symbols and candidates. Long pre-tokens (URLs,
+ * base64 and other unbroken runs) would otherwise allocate both arrays for every word in a call. */
+struct BpeMergeScratch {
+    struct Node { int32_t prev, next; uint32_t ver; bool alive; };
+    struct Cand {
+        uint32_t rank, left, right, vl, vr;
+        int32_t  merged;
+        /* std::*_heap is a max-heap: the pair that should come out first compares greatest. */
+        bool operator<(const Cand& o) const {
+            return rank != o.rank ? rank > o.rank : left > o.left;
+        }
+    };
+    std::vector<Node> nodes;
+    std::vector<Cand> heap;
+};
+
 /* Merge `syms` in place until no adjacent pair has a rank. `force_heap` lets a test check that
  * both strategies agree. */
+void bpe_merge(std::vector<BpeSym>& syms, const MergeTable& merges, BpeMergeScratch& scratch,
+               bool force_heap = false);
 void bpe_merge(std::vector<BpeSym>& syms, const MergeTable& merges, bool force_heap = false);
 
 }  /* namespace rad */

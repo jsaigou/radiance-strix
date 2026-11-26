@@ -184,7 +184,7 @@ struct Model {
     std::string mul, add;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 static rad_weight wcopy(RadBuilder* b, const char* dn, const char* src, uint32_t dtype,
                         std::initializer_list<int64_t> shape, int access, int group) {
@@ -978,8 +978,9 @@ static int find_prefix(RadBuilder* b, Model& m, const char** marker) {
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
-    Model& m = g_model[ctx->rank];
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(check_format(meta, ctx));
@@ -1335,7 +1336,7 @@ static void step_decode(RadCtx* c, const RadBatch* batch, const Model& m) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
+    const Model& m = g_model[rad_slot(c)];
     if (!batch->gen || !batch->gen_b) {
         rad_step_fail(c, "anima is an image generator and runs generator passes only");
         return;
@@ -1361,6 +1362,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PROBE(anima)
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(anima, "anima", "", "0.1.0",
                 "Anima (Base, Aesthetic, Turbo): Qwen3-0.6B through the LLM adapter, Cosmos-Predict2's "
                 "2B diffusion transformer and the Qwen-Image VAE; bf16 or block-fp8 linears")

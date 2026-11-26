@@ -138,7 +138,7 @@ TEST(the_metadata_names_the_architecture_and_the_quantisation) {
 
 /* The index is checkpoint-supplied data like the tensors, and its weight_map values are paths:
  * a poisoned one must not lead the loader to open files outside the model dir as the serving
- * user. hfget screens the listing's names; nothing screened the index's until here. */
+ * user. */
 TEST(a_poisoned_index_cannot_lead_the_shard_list_out_of_the_model_dir) {
     auto dir_with_index = [](const char* shard) -> std::string {
         const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) }, kConfig);
@@ -162,6 +162,20 @@ TEST(a_poisoned_index_cannot_lead_the_shard_list_out_of_the_model_dir) {
     }
 }
 
+/* A Hugging Face cache snapshot is a directory of symbolic links into the cache's blob store,
+ * which lies outside it. The shard's name is under the model directory; where its link points is
+ * the operator's layout, and the loader follows it. */
+TEST(a_shard_that_is_a_link_out_of_the_model_dir_opens) {
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) }, kConfig);
+    const std::string blob = dir + ".blob";
+    REQUIRE(std::rename((dir + "/model.safetensors").c_str(), blob.c_str()) == 0);
+    REQUIRE(::symlink(blob.c_str(), (dir + "/model.safetensors").c_str()) == 0);
+    Checkpoint ck;
+    CHECK_EQ(ck.open(dir), RAD_OK);
+    std::remove((dir + "/model.safetensors").c_str());
+    std::remove(blob.c_str());
+}
+
 TEST(routed_expert_metadata_accepts_the_deepseek_and_glm_config_spellings) {
     const std::string dir = write_checkpoint({ bf16("x", {2, 2}, 0) },
         "{\"model_type\":\"glm5_next\",\"text_config\":{\"hidden_size\":4096,"
@@ -174,6 +188,57 @@ TEST(routed_expert_metadata_accepts_the_deepseek_and_glm_config_spellings) {
     CHECK_EQ(ck.meta().m.n_expert_shared, (int64_t)1);
     CHECK_EQ(ck.meta().m.n_expert_used, (int64_t)8);
     CHECK_EQ(ck.meta().m.head_dim, (int64_t)0);
+}
+
+/* Muse Glimmer: the underscore-stripped model_type is the architecture id, the trunk's config
+ * lives under text_config (nested() reads it; the alias pass copies it to bare keys), and the
+ * head_dim 128 is read, not derived (6656/32 would be 208). The free-form keys a plugin reads --
+ * the layer schedule, the per-layer rotary bases, the family scalars -- flatten to strings under
+ * their dotted config.json spellings, and vision_config stays unaliased under its full prefix. */
+TEST(muse_glimmer_metadata_maps_the_trunk_and_keeps_the_family_keys) {
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
+        "{\"model_type\":\"muse_glimmer\",\"architectures\":[\"MuseGlimmerForConditionalGeneration\"],"
+        "\"image_token_id\":200092,\"video_token_id\":200091,"
+        "\"text_config\":{\"hidden_size\":6656,\"num_hidden_layers\":52,"
+        "\"num_attention_heads\":32,\"num_key_value_heads\":2,\"head_dim\":128,"
+        "\"intermediate_size\":19968,\"vocab_size\":202048,\"rms_norm_eps\":1e-5,"
+        "\"post_norm_eps\":1e-8,\"sliding_window\":2048,\"max_position_embeddings\":131072,"
+        "\"qk_scale_factor\":3.87,\"output_multiplier\":0.19611613513818404,"
+        "\"final_logit_softcapping\":20.0,"
+        "\"rope_parameters\":{\"rope_theta\":500000.0,\"rope_type\":\"default\"},"
+        "\"layer_types\":[\"sliding_attention\",\"sliding_attention\",\"sliding_attention\","
+        "\"full_attention\"],\"layer_rope_theta\":[500000.0,500000.0,500000.0,0]},"
+        "\"vision_config\":{\"model_type\":\"muse_glimmer_vision\",\"hidden_size\":1536,"
+        "\"num_hidden_layers\":50,\"patch_size\":14}}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    const MetaOwn& mo = ck.meta();
+    const RadModelMeta& m = mo.m;
+    CHECK_EQ(mo.arch, std::string("museglimmer"));
+    CHECK_EQ(mo.quant, std::string(""));
+    CHECK_EQ(mo.has("text_config.layer_rope_theta"), true);
+    CHECK_EQ(m.n_embd, (int64_t)6656);
+    CHECK_EQ(m.n_layers, (int64_t)52);
+    CHECK_EQ(m.n_head, (int64_t)32);
+    CHECK_EQ(m.n_head_kv, (int64_t)2);
+    CHECK_EQ(m.head_dim, (int64_t)128);
+    CHECK_EQ(m.n_ff, (int64_t)19968);
+    CHECK_EQ(m.n_vocab, (int64_t)202048);
+    CHECK_EQ(m.rms_eps, 1e-5f);
+    CHECK_EQ(m.n_ctx_train, (int64_t)131072);
+    CHECK_EQ(m.rope_theta, 500000.0);
+    /* The plugin's free-form reads: the aliased bare spellings and the dotted originals agree,
+     * and the layer arrays arrive as one space-separated string each. */
+    CHECK_EQ(rad_meta_gets(&m, "layer_types", ""), std::string("sliding_attention sliding_attention "
+                                                               "sliding_attention full_attention"));
+    CHECK_EQ(rad_meta_gets(&m, "layer_rope_theta", ""), std::string("500000 500000 500000 0"));
+    CHECK_EQ(rad_meta_geti(&m, "sliding_window", 0), (long long)2048);
+    CHECK_EQ(rad_meta_getf(&m, "qk_scale_factor", 0.0), 3.87);
+    CHECK_EQ(rad_meta_getf(&m, "post_norm_eps", 0.0), 1e-8);
+    /* vision_config is never aliased: only the full prefix carries it. */
+    CHECK_EQ(rad_meta_geti(&m, "vision_config.num_hidden_layers", -1), (long long)50);
+    CHECK_EQ(rad_meta_geti(&m, "num_hidden_layers", -1), (long long)52);
+    CHECK_EQ(rad_meta_gets(&m, "vision_config.model_type", ""), std::string("muse_glimmer_vision"));
 }
 
 /* The descriptor derives from quant_method and fmt whoever set them, including rad-convert's
@@ -228,6 +293,46 @@ TEST(a_gemma4_e4b_checkpoint_selects_the_bf16_plugin_on_its_own) {
 }
 
 /* The 26B-A4B/31B shape declares neither key and keeps the bare descriptor arch/gemma4 owns. */
+/* The loop checkpoint's model type is `inkling2_loop`; its architecture id is the plugin's, the
+ * same id the release's `inkling2` checkpoints select. */
+TEST(an_inkling2_loop_checkpoint_selects_the_inkling2_plugin) {
+    const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
+        "{\"model_type\":\"inkling2_loop\",\"hidden_size\":64,\"num_hidden_layers\":24}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK_EQ(ck.meta().arch, std::string("inkling2"));
+}
+
+/* A full-attention layer's K convolution is stored lag-major, static_w [k, C]: row `lag` multiplies
+ * the input `lag` steps back. The importer reads it as causal_conv1d's [C, k] with the current tap
+ * last, so w[c][j] = static_w[k - 1 - j][c]. Each element here encodes its own (lag, channel). */
+TEST(an_inkling2_static_w_conv_is_its_conv1d_layout) {
+    const int64_t k = 4, C = 3;
+    T s{ "m.attn.k_sconv.static_w", "F32", { k, C }, std::vector<uint8_t>((size_t)(k * C * 4)) };
+    for (int64_t lag = 0; lag < k; ++lag)
+        for (int64_t c = 0; c < C; ++c) {
+            const float v = (float)(10 * lag + c);
+            std::memcpy(s.bytes.data() + (size_t)((lag * C + c) * 4), &v, 4);
+        }
+    const std::string dir = write_checkpoint({ s },
+        "{\"model_type\":\"inkling2_loop\",\"hidden_size\":64,\"num_hidden_layers\":24}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("kc", RAD_MAP_COPY, { "m.attn.k_sconv.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "kc", false, &w, &why), RAD_OK);
+    CHECK_EQ(w.rows, C);
+    CHECK_EQ(w.cols, k);
+    std::vector<float> f((size_t)k);
+    for (int64_t c = 0; c < C; ++c) {
+        REQUIRE_EQ(ckpt_rows_f32(w, c, 1, f.data(), &why), RAD_OK);
+        for (int64_t j = 0; j < k; ++j)
+            CHECK_EQ(f[(size_t)j], (float)(10 * (k - 1 - j) + c));
+    }
+}
+
 TEST(a_gemma4_31b_checkpoint_keeps_the_bare_descriptor) {
     const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) },
         "{\"model_type\":\"gemma4\",\"text_config\":{\"hidden_size\":5376,"
@@ -1951,6 +2056,26 @@ TEST(config_json_fills_the_model_meta_as_each_family_spells_it) {
           "lfm2", 0, 1024, 16, 8, 64, 0, 0, 0, 0, 0, 0, 1e-5, 1e4,
           { { "layer_types", "conv full_attention conv" }, { "hidden_size", "7" },
             { "vision_config.hidden_size", "768" } } },
+        { "LFM3: the rotary per attention class with its partial factor, the window, booleans; the "
+          "typed theta is the default, which the plugin does not read",
+          R"({"model_type":"lfm3","hidden_size":2048,"num_attention_heads":16,
+              "num_key_value_heads":4,"head_dim":128,"num_hidden_layers":4,
+              "intermediate_size":7680,"norm_eps":1e-05,"vocab_size":128000,
+              "max_position_embeddings":262144,"conv_L_cache":7,"conv_bias":false,
+              "use_sandwich_norm":true,"tie_word_embeddings":true,"sliding_window":256,
+              "layer_types":["conv","full_attention","sliding_attention","conv"],
+              "rope_parameters":{"full_attention":{"partial_rotary_factor":0.5,
+                                                   "rope_theta":1000000.0,"rope_type":"default"},
+                                 "sliding_attention":{"rope_theta":10000,"rope_type":"default"}}})",
+          "lfm3", 4, 2048, 16, 4, 128, 7680, 128000, 262144, 0, 0, 0, 1e-5, 1e4,
+          { { "layer_types", "conv full_attention sliding_attention conv" },
+            { "rope_parameters.full_attention.rope_theta", "1000000" },
+            { "rope_parameters.full_attention.partial_rotary_factor", "0.5" },
+            { "rope_parameters.full_attention.rope_type", "default" },
+            { "rope_parameters.sliding_attention.rope_theta", "10000" },
+            { "rope_parameters.sliding_attention.partial_rotary_factor", nullptr },
+            { "sliding_window", "256" }, { "conv_L_cache", "7" }, { "conv_bias", "0" },
+            { "use_sandwich_norm", "1" }, { "tie_word_embeddings", "1" } } },
         { "Gemma 4 12B: the unified wrapper maps to gemma4, its model_type stays, null experts",
           R"({"model_type":"gemma4_unified","eos_token_id":[1,106],
               "text_config":{"model_type":"gemma4_unified_text","hidden_size":3840,
@@ -2381,8 +2506,8 @@ TEST(a_gguf_q8_0_q4_k_or_q6_k_tensor_is_imported_as_its_planes) {
     const GTensor g = k_blocks("g", 12, 2, 512, 1), u = k_blocks("u", 12, 3, 512, 2);
     const GTensor s = k_blocks("s", 12, 2, 256, 3), k6 = k_blocks("k6", 14, 2, 256, 4);
     const GTensor q5{ "t.q5_k", 13, { 256, 1 }, std::vector<uint8_t>(176, 0) };
-    /* A type the reader does not import (Q3_K, 110 bytes a block), for the refusal below: Q5_K used to
-     * be that type until this fork's reader began importing it as planes. */
+    /* A type the reader does not import (Q3_K, 110 bytes a block), for the refusal below:
+     * Q5_K used to be that type until this fork's reader began importing it as planes. */
     const GTensor q3{ "t.q3_k", 11, { 256, 1 }, std::vector<uint8_t>(110, 0) };
     write_gguf(path, llama_kvs(15), { q8, g, u, s, k6, q5, q3 });
     Checkpoint ck;
@@ -2648,6 +2773,29 @@ TEST(a_diffusers_pipeline_reads_as_one_checkpoint) {
         Checkpoint ck;
         CHECK_EQ(ck.open(dir), (int)RAD_E_NOTFOUND);
     }
+}
+
+TEST(a_wan_pipeline_normalizes_its_umt5_encoder_dimensions) {
+    const std::string dir = fresh_dir();
+    ::mkdir((dir + "/text_encoder").c_str(), 0755);
+    write_file(dir + "/model_index.json", R"({"_class_name":"WanPipeline"})");
+    write_file(dir + "/text_encoder/config.json",
+               R"({"model_type":"umt5","num_layers":24,"d_model":4096,"num_heads":64,
+                   "d_kv":32,"d_ff":10240,"vocab_size":256384})");
+    write_shard(dir + "/text_encoder/model.safetensors", {bf16("shared.weight", {4, 4}, 1.0f)});
+
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK_EQ(ck.meta().arch, std::string("wan"));
+    const auto& m = ck.meta().m;
+    CHECK_EQ(m.n_layers, 24);
+    CHECK_EQ(m.n_embd, 4096);
+    CHECK_EQ(m.n_head, 64);
+    CHECK_EQ(m.n_head_kv, 64);
+    CHECK_EQ(m.head_dim, 32);
+    CHECK_EQ(m.n_ff, 10240);
+    CHECK_EQ(m.n_vocab, 256384);
+    CHECK(ck.find("shared.weight") != nullptr);
 }
 
 /* ================================================================== a drafter of its own
@@ -3543,4 +3691,360 @@ TEST(single_files_merge_by_name_and_read_their_metadata_elsewhere) {
     CHECK_EQ(ck.tok_dir(), meta);
 }
 
+TEST(a_bailing_gguf_must_promise_a_walkable_layer_count) {
+    /* bailingmoe3_layouts rebuilds the release layout by walking every layer the container
+     * claims, on the open path and before any plugin runs. A GGUF naming 2^62 layers is
+     * therefore not a slow load but a permanent hang -- and a negative dense prefix opens a
+     * second loop of the same order. Both must refuse at open, quickly, RAD_E_FORMAT. */
+    const std::string dir = fresh_dir();
+    auto bailing_kvs = [](int64_t layers, int64_t dense, int64_t heads = 4, int64_t latent = 512) {
+        return std::vector<GKv>{
+            { "general.architecture", 8, 0, { "bailingmoe3" } },
+            { "bailingmoe3.block_count", 10, (double)layers, {} },
+            { "bailingmoe3.embedding_length", 4, 64, {} },
+            { "bailingmoe3.attention.head_count", 10, (double)heads, {} },
+            { "bailingmoe3.feed_forward_length", 4, 128, {} },
+            { "bailingmoe3.context_length", 4, 4096, {} },
+            { "bailingmoe3.kda.head_dim", 4, 128, {} },
+            { "bailingmoe3.rope.dimension_count", 4, 64, {} },
+            { "bailingmoe3.attention.key_length_mla", 4, 192, {} },
+            { "bailingmoe3.attention.value_length_mla", 4, 128, {} },
+            { "bailingmoe3.attention.kv_lora_rank", 10, (double)latent, {} },
+            { "bailingmoe3.expert_feed_forward_length", 4, 256, {} },
+            { "bailingmoe3.leading_dense_block_count", 10, (double)dense, {} },
+        };
+    };
+    const std::string huge = dir + "/huge.gguf";
+    write_gguf(huge, bailing_kvs(4611686018427387904LL, 0), {});
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(huge), RAD_E_FORMAT);
+    const std::string neg = dir + "/neg.gguf";
+    write_gguf(neg, bailing_kvs(4, -4611686018427387904LL), {});
+    Checkpoint ck2;
+    REQUIRE_EQ(ck2.open(neg), RAD_E_FORMAT);
+    /* The bound must not bite the honest: a small stack opens (no tensors, so the walk finds
+     * nothing to rebuild, and open returns OK exactly as before). */
+    const std::string sane = dir + "/sane.gguf";
+    write_gguf(sane, bailing_kvs(4, 1), {});
+    Checkpoint ck3;
+    REQUIRE_EQ(ck3.open(sane), RAD_OK);
+    /* The widths the layout products are built from are bounded too: past the caps they are
+     * vector sizes and wrapped row products, not geometry. */
+    const std::string wide = dir + "/wide.gguf";
+    write_gguf(wide, bailing_kvs(4, 1, 4611686018427387904LL), {});
+    Checkpoint ck4;
+    REQUIRE_EQ(ck4.open(wide), RAD_E_FORMAT);
+    const std::string deep_rank = dir + "/deep_rank.gguf";
+    write_gguf(deep_rank, bailing_kvs(4, 1, 4, 4611686018427387904LL), {});
+    Checkpoint ck5;
+    REQUIRE_EQ(ck5.open(deep_rank), RAD_E_FORMAT);
+}
+
 RAD_TEST_MAIN()
+
+/* Inkling 2's per-tensor release: hf_quant_config.json's parameter groups name each stacked expert
+ * tensor's form, and take precedence over config.json (which here names ModelOpt's NVFP4, the wrong
+ * truth). An NVFP4 expert is its e2m1 codes, its e4m3 scales and its f32 level (amax over the
+ * file's one divisor), each as shipped; an MXFP8 expert is its e4m3 codes and its e8m0 exponents. */
+namespace {
+
+const char* kPerTensorConfig =
+    "{\"model_type\":\"inkling2\",\"quantization_config\":{\"quant_method\":\"modelopt\","
+    "\"quant_algo\":\"NVFP4\",\"group_size\":16}}";
+
+const char* kPerTensorGroups =
+    "{\"model\":{\"parameter_groups\":["
+    "{\"compute_dtype\":\"bfloat16\",\"tensors\":[\"n.weight\"]},"
+    "{\"compute_dtype\":\"nvfp4\",\"tensors\":[\"m.experts.w13_weight\"]},"
+    "{\"compute_dtype\":\"mxfp8\",\"tensors\":[\"m.experts.w2_weight\"]}]}}";
+
+/* A stack of E NVFP4 experts [E, N, K]: code byte (e, n, j) = (e * 37 + n * 11 + j * 5) & 0xff,
+ * scale (e, n, g) the e4m3 value 2^((n + g) % 5 - 2), and the amax per expert over a divisor. */
+void add_nvfp4_stack(std::vector<T>* ts, const std::string& base, int64_t E, int64_t N, int64_t K,
+                     const std::vector<float>& amax, float denom) {
+    T w{ base + "_weight", "U8", { E, N, K / 2 }, {} };
+    for (int64_t e = 0; e < E; ++e)
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t j = 0; j < K / 2; ++j)
+                w.bytes.push_back((uint8_t)((e * 37 + n * 11 + j * 5) & 0xff));
+    ts->push_back(w);
+    T s{ base + "_weight_scale", "F8_E4M3", { E, N, K / 16 }, {} };
+    for (int64_t e = 0; e < E; ++e)
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t g = 0; g < K / 16; ++g) {
+                uint8_t b;
+                rad_store_f32(&b, RAD_F8E4M3, 0, std::ldexp(1.0f, (int)((n + g) % 5) - 2));
+                s.bytes.push_back(b);
+            }
+    ts->push_back(s);
+    T a{ base + "_weight_amax", "F32", { E }, std::vector<uint8_t>((size_t)E * 4) };
+    std::memcpy(a.bytes.data(), amax.data(), (size_t)E * 4);
+    ts->push_back(a);
+    T d{ base + "_weight_outer_scale_denominator", "F32", { 1 }, std::vector<uint8_t>(4) };
+    std::memcpy(d.bytes.data(), &denom, 4);
+    ts->push_back(d);
+}
+
+/* A stack of E MXFP8 experts [E, N, K]: e4m3 codes (i % 7 - 3) and ue8m0 exponents (127 + e). */
+void add_mxfp8_stack(std::vector<T>* ts, const std::string& base, int64_t E, int64_t N, int64_t K) {
+    T w{ base + "_weight", "F8_E4M3", { E, N, K }, {} };
+    for (int64_t i = 0; i < E * N * K; ++i) {
+        uint8_t b;
+        rad_store_f32(&b, RAD_F8E4M3, 0, (float)(i % 7) - 3.0f);
+        w.bytes.push_back(b);
+    }
+    ts->push_back(w);
+    T s{ base + "_weight_scale", "U8", { E, N, K / 32 }, {} };
+    for (int64_t e = 0; e < E; ++e)
+        for (int64_t i = 0; i < N * (K / 32); ++i) s.bytes.push_back((uint8_t)(127 + e));
+    ts->push_back(s);
+}
+
+/* The per-tensor checkpoint of `ts`: the groups file, and the config that must lose to it. */
+std::string per_tensor_dir(const std::vector<T>& ts) {
+    const std::string dir = fresh_dir();
+    write_shard(dir + "/model.safetensors", ts);
+    write_file(dir + "/config.json", kPerTensorConfig);
+    write_file(dir + "/hf_quant_config.json", kPerTensorGroups);
+    return dir;
+}
+
+}  /* namespace */
+
+TEST(an_inkling_nvfp4_expert_is_its_regrouped_codes_scales_and_level) {
+    std::vector<T> ts;
+    ts.push_back(bf16("n.weight", { 4 }, 1.0f));
+    add_nvfp4_stack(&ts, "m.experts.w13", 2, 4, 32, { 3.0f, 6.0f }, 2.0f);
+    const std::string dir = per_tensor_dir(ts);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::PerTensor);
+    CHECK(ck.import_refusal().empty());
+    Program prog;
+    prog.name_map.push_back(map("e1", RAD_MAP_COPY, { "m.experts.w13_weight" }, { 1 }));
+    prog.name_map.push_back(map("n", RAD_MAP_COPY, { "n.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "e1", false, &w, &why), RAD_OK);
+    CHECK(w.imported);
+    CHECK(!w.trivial);
+    CHECK_EQ(w.rows, (int64_t)4);
+    CHECK_EQ(w.cols, (int64_t)32);
+    REQUIRE_EQ(w.enc.n_planes, 3);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_FP4E2M1);
+    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_F8E4M3);
+    CHECK_EQ(w.enc.plane[1].block[0], (int64_t)1);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)16);
+    CHECK_EQ(w.enc.plane[2].dtype, (uint32_t)RAD_F32);
+    CHECK(rad_enc_valid(&w.enc));
+    REQUIRE_EQ(w.levels.size(), (size_t)1);
+
+    /* Plane 0 is expert 1's codes and plane 1 its scales, with the rows regrouped from the
+     * checkpoint's interleaved gate and up rows: [gate 0, up 0, gate 1, up 1] becomes
+     * [gate 0, gate 1, up 0, up 1], the source row order {0, 2, 1, 3}. Plane 2 is its level:
+     * amax 6 over the divisor 2, unchanged. */
+    const T& cw = ts[1];
+    const T& sw = ts[2];
+    const size_t eb = 4 * 16, sb = 4 * 2;   /* one expert's codes and scales, in bytes */
+    const int perm[4] = { 0, 2, 1, 3 };
+    std::vector<uint8_t> cp(eb), sp(sb), lp(4);
+    REQUIRE_EQ(ckpt_plane_rows(w, 0, 0, 4, cp.data(), &why), RAD_OK);
+    REQUIRE_EQ(ckpt_plane_rows(w, 1, 0, 4, sp.data(), &why), RAD_OK);
+    REQUIRE_EQ(ckpt_plane_rows(w, 2, 0, 1, lp.data(), &why), RAD_OK);
+    for (int r = 0; r < 4; ++r) {
+        CHECK_EQ(std::memcmp(cp.data() + r * 16, cw.bytes.data() + eb + perm[r] * 16, 16), 0);
+        CHECK_EQ(std::memcmp(sp.data() + r * 2, sw.bytes.data() + sb + perm[r] * 2, 2), 0);
+    }
+    float level;
+    std::memcpy(&level, lp.data(), 4);
+    CHECK_EQ(level, 3.0f);
+
+    /* logical row 2 of the expert, code by code: e2m1 * e4m3 * level */
+    static const float kMag[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    std::vector<float> f((size_t)32);
+    REQUIRE_EQ(ckpt_rows_f32(w, 2, 1, f.data(), &why), RAD_OK);
+    int bad = 0;
+    for (int64_t k = 0; k < 32; ++k) {
+        /* the regrouped row 2 is the source's row 1 (up 0) */
+        const uint8_t byte = cw.bytes[(size_t)(eb + 1 * 16 + k / 2)];
+        const uint8_t c = (uint8_t)(k % 2 ? byte >> 4 : byte & 15);
+        const float code = c & 8 ? -kMag[c & 7] : kMag[c & 7];
+        const float sc = rad_fp8e4m3_to_f32(sw.bytes[(size_t)(sb + 1 * 2 + k / 16)]);
+        if (f[(size_t)k] != code * sc * level) ++bad;
+    }
+    CHECK_EQ(bad, 0);
+
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "n", false, &w, &why), RAD_OK);
+    CHECK(w.trivial && rad_enc_is(&w.enc, "plain"));
+}
+
+TEST(an_inkling_mxfp8_expert_is_its_e4m3_codes_and_e8m0_exponents) {
+    std::vector<T> ts;
+    add_mxfp8_stack(&ts, "m.experts.w2", 2, 4, 32);
+    const std::string dir = per_tensor_dir(ts);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::PerTensor);
+    Program prog;
+    prog.name_map.push_back(map("e1", RAD_MAP_COPY, { "m.experts.w2_weight" }, { 1 }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "e1", false, &w, &why), RAD_OK);
+    CHECK(w.imported);
+    CHECK_EQ(w.rows, (int64_t)4);
+    CHECK_EQ(w.cols, (int64_t)32);
+    REQUIRE_EQ(w.enc.n_planes, 2);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_F8E4M3);
+    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_E8M0);
+    CHECK_EQ(w.enc.plane[1].block[1], (int64_t)32);
+    CHECK(w.levels.empty() || w.levels[0] == nullptr);
+    /* expert 1's exponent is 128: every value times 2 */
+    std::vector<float> f((size_t)4 * 32);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 4, f.data(), &why), RAD_OK);
+    int bad = 0;
+    const size_t eb = 4 * 32;
+    for (int64_t i = 0; i < 4 * 32; ++i)
+        if (f[(size_t)i] != 2.0f * rad_fp8e4m3_to_f32(ts[0].bytes[eb + (size_t)i])) ++bad;
+    CHECK_EQ(bad, 0);
+}
+
+/* A bf16 stack of two experts, [E, 4, 3], whose element (e, r, c) is e * 100 + r * 10 + c. The
+ * checkpoint interleaves gate and up (row 2i gate, 2i+1 up); the importer must read
+ * [gate 0, gate 1, up 0, up 1] for every expert, so the source rows are {0, 2, 1, 3}. */
+TEST(an_inkling_bf16_expert_stack_is_regrouped_gate_then_up) {
+    T w{ "m.experts.w13_weight", "BF16", { 2, 4, 3 }, {} };
+    for (int64_t e = 0; e < 2; ++e)
+        for (int64_t r = 0; r < 4; ++r)
+            for (int64_t c = 0; c < 3; ++c) {
+                uint16_t b = 0;
+                rad_store_f32(&b, RAD_BF16, 0, (float)(e * 100 + r * 10 + c));
+                w.bytes.push_back((uint8_t)(b & 0xff));
+                w.bytes.push_back((uint8_t)(b >> 8));
+            }
+    std::vector<T> ts{ w };
+    const std::string dir = fresh_dir();
+    write_shard(dir + "/model.safetensors", ts);
+    write_file(dir + "/config.json", "{\"model_type\":\"inkling2\",\"hidden_size\":3}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    const SrcTensor* t = ck.find("m.experts.w13_weight");
+    REQUIRE(t != nullptr);
+    const int perm[4] = { 0, 2, 1, 3 };
+    int bad = 0;
+    for (int64_t e = 0; e < 2; ++e)
+        for (int64_t r = 0; r < 4; ++r)
+            for (int64_t c = 0; c < 3; ++c) {
+                const float want = (float)(e * 100 + perm[r] * 10 + c);
+                const float got = rad_load_f32(t->data, RAD_BF16, (e * 4 + r) * 3 + c);
+                if (got != want) ++bad;
+            }
+    CHECK_EQ(bad, 0);
+}
+
+/* An MXFP8 stack's e4m3 codes regroup row by row like the bf16 stack's, and the ue8m0 exponents
+ * (one row of the scale plane per code row) move with them. */
+TEST(an_inkling_mxfp8_w13_stack_is_regrouped_with_its_exponents) {
+    std::vector<T> ts;
+    add_mxfp8_stack(&ts, "m.experts.w13", 2, 4, 32);
+    const std::string dir = fresh_dir();
+    write_shard(dir + "/model.safetensors", ts);
+    write_file(dir + "/config.json", "{\"model_type\":\"inkling2\",\"hidden_size\":32}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    const T& src = ts[0];
+    const SrcTensor* codes = ck.find("m.experts.w13_weight");
+    const SrcTensor* exps = ck.find("m.experts.w13_weight_scale");
+    REQUIRE(codes != nullptr && exps != nullptr);
+    const int perm[4] = { 0, 2, 1, 3 };
+    int bad = 0;
+    for (int64_t e = 0; e < 2; ++e)
+        for (int64_t r = 0; r < 4; ++r) {
+            const uint8_t* got = static_cast<const uint8_t*>(codes->data) + (e * 4 + r) * 32;
+            if (std::memcmp(got, src.bytes.data() + (e * 4 + perm[r]) * 32, 32) != 0) ++bad;
+            const uint8_t* g = static_cast<const uint8_t*>(exps->data) + (e * 4 + r) * 1;
+            if (*g != (uint8_t)(127 + e)) ++bad;
+        }
+    CHECK_EQ(bad, 0);
+}
+
+TEST(an_inkling_expert_that_cannot_be_read_is_refused_by_name) {
+    /* a missing companion: no amax beside the codes */
+    {
+        std::vector<T> ts;
+        add_nvfp4_stack(&ts, "m.experts.w13", 2, 4, 32, { 3.0f, 6.0f }, 2.0f);
+        ts.erase(ts.begin() + 2);   /* the _amax */
+        const std::string dir = per_tensor_dir(ts);
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        Program prog;
+        prog.name_map.push_back(map("e1", RAD_MAP_COPY, { "m.experts.w13_weight" }, { 1 }));
+        CkptWeight w;
+        std::string why;
+        CHECK(ckpt_resolve(ck, prog, "e1", false, &w, &why) != RAD_OK);
+        CHECK(why.find("_amax") != std::string::npos);
+    }
+    /* a scale shape that does not divide: K = 24 is not whole 16-wide groups */
+    {
+        std::vector<T> ts;
+        add_nvfp4_stack(&ts, "m.experts.w13", 2, 4, 32, { 3.0f, 6.0f }, 2.0f);
+        ts[0].shape = { 2, 4, 12 };
+        ts[0].bytes.resize(2 * 4 * 12);
+        ts[1].shape = { 2, 4, 1 };
+        ts[1].bytes.resize(2 * 4);
+        const std::string dir = per_tensor_dir(ts);
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        Program prog;
+        prog.name_map.push_back(map("e1", RAD_MAP_COPY, { "m.experts.w13_weight" }, { 1 }));
+        CkptWeight w;
+        std::string why;
+        CHECK(ckpt_resolve(ck, prog, "e1", false, &w, &why) != RAD_OK);
+        CHECK(why.find("divide") != std::string::npos || why.find("scale") != std::string::npos);
+    }
+    /* a NaN scale in expert 1: refused at that expert, not read */
+    {
+        std::vector<T> ts;
+        add_nvfp4_stack(&ts, "m.experts.w13", 2, 4, 32, { 3.0f, 6.0f }, 2.0f);
+        ts[1].bytes[(size_t)(8 + 3 * 2 + 1)] = 0x7f;   /* expert 1, row 3, group 1 */
+        const std::string dir = per_tensor_dir(ts);
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        Program prog;
+        prog.name_map.push_back(map("e1", RAD_MAP_COPY, { "m.experts.w13_weight" }, { 1 }));
+        CkptWeight w;
+        std::string why;
+        CHECK(ckpt_resolve(ck, prog, "e1", false, &w, &why) != RAD_OK);
+        CHECK(why.find("NaN") != std::string::npos);
+        /* expert 0 holds no NaN and reads */
+        prog.name_map.push_back(map("e0", RAD_MAP_COPY, { "m.experts.w13_weight" }, { 0 }));
+        CHECK_OK(ckpt_resolve(ck, prog, "e0", false, &w, &why));
+    }
+    /* a zero divisor, the file's one multiplier */
+    {
+        std::vector<T> ts;
+        add_nvfp4_stack(&ts, "m.experts.w13", 2, 4, 32, { 3.0f, 6.0f }, 0.0f);
+        const std::string dir = per_tensor_dir(ts);
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        Program prog;
+        prog.name_map.push_back(map("e1", RAD_MAP_COPY, { "m.experts.w13_weight" }, { 1 }));
+        CkptWeight w;
+        std::string why;
+        CHECK(ckpt_resolve(ck, prog, "e1", false, &w, &why) != RAD_OK);
+        CHECK(why.find("divisor") != std::string::npos);
+    }
+    /* the stack named without its expert index */
+    {
+        std::vector<T> ts;
+        add_mxfp8_stack(&ts, "m.experts.w2", 2, 4, 32);
+        const std::string dir = per_tensor_dir(ts);
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        Program prog;
+        prog.name_map.push_back(map("all", RAD_MAP_COPY, { "m.experts.w2_weight" }));
+        CkptWeight w;
+        std::string why;
+        CHECK(ckpt_resolve(ck, prog, "all", false, &w, &why) != RAD_OK);
+        CHECK(why.find("one expert") != std::string::npos);
+    }
+}

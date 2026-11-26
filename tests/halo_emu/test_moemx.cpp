@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 extern const char* emu_last_kernel;
@@ -113,8 +114,19 @@ static std::vector<int> glm_runs(std::vector<int> live) {
     return runs;
 }
 
-int main() {
-    int fails = check_decode(), cases = 1;
+int main(int argc, char** argv) {
+    /* [--shard k/n]: every n-th case from the k-th (the table decode with shard 0), so ctest can
+     * split the run. A case's seed is its place in the table, whichever shard runs it. */
+    int shard = 0, shards = 1;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--shard" && i + 1 < argc &&
+            std::sscanf(argv[++i], "%d/%d", &shard, &shards) == 2 && shards >= 1 && shard >= 0 &&
+            shard < shards)
+            continue;
+        std::fprintf(stderr, "usage: %s [--shard k/n], 0 <= k < n\n", argv[0]);
+        return 2;
+    }
+    int fails = shard == 0 ? check_decode() : 0, cases = shard == 0 ? 1 : 0;
     if (fails) std::printf("FAIL table decode: %d mismatches\n", fails);
 
     const std::vector<int> runs9 = { 0, 1, 15, 16, 17, 63, 64, 65, 130, 141 };
@@ -261,14 +273,16 @@ int main() {
     };
 
     for (const Case& c : all) {
+        const int idx = (int)(&c - all);
+        if (idx % shards != shard) continue;
         const int E = (int)c.runs.size(), NK = std::max(c.K, c.K_odd), OUT = std::max(c.N, c.N_odd);
         int routed = 0;
         for (int r : c.runs) routed += r;
         const int T = (routed + c.tail + c.top - 1) / c.top * c.top;
         // An odd pitch on every other case: the LDS output's 16-byte stores need an aligned row.
         const int Arows = c.sorted_a ? T : T / c.top, ap = NK + 16, asp = NK / 128 + 1,
-                  yp = OUT + ((&c - all) % 2 ? 5 : 8);
-        std::mt19937 rng(1000 + cases);
+                  yp = OUT + (idx % 2 ? 5 : 8);
+        std::mt19937 rng(1001 + idx);
         std::normal_distribution<float> nd(0.f, 1.f);
         std::uniform_real_distribution<float> oct(-6.f, 6.f);
         std::vector<uint8_t> a((size_t)Arows * ap);

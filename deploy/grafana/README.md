@@ -15,10 +15,10 @@ scrape_configs:
   - job_name: radiance
     static_configs:
       - targets: ["gpu-host:8000"]
-    # Only when the server runs with --api-key: /metrics is behind the key like every path but
+    # Only when the server sets server.api-key: /metrics is behind the key like every path but
     # /health, /ping and the dashboard page, and an unauthorised scrape gets 401.
     authorization:
-      credentials: "<the server's --api-key>"
+      credentials: "<the server's api-key>"
 ```
 
 Window values are ratios of counters (named here without their `radiance:`/`vllm:` prefix and
@@ -33,7 +33,7 @@ Window values are ratios of counters (named here without their `radiance:`/`vllm
 
 Draft blocks per decode step is the reach of position 0 over `engine_steps_decode`
 ([`docs/GUIDE.md`](../../docs/GUIDE.md) §6.3). The adaptive draft window and verifies by draft depth
-have data only under `--draft-window adaptive`.
+have data only under `draft-window: adaptive`.
 
 Prometheus extrapolates `rate()` inside the window and VictoriaMetrics does not, so short windows at
 the edge of a burst differ between the two. The overview's ratios are taken over the dashboard's

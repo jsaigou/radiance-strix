@@ -5,12 +5,16 @@
 #include "mm/processor.h"
 #include "server/nemotron35.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
+#include "util/rowpool.h"
+#include "util/simd.h"
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <limits>
@@ -44,22 +48,25 @@ static const char kB64[] =
 
 std::string base64_encode(const void* data, size_t len) {
     const uint8_t* p = (const uint8_t*)data;
-    std::string out;
-    out.reserve((len + 2) / 3 * 4);
-    size_t i = 0;
+    std::string out((len + 2) / 3 * 4, '\0');
+    char* w = out.data();
+    /* The vector levels take whole blocks; the scalar loop below the rest and the padding. */
+    size_t i = simd::b64_encode_run(p, len, w);
+    w += i / 3 * 4;
     for (; i + 2 < len; i += 3) {
         uint32_t v = (uint32_t)p[i] << 16 | (uint32_t)p[i + 1] << 8 | p[i + 2];
-        out.push_back(kB64[(v >> 18) & 63]); out.push_back(kB64[(v >> 12) & 63]);
-        out.push_back(kB64[(v >> 6) & 63]);  out.push_back(kB64[v & 63]);
+        w[0] = kB64[(v >> 18) & 63]; w[1] = kB64[(v >> 12) & 63];
+        w[2] = kB64[(v >> 6) & 63];  w[3] = kB64[v & 63];
+        w += 4;
     }
     if (i < len) {
         uint32_t v = (uint32_t)p[i] << 16;
         bool two = (i + 1 < len);
         if (two) v |= (uint32_t)p[i + 1] << 8;
-        out.push_back(kB64[(v >> 18) & 63]);
-        out.push_back(kB64[(v >> 12) & 63]);
-        out.push_back(two ? kB64[(v >> 6) & 63] : '=');
-        out.push_back('=');
+        w[0] = kB64[(v >> 18) & 63];
+        w[1] = kB64[(v >> 12) & 63];
+        w[2] = two ? kB64[(v >> 6) & 63] : '=';
+        w[3] = '=';
     }
     return out;
 }
@@ -83,8 +90,19 @@ bool base64_decode(const std::string& in, std::vector<uint8_t>* out) {
     const uint8_t* const end = p + in.size();
     uint32_t acc = 0;
     int bits = 0;
+    /* The scalar level has no vector run to offer. */
+    const uint8_t* vec_from = simd::level() > simd::kScalar ? p : end;
     while (p < end) {
-        /* Fast path: four valid digits at once. */
+        /* Whole vector blocks of digits, then four valid digits at once. A block the vector
+         * levels did not take (a line break or padding) is not offered again
+         * for its 16 bytes, so the scalar path below pays no call per group. */
+        if (bits == 0 && p >= vec_from && end - p >= 16) {
+            const size_t k = simd::b64_decode_run(p, (size_t)(end - p), o);
+            p += k;
+            o += k / 4 * 3;
+            if (p == end) break;
+            vec_from = p + 16;
+        }
         if (bits == 0 && end - p >= 4) {
             const int a = kVal[p[0]], b = kVal[p[1]], c = kVal[p[2]], d = kVal[p[3]];
             if ((a | b | c | d) >= 0) {
@@ -124,22 +142,12 @@ int64_t json_value_budget(int64_t max_ctx) {
  * copy recurse once per level, and a request's schema is serialised on the way to its grammar.
  * A few hundred KB of brackets, well inside the value budget, would overflow the worker's stack.
  * No legitimate request nests near it; the grammar compiler refuses schemas at half the bound. */
+/* The bounded read itself lives in util/json.cpp. Both of its bounds -- the value count here,
+ * the reader's byte cap -- are enforced as the document is discovered, so a body refused for
+ * size or nesting is refused while the conversion's scratch is still budget-sized; what stays
+ * proportional to the body is yyjson's own read arena, capped by the byte bound at its open. */
 json parse_json_bounded(const std::string& body, int64_t max_ctx, bool* over, bool* deep) {
-    const int64_t budget = json_value_budget(max_ctx);
-    int64_t n = 0;
-    *over = false;
-    *deep = false;
-    /* Each completed value counts once: a scalar at `value`, a container at its end. Once over
-     * or too deep, every event returns false so the parser keeps nothing more. */
-    json::parser_callback_t keep = [&](int depth, json::parse_event_t ev, json&) {
-        if (!*deep && depth > kJsonMaxDepth) *deep = true;
-        if (!*over && (ev == json::parse_event_t::value ||
-                       ev == json::parse_event_t::object_end ||
-                       ev == json::parse_event_t::array_end))
-            *over = ++n > budget;
-        return !*over && !*deep;
-    };
-    return json::parse(body, keep, /*allow_exceptions=*/false);
+    return Json::parse_bounded(body, json_value_budget(max_ctx), kJsonMaxDepth, over, deep);
 }
 
 bool token_id(const json& v, int32_t* out) {
@@ -246,8 +254,9 @@ ApiError err_internal(const std::string& why) {
 namespace {
 
 const char* kAcceptedCommon[] = {
-    "model", "stream", "stream_options", "n", "seed", "stop", "max_tokens", "n_predict",
-    "temperature", "top_p", "top_k", "min_p", "typical_p",
+    "model", "stream", "stream_options", "usage", "n", "seed", "stop", "max_tokens",
+    "max_completion_tokens", "max_output_tokens", "max_new_tokens", "n_predict",
+    "temperature", "top_p", "top_k", "min_p", "typical_p", "typ_p",
     "presence_penalty", "frequency_penalty", "repetition_penalty", "repeat_penalty",
     "repeat_last_n", "xtc_probability", "xtc_threshold",
     "dry_multiplier", "dry_base", "dry_allowed_length", "dry_penalty_last_n",
@@ -256,12 +265,14 @@ const char* kAcceptedCommon[] = {
     "timings_per_token", "return_progress", "session_id", "n_probs",
     "control_vector",
     "ngram_ban_n", "ngram_window", "ngram_whitelist", "no_repeat_ngram_whitelist",
+    "no_repeat_ngram_size", "no_repeat_ngram_window_size",
 };
 
 const char* kAcceptedChat[] = {
     "messages", "tools", "tool_choice", "response_format", "top_logprobs",
     "parallel_tool_calls", "add_generation_prompt", "max_completion_tokens",
-    "chat_template_kwargs", "reasoning_effort", "enable_thinking", "preserve_thinking",
+    "chat_template_kwargs", "reasoning_effort", "reasoning", "thinking",
+    "enable_thinking", "preserve_thinking",
     "thinking_token_budget", "thinking_budget", "thinking_budget_tokens",
     "reasoning_budget_tokens", "reasoning_format", "continue_final_message",
     "functions", "function_call",
@@ -304,6 +315,7 @@ struct Guarded {
 bool is_zero(const json& v)      { return v.is_null() || (v.is_number() && v.get<double>() == 0.0); }
 bool non_positive(const json& v) { return v.is_null() || (v.is_number() && v.get<double>() <= 0.0); }
 bool falsy(const json& v)        { return v.is_null() || (v.is_boolean() && !v.get<bool>()); }
+bool truthy(const json& v)       { return v.is_null() || (v.is_boolean() && v.get<bool>()); }
 /* json::empty() is false for every string, the empty one included, so a string is tested as one. */
 bool empty_value(const json& v) {
     if (v.is_string()) return v.get_ref<const std::string&>().empty();
@@ -347,6 +359,15 @@ const Guarded kGuarded[] = {
       "a caller's grammar applies from the first token; the lazy form is the chat format's own" },
     { "preserved_tokens", empty_value, "an empty list",
       "the chat format names the control tokens a reply keeps" },
+    /* vLLM's and SGLang's switches for keeping the reasoning out of, or merged into, the
+     * reply. Their "off" meanings differ between servers, so each is served only at the
+     * value that matches this server's separated reasoning; `reasoning_format` names the
+     * same choice here. */
+    { "include_reasoning", truthy, "true",
+      "suppressing the reasoning in a reply is not served; it is returned beside the "
+      "content (`reasoning_format` names the spellings served)" },
+    { "separate_reasoning", truthy, "true",
+      "merging the reasoning into the content is `reasoning_format: \"none\"` here" },
 };
 
 template <size_t N>
@@ -399,7 +420,7 @@ bool get_num(const json& b, const char* k, double* out, ApiError* err) {
 }
 /* Every integer field read here is stored in 32 bits, so a value that does not fit is refused
  * rather than narrowed: 2^32 would become 0 and 2^31 negative, both "no limit" for `max_tokens`.
- * nlohmann keeps a literal above INT64_MAX as unsigned, hence the unsigned branch. */
+ * The DOM keeps a literal above INT64_MAX as unsigned, hence the unsigned branch. */
 bool get_int(const json& b, const char* k, int64_t* out, ApiError* err) {
     auto it = b.find(k);
     if (it == b.end() || it->is_null()) return true;
@@ -744,8 +765,10 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
     if (!ok("min_p", d)) return RAD_E_INVAL;
     r->sp.min_p = (float)d;
 
+    /* /props spells it `typ_p` beside `typical_p`, and llama.cpp's clients echo /props back:
+     * both names are the one stage, and disagreeing values are refused as elsewhere. */
     d = r->sp.typical_p;
-    if (!get_num(b, "typical_p", &d, err)) return RAD_E_INVAL;
+    if (!get_any(b, { "typical_p", "typ_p" }, &d, nullptr, err)) return RAD_E_INVAL;
     if (!ok("typical_p", d)) return RAD_E_INVAL;
     r->sp.typical_p = (float)d;
 
@@ -854,8 +877,8 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
      * what the context leaves; unlike an absent field it ignores --default-max-tokens. */
     int64_t mt = 0;
     bool mt_named = false;
-    if (!get_any(b, { "max_tokens", "max_completion_tokens", "n_predict" }, &mt, &mt_named,
-                     err))
+    if (!get_any(b, { "max_tokens", "max_completion_tokens", "max_output_tokens",
+                      "max_new_tokens", "n_predict" }, &mt, &mt_named, err))
         return RAD_E_INVAL;
     if (mt_named && mt == 0) { *err = err_bad("max_tokens", "must be >= 1, or -1 for no limit"); return RAD_E_INVAL; }
     r->max_tokens = (int32_t)(mt > 0 ? mt : mt < 0 ? 0 : lim.default_max_tokens);
@@ -1017,6 +1040,24 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
         bool iu = false;
         if (!get_bool(*so, "include_usage", &iu, err)) return RAD_E_INVAL;
         r->include_usage = iu;
+        /* Continuous stats would put a usage object on every chunk; this server sends it in
+         * the final chunk only, so asking for more is refused rather than dropped. */
+        bool cont = false;
+        if (!get_bool(*so, "continuous_usage_stats", &cont, err)) return RAD_E_INVAL;
+        if (cont) {
+            *err = err_unsupported("stream_options.continuous_usage_stats",
+                                   "usage is sent in the final chunk only; send "
+                                   "`stream_options.include_usage`");
+            return RAD_E_UNSUPPORTED;
+        }
+    }
+    /* OpenRouter's spelling of the same ask, at the top level. */
+    auto uo = b.find("usage");
+    if (uo != b.end() && !uo->is_null()) {
+        if (!uo->is_object()) { *err = err_bad("usage", "expected an object"); return RAD_E_INVAL; }
+        bool iu = false;
+        if (!get_bool(*uo, "include", &iu, err)) return RAD_E_INVAL;
+        if (iu) r->include_usage = true;
     }
 
     return RAD_OK;
@@ -1045,11 +1086,20 @@ RequestThinking request_thinking(const json& b) {
     auto top = b.find("enable_thinking");
     /* An empty reasoning_effort string reads as unset, so it names no effort either. */
     auto re = b.find("reasoning_effort");
+    /* The grouped spellings count as saying something, too: OpenRouter's `reasoning`
+     * object and Anthropic's `thinking` object, both read in parse_thinking. */
+    auto ro = b.find("reasoning");
+    const bool ro_obj = ro != b.end() && ro->is_object();
+    auto th = b.find("thinking");
+    const bool th_obj = th != b.end() && th->is_object();
     RequestThinking t;
     t.effort = (obj && kw->contains("reasoning_effort")) ||
-               (re != b.end() && re->is_string() && !re->get<std::string>().empty());
+               (re != b.end() && re->is_string() && !re->get<std::string>().empty()) ||
+               (ro_obj && ro->contains("effort") && ro->at("effort").is_string() &&
+                !ro->at("effort").get_ref<const std::string&>().empty());
     t.thinking = t.effort || (top != b.end() && !top->is_null()) ||
-                 (obj && kw->contains("enable_thinking"));
+                 (obj && kw->contains("enable_thinking")) ||
+                 (ro_obj && (ro->contains("enabled") || ro->contains("max_tokens"))) || th_obj;
     return t;
 }
 
@@ -1143,6 +1193,49 @@ static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions
     }
     map_reasoning_effort(lim, opt);
 
+    /* OpenRouter groups the same switches in one `reasoning` object on Chat
+     * (`effort`, `enabled`, `max_tokens`), and Anthropic's `thinking` object names its
+     * switch by `type`. Both are read onto the flat fields here; the flat spellings,
+     * read below, still win. `reasoning.exclude` would keep the reasoning out of the
+     * reply altogether, which is not served, so it is refused rather than dropped --
+     * silently ignoring it would return the very text the caller asked to withhold.
+     * A budget in either object is read with the flat ones in parse_thinking_budget. */
+    std::string grouped_effort;
+    if (auto ro = b.find("reasoning"); ro != b.end() && !ro->is_null()) {
+        if (!ro->is_object()) {
+            *err = err_bad("reasoning", "expected an object");
+            return RAD_E_INVAL;
+        }
+        bool enabled = opt->enable_thinking;
+        if (!get_bool(*ro, "enabled", &enabled, err)) return RAD_E_INVAL;
+        if (ro->contains("enabled") && !ro->at("enabled").is_null())
+            opt->enable_thinking = enabled;
+        bool exclude = false;
+        if (!get_bool(*ro, "exclude", &exclude, err)) return RAD_E_INVAL;
+        if (exclude) {
+            *err = err_unsupported("reasoning.exclude",
+                                   "the reasoning is returned beside the content, or in "
+                                   "it with `reasoning_format: \"none\"`; it is not withheld");
+            return RAD_E_UNSUPPORTED;
+        }
+        if (!get_str(*ro, "effort", &grouped_effort, err)) return RAD_E_INVAL;
+    }
+    if (auto th = b.find("thinking"); th != b.end() && !th->is_null()) {
+        if (!th->is_object()) {
+            *err = err_bad("thinking", "expected an object");
+            return RAD_E_INVAL;
+        }
+        std::string type;
+        if (!member_str(*th, "type", "thinking.type", &type, err)) return RAD_E_INVAL;
+        if (type == "disabled" || type == "between_tools") opt->enable_thinking = false;
+        else if (type == "enabled" || type == "adaptive") opt->enable_thinking = true;
+        else if (!type.empty()) {
+            *err = err_bad("thinking.type", "must be \"enabled\", \"adaptive\", "
+                                            "\"disabled\" or \"between_tools\"");
+            return RAD_E_INVAL;
+        }
+    }
+
     bool think = opt->enable_thinking;
     if (!get_bool(b, "enable_thinking", &think, err)) return RAD_E_INVAL;
     opt->enable_thinking = think;
@@ -1169,6 +1262,7 @@ static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions
      * emplace does not overwrite. */
     std::string effort;
     if (!get_str(b, "reasoning_effort", &effort, err)) return RAD_E_INVAL;
+    if (effort.empty()) effort = grouped_effort;
     /* --reasoning-effort-map, before "none" and "minimal" are read, so a map can name either. */
     if (auto m = lim.reasoning_effort_map.find(effort);
         !effort.empty() && m != lim.reasoning_effort_map.end())
@@ -1354,21 +1448,21 @@ static bool json_text_too_deep(const std::string& s) {
  * Tool-call arguments and tool-message content arrive as strings; the template layer parses and
  * re-serialises them recursively, so a string of brackets could overflow the worker's stack. */
 static int check_template_json(const json& msg, const std::string& role, ApiError* err) {
-    if (role == "assistant") {
-        auto tcs = msg.find("tool_calls");
-        if (tcs != msg.end() && tcs->is_array()) {
-            for (const auto& tc : *tcs) {
-                if (!tc.is_object()) continue;
-                auto fn = tc.find("function");
-                if (fn == tc.end() || !fn->is_object()) continue;
-                auto args = fn->find("arguments");
-                if (args != fn->end() && args->is_string() &&
-                    json_text_too_deep(args->get_ref<const std::string&>())) {
-                    *err = err_bad("messages[].tool_calls[].function.arguments",
-                                   "nests more than " + std::to_string(kJsonMaxDepth) +
-                                       " levels deep");
-                    return RAD_E_INVAL;
-                }
+    /* Whatever the role: the chat lift reads tool_calls on any message, and parses their
+     * arguments text recursively. */
+    auto tcs = msg.find("tool_calls");
+    if (tcs != msg.end() && tcs->is_array()) {
+        for (const auto& tc : *tcs) {
+            if (!tc.is_object()) continue;
+            auto fn = tc.find("function");
+            if (fn == tc.end() || !fn->is_object()) continue;
+            auto args = fn->find("arguments");
+            if (args != fn->end() && args->is_string() &&
+                json_text_too_deep(args->get_ref<const std::string&>())) {
+                *err = err_bad("messages[].tool_calls[].function.arguments",
+                               "nests more than " + std::to_string(kJsonMaxDepth) +
+                                   " levels deep");
+                return RAD_E_INVAL;
             }
         }
     }
@@ -1537,13 +1631,21 @@ static int lower_content_parts(json& messages, const OaiDeps& d, const OaiLimits
             }
             type = tit->get<std::string>();
 
-            if (type == "text") {
+            if (type == "text" || type == "input_text" || type == "output_text") {
                 if (!part.contains("text") || !part.at("text").is_string()) {
                     *err = err_bad("messages[].content[].text", "expected a string");
                     return RAD_E_INVAL;
                 }
+                /* The Responses API's names for a text part, in a Chat message: the chat
+                 * layer reads only `text`, so the part is renamed on its way there. */
+                part["type"] = "text";
                 continue;
             }
+            /* Reasoning carried as a part is moved onto the message by the chat layer
+             * (core/text/chat.cpp); it is admitted here and left for that pass. */
+            if (type == "thinking" || type == "reasoning" || type == "reasoning_text" ||
+                type == "redacted_thinking")
+                continue;
             /* Media parts (read_media_part) become a media_marker part, not text: the chat layer
              * joins text parts with a newline but a marker with nothing, matching the model's own
              * template (<|vision_end|> runs straight into the following text). As text, each
@@ -1763,6 +1865,30 @@ static int parse_thinking_budget(const json& b, const OaiDeps& d, const OaiLimit
         budget = v;
         named = k;
     }
+    /* The grouped spellings carry the same budget: OpenRouter's `reasoning.max_tokens`
+     * and Anthropic's `thinking.budget_tokens`. A second, disagreeing budget is refused
+     * like the flat spellings above. */
+    {
+        struct Grouped { const char* outer; const char* inner; const char* name; };
+        for (const Grouped g :
+             { Grouped{ "reasoning", "max_tokens", "reasoning.max_tokens" },
+               Grouped{ "thinking", "budget_tokens", "thinking.budget_tokens" } }) {
+            auto outer = b.find(g.outer);
+            if (outer == b.end() || !outer->is_object()) continue;
+            auto inner = outer->find(g.inner);
+            if (inner == outer->end() || inner->is_null()) continue;
+            int64_t v = 0;
+            if (!get_int(*outer, g.inner, &v, err)) return RAD_E_INVAL;
+            if (v < 0) v = -1;
+            if (named && v != budget) {
+                *err = err_bad(g.name, std::string("disagrees with ") + named +
+                                           ", which is the same field");
+                return RAD_E_INVAL;
+            }
+            budget = v;
+            named = g.name;
+        }
+    }
     if (!named) {
         if (span.known()) sp->thinking_budget = (int32_t)lim.default_thinking_budget;
         return RAD_OK;
@@ -1949,7 +2075,10 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
             return RAD_E_INVAL;
         }
         if (fcall->is_string()) {
-            b["tool_choice"] = *fcall;
+            /* By value first: inserting "tool_choice" can reallocate b's member vector,
+             * which fcall points into. */
+            const json choice = *fcall;
+            b["tool_choice"] = choice;
         } else if (fcall->is_object() && fcall->contains("name") && fcall->at("name").is_string()) {
             b["tool_choice"] = json{ { "type", "function" },
                                      { "function", { { "name", fcall->at("name") } } } };
@@ -1959,22 +2088,34 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         }
     }
 
-    /* tools and tool_choice. */
+    /* tools and tool_choice. The Responses API spells a function tool flat
+     * ({"type":"function","name":..., "parameters":...}) where Chat nests it under
+     * `function`; unified SDKs send the flat form to both, so it is folded into the
+     * nested one here, as the deprecated `functions` list is above. */
     json tools = json::array();
     auto tit = b.find("tools");
     if (tit != b.end() && !tit->is_null()) {
         if (!tit->is_array()) { *err = err_bad("tools", "expected an array"); return RAD_E_INVAL; }
         for (const auto& t : *tit) {
-            if (!t.is_object() || !t.contains("type") || t.at("type") != "function" ||
-                !t.contains("function") || !t.at("function").is_object() ||
-                !t.at("function").contains("name") ||
-                !t.at("function").at("name").is_string()) {
+            json tool = t;
+            if (tool.is_object() && tool.contains("type") && tool.at("type") == "function" &&
+                !tool.contains("function") && tool.contains("name") &&
+                tool.at("name").is_string()) {
+                json fn = json::object();
+                for (auto it = tool.begin(); it != tool.end(); ++it)
+                    if (it.key() != "type") fn[it.key()] = it.value();
+                tool = json{ { "type", "function" }, { "function", std::move(fn) } };
+            }
+            if (!tool.is_object() || !tool.contains("type") || tool.at("type") != "function" ||
+                !tool.contains("function") || !tool.at("function").is_object() ||
+                !tool.at("function").contains("name") ||
+                !tool.at("function").at("name").is_string()) {
                 *err = err_bad("tools[]",
                                "expected {\"type\":\"function\",\"function\":{\"name\":...}}");
                 return RAD_E_INVAL;
             }
+            tools.push_back(std::move(tool));
         }
-        tools = *tit;
         out->n_tools = (int)tools.size();
     }
 
@@ -1988,13 +2129,18 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
             tool_choice = tcit->get<std::string>();
         } else if (tcit->is_object()) {
             auto f = tcit->find("function");
-            if (f == tcit->end() || !f->is_object() || !f->contains("name") ||
+            if ((f == tcit->end() || !f->is_object()) && tcit->contains("name") &&
+                tcit->at("name").is_string()) {
+                /* The flat Responses spelling: {"type":"function","name":...}. */
+                named = tcit->at("name").get<std::string>();
+                tool_choice = "required";
+            } else if (f == tcit->end() || !f->is_object() || !f->contains("name") ||
                 !f->at("name").is_string()) {
                 *err = err_bad("tool_choice",
                                "an object tool_choice must be {\"type\":\"function\","
                                "\"function\":{\"name\":...}}");
                 return RAD_E_INVAL;
-            }
+            } else
             named = f->at("name").get<std::string>();
             tool_choice = "required";
         } else {
@@ -2032,8 +2178,14 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
     if (!get_bool(b, "parallel_tool_calls", &parallel, err)) return RAD_E_INVAL;
 
     if (!tools.empty() && !d.chat->supports_tools()) {
+        /* A probe that threw says so: the template may declare tools and call something the
+         * engine lacks (ChatCaps::probe_error). */
+        const std::string probe = d.chat->tools_probe_error();
         *err = err_unsupported("tools",
-                               "this model's chat template does not declare tool support");
+                               probe.empty()
+                                   ? "this model's chat template does not declare tool support"
+                                   : "this model's chat template failed the tool capability "
+                                     "probe: " + probe);
         return RAD_E_UNSUPPORTED;
     }
     if (!tools.empty()) {
@@ -2656,7 +2808,7 @@ int parse_embeddings_request(const std::string& body, const OaiDeps& d, const Oa
                 return RAD_E_INVAL;
             }
             const std::string type = tit->get<std::string>();
-            if (type == "text") {
+            if (type == "text" || type == "input_text" || type == "output_text") {
                 if (!part.contains("text") || !part.at("text").is_string()) {
                     *e = err_bad("input[].text", "expected a string");
                     return RAD_E_INVAL;
@@ -2963,7 +3115,13 @@ std::string chat_completion_body(const OaiRequest& r, const std::vector<ChoiceOu
         m["role"] = "assistant";
         if (c.msg.content.empty() && !c.msg.tool_calls.empty()) m["content"] = nullptr;
         else m["content"] = c.msg.content;
-        if (!c.msg.reasoning.empty()) m["reasoning_content"] = c.msg.reasoning;
+        /* Both spellings, the one text: llama.cpp's clients read `reasoning_content`,
+         * vLLM's and OpenRouter's read `reasoning`. A client that takes only the other
+         * name would drop the reasoning at receipt and replay none of it. */
+        if (!c.msg.reasoning.empty()) {
+            m["reasoning_content"] = c.msg.reasoning;
+            m["reasoning"] = c.msg.reasoning;
+        }
         if (!c.msg.tool_calls.empty() && r.legacy_functions)
             m["function_call"] = json{ { "name", c.msg.tool_calls[0].name },
                                        { "arguments", c.msg.tool_calls[0].arguments } };
@@ -3000,28 +3158,69 @@ std::string text_completion_body(const OaiRequest& r, const std::vector<ChoiceOu
     return completion_object(r, "text_completion", std::move(arr), u, t);
 }
 
+/* One embedding value, as JSON: the shortest digits that read back as the float, so a reader
+ * narrowing to float gets the engine's value exactly and one parsing a double gets its nearest
+ * decimal (OpenAI's spelling of the same values). A non-finite value is null, as the DOM writes
+ * it. */
+static void append_json_f32(std::string& out, float v) { json_append_float(out, v); }
+
 std::string embeddings_body(const OaiRequest& r, const std::vector<std::vector<float>>& vecs,
                             const UsageOut& u) {
-    json data = json::array();
-    for (size_t i = 0; i < vecs.size(); ++i) {
-        json e;
-        e["object"] = "embedding";
-        if (r.base64_embeddings)
-            e["embedding"] = base64_encode(vecs[i].data(), vecs[i].size() * sizeof(float));
-        else
-            e["embedding"] = vecs[i];
-        e["index"] = (int64_t)i;
-        data.push_back(std::move(e));
+    /* Written, not built: a batch is hundreds of thousands of floats, and a DOM node plus a
+     * dump per float cost about twice the direct write (measured in hostbench's embeddings
+     * bench). The object shape and key order are the DOM's. */
+    std::string out;
+    size_t est = 128 + r.model.size();
+    int64_t floats = 0;
+    for (const auto& v : vecs) {
+        est += 48 + (r.base64_embeddings ? v.size() * sizeof(float) / 3 * 4 + 4 : v.size() * 20);
+        floats += (int64_t)v.size();
     }
-    json usage;
-    usage["prompt_tokens"] = u.prompt;
-    usage["total_tokens"] = u.prompt;
-    json o;
-    o["object"] = "list";
-    o["data"] = std::move(data);
-    o["model"] = r.model;
-    o["usage"] = std::move(usage);
-    return o.dump();
+    out.reserve(est);
+    auto spell = [](std::string& o, const std::vector<float>& v) {
+        o += '[';
+        for (size_t j = 0; j < v.size(); ++j) {
+            if (j) o += ',';
+            append_json_f32(o, v[j]);
+        }
+        o += ']';
+    };
+    /* A batch's vectors are spelled on the row pool, each into its own string, and joined in
+     * order: the shortest spelling of a float is ~40 ns, a millisecond for 32 vectors of 768. */
+    constexpr int64_t kParFloats = 16384;
+    std::vector<std::string> spelled;
+    if (!r.base64_embeddings && vecs.size() > 1 && floats >= kParFloats) {
+        spelled.resize(vecs.size());
+        row_pool_run((int64_t)vecs.size(), 8, [&](int64_t i) {
+            spelled[(size_t)i].reserve(vecs[(size_t)i].size() * 20 + 2);
+            spell(spelled[(size_t)i], vecs[(size_t)i]);
+        });
+    }
+    out += "{\"object\":\"list\",\"data\":[";
+    for (size_t i = 0; i < vecs.size(); ++i) {
+        if (i) out += ',';
+        out += "{\"object\":\"embedding\",\"embedding\":";
+        if (r.base64_embeddings) {
+            out += '"';
+            out += base64_encode(vecs[i].data(), vecs[i].size() * sizeof(float));
+            out += '"';
+        } else if (!spelled.empty()) {
+            out += spelled[i];
+        } else {
+            spell(out, vecs[i]);
+        }
+        out += ",\"index\":";
+        out += std::to_string(i);
+        out += '}';
+    }
+    out += "],\"model\":";
+    if (!json_quote_append(out, r.model)) out += json(r.model).dump();
+    out += ",\"usage\":{\"prompt_tokens\":";
+    out += std::to_string(u.prompt);
+    out += ",\"total_tokens\":";
+    out += std::to_string(u.prompt);
+    out += "}}";
+    return out;
 }
 
 std::string rerank_body(const OaiRequest& r, const std::vector<std::vector<float>>& scores,
@@ -3202,8 +3401,8 @@ std::string ChatDeltaStream::chunk(json delta, const char* finish_reason, const 
 }
 
 void ChatDeltaStream::delta_open(std::string& out) {
-    /* Built from nlohmann's serialisation of each field, on first use rather than in the
-     * constructor, so a field nlohmann refuses throws where chunk() would. */
+    /* Built from Json::dump of each field, on first use rather than in the constructor,
+     * so a field dump() refuses throws where chunk() would. */
     if (head_.empty())
         head_ = "data: {\"id\":" + json(id_).dump() +
                 ",\"object\":\"chat.completion.chunk\",\"created\":" + json(created_).dump() +
@@ -3239,7 +3438,7 @@ void ChatDeltaStream::set_timings(const TimingsOut& t) {
     if (t.valid) timings_ = "\"timings\":" + timings_json(t).dump();
 }
 
-/* Malformed UTF-8 falls back to nlohmann, which throws the same exception chunk() would. */
+/* Malformed UTF-8 falls back to Json::dump, which throws the same exception chunk() would. */
 void ReplyStream::quote(std::string& out, std::string_view s) {
     if (!json_quote_append(out, s)) out += json(std::string(s)).dump();
 }
@@ -3275,7 +3474,10 @@ std::string ChatDeltaStream::emit(const std::vector<ReplyDelta>& ev) {
         delta_open(out);
         switch (d.kind) {
         case ReplyDelta::Reasoning:
+            /* Both spellings of the one delta, as in chat_completion_body. */
             out += "{\"reasoning_content\":";
+            quote(out, d.text);
+            out += ",\"reasoning\":";
             quote(out, d.text);
             out += '}';
             break;
@@ -4006,8 +4208,8 @@ std::string anthropic_message_body(const OaiRequest& r, const ChoiceOut& c, cons
     if (!text.empty()) blocks.push_back(json{ { "type", "text" }, { "text", text } });
     for (const ToolCall& tc : c.msg.tool_calls) {
         /* The same bound the streaming path applies: `arguments` is model output, and
-         * json_complete's depth-capped scan must run before nlohmann's recursion and its
-         * teardown, neither of which bounds depth on its own. Too deep or incomplete reads as
+         * json_complete's depth-capped scan must run before the DOM's teardown, which does
+         * not bound depth on its own. Too deep or incomplete reads as
          * an empty input, as a discarded parse did. */
         json in = json::object();
         if (json_complete(tc.arguments)) {
@@ -4052,6 +4254,22 @@ void AnthropicStream::event(std::string& out, const char* type, const json& data
     out += "\n\n";
 }
 
+/* The bytes event() writes for a content_block_delta, without the DOM: this is the per-token
+ * event, and building and dumping a four-level object for one short string cost an order of
+ * magnitude more than the OpenAI chunk's hand-written path (hostbench stream_cost). */
+void AnthropicStream::delta(std::string& out, const char* dtype, const char* field,
+                             std::string_view text) {
+    out += "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":";
+    out += std::to_string(n_blocks_ - 1);
+    out += ",\"delta\":{\"type\":\"";
+    out += dtype;
+    out += "\",\"";
+    out += field;
+    out += "\":";
+    quote(out, text);
+    out += "}}\n\n";
+}
+
 std::string AnthropicStream::first_chunk() { return std::string(); }
 
 std::string AnthropicStream::started() {
@@ -4073,14 +4291,19 @@ std::string AnthropicStream::started() {
 
 void AnthropicStream::open(std::string& out, Block b, const ToolCall* tc) {
     close(out);
-    json cb;
-    if (b == Block::Thinking)
-        cb = { { "type", "thinking" }, { "thinking", "" }, { "signature", "" } };
-    else if (b == Block::Text) cb = { { "type", "text" }, { "text", "" } };
-    else cb = { { "type", "tool_use" }, { "id", tc->id }, { "name", tc->name },
-                { "input", json::object() } };
-    event(out, "content_block_start",
-          json{ { "type", "content_block_start" }, { "index", n_blocks_ }, { "content_block", cb } });
+    out += "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":";
+    out += std::to_string(n_blocks_);
+    out += ",\"content_block\":";
+    if (b == Block::Thinking) out += "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}";
+    else if (b == Block::Text) out += "{\"type\":\"text\",\"text\":\"\"}";
+    else {
+        out += "{\"type\":\"tool_use\",\"id\":";
+        quote(out, tc->id);
+        out += ",\"name\":";
+        quote(out, tc->name);
+        out += ",\"input\":{}}";
+    }
+    out += "}\n\n";
     ++n_blocks_;
     block_ = b;
 }
@@ -4089,11 +4312,10 @@ void AnthropicStream::close(std::string& out) {
     if (block_ == Block::None) return;
     /* A thinking block ends with its signature, which clients send back next turn. A local model
      * has none; the empty one matches llama-server. */
-    if (block_ == Block::Thinking)
-        event(out, "content_block_delta",
-              json{ { "type", "content_block_delta" }, { "index", n_blocks_ - 1 },
-                    { "delta", { { "type", "signature_delta" }, { "signature", "" } } } });
-    event(out, "content_block_stop", json{ { "type", "content_block_stop" }, { "index", n_blocks_ - 1 } });
+    if (block_ == Block::Thinking) delta(out, "signature_delta", "signature", std::string_view());
+    out += "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":";
+    out += std::to_string(n_blocks_ - 1);
+    out += "}\n\n";
     block_ = Block::None;
 }
 
@@ -4104,9 +4326,7 @@ std::string AnthropicStream::emit(const std::vector<ReplyDelta>& ev) {
         switch (d.kind) {
         case ReplyDelta::Reasoning:
             if (block_ != Block::Thinking) open(out, Block::Thinking, nullptr);
-            event(out, "content_block_delta",
-                  json{ { "type", "content_block_delta" }, { "index", n_blocks_ - 1 },
-                        { "delta", { { "type", "thinking_delta" }, { "thinking", d.text } } } });
+            delta(out, "thinking_delta", "thinking", d.text);
             break;
         case ReplyDelta::Content: {
             /* The prefill is the caller's own text; Anthropic's API answers what follows it, and
@@ -4131,9 +4351,7 @@ std::string AnthropicStream::emit(const std::vector<ReplyDelta>& ev) {
             open(out, Block::Tool, &last_.tool_calls.back());
             break;
         case ReplyDelta::CallArgs:
-            event(out, "content_block_delta",
-                  json{ { "type", "content_block_delta" }, { "index", n_blocks_ - 1 },
-                        { "delta", { { "type", "input_json_delta" }, { "partial_json", d.text } } } });
+            delta(out, "input_json_delta", "partial_json", d.text);
             break;
         case ReplyDelta::CallEnd:
             close(out);
@@ -4146,9 +4364,7 @@ std::string AnthropicStream::emit(const std::vector<ReplyDelta>& ev) {
 void AnthropicStream::text_delta(std::string& out, const std::string& text) {
     if (text.empty()) return;
     if (block_ != Block::Text) open(out, Block::Text, nullptr);
-    event(out, "content_block_delta",
-          json{ { "type", "content_block_delta" }, { "index", n_blocks_ - 1 },
-                { "delta", { { "type", "text_delta" }, { "text", text } } } });
+    delta(out, "text_delta", "text", text);
 }
 
 /* Content held against the prefill is the reply's own text once nothing more can complete the
@@ -4578,6 +4794,28 @@ void ResponsesStream::event(std::string& out, const char* type, json data) {
     out += "\n\n";
 }
 
+/* The bytes event() writes for a delta, without the DOM: `type` and `sequence_number` come last,
+ * as event() appends them. As with Anthropic's, the per-token DOM dump cost an order of
+ * magnitude more than the hand-written chunk. */
+void ResponsesStream::delta_event(std::string& out, const char* type, bool content_index,
+                                  bool logprobs, std::string_view text) {
+    out += "event: ";
+    out += type;
+    out += "\ndata: {\"item_id\":";
+    quote(out, item_id_);
+    out += ",\"output_index\":";
+    out += std::to_string((int64_t)items_.size());
+    if (content_index) out += ",\"content_index\":0";
+    out += ",\"delta\":";
+    quote(out, text);
+    if (logprobs) out += ",\"logprobs\":[]";
+    out += ",\"type\":\"";
+    out += type;
+    out += "\",\"sequence_number\":";
+    out += std::to_string(seq_++);
+    out += "}\n\n";
+}
+
 json ResponsesStream::response(const char* status) const {
     const bool done = std::strcmp(status, "in_progress") != 0;
     return response_object(*r_, status, json(items_), done ? &usage_ : nullptr, incomplete_);
@@ -4658,29 +4896,22 @@ std::string ResponsesStream::emit(const std::vector<ReplyDelta>& ev) {
     std::string out;
     for (const ReplyDelta& d : ev) {
         if (!absorb(d)) continue;
-        /* The open item's index; read after open(), which may close one first. */
-        auto at = [this] { return (int64_t)items_.size(); };
         switch (d.kind) {
         case ReplyDelta::Reasoning:
             if (item_ != Item::Reasoning) open(out, Item::Reasoning, 0);
             text_ += d.text;
-            event(out, "response.reasoning_text.delta",
-                  json{ { "item_id", item_id_ }, { "output_index", at() },
-                        { "content_index", 0 }, { "delta", d.text } });
+            delta_event(out, "response.reasoning_text.delta", true, false, d.text);
             break;
         case ReplyDelta::Content:
             if (item_ != Item::Message) open(out, Item::Message, 0);
             text_ += d.text;
-            event(out, "response.output_text.delta",
-                  json{ { "item_id", item_id_ }, { "output_index", at() },
-                        { "content_index", 0 }, { "delta", d.text }, { "logprobs", json::array() } });
+            delta_event(out, "response.output_text.delta", true, true, d.text);
             break;
         case ReplyDelta::CallBegin:
             open(out, Item::Call, last_.tool_calls.size() - 1);
             break;
         case ReplyDelta::CallArgs:
-            event(out, "response.function_call_arguments.delta",
-                  json{ { "item_id", item_id_ }, { "output_index", at() }, { "delta", d.text } });
+            delta_event(out, "response.function_call_arguments.delta", false, false, d.text);
             break;
         case ReplyDelta::CallEnd:
             close(out);

@@ -1,0 +1,34 @@
+# minicpm5-2b-iq8r.recipe -- MiniCPM5-2B with the DSpark drafter at IQ8R: every linear of the trunk
+# and of the drafter as rotated int8, read against int8 activations (arch/llama_dense_fp8).
+#
+# OpenBMB publishes MiniCPM5-2B in bf16 only. IQ8R is int8 codes in the 128-wide Hadamard domain
+# with a u8 scale per [1 x 256] of K under a bf16 scale per row, so a weight costs eight bits and
+# 1/256 of a byte a parameter plus two bytes a row. Round to nearest with a scale search: no
+# calibration data is read. Also:
+#
+#   - the lm_head, int8 with a bf16 scale per [1 x 128], unrotated: the widest GEMM in the model
+#     at half the bytes
+#   - the drafter's 2-bit copy of the target's head (u2 codes, an f16 scale and a u8 zero a group
+#     of 128), read by its draft passes only
+#
+# Every norm, the embedding and the drafter's Markov codebooks stay bf16.
+#
+#   rad-convert openbmb/MiniCPM5-2B --draft-model openbmb/MiniCPM5-2B-DSpark \
+#       --tokenizer openbmb/MiniCPM5-2B/tokenizer.json \
+#       --recipe data/recipes/minicpm5-2b-iq8r.recipe -o minicpm5-2b-iq8r.rad
+
+output.weight                        rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+dspark.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16
+
+blk.*.attn_qkv.weight                rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.attn_output.weight             rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_gate_up.weight             rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_down.weight                rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+
+dspark.fc.weight                     rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dspark.blk.*.attn_q.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dspark.blk.*.attn_k.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dspark.blk.*.attn_v.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dspark.blk.*.attn_output.weight      rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dspark.blk.*.ffn_gate_up.weight      rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dspark.blk.*.ffn_down.weight         rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search

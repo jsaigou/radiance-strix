@@ -65,6 +65,7 @@ struct VramFacts {
      * per queue on an R9700, 8x the ring). */
     int     n_queues    = 0;
     int64_t queue_bytes = 0;
+    int64_t queue_scratch = 0;   /* resident queue scratch (rad_dev_resident_scratch_bytes), once a card */
     /* The next-layer expert prefetch's ring and buffers (xprefetch.h), when enabled; its stream is
      * one of `n_queues`. */
     int64_t prefetch    = 0;
@@ -137,6 +138,12 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
 /* The same split on a copy of `cfg`, without writing or logging anything: for choosing between
  * two programs before resolving one (Engine::plan's table placement). */
 int vram_budget_trial(const Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out);
+
+/* Bytes a card must give this program, as vram_budget_resolve charges them: `need` holds the fixed
+ * terms, the static weights, the experts the host pool cannot hold and one full-length sequence's
+ * cache; `want` the whole expert plane and the cache at its ceiling instead. A fleet grants a
+ * claim between the two (Config::vram_claim, docs/MULTIMODEL.md §6.3). */
+void vram_budget_need(const std::vector<VramFacts>& per_rank, int64_t* need, int64_t* want);
 
 /* Re-split for an uneven world's cheaper rank. The resolver derives the most expensive rank's
  * split, and one block table serves every rank, so a rank whose cache costs less per token (e.g.

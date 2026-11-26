@@ -36,7 +36,8 @@ struct Model {
     std::vector<Layer> layers;
     Pixtral vision;
 };
-static Model model;
+/* One per engine instance in the process, by slot (rad_builder.h, rad_build_slot). */
+static Model g_model[RAD_MAX_SLOTS];
 
 /* JSON booleans reach plugins as 0/1, while out-of-tree callers may use their JSON spelling. */
 static bool false_value(const char* s) {
@@ -86,7 +87,9 @@ static int read_rope(Geom& g, const RadModelMeta* meta) {
 }
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
-    if (!b || !meta || !ctx || ctx->max_seqs <= 0) return RAD_E_INVAL;
+    if (!b || !meta || !ctx || ctx->max_seqs <= 0 || ctx->rank < 0 ||
+        rad_build_slot(ctx) >= RAD_MAX_SLOTS)
+        return RAD_E_INVAL;
     if (ctx->rank != 0 || ctx->world_size > 1 || ctx->is_draft || ctx->max_spec > 0) {
         std::fprintf(stderr, "radiance: nemotron35_embed serves BF16 at TP1, without drafting\n");
         return RAD_E_UNSUPPORTED;
@@ -116,8 +119,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         rad_meta_geti(meta, "text_config.rope_parameters.original_max_position_embeddings", 0);
     if (!std::isfinite(beta) || beta < 0 || original <= 0) return RAD_E_INVAL;
 
-    model = Model{};
-    Model& m = model;
+    Model& m = g_model[rad_build_slot(ctx)];
+    m = Model{};
     m.rerank =
         !std::strcmp(rad_meta_gets(meta, "architectures", ""), "Mistral3ForSequenceClassification");
     const char* architecture = rad_meta_gets(meta, "architectures", "");
@@ -340,7 +343,7 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = model;
+    const Model& m = g_model[rad_slot(c)];
     const Geom& g = m.g;
     if (batch->enc) {
         m.vision.step(c, batch);
@@ -399,6 +402,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
 } // namespace nemotron35_embed
 
 #ifndef RAD_ARCH_NO_EXPORTS
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(nemotron35_embed, "mistral3", "", "0.5.0",
                 "Nemotron-3.5-Embed/Rerank: experimental BF16 text/image retrieval, TP1")
 RAD_ARCH_PROBE(nemotron35_embed)

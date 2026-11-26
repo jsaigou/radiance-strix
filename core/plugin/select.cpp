@@ -328,8 +328,8 @@ Resolved Registry::resolve(std::string_view op, const Geometry& g, int domain, S
             chosen.emplace_back(ki->tunables[i].key, ki->tunables[i].deflt);
         r.tune_source = "axis defaults";
 
-        if (!tune_.empty()) {
-            if (const TuneRow* tr = tune_.find(ki->name, r.row->plugin, r.geom_key)) {
+        if (!set_->tune.empty()) {
+            if (const TuneRow* tr = set_->tune.find(ki->name, r.row->plugin, r.geom_key)) {
                 bool took = false;
                 for (const auto& kv : TuneCache::parse_choice(tr->choice))
                     for (int i = 0; i < ki->n_tunables; ++i)
@@ -470,7 +470,17 @@ int Registry::init_instance(Resolved& r, int rank, int world_size) {
     if (!k->init) { r.instance = nullptr; return RAD_OK; }
 
     void* inst = nullptr;
-    const int st = k->init(r.geom.params(), r.geom.n_params(), rank, world_size, &inst);
+    /* The parameters init reads: the frozen geometry, plus the engine's tensor-parallel group when
+     * one is set. The extended copy lives as long as the instance, as the frozen geometry does,
+     * since an init may keep pointers into what it was handed. */
+    const Geometry* g = &r.geom;
+    if (tp_group_ >= 0) {
+        std::lock_guard<std::mutex> lk(mu_);
+        init_geoms_.push_back(r.geom);
+        init_geoms_.back().set_i("tp_group", tp_group_);
+        g = &init_geoms_.back();
+    }
+    const int st = k->init(g->params(), g->n_params(), rank, world_size, &inst);
     if (st < 0) {
         /* A negative init aborts startup rather than launching a kernel whose setup failed. */
         RAD_ERR("kernel '%s' (%s) failed to initialise for %s: %s", k->name, r.row->plugin.c_str(),
@@ -492,6 +502,8 @@ void Registry::fini_instances() {
     }
     for (auto it = take.rbegin(); it != take.rend(); ++it)
         if (it->first->fini) it->first->fini(it->second);
+    std::lock_guard<std::mutex> lk(mu_);
+    init_geoms_.clear();
 }
 
 size_t Registry::n_instances() const {

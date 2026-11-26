@@ -17,7 +17,7 @@ cd "$BUILD" || exit 1
 pkill -f "bin/radianc[e]"; while pgrep -f "bin/radianc[e]" >/dev/null; do sleep 1; done; sleep 3
 : > "$HOME/dprofd.log"
 GPU_MAX_ALLOC_PERCENT=100 GPU_MAX_HEAP_SIZE=100 RADIANCE_PROFILE_EVERY="$EVERY" \
-./bin/radiance --model "${M:-$HOME/models/rad/qwen3.8-27b-fp8.rad}" \
+"$ROOT/scripts/radiance-flags" ./bin/radiance --model "${M:-$HOME/models/rad/qwen3.8-27b-iq8r-dflash.rad}" \
     --radiance-home radiance_home \
     --max-num-seqs 8 --max-model-len 24000 --checkpoint-slots 0 --no-prefix-cache \
     --tp 2 --tp-wire wht6 --tp-wire-min-kb 128 \

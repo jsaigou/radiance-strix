@@ -20,7 +20,7 @@ every step) needs this plugin.
 ## The embedding gather
 
 `embed_lookup_q` over an E4M3 table into bf16 is the one host op a GPU deployment runs, wherever
-`--ngram-placement` leaves the n-gram table for the host gather: read from the container file
+`ngram-placement` leaves the n-gram table for the host gather: read from the container file
 (`disk`), or a locked copy in RAM when no device kernel for the op is loaded (`ram`). Where libr4d
 is loaded, `ram` is a pinned copy its kernel reads over the link, and this one does not run.
 
@@ -78,10 +78,10 @@ Every `RAD_E_UNSUPPORTED` a libavx kernel returns, beside libref's answer to the
 | `rope` | YaRN with `axial` or a position scale | the same |
 | `rope` | Llama 3 scaling beside YaRN, with `axial`, or over multi-component positions | the same |
 | `rope` | a rotary half-width over 1024 | the same |
-| `had_quant_act_i8`, `had_quant_act_fp8`, `had_quant_act_i8g`, `rmsnorm_had_quant_i8`, `gated_had_quant_i8`, `hc_read` | a Hadamard group over 4096 | the same (`REF_HAD_MAX`) |
+| `had_quant_act_i8`, `had_quant_act_i8g`, `rmsnorm_had_quant_i8`, `gated_had_quant_i8`, `hc_read` | a Hadamard group over 4096 | the same (`REF_HAD_MAX`) |
 | `gdn_conv_prep`, `gdn_conv_update` | a convolution history over 16 | the same |
 | `gdn_recurrent_update` | a `state_form` other than `per_candidate` or `anchor` | the same |
-| `ple_conv`, `causal_conv1d` | a history over 64 | the same |
+| `ple_conv`, `causal_conv1d`, `sconv_res` | a history over 64 | the same |
 | `ngram_ids` | `ngram` over 8 | the same |
 | `moe_gemm`, `moe_gemm_q`, `moe_gemm_q_mod4` | an `a_order` other than `token` or `sorted` | the same |
 | `gemm_nt_q` | parts (`pb1`/`pb2`) over a weight other than MXFP4 and the ParoQuant grids, or on the bias form | the same |
@@ -471,7 +471,7 @@ On a busy machine each figure moves by up to 2x between runs; repeat before comp
 
 ## Image generation
 
-Qwen-Image 2.1 (`arch/qwenimage21`) generates on the host backend with `--kernels libavx` alone,
+Qwen-Image 2.1 (`arch/qwenimage21`) generates on the host backend with `server.kernels: libavx` alone,
 no reference library loaded: engine_e2e_test's `qwen_image_generates_on_libavx_alone_as_on_libref`
 serves a tiny synthetic pipeline converted to a bf16 and a block-fp8 container, with and without
 guidance. A seed repeats its PNG byte for byte, and the picture agrees with libref's at 51-53 dB
@@ -517,7 +517,6 @@ core at AVX-512:
 | attn_prefix_self | 4096 rows + 256, 4 x 128, bf16 | - | 1243625 | 287250 | 282482 | **80237** | 455 GFLOP/s |
 | ln_mod | 1024 x 4096 | 53696 | 3490 | 1909 | 1347 | **879** | 19.1 GB/s |
 | gate_add | 1024 x 4096 | 48096 | 2974 | 2105 | 1444 | **991** | 25.4 GB/s |
-| ln_mod_quant_fp8 | 1024 x 4096, gated | 120492 | 28441 | 23452 | 5227 | **3267** | 9.0 GB/s |
 | qk_norm_rope | gptj_blocks, 1024 x 64 heads of 128 | 83241 | 9851 | 4963 | 3851 | **3078** | 10.9 GB/s |
 | l2norm_chan | 262144 px x 144, silu | 534042 | 100513 | 50344 | 34219 | **23405** | 6.5 GB/s |
 | d2s_add | 576 -> 288, 512 x 512 out | 174944 | 47387 | 42418 | 34430 | **29654** | 12.7 GB/s |
@@ -544,7 +543,7 @@ so these vary by about 15%):
 | gemm_nt | the DiT's gate_up, bf16, M 1024 | 5.2 TFLOP/s | 0.64 TFLOP/s |
 | gemm_nt_q | the same, fp8a8 (block fp8) | 0.31-0.42 TFLOP/s | 0.26 TFLOP/s |
 | ln_mod, gate_add | 1024 x 4096 | 92-101 GB/s | |
-| ln_mod_quant_fp8, qk_norm_rope | 1024 x 4096 | 33-35 GB/s | |
+| qk_norm_rope | 1024 x 4096 | 33-35 GB/s | |
 
 At AVX2 the convolution and the bf16 GEMM run on the generic driver, which at large M forks one
 parallel region per 6- to 16-row block of A: it is a decode-shaped loop, and why their 16-thread

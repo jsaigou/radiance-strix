@@ -13,6 +13,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <set>
 
 namespace rad {
 
@@ -26,6 +29,44 @@ namespace rad {
 Registry& rad_tools_registry() {
     static Registry* r = new Registry();
     return *r;
+}
+
+/* ------------------------------------------------------------------ engines in one process */
+
+namespace {
+std::mutex                 g_claim_mu;
+bool                       g_slot_held[RAD_MAX_SLOTS] = {};
+std::map<std::string, int> g_arch_engines;   /* arch plugin -> engines holding it */
+}  // namespace
+
+int rad_engine_claim(const std::string& arch_plugin, int n_ranks, int* slot_base) {
+    std::lock_guard<std::mutex> lk(g_claim_mu);
+    const Plugin* ap = rad_tools_registry().plugin(arch_plugin);
+    if (ap && !ap->arch_multi_instance && g_arch_engines[arch_plugin] > 0) {
+        RAD_ERR("architecture plugin '%s' keeps one model's state per process and already backs "
+                "a running model; it does not export rad_arch_multi_instance, so a second model on "
+                "it cannot run beside the first", arch_plugin.c_str());
+        return RAD_E_STATE;
+    }
+    for (int base = 0; base + n_ranks <= RAD_MAX_SLOTS; ++base) {
+        bool free = true;
+        for (int i = 0; i < n_ranks && free; ++i) free = !g_slot_held[base + i];
+        if (!free) continue;
+        for (int i = 0; i < n_ranks; ++i) g_slot_held[base + i] = true;
+        ++g_arch_engines[arch_plugin];
+        *slot_base = base;
+        return RAD_OK;
+    }
+    RAD_ERR("no %d free instance slot(s) in a row: the process holds at most %d ranks across its "
+            "models (RAD_MAX_SLOTS)", n_ranks, RAD_MAX_SLOTS);
+    return RAD_E_FULL;
+}
+
+void rad_engine_release(const std::string& arch_plugin, int slot_base, int n_ranks) {
+    std::lock_guard<std::mutex> lk(g_claim_mu);
+    for (int i = 0; i < n_ranks && slot_base + i < RAD_MAX_SLOTS; ++i) g_slot_held[slot_base + i] = false;
+    auto it = g_arch_engines.find(arch_plugin);
+    if (it != g_arch_engines.end() && --it->second <= 0) g_arch_engines.erase(it);
 }
 
 /* ------------------------------------------------------------------ the reference-kernel gate */
@@ -119,46 +160,10 @@ static std::vector<std::string> home_subdirs(const std::string& home, const char
     return out;
 }
 
-int rad_tools_load_plugins(const std::string& home, const std::vector<std::string>& hierarchy,
-                           const std::string& arch_id, const std::string& quant,
-                           LoadedPlugins* out, bool imported) {
-    if (!out) return RAD_E_INVAL;
-    *out = LoadedPlugins{};
-
-    Registry& r = rad_tools_registry();
-
-    /* Kernels first, in hierarchy order, then architectures (unordered: no two may claim the same
-     * id). A home need not have every directory, but kernels/ and architectures/ must each exist
-     * somewhere on the path, or the scan reports the first home's as missing. */
-    const std::string first = rad_home_dirs(home).front();
-    std::vector<std::string> kdirs = home_subdirs(home, "kernels");
-    if (kdirs.empty()) kdirs.push_back(first + "/kernels");
-    int s = r.load_dirs(kdirs, hierarchy);
-    if (s < 0) return s;
-
-    std::vector<std::string> adirs = home_subdirs(home, "architectures");
-    if (adirs.empty()) adirs.push_back(first + "/architectures");
-    s = r.load_dirs(adirs, {});
-    if (s < 0) return s;
-
-    /* Quantisers: rad-convert drives them, and the oracle decodes through them for schemes the
-     * core does not define. Optional. */
-    const std::vector<std::string> qdirs = home_subdirs(home, "quantizers");
-    if (!qdirs.empty()) {
-        s = r.load_dirs(qdirs, {});
-        if (s < 0) return s;
-    }
-
-    RAD_TRY(r.check_complete());
-
-    /* The tuning cache, once the kernel set is known. A missing file leaves every shape on its
-     * plugin's first variant. Logged when it has rows; --debug-graph shows the per-shape
-     * source. */
-    const std::string tune = rad_home_file(home, TuneCache::rel_path(rad_machine_key()));
-    const std::string tune_home = tune.substr(0, tune.size() - TuneCache::rel_path(rad_machine_key()).size() - 1);
-    const int n_tuned = r.load_tune(tune_home);
-    if (n_tuned > 0) RAD_INFO("tune cache: %d row(s) from %s", n_tuned, tune.c_str());
-
+/* The architecture plugin for (arch_id, quant) among a loaded set, and the kernel libraries it
+ * selects from, into *out. */
+static int pick_arch(Registry& r, const std::string& home, const std::string& arch_id,
+                     const std::string& quant, LoadedPlugins* out, bool imported) {
     /* The selection key is the (arch_id, quant) pair (spec §2.4), matched exactly with no
      * fallback; a mismatched plugin would only fail later at the name map with a worse message. */
     for (const Plugin& p : r.plugins()) {
@@ -243,6 +248,66 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
         return RAD_E_NOTFOUND;
     }
     return RAD_OK;
+}
+
+int rad_tools_load_plugins(const std::string& home, const std::vector<std::string>& hierarchy,
+                           const std::string& arch_id, const std::string& quant,
+                           LoadedPlugins* out, bool imported) {
+    if (!out) return RAD_E_INVAL;
+    *out = LoadedPlugins{};
+
+    Registry& r = rad_tools_registry();
+
+    /* One plugin set serves every engine in the process (registry.h, Sharing): the first load
+     * reads the homes, a later one finds the set loaded and only picks its architecture. The home
+     * and the hierarchy are server-level settings, so every engine asks for the same set; a
+     * different one is refused rather than served from the wrong libraries. */
+    static std::string loaded_home;
+    static std::vector<std::string> loaded_hierarchy;
+    if (!r.plugins().empty()) {
+        if (home != loaded_home || hierarchy != loaded_hierarchy) {
+            RAD_ERR("the plugin set is already loaded from %s; every model in a process uses the "
+                    "same radiance-home and kernels", loaded_home.c_str());
+            return RAD_E_STATE;
+        }
+        return pick_arch(r, home, arch_id, quant, out, imported);
+    }
+    loaded_home = home;
+    loaded_hierarchy = hierarchy;
+
+    /* Kernels first, in hierarchy order, then architectures (unordered: no two may claim the same
+     * id). A home need not have every directory, but kernels/ and architectures/ must each exist
+     * somewhere on the path, or the scan reports the first home's as missing. */
+    const std::string first = rad_home_dirs(home).front();
+    std::vector<std::string> kdirs = home_subdirs(home, "kernels");
+    if (kdirs.empty()) kdirs.push_back(first + "/kernels");
+    int s = r.load_dirs(kdirs, hierarchy);
+    if (s < 0) return s;
+
+    std::vector<std::string> adirs = home_subdirs(home, "architectures");
+    if (adirs.empty()) adirs.push_back(first + "/architectures");
+    s = r.load_dirs(adirs, {});
+    if (s < 0) return s;
+
+    /* Quantisers: rad-convert drives them, and the oracle decodes through them for schemes the
+     * core does not define. Optional. */
+    const std::vector<std::string> qdirs = home_subdirs(home, "quantizers");
+    if (!qdirs.empty()) {
+        s = r.load_dirs(qdirs, {});
+        if (s < 0) return s;
+    }
+
+    RAD_TRY(r.check_complete());
+
+    /* The tuning cache, once the kernel set is known. A missing file leaves every shape on its
+     * plugin's first variant. Logged when it has rows; --debug-graph shows the per-shape
+     * source. */
+    const std::string tune = rad_home_file(home, TuneCache::rel_path(rad_machine_key()));
+    const std::string tune_home = tune.substr(0, tune.size() - TuneCache::rel_path(rad_machine_key()).size() - 1);
+    const int n_tuned = r.load_tune(tune_home);
+    if (n_tuned > 0) RAD_INFO("tune cache: %d row(s) from %s", n_tuned, tune.c_str());
+
+    return pick_arch(r, home, arch_id, quant, out, imported);
 }
 
 /* Optional export. Without it, or on failure, every field is zero and the caller uses its own
@@ -403,7 +468,7 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
                       const LoraDeclare* lora) {
     if (!out) return RAD_E_INVAL;
 
-    Registry& r = rad_tools_registry();
+    Registry& r = lp.registry ? *lp.registry : rad_tools_registry();
     const Plugin* ap = r.plugin(lp.arch_plugin);
     if (!ap || !ap->arch_declare) {
         RAD_ERR("architecture plugin '%s' is not loaded or exports no rad_arch_declare",
@@ -422,6 +487,30 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
     if (s < 0) {
         RAD_ERR("%s: rad_arch_declare returned %s", lp.arch_plugin.c_str(), rad_strerror(s));
         for (const auto& e : b.errors()) RAD_ERR("    %s", e.c_str());
+        /* A plugin that needs an op it declared, and finds it resolved to no kernel, returns a
+         * status and may say nothing more. The ops no library serves in either domain are the
+         * usual reason on a card whose kernel library covers fewer forms, so they are listed with
+         * the constraint that refused each: the device's line, which names the form the card
+         * lacks. */
+        const Program& p = b.program();
+        std::set<std::pair<int32_t, std::string>> no_host;
+        for (const Program::Miss& m : p.misses)
+            if (m.domain == RAD_DOMAIN_HOST) no_host.emplace(m.index, m.span);
+        std::vector<std::string> unserved;
+        for (const Program::Miss& m : p.misses) {
+            if (m.domain != RAD_DOMAIN_DEVICE || !no_host.count({ m.index, m.span })) continue;
+            const std::string line = m.line();
+            if (std::find(unserved.begin(), unserved.end(), line) == unserved.end())
+                unserved.push_back(line);
+        }
+        if (!unserved.empty()) {
+            const size_t shown = std::min<size_t>(unserved.size(), 16);
+            RAD_ERR("    %zu op form(s) it declared before stopping have no kernel in the loaded "
+                    "libraries, on the card or on the host; a plugin that needs one of them stops "
+                    "where it finds that%s:", unserved.size(),
+                    shown < unserved.size() ? " (the first 16)" : "");
+            for (size_t i = 0; i < shown; ++i) RAD_ERR("      %s", unserved[i].c_str());
+        }
         return s;
     }
 

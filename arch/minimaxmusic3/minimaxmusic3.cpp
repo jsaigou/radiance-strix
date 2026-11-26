@@ -208,7 +208,7 @@ struct Model {
     rad_buf b_audio = 0;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* ================================================================== declare helpers */
 static rad_op norm_op(RadBuilder* b, int64_t rows, int64_t n, double eps, rad_weight w, rad_buf x,
@@ -1083,8 +1083,9 @@ static int check_format(const RadModelMeta* meta) {
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
-    Model& m = g_model[ctx->rank];
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(check_format(meta));
@@ -1381,7 +1382,7 @@ static void step_vocode(RadCtx* c, const RadBatch* batch, const Model& m) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
+    const Model& m = g_model[rad_slot(c)];
     if (!batch->gen || !batch->agen_b) {
         rad_step_fail(c, "minimaxmusic3 is an audio generator and runs generator passes only");
         return;
@@ -1575,6 +1576,8 @@ RAD_ARCH_PROBE(minimaxmusic3)
 extern "C" int64_t rad_arch_text_prepare(int field, const char* in, char* out, int64_t cap) {
     return minimaxmusic3::text_prepare(field, in, out, cap);
 }
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(minimaxmusic3, "minimaxmusic3", "", "0.1.0",
                 "MiniMax-Music3: a Qwen3-8B music language model with a residual-code depth "
                 "decoder, a 2.4B flow-matching transformer over windows of frames, and a DAC "

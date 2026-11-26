@@ -71,6 +71,8 @@ struct AudioRequest {
     std::vector<float>   ref_audio;
     std::vector<int32_t> ref_cu;
     std::vector<int32_t> ref_frame;
+    /* Reference-direction guidance: the negative prompt's own map into the same clips. */
+    std::vector<int32_t> neg_ref_frame;
     int64_t  max_frames = 0;       /* the most frames to make, >= 1 */
     int32_t  steps = 0;            /* 0: the model's default */
     float    cfg = 0.0f;           /* 0: the model's default */

@@ -11,6 +11,8 @@
 # layer scales and snake parameters stay f32 -- read once a pass or less.
 
 dep.heads.weight                     cast dtype=bf16
+# The reference-audio encoder and Euclidean RVQ run in their released f32 precision.
+ref.*                                cast dtype=f32
 codec.*.n1.weight                    cast dtype=f32
 codec.*.n2.weight                    cast dtype=f32
 codec.*.ls1.weight                   cast dtype=f32

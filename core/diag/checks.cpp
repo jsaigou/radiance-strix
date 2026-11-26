@@ -385,7 +385,7 @@ void check_engine(const Facts& f, const RunFacts& r, std::vector<Finding>* out) 
             "a prefill step streams every routed layer's pooled experts onto the card, so its speed "
             "is bounded by the link; decode reads the ones it routes to",
             "more VRAM for the experts: a shorter --max-model-len or fewer --max-num-seqs, "
-            "--embedding-placement ram, --kv-cache-dtype fp8, or more cards (--tp)");
+            "--embedding-placement ram, --kv-cache-dtype i8, or more cards (--tp)");
     if (r.file_weight_bytes > 0)
         add(out, Finding::Warn, "weights-from-disk",
             fmt("%s of weights a rank are read from the container on disk as they are needed",

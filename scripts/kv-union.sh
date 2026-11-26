@@ -99,10 +99,10 @@ stream_line() {
 run_arm() {  local arm="$1" prompt="$2" ctx="$3" maxtok="$4"; shift 4
   local log="$OUT/$arm.log" req="$OUT/$arm.req.json" resp="$OUT/$arm.json"
   echo "== $arm: max-model-len $ctx, max_tokens $maxtok, $* =="
-  ( exec "$BIN" --model "$MODEL" \
+  ( exec "$ROOT/scripts/radiance-flags" "$BIN" --model "$MODEL" \
       --tp 2 --tp-wire exact \
-      --max-num-seqs 1 --max-model-len "$ctx" --placement expert_tiered --host-pool-mib 23652 \
-      --kv-cache-dtype fp8 --prefix-cache-mib 4096 --vision-tower-placement ram \
+      --max-num-seqs 1 --max-model-len "$ctx" --placement expert_tiered --host-pool-mib 47304 \
+      --kv-cache-dtype i8 --prefix-cache-mib 4096 --vision-tower-placement ram \
       --num-speculative-tokens 0 --deterministic \
       "$@" --host 127.0.0.1 --port "$PORT" --api-key test ) > "$log" 2>&1 &
   SERVER_PID=$!

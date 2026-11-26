@@ -1453,9 +1453,15 @@ int GbnfGrammar::fill_mask(uint32_t* bitmask, int64_t n_words) const {
      * probe sorts pointers in thread-local storage and copies stacks only to store. */
     thread_local std::vector<const GbnfStack*> sorted;
     sorted.clear();
-    for (const GbnfStack& s : stacks_) sorted.push_back(&s);
-    std::sort(sorted.begin(), sorted.end(),
-              [](const GbnfStack* a, const GbnfStack* b) { return *a < *b; });
+    bool is_sorted = true;
+    for (const GbnfStack& s : stacks_) {
+        if (is_sorted && !sorted.empty() && s < *sorted.back()) is_sorted = false;
+        sorted.push_back(&s);
+    }
+    if (!is_sorted) {
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const GbnfStack* a, const GbnfStack* b) { return *a < *b; });
+    }
     const GbnfStateView key{ &sorted, partial_utf8_, complete(), n_words };
     if (prog_->lookup(key, bitmask, n_words)) return RAD_OK;
 

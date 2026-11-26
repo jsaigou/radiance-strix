@@ -28,9 +28,9 @@
 
 #include "r4d.h"
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "rad_yarn.h"
 #include "r4d_emit.h"
-#include "r4d_chain.h"
 #include "r4d_common.h"   // r4d_wave_sum
 
 #include <hip/hip_runtime.h>
@@ -55,12 +55,13 @@ __device__ __forceinline__ int qbk_comp(int mode, int i, int s0, int s1, int s2)
     return i < s0 ? 0 : (i < s0 + s1 ? 1 : 2);
 }
 
-__device__ __forceinline__ void qsa_block_key_kernel_body(
-    const uint16_t* __restrict__ k, const float* __restrict__ w,
-    const int32_t* __restrict__ page, const int32_t* __restrict__ bpos,
-    uint16_t* __restrict__ out,
-    int n, int ratio, int rot, float eps, float wadd, float theta, float rscale,
-    long long pos0, int k_ld, int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc, RadYarn yarn) {
+#define QSA_BLOCK_KEY_PARAMS                                                                    \
+    const uint16_t* __restrict__ k, const float* __restrict__ w,                                \
+    const int32_t* __restrict__ page, const int32_t* __restrict__ bpos,                         \
+    uint16_t* __restrict__ out, int n, int ratio, int rot, float eps, float wadd,               \
+    float theta, float rscale, long long pos0, int k_ld, int o_ld, int mode, int s0, int s1,    \
+    int s2, int bstep, int mc, RadYarn yarn
+__device__ __forceinline__ void qsa_block_key_body(QSA_BLOCK_KEY_PARAMS) {
 
     __shared__ float sh[kMaxN];
     __shared__ float red[kMaxN / 32];
@@ -125,25 +126,17 @@ __device__ __forceinline__ void qsa_block_key_kernel_body(
     ((__hip_bfloat16*)out)[(size_t)orow * o_ld + t] = __float2bfloat16(res);
 }
 
-/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
-__global__ __launch_bounds__(kMaxN) void qsa_block_key_kernel(
-    const uint16_t* __restrict__ k, const float* __restrict__ w,
-    const int32_t* __restrict__ page, const int32_t* __restrict__ bpos,
-    uint16_t* __restrict__ out,
-    int n, int ratio, int rot, float eps, float wadd, float theta, float rscale,
-    long long pos0, int k_ld, int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc, RadYarn yarn) {
-    qsa_block_key_kernel_body(k, w, page, bpos, out, n, ratio, rot, eps, wadd, theta, rscale, pos0, k_ld, o_ld, mode, s0, s1, s2, bstep, mc, yarn);
+/* The kernel around the body, whose blocks and threads return where their work ends: CH `r4dchain`
+ * is the chained form (r4d_chain.h). */
+template <class CH>
+__global__ __launch_bounds__(kMaxN)
+void qsa_block_key_kernel(QSA_BLOCK_KEY_PARAMS) {
+    if (CH::on) r4d_chain_wait();
+    qsa_block_key_body(k, w, page, bpos, out, n, ratio, rot, eps, wadd, theta, rscale, pos0, k_ld,
+                       o_ld, mode, s0, s1, s2, bstep, mc, yarn);
+    if (CH::on) r4d_chain_done();
 }
-__global__ __launch_bounds__(kMaxN) void r4dchain_qsa_block_key(
-    const uint16_t* __restrict__ k, const float* __restrict__ w,
-    const int32_t* __restrict__ page, const int32_t* __restrict__ bpos,
-    uint16_t* __restrict__ out,
-    int n, int ratio, int rot, float eps, float wadd, float theta, float rscale,
-    long long pos0, int k_ld, int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc, RadYarn yarn) {
-    r4d_chain_wait();
-    qsa_block_key_kernel_body(k, w, page, bpos, out, n, ratio, rot, eps, wadd, theta, rscale, pos0, k_ld, o_ld, mode, s0, s1, s2, bstep, mc, yarn);
-    r4d_chain_done();
-}
+#undef QSA_BLOCK_KEY_PARAMS
 
 }  // namespace
 
@@ -157,7 +150,7 @@ static int r4d_qsa_block_key_bf16_emit(long k, long w, long page, long bpos, lon
                                       int n, int ratio, int rot, float eps, float wadd,
                                       float theta, float rscale, long long pos0, int k_ld,
                                       int o_ld, int mode, int s0, int s1, int s2, int bstep, int mc,
-                                      RadStream stream, RadYarn yarn) {
+                                      RadStream stream, RadYarn yarn, bool chain) {
     if (!k || !w || !out || (pos0 < 0 && !bpos)) return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || n <= 0 || n > kMaxN || ratio <= 0) return R4D_NO(RAD_E_SHAPE);
     if (rot < 0 || rot > n || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
@@ -165,10 +158,15 @@ static int r4d_qsa_block_key_bf16_emit(long k, long w, long page, long bpos, lon
     if (!o_ld) o_ld = n;
     /* n threads rounded up to whole waves for the block reduction (extra threads contribute 0). */
     const int thr = ((n + 31) / 32) * 32;
-    return R4D_EMIT(stream, g_r4d_chain_arg ? &r4dchain_qsa_block_key : &qsa_block_key_kernel, dim3((unsigned)M), dim3((unsigned)thr), 0,
-                    (const uint16_t*)k, (const float*)w, (const int32_t*)page,
-                    (const int32_t*)bpos, (uint16_t*)out, n, ratio, rot, eps, wadd, theta, rscale,
-                    pos0, k_ld, o_ld, mode, s0, s1, s2, bstep, mc, yarn);
+    /* Each form named at its own launch: a test reads the kernel a launch site names. */
+#define R4D_QBKEY(CH_)                                                                        \
+    R4D_EMIT(stream, qsa_block_key_kernel<CH_>, dim3((unsigned)M), dim3((unsigned)thr), 0,    \
+             (const uint16_t*)k, (const float*)w, (const int32_t*)page, (const int32_t*)bpos, \
+             (uint16_t*)out, n, ratio, rot, eps, wadd, theta, rscale, pos0, k_ld, o_ld, mode, \
+             s0, s1, s2, bstep, mc, yarn)
+    const int rc = chain ? R4D_QBKEY(r4dchain) : R4D_QBKEY(R4dUnchained);
+#undef R4D_QBKEY
+    return rc;
 }
 
 // ============================================================== the plugin ABI entry point
@@ -238,12 +236,12 @@ extern "C" int r4d_rad_qsa_block_key(const RadArgs* a, RadStream stream) {
     if (!rad_yarn_valid(yarn) ||
         (yarn.factor != 0.0f && (rot <= 0 || r4d_getf(a, "scale", 1.0) != 1.0)))
         return R4D_NO(RAD_E_INVAL);
-    const R4dChainArg chain_arg(r4d_geti_or(a, "chain", 0) != 0);
     return r4d_qsa_block_key_bf16_emit(
         r4d_addr(k), r4d_addr(w), r4d_addr(pg), r4d_addr(bp), r4d_addr(o),
         (int)M, (int)n, (int)ratio, (int)rot,
         (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 1.0),
         (float)r4d_getf(a, "theta", 10000.0), (float)r4d_getf(a, "scale", 1.0),
-        pos0, (int)kp, (int)op, mode, sec[0], sec[1], sec[2], bstep, mc, stream, yarn);
+        pos0, (int)kp, (int)op, mode, sec[0], sec[1], sec[2], bstep, mc, stream, yarn,
+        r4d_geti_or(a, "chain", 0) != 0);
 }
 

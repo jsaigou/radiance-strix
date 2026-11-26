@@ -17,7 +17,7 @@
 #include "diag/diag.h"
 #include "gen_config.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -500,8 +500,8 @@ TEST(a_run_started_anyway_says_so_at_the_top) {
     CHECK(text.find("--proceed-with-incompatible-configuration") != std::string::npos);
     CHECK(text.find("1 incompatible (started anyway)") != std::string::npos);
     CHECK(text.find("INCOMPATIBLE cwsr-off") != std::string::npos);
-    const nlohmann::json j =
-        nlohmann::json::parse(diag::to_json({}, {}, f, run, found), nullptr, false);
+    const Json j =
+        Json::parse(diag::to_json({}, {}, f, run, found), nullptr, false);
     CHECK(!j.is_discarded());
     if (j.is_discarded()) return;
     CHECK(j["unsupported_configuration"] == true);
@@ -679,7 +679,7 @@ TEST(a_value_that_is_not_utf8_does_not_break_the_json) {
     std::string out;
     try { out = diag::to_json(rows, {}, f, diag::RunFacts{}, {}); } catch (...) { threw = true; }
     CHECK(!threw);
-    const nlohmann::json j = nlohmann::json::parse(out, nullptr, false);
+    const Json j = Json::parse(out, nullptr, false);
     CHECK(!j.is_discarded());
     if (j.is_discarded()) return;
     CHECK(j["configuration"][0]["value"].get<std::string>() == "/m/caf\xef\xbf\xbd.rad");
@@ -736,7 +736,7 @@ TEST(the_json_carries_every_section) {
     Config c;
     Argv a({ "--model", "/m/x.rad" });
     CHECK_EQ(config_parse(a.argc(), a.argv.data(), &c), 0);
-    const nlohmann::json j = nlohmann::json::parse(
+    const Json j = Json::parse(
         diag::to_json(diag::config_rows(c), {}, f, diag::RunFacts{}, found), nullptr, false);
     CHECK(!j.is_discarded());
     if (j.is_discarded()) return;
@@ -748,6 +748,47 @@ TEST(the_json_carries_every_section) {
     const std::string text = diag::render(diag::config_rows(c), {}, f, diag::RunFacts{}, found);
     CHECK(text.find("00:01.3 16.0 GT/s x8 (max 32.0 GT/s x8)") != std::string::npos);
     CHECK(text.find("WARN link-below-max") != std::string::npos);
+}
+
+TEST(a_card_sample_reads_temperatures_by_label_and_the_current_level) {
+    Root r;
+    const std::string d = "/sys/bus/pci/devices/0000:03:00.0";
+    r.put(d + "/power_dpm_force_performance_level", "auto\n");
+    r.put(d + "/pp_dpm_sclk", "0: 500Mhz\n1: 1800Mhz *\n2: 2350Mhz\n");
+    r.put(d + "/pp_dpm_mclk", "0: 96Mhz\n1: 1258Mhz *\n");
+    r.put(d + "/gpu_busy_percent", "0\n");
+    r.put(d + "/hwmon/hwmon3/temp1_input", "45000\n");
+    r.put(d + "/hwmon/hwmon3/temp1_label", "edge\n");
+    r.put(d + "/hwmon/hwmon3/temp2_input", "61000\n");
+    r.put(d + "/hwmon/hwmon3/temp2_label", "junction\n");
+    r.put(d + "/hwmon/hwmon3/temp3_input", "52000\n");
+    r.put(d + "/hwmon/hwmon3/temp3_label", "mem\n");
+    r.put(d + "/hwmon/hwmon3/power1_input", "31000000\n");   /* no power1_average: the instant reading */
+    /* A card whose driver labels nothing: its temp1 is the edge sensor. */
+    const std::string e = "/sys/bus/pci/devices/0000:07:00.0";
+    r.put(e + "/hwmon/hwmon5/temp1_input", "38000\n");
+    r.put(e + "/hwmon/hwmon5/power1_average", "12000000\n");
+    r.put(e + "/hwmon/hwmon5/power1_input", "99000000\n");
+
+    const auto s = diag::sample_cards(r.dir, { "0000:03:00.0", "0000:07:00.0", "0000:0b:00.0" });
+    REQUIRE(s.size() == 3);
+    CHECK_EQ(s[0].perf_level, std::string("auto"));
+    CHECK_EQ(s[0].sclk_cur, std::string("1800Mhz"));
+    CHECK_EQ(s[0].mclk_cur, std::string("1258Mhz"));
+    CHECK_EQ(s[0].busy_percent, 0);
+    CHECK_EQ(s[0].edge_mc, (int64_t)45000);
+    CHECK_EQ(s[0].junction_mc, (int64_t)61000);
+    CHECK_EQ(s[0].mem_mc, (int64_t)52000);
+    CHECK_EQ(s[0].power_uw, (int64_t)31000000);
+    CHECK_EQ(s[1].edge_mc, (int64_t)38000);
+    CHECK_EQ(s[1].junction_mc, (int64_t)-1);
+    CHECK_EQ(s[1].power_uw, (int64_t)12000000);   /* the average, when there is one */
+    CHECK(s[1].perf_level.empty());
+    /* A card with no files at all is all unknown, not an error. */
+    CHECK_EQ(s[2].bdf, std::string("0000:0b:00.0"));
+    CHECK_EQ(s[2].edge_mc, (int64_t)-1);
+    CHECK_EQ(s[2].power_uw, (int64_t)-1);
+    CHECK(s[2].sclk_cur.empty());
 }
 
 RAD_TEST_MAIN()

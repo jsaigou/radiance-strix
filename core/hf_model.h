@@ -1,6 +1,7 @@
-/* hf_model.h -- a --model that names a Hugging Face repo instead of a local path.
+/* hf_model.h -- a model source (the `model` key, or a tool's --model) that names a Hugging Face
+ * repo instead of a local path.
  *
- * `radiance --model StillDeadcode/minicpm5-2b-fp8` fetches the repo with scripts/hfget.sh into
+ * `model: StillDeadcode/minicpm5-2b-fp8` fetches the repo with scripts/hfget.sh into
  * the download directory and serves what it fetched: the one container at the repo's top level,
  * or the directory as a checkpoint when it holds none. Every start re-checks the hub, so a
  * changed file is fetched again before bring-up; a start that cannot reach the hub serves the

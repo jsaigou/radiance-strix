@@ -18,8 +18,8 @@
 //
 #include "r4d.h"
 #include "r4d_args.h"
-#include "r4d_emit.h"
 #include "r4d_chain.h"
+#include "r4d_emit.h"
 #include "r4d_common.h"
 #include "rad_yarn.h"
 #include <hip/hip_bf16.h>
@@ -43,15 +43,13 @@
 // Cost: at rot 64 the rotary partner is in another wave. The lane re-derives it instead of an LDS
 // exchange: it loads the partner's input (an L1-hot read) and norms it with the block's `inv`.
 /* The paged cache the KV form writes: kv_store's operands and parameters in one argument, to stay
- * inside the emitter's parameter budget. Only the E4M3 form reads the descales. */
+ * inside the emitter's parameter budget. */
 struct QkKvStore {
   const __hip_bfloat16* v;
   const int32_t*        slot;
   void*                 cache;
   int   v_pitch, block_size, n_blocks;
-  float k_inv, v_inv;
-  int   row;   /* fp8_v4 / k6_v4: a token's bytes in a page, 25 or 22 * HD / 16 */
-  /* QK_KV_STREAMED only: the group's host mirror and per-layer residency map, as
+  /* The streamed forms only: the group's host mirror and per-layer residency map, as
    * kv_store_streamed takes them (libr4d/r4d_model_bf16.hip). `blocks` is the mirror's block
    * count (the id space) while `n_blocks` stays the ring depth. */
   const int32_t*        res;
@@ -59,23 +57,23 @@ struct QkKvStore {
   int                   blocks;
 };
 
-/* The cache forms KV selects. The two streamed forms are the same store into two planes, E4M3
- * and bf16. */
-enum { QK_KV_NONE = 0, QK_KV_FP8 = 1, QK_KV_BF16 = 2, QK_KV_F8V4 = 3, QK_KV_K6V4 = 4,
-       QK_KV_STREAMED = 5, QK_KV_STREAMED_BF16 = 6 };
+/* The cache forms KV selects: bf16 or the int8 cache, each resident or streamed (the same store
+ * into the host mirror and, where the block is resident, the ring). */
+enum { QK_KV_NONE = 0, QK_KV_BF16 = 2, QK_KV_STREAMED_BF16 = 6, QK_KV_I8 = 7,
+       QK_KV_STREAMED_I8 = 8 };
 
 /* KV folds kv_store in: a k head's block, holding the token's rotated k one element per lane, also
- * writes that element and the head's v element into the cache at the token's slot, as E4M3 with
- * kv_store_fp8's arithmetic or as bf16 like kv_store_bf16 (see the store at the end). */
+ * writes that element and the head's v element into the cache at the token's slot, as bf16 like
+ * kv_store_bf16 or as the int8 cache's codes like kv_store_i8 (see the store at the end). */
+#define R4D_QK_NORM_ROPE_GATE_PARAMS                                                            \
+    const __hip_bfloat16* __restrict__ QG, const __hip_bfloat16* __restrict__ K,                \
+    __hip_bfloat16* __restrict__ QO, __hip_bfloat16* __restrict__ KO,                           \
+    __hip_bfloat16* __restrict__ GO, const void* __restrict__ WQ,                               \
+    const void* __restrict__ WK, const void* __restrict__ CS, const void* __restrict__ POS,     \
+    long cs_rows, int nq, int nkv, int rot, float eps, float wadd, int qg_pitch,                \
+    int k_pitch, int cs_f32, int pos_i64, int w_f32, QkKvStore kvs
 template <int HD, int KV = QK_KV_NONE>
-__device__ __forceinline__ void r4d_qk_norm_rope_gate_kernel_body(
-    const __hip_bfloat16* __restrict__ QG, const __hip_bfloat16* __restrict__ K,
-    __hip_bfloat16* __restrict__ QO, __hip_bfloat16* __restrict__ KO,
-    __hip_bfloat16* __restrict__ GO,
-    const void* __restrict__ WQ, const void* __restrict__ WK,
-    const void* __restrict__ CS, const void* __restrict__ POS, long cs_rows,
-    int nq, int nkv, int rot, float eps, float wadd,
-    int qg_pitch, int k_pitch, int cs_f32, int pos_i64, int w_f32, QkKvStore kvs) {
+__device__ __forceinline__ void r4d_qk_norm_rope_gate_body(R4D_QK_NORM_ROPE_GATE_PARAMS) {
   constexpr int THR = 256;
   __shared__ float lds[THR / 32];
   const int tok = blockIdx.x, h = blockIdx.y;
@@ -148,158 +146,116 @@ __device__ __forceinline__ void r4d_qk_norm_rope_gate_kernel_body(
   if (t < HD) {
     out[t] = __float2bfloat16(res);
     // `gate_out` is optional: a caller that reads the gate straight from the interleaved projection
-    // (the fp8 block, via gate_quant_fp8) passes none.
+    // passes none.
     if (!isk && GO) GO[((size_t)tok * nq + lh) * HD + t] = in[HD + t];
   }
   // The cache write kv_store would make next, from the same bytes: the rotated k as just stored
-  // and the v row as the projection left it. The E4M3 form scales by the inverse descale, clamps
-  // (v_cvt_pk_fp8_f32 returns NaN out of range) and converts each element on its own, so one
-  // element a lane gives the same byte. The bf16 form stores the values as kv_store_bf16 does.
-  // Layout [n_blocks, kv_heads, block_size, 2*head_dim], k then v; a negative or out-of-range slot
-  // stores nothing.
-  if constexpr (KV != QK_KV_NONE) {
+  // and the v row as the projection left it. Layout [n_blocks, kv_heads, block_size, row], k then
+  // v; a negative or out-of-range slot stores nothing.
+  //
+  // A streamed group's cache is the ring and its truth is the host mirror: the token goes to the
+  // mirror's block row always and to the ring slot only where the residency map says the block is
+  // resident, exactly as kv_store_streamed writes it (libref/ref_attn.cpp states why the test
+  // belongs in the writer). The block id bounds the mirror, the map bounds the ring, and a slot
+  // names a ring block only through `res`.
+  if constexpr (KV == QK_KV_I8 || KV == QK_KV_STREAMED_I8) {
+    // The int8 cache (kv_store_i8's bytes): the head's k and v each as int8 codes against one f16
+    // scale, the head's absmax / 127, taken over the block through LDS. `isk` is uniform over the
+    // block, so every thread of a k head's block meets the barrier.
+    if (isk) {
+      __shared__ float s_m[2][THR / 32];
+      const bool in = t < HD;
+      const float kf = in ? __bfloat162float(__float2bfloat16(res)) : 0.0f;
+      const float vf =
+          in ? __bfloat162float(kvs.v[(size_t)tok * kvs.v_pitch + (size_t)lh * HD + t]) : 0.0f;
+      float km = r4d_wave_max(fabsf(kf)), vm = r4d_wave_max(fabsf(vf));
+      if ((t & 31) == 0) { s_m[0][t >> 5] = km; s_m[1][t >> 5] = vm; }
+      __syncthreads();
+      km = 0.0f; vm = 0.0f;
+#pragma unroll
+      for (int wv = 0; wv < THR / 32; ++wv) {
+        km = fmaxf(km, s_m[0][wv]);
+        vm = fmaxf(vm, s_m[1][wv]);
+      }
+      const int32_t sl = kvs.slot[tok];
+      constexpr bool STREAMED = KV == QK_KV_STREAMED_I8;
+      const uint32_t id_space = (uint32_t)(STREAMED ? kvs.blocks : kvs.n_blocks);
+      if (in && sl >= 0 && (uint32_t)sl / (uint32_t)kvs.block_size < id_space) {
+        const uint32_t blk = (uint32_t)sl / (uint32_t)kvs.block_size;
+        const uint32_t off = (uint32_t)sl % (uint32_t)kvs.block_size;
+        const size_t rowb = (size_t)(2 * HD + 4);
+        const __fp16 k16 = (__fp16)fminf(km / 127.0f, 515.0f);
+        const __fp16 v16 = (__fp16)fminf(vm / 127.0f, 515.0f);
+        const float ksc = (float)k16, vsc = (float)v16;
+        const float kr = ksc > 0.0f ? rintf(kf / ksc) : 0.0f;
+        const float vr = vsc > 0.0f ? rintf(vf / vsc) : 0.0f;
+        const unsigned char kc = (unsigned char)(signed char)(int)fminf(fmaxf(kr, -127.0f), 127.0f);
+        const unsigned char vc = (unsigned char)(signed char)(int)fminf(fmaxf(vr, -127.0f), 127.0f);
+        auto put = [&](unsigned char* c) {
+          c[t]      = kc;
+          c[HD + t] = vc;
+          if (t == 0) {
+            *(uint16_t*)(c + 2 * HD)     = __builtin_bit_cast(uint16_t, k16);
+            *(uint16_t*)(c + 2 * HD + 2) = __builtin_bit_cast(uint16_t, v16);
+          }
+        };
+        if constexpr (STREAMED) {
+          const size_t o = ((size_t)lh * kvs.block_size + off) * rowb;
+          const size_t brow = (size_t)nkv * kvs.block_size * rowb;
+          put((unsigned char*)kvs.host + (size_t)blk * brow + o);
+          const int32_t rs = kvs.res[blk];
+          if (rs >= 0 && (uint32_t)rs < (uint32_t)kvs.n_blocks)
+            put((unsigned char*)kvs.cache + (size_t)rs * brow + o);
+        } else {
+          put((unsigned char*)kvs.cache + (((size_t)blk * nkv + lh) * kvs.block_size + off) * rowb);
+        }
+      }
+    }
+  } else if constexpr (KV != QK_KV_NONE) {
     if (isk && t < HD) {
       const int32_t sl = kvs.slot[tok];
-      /* A streamed group's cache is the ring and its truth is the host mirror: the token goes to
-       * the mirror's block row ALWAYS and to the ring slot only where the residency map says the
-       * block is resident, exactly as kv_store_streamed writes it (libref/ref_attn.cpp states why
-       * the test belongs in the writer). The block id bounds the mirror, the map bounds the ring,
-       * and a slot names a ring block only through `res`. */
-      if constexpr (KV == QK_KV_STREAMED || KV == QK_KV_STREAMED_BF16) {
+      const size_t rowb = (size_t)(2 * HD);
+      const __hip_bfloat16 kb = __float2bfloat16(res);
+      const __hip_bfloat16 vb = kvs.v[(size_t)tok * kvs.v_pitch + (size_t)lh * HD + t];
+      if constexpr (KV == QK_KV_STREAMED_BF16) {
         if (sl >= 0 && (uint32_t)sl / (uint32_t)kvs.block_size < (uint32_t)kvs.blocks) {
           const uint32_t blk = (uint32_t)sl / (uint32_t)kvs.block_size;
           const uint32_t off = (uint32_t)sl % (uint32_t)kvs.block_size;
-          /* One element of each plane. The mirror and the ring are byte planes of the same paged
-           * layout and `block_bytes` is their pitch, so a bf16 element is two bytes at twice the
-           * fp8 offset. */
-          const size_t EB = KV == QK_KV_STREAMED_BF16 ? 2 : 1;
-          const size_t rowb = (size_t)(2 * HD) * EB;
-          const size_t at = ((size_t)blk * nkv * kvs.block_size + off) * rowb +
-                            (size_t)lh * kvs.block_size * rowb;
-          const __hip_bfloat16 kb = __float2bfloat16(res);
-          const __hip_bfloat16 vb = kvs.v[(size_t)tok * kvs.v_pitch + (size_t)lh * HD + t];
+          const size_t o = ((size_t)lh * kvs.block_size + off) * rowb;
+          const size_t brow = (size_t)nkv * kvs.block_size * rowb;
+          __hip_bfloat16* const m = (__hip_bfloat16*)kvs.host + (size_t)blk * brow + o;
+          m[t]      = kb;
+          m[HD + t] = vb;
           const int32_t rs = kvs.res[blk];
-          unsigned char* const m = (unsigned char*)kvs.host + at;
-          unsigned char* const c =
-              (rs >= 0 && (uint32_t)rs < (uint32_t)kvs.n_blocks)
-                  ? (unsigned char*)kvs.cache +
-                        (((size_t)rs * nkv * kvs.block_size + off) * rowb +
-                         (size_t)lh * kvs.block_size * rowb)
-                  : nullptr;
-          if constexpr (KV == QK_KV_STREAMED_BF16) {
-            /* kv_store_bf16 writes the values themselves: no descales. */
-            *(__hip_bfloat16*)(m + EB * t)      = kb;
-            *(__hip_bfloat16*)(m + EB * (HD + t)) = vb;
-            if (c) {
-              *(__hip_bfloat16*)(c + EB * t)      = kb;
-              *(__hip_bfloat16*)(c + EB * (HD + t)) = vb;
-            }
-          } else {
-            const float kf = __bfloat162float(kb) * kvs.k_inv;
-            const float vf = __bfloat162float(vb) * kvs.v_inv;
-            const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(kf, -448.0f), 448.0f), 0.0f,
-                                                           0, false);
-            const int pv = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(vf, -448.0f), 448.0f), 0.0f,
-                                                           0, false);
-            m[t]      = (unsigned char)(pk & 0xFF);
-            m[HD + t] = (unsigned char)(pv & 0xFF);
-            if (c) {
-              c[t]      = (unsigned char)(pk & 0xFF);
-              c[HD + t] = (unsigned char)(pv & 0xFF);
-            }
+          if (rs >= 0 && (uint32_t)rs < (uint32_t)kvs.n_blocks) {
+            __hip_bfloat16* const c = (__hip_bfloat16*)kvs.cache + (size_t)rs * brow + o;
+            c[t]      = kb;
+            c[HD + t] = vb;
           }
         }
       } else if (sl >= 0 && (uint32_t)sl / (uint32_t)kvs.block_size < (uint32_t)kvs.n_blocks) {
         const uint32_t blk = (uint32_t)sl / (uint32_t)kvs.block_size;
         const uint32_t off = (uint32_t)sl % (uint32_t)kvs.block_size;
-        const size_t rowb = (KV == QK_KV_F8V4 || KV == QK_KV_K6V4) ? (size_t)kvs.row : (size_t)(2 * HD);
         const size_t at = ((size_t)blk * nkv * kvs.block_size + off) * rowb +
                           (size_t)lh * kvs.block_size * rowb;
-        const __hip_bfloat16 kb = __float2bfloat16(res);
-        const __hip_bfloat16 vb = kvs.v[(size_t)tok * kvs.v_pitch + (size_t)lh * HD + t];
-        if constexpr (KV == QK_KV_BF16) {
-          __hip_bfloat16* c = (__hip_bfloat16*)kvs.cache + at;
-          c[t]      = kb;
-          c[HD + t] = vb;
-        } else if constexpr (KV == QK_KV_F8V4 || KV == QK_KV_K6V4) {
-          // fp8_v4: K as the E4M3 form writes it. k6_v4: K as int6 in groups of 32 (one wave)
-          // with an f16 scale, absmax / 31, in kv_store_k6v4's layout. V as int4 in groups of 32
-          // with an f16 scale, absmax / 7. The even lane of a pair writes the pair's nibble byte.
-          unsigned char* c = (unsigned char*)kvs.cache + at;
-          const float kf = __bfloat162float(kb) * kvs.k_inv;
-          constexpr int voff = KV == QK_KV_K6V4 ? HD * 3 / 4 : HD;
-          constexpr int vsoff = KV == QK_KV_K6V4 ? HD * 21 / 16 : HD * 3 / 2;
-          if constexpr (KV == QK_KV_K6V4) {
-            float kmax = fabsf(kf);
-            for (int m = 16; m >= 1; m >>= 1) kmax = fmaxf(kmax, __shfl_xor(kmax, m, 32));
-            const __fp16 k16 = (__fp16)fminf(kmax / 31.0f, 2112.0f);   // finite codes, as kv_store_k6v4
-            const float ksc = (float)k16;
-            const float r = ksc > 0.0f ? rintf(kf / ksc) : 0.0f;
-            const int q = ((int)fminf(fmaxf(r, -31.0f), 31.0f)) & 0x3F;
-            const int qn = __shfl_xor(q & 15, 1, 32);
-            if ((t & 1) == 0) c[t / 2] = (unsigned char)((q & 15) | (qn << 4));
-            // High bits: a pair's four into bits 0-3 at its even lane, then the pair eight dims on
-            // into bits 4-7; lane 2j of a 16-dim chunk writes byte j.
-            const int h01 = (q >> 4) | (__shfl_xor(q >> 4, 1, 32) << 2);
-            const int hb  = h01 | (__shfl_xor(h01, 8, 32) << 4);
-            if ((t & 1) == 0 && (t & 15) < 8) c[HD / 2 + (t / 16) * 4 + (t & 7) / 2] = (unsigned char)hb;
-            if ((t & 31) == 0) *(uint16_t*)(c + HD * 5 / 4 + (t / 32) * 2) = __builtin_bit_cast(uint16_t, k16);
-          } else {
-            const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(kf, -448.0f), 448.0f), 0.0f,
-                                                           0, false);
-            c[t] = (unsigned char)(pk & 0xFF);
-          }
-          const float vf = __bfloat162float(vb) * kvs.v_inv;
-          float amax = fabsf(vf);
-          for (int m = 16; m >= 1; m >>= 1) amax = fmaxf(amax, __shfl_xor(amax, m, 32));
-          const __fp16 s16 = (__fp16)fminf(amax / 7.0f, 8188.0f);   // finite codes, as kv_store_fp8v4
-          const float sc = (float)s16;
-          const float r = sc > 0.0f ? rintf(vf / sc) : 0.0f;
-          const int q = ((int)fminf(fmaxf(r, -7.0f), 7.0f)) & 0xF;
-          const int qn = __shfl_xor(q, 1, 32);
-          if ((t & 1) == 0) c[voff + t / 2] = (unsigned char)(q | (qn << 4));
-          if ((t & 31) == 0) *(uint16_t*)(c + vsoff + (t / 32) * 2) = __builtin_bit_cast(uint16_t, s16);
-        } else {
-          unsigned char* c = (unsigned char*)kvs.cache + at;
-          const float kf = __bfloat162float(kb) * kvs.k_inv;
-          const float vf = __bfloat162float(vb) * kvs.v_inv;
-          const int pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(kf, -448.0f), 448.0f), 0.0f,
-                                                         0, false);
-          const int pv = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(vf, -448.0f), 448.0f), 0.0f,
-                                                         0, false);
-          c[t]      = (unsigned char)(pk & 0xFF);
-          c[HD + t] = (unsigned char)(pv & 0xFF);
-        }
+        __hip_bfloat16* c = (__hip_bfloat16*)kvs.cache + at;
+        c[t]      = kb;
+        c[HD + t] = vb;
       }
     }
   }
 }
 
-/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
-template <int HD, int KV = QK_KV_NONE>
-__global__ __launch_bounds__(256) void r4d_qk_norm_rope_gate_kernel(
-    const __hip_bfloat16* __restrict__ QG, const __hip_bfloat16* __restrict__ K,
-    __hip_bfloat16* __restrict__ QO, __hip_bfloat16* __restrict__ KO,
-    __hip_bfloat16* __restrict__ GO,
-    const void* __restrict__ WQ, const void* __restrict__ WK,
-    const void* __restrict__ CS, const void* __restrict__ POS, long cs_rows,
-    int nq, int nkv, int rot, float eps, float wadd,
-    int qg_pitch, int k_pitch, int cs_f32, int pos_i64, int w_f32, QkKvStore kvs) {
-    r4d_qk_norm_rope_gate_kernel_body<HD, KV>(QG, K, QO, KO, GO, WQ, WK, CS, POS, cs_rows, nq, nkv, rot, eps, wadd, qg_pitch, k_pitch, cs_f32, pos_i64, w_f32, kvs);
+// The kernel around the body: CH `r4dchain` is the chained form (r4d_chain.h).
+template <int HD, int KV, class CH>
+__global__ __launch_bounds__(256)
+void r4d_qk_norm_rope_gate_kernel(R4D_QK_NORM_ROPE_GATE_PARAMS) {
+  if (CH::on) r4d_chain_wait();
+  r4d_qk_norm_rope_gate_body<HD, KV>(QG, K, QO, KO, GO, WQ, WK, CS, POS, cs_rows, nq, nkv, rot, eps,
+                                     wadd, qg_pitch, k_pitch, cs_f32, pos_i64, w_f32, kvs);
+  if (CH::on) r4d_chain_done();
 }
-template <int HD, int KV = QK_KV_NONE>
-__global__ __launch_bounds__(256) void r4dchain_qk_norm_rope_gate(
-    const __hip_bfloat16* __restrict__ QG, const __hip_bfloat16* __restrict__ K,
-    __hip_bfloat16* __restrict__ QO, __hip_bfloat16* __restrict__ KO,
-    __hip_bfloat16* __restrict__ GO,
-    const void* __restrict__ WQ, const void* __restrict__ WK,
-    const void* __restrict__ CS, const void* __restrict__ POS, long cs_rows,
-    int nq, int nkv, int rot, float eps, float wadd,
-    int qg_pitch, int k_pitch, int cs_f32, int pos_i64, int w_f32, QkKvStore kvs) {
-    r4d_chain_wait();
-    r4d_qk_norm_rope_gate_kernel_body<HD, KV>(QG, K, QO, KO, GO, WQ, WK, CS, POS, cs_rows, nq, nkv, rot, eps, wadd, qg_pitch, k_pitch, cs_f32, pos_i64, w_f32, kvs);
-    r4d_chain_done();
-}
+#undef R4D_QK_NORM_ROPE_GATE_PARAMS
 
 // ============================================================ the cos/sin table
 //
@@ -315,9 +271,10 @@ __global__ __launch_bounds__(256) void r4dchain_qk_norm_rope_gate(
 // bit-identical: `1.0f / powf(theta, 2i/den)` with `den` the ladder's width (`rot` for `rotary`,
 // `head_dim` for `head`), the position divided by `rscale` in f32, `sincosf`, and the products
 // consumed in f32 by the caller. Changing any of it changes the model's output.
-__global__ __launch_bounds__(64) void r4d_qk_rope_table_kernel(
-    const void* __restrict__ POS, void* __restrict__ CS, long rows, int rot, int den, float theta,
-    float rscale, int cs_f32, int pos_i64, RadYarn yarn) {
+#define R4D_QK_ROPE_TABLE_PARAMS                                                                \
+    const void* __restrict__ POS, void* __restrict__ CS, long rows, int rot, int den,           \
+    float theta, float rscale, int cs_f32, int pos_i64, RadYarn yarn
+__device__ __forceinline__ void r4d_qk_rope_table_body(R4D_QK_ROPE_TABLE_PARAMS) {
   const int m = blockIdx.x;
   const long pp = pos_i64 ? ((const long*)POS)[m] : (long)((const int*)POS)[m];
   // A padded row addresses no table row, and a position at or past the table's height writes
@@ -342,6 +299,16 @@ __global__ __launch_bounds__(64) void r4d_qk_rope_table_kernel(
   }
 }
 
+// The kernel around the body: CH `r4dchain` is the chained form (r4d_chain.h).
+template <class CH>
+__global__ __launch_bounds__(64)
+void r4d_qk_rope_table_kernel(R4D_QK_ROPE_TABLE_PARAMS) {
+  if (CH::on) r4d_chain_wait();
+  r4d_qk_rope_table_body(POS, CS, rows, rot, den, theta, rscale, cs_f32, pos_i64, yarn);
+  if (CH::on) r4d_chain_done();
+}
+#undef R4D_QK_ROPE_TABLE_PARAMS
+
 // The two launches, as the plugin ABI's RadLaunchFn. See the note at the head of
 // r4d_quant_act_i8.hip on the argument list and status return.
 enum { QK_QGATE = 0, QK_K, QK_COSSIN, QK_POS, QK_WQ, QK_WK, QK_QOUT, QK_KOUT, QK_GOUT,
@@ -350,6 +317,7 @@ enum { QK_QGATE = 0, QK_K, QK_COSSIN, QK_POS, QK_WQ, QK_WK, QK_QOUT, QK_KOUT, QK
 /* The body of both forms; KVF is the kv_store fold and `kvs` its cache, already checked. */
 template <int KVF>
 static int qk_body(const RadArgs* args, RadStream stream, const QkKvStore& kvs) {
+  const bool chain = r4d_geti_or(args, "chain", 0) != 0;   // the chained form (r4d_chain.h)
   const RadTensor* qg = r4d_opt(args, QK_QGATE);
   const RadTensor* k  = r4d_opt(args, QK_K);
   const RadTensor* cs = r4d_opt(args, QK_COSSIN);
@@ -403,15 +371,14 @@ static int qk_body(const RadArgs* args, RadStream stream, const QkKvStore& kvs) 
   const int nh = (int)(nq + nkv);
   // One block per (token, head), 256 threads, one element per lane. The width is fixed at 256, not
   // fitted to the head count, so the sum of squares matches r4d_rmsnorm_bf16 (see the kernel).
-  /* The chained form (r4d_chain.h) where the row resolved with `chain`. */
-  const bool ch = r4d_geti_or(args, "chain", 0) != 0 && r4d_chain_rows_ok(M);
-#define R4D_QKG_L(H) emit_rc = R4D_EMIT(stream, (ch ? &r4dchain_qk_norm_rope_gate<H, KVF> \
-                                                    : &r4d_qk_norm_rope_gate_kernel<H, KVF>), \
+#define R4D_QKG_E(H, CH_) emit_rc = R4D_EMIT(stream, (r4d_qk_norm_rope_gate_kernel<H, KVF, CH_>), \
     dim3((int)M, nh), dim3(256), 0, (const __hip_bfloat16*)r4d_p(qg), \
     (const __hip_bfloat16*)r4d_p(k), (__hip_bfloat16*)r4d_wp(qo), (__hip_bfloat16*)r4d_wp(ko), \
     (__hip_bfloat16*)r4d_wp(go), r4d_p(wq), r4d_p(wk), r4d_p(cs), r4d_p(po), (long)cs_rows, \
     (int)nq, (int)nkv, (int)rot, eps, wadd, (int)qg_pitch, (int)k_pitch, cs_f32, pos_i64, w_f32, \
     kvs)
+#define R4D_QKG_L(H) \
+    do { if (chain) R4D_QKG_E(H, r4dchain); else R4D_QKG_E(H, R4dUnchained); } while (0)
   int emit_rc = RAD_OK;
   switch (hd) {
     case 64:  R4D_QKG_L(64); break;
@@ -419,6 +386,7 @@ static int qk_body(const RadArgs* args, RadStream stream, const QkKvStore& kvs) 
     default:  R4D_QKG_L(256); break;
   }
 #undef R4D_QKG_L
+#undef R4D_QKG_E
   return emit_rc;
 }
 
@@ -427,81 +395,39 @@ extern "C" int r4d_rad_qk_norm_rope_gate(const RadArgs* args, RadStream stream) 
 }
 
 /* The prologue with the KV store folded in: qk_norm_rope_gate's operands, then kv_store's `v`,
- * `slot_mapping` and `kv_cache`, and its parameters. The cache is E4M3 or bf16 as `kv_dtype`
- * names, checked as kv_store checks it, one slot per prologue row. The k kv_store would read is the
- * prologue's own output, so it is not a separate operand. */
-extern "C" int r4d_rad_qk_norm_rope_gate_kv_store(const RadArgs* args, RadStream stream) {
-  const RadTensor* k  = r4d_opt(args, QK_K);
-  const RadTensor* qg = r4d_opt(args, QK_QGATE);
-  const RadTensor* v  = r4d_opt(args, QK_V);
-  const RadTensor* sm = r4d_opt(args, QK_SLOT);
-  const RadTensor* kv = r4d_opt(args, QK_CACHE);
-  if (!k || !v || !sm || !kv) return R4D_NO(RAD_E_INVAL);
-  const char* kvd = r4d_gets(args, "kv_dtype");
-  const uint32_t want = kvd ? rad_dtype_parse(kvd) : (uint32_t)RAD_DT_INVALID;
-  if (v->dtype != RAD_BF16 || sm->dtype != RAD_I32 || kv->dtype != want ||
-      (kv->dtype != RAD_F8E4M3 && kv->dtype != RAD_BF16))
-    return R4D_NO(RAD_E_DTYPE);
-  if (!r4d_contig(sm) || !r4d_contig(kv)) return R4D_NO(RAD_E_STRIDE);
-
-  const long long hd  = r4d_geti_or(args, "head_dim", 0);
-  const long long nkv = r4d_geti_or(args, "n_head_kv", 0);
-  const long long bs  = r4d_geti_or(args, "block_size", 0);
-  if (hd <= 0 || nkv <= 0 || bs <= 0) return R4D_NO(RAD_E_SHAPE);
-  if (kv->rank != 4 || kv->shape[1] != nkv || kv->shape[2] != bs || kv->shape[3] != 2 * hd)
-    return R4D_NO(RAD_E_SHAPE);
-  const long long M = qg ? qg->shape[0] : k->shape[0];
-  long long Mv = 0;
-  const long long v_ld = r4d_rows_pitch(v, nkv * hd, &Mv);
-  if (v_ld < 0) return R4D_NO(RAD_E_STRIDE);
-  if (Mv < M || r4d_numel(sm) != M) return R4D_NO(RAD_E_SHAPE);
-
-  const double ks = r4d_getf(args, "k_scale", 1.0);
-  const double vs = r4d_getf(args, "v_scale", 1.0);
-  if (!(ks > 0.0) || !(vs > 0.0)) return R4D_NO(RAD_E_INVAL);
-
-  QkKvStore kvs{};
-  kvs.v          = (const __hip_bfloat16*)r4d_p(v);
-  kvs.slot       = (const int32_t*)r4d_p(sm);
-  kvs.cache      = r4d_wp(kv);
-  kvs.v_pitch    = (int)v_ld;
-  kvs.block_size = (int)bs;
-  kvs.n_blocks   = (int)kv->shape[0];
-  kvs.k_inv      = 1.0f / (float)ks;
-  kvs.v_inv      = 1.0f / (float)vs;
-  return kv->dtype == RAD_BF16 ? qk_body<QK_KV_BF16>(args, stream, kvs)
-                               : qk_body<QK_KV_FP8>(args, stream, kvs);
-}
-
-/* The prologue with the streamed store folded in (docs/OPS.md "kv_store_streamed"): each token's
- * rotated k and its v go to the mirror's block row always and to `kv_cache[res[block]]` only where
- * the block is resident, one launch where qk_norm_rope_gate + kv_store_streamed were two. The bytes
- * are the pair's: `k_out`'s bf16 value is what the conversion reads, and both planes share one
- * layout. E4M3, or bf16 storing the values themselves. */
-extern "C" int r4d_rad_qk_norm_rope_gate_kv_store_streamed(const RadArgs* args, RadStream stream) {
+ * `slot_mapping` and `kv_cache`, and its parameters. The cache is bf16 or the int8 cache
+ * ([n_blocks, kv_heads, block_size, 2 * HD + 4] bytes) as `kv_dtype` names, checked as kv_store
+ * checks it, one slot per prologue row. The k kv_store would read is the prologue's own output, so
+ * it is not a separate operand. `streamed` adds the residency map and the host mirror (docs/OPS.md
+ * "kv_store_streamed"): each token's rotated k and its v go to the mirror's block row always and
+ * to `kv_cache[res[block]]` only where the block is resident, one launch where qk_norm_rope_gate +
+ * kv_store_streamed were two, and the same bytes. */
+static int qk_kv_store(const RadArgs* args, RadStream stream, bool streamed) {
   const RadTensor* k   = r4d_opt(args, QK_K);
   const RadTensor* qg  = r4d_opt(args, QK_QGATE);
   const RadTensor* v   = r4d_opt(args, QK_V);
   const RadTensor* sm  = r4d_opt(args, QK_SLOT);
   const RadTensor* kv  = r4d_opt(args, QK_CACHE);
-  const RadTensor* res = r4d_opt(args, QK_RES);
-  const RadTensor* ho  = r4d_opt(args, QK_HOST);
-  if (!k || !v || !sm || !kv || !res || !ho) return R4D_NO(RAD_E_INVAL);
+  const RadTensor* res = streamed ? r4d_opt(args, QK_RES) : nullptr;
+  const RadTensor* ho  = streamed ? r4d_opt(args, QK_HOST) : nullptr;
+  if (!k || !v || !sm || !kv || (streamed && (!res || !ho))) return R4D_NO(RAD_E_INVAL);
   const char* kvd = r4d_gets(args, "kv_dtype");
   const uint32_t want = kvd ? rad_dtype_parse(kvd) : (uint32_t)RAD_DT_INVALID;
   if (v->dtype != RAD_BF16 || sm->dtype != RAD_I32 || kv->dtype != want ||
-      (kv->dtype != RAD_F8E4M3 && kv->dtype != RAD_BF16) || res->dtype != RAD_I32 ||
-      ho->dtype != RAD_U8)
+      (kv->dtype != RAD_I8 && kv->dtype != RAD_BF16))
     return R4D_NO(RAD_E_DTYPE);
-  if (!r4d_contig(sm) || !r4d_contig(kv) || !r4d_contig(res) || !r4d_contig(ho) ||
-      ho->rank != 2)
+  if (streamed && (res->dtype != RAD_I32 || ho->dtype != RAD_U8)) return R4D_NO(RAD_E_DTYPE);
+  if (!r4d_contig(sm) || !r4d_contig(kv)) return R4D_NO(RAD_E_STRIDE);
+  if (streamed && (!r4d_contig(res) || !r4d_contig(ho) || ho->rank != 2))
     return R4D_NO(RAD_E_STRIDE);
+  const bool i8 = kv->dtype == RAD_I8;
 
   const long long hd  = r4d_geti_or(args, "head_dim", 0);
   const long long nkv = r4d_geti_or(args, "n_head_kv", 0);
   const long long bs  = r4d_geti_or(args, "block_size", 0);
   if (hd <= 0 || nkv <= 0 || bs <= 0) return R4D_NO(RAD_E_SHAPE);
-  if (kv->rank != 4 || kv->shape[1] != nkv || kv->shape[2] != bs || kv->shape[3] != 2 * hd)
+  const long long rowe = i8 ? 2 * hd + 4 : 2 * hd;       /* a token's row in a head, in elements */
+  if (kv->rank != 4 || kv->shape[1] != nkv || kv->shape[2] != bs || kv->shape[3] != rowe)
     return R4D_NO(RAD_E_SHAPE);
   const long long M = qg ? qg->shape[0] : k->shape[0];
   long long Mv = 0;
@@ -509,61 +435,6 @@ extern "C" int r4d_rad_qk_norm_rope_gate_kv_store_streamed(const RadArgs* args, 
   if (v_ld < 0) return R4D_NO(RAD_E_STRIDE);
   if (Mv < M || r4d_numel(sm) != M) return R4D_NO(RAD_E_SHAPE);
 
-  /* One block of one layer: the mirror's row pitch and the ring's slot pitch are the same bytes,
-   * so the store addresses both with one row arithmetic. */
-  const long long row    = nkv * bs * 2 * hd * (kv->dtype == RAD_BF16 ? 2 : 1);
-  const long long blocks = ho->shape[0], slots = kv->shape[0];
-  if (blocks <= 0 || slots <= 0 || row <= 0) return R4D_NO(RAD_E_SHAPE);
-  if (ho->shape[1] != row || ho->stride[0] != row) return R4D_NO(RAD_E_STRIDE);
-  if (r4d_numel(res) < blocks) return R4D_NO(RAD_E_SHAPE);
-
-  const double ks = r4d_getf(args, "k_scale", 1.0);
-  const double vs = r4d_getf(args, "v_scale", 1.0);
-  if (!(ks > 0.0) || !(vs > 0.0)) return R4D_NO(RAD_E_INVAL);
-
-  QkKvStore kvs{};
-  kvs.v          = (const __hip_bfloat16*)r4d_p(v);
-  kvs.slot       = (const int32_t*)r4d_p(sm);
-  kvs.cache      = r4d_wp(kv);
-  kvs.v_pitch    = (int)v_ld;
-  kvs.block_size = (int)bs;
-  kvs.n_blocks   = (int)slots;
-  kvs.k_inv      = 1.0f / (float)ks;
-  kvs.v_inv      = 1.0f / (float)vs;
-  kvs.res        = (const int32_t*)r4d_p(res);
-  kvs.host       = r4d_wp(ho);
-  kvs.blocks     = (int)blocks;
-  return kv->dtype == RAD_BF16 ? qk_body<QK_KV_STREAMED_BF16>(args, stream, kvs)
-                               : qk_body<QK_KV_STREAMED>(args, stream, kvs);
-}
-
-/* The fp8_v4 and k6_v4 forms: the same operands, the cache [n_blocks, kv_heads, block_size,
- * 25 or 22 * HD / 16] E4M3-typed bytes (fp8_v4: E4M3 K; k6_v4: int6 K; both int4 V, f16 scales). */
-static int qk_kv_q4(const RadArgs* args, RadStream stream, int k6) {
-  const long long r16 = k6 ? 22 : 25;
-  const RadTensor* k  = r4d_opt(args, QK_K);
-  const RadTensor* qg = r4d_opt(args, QK_QGATE);
-  const RadTensor* v  = r4d_opt(args, QK_V);
-  const RadTensor* sm = r4d_opt(args, QK_SLOT);
-  const RadTensor* kv = r4d_opt(args, QK_CACHE);
-  if (!k || !v || !sm || !kv) return R4D_NO(RAD_E_INVAL);
-  if (v->dtype != RAD_BF16 || sm->dtype != RAD_I32 || kv->dtype != RAD_F8E4M3)
-    return R4D_NO(RAD_E_DTYPE);
-  if (!r4d_contig(sm) || !r4d_contig(kv)) return R4D_NO(RAD_E_STRIDE);
-  const long long hd  = r4d_geti_or(args, "head_dim", 0);
-  const long long nkv = r4d_geti_or(args, "n_head_kv", 0);
-  const long long bs  = r4d_geti_or(args, "block_size", 0);
-  if (hd <= 0 || nkv <= 0 || bs <= 0 || hd % 32) return R4D_NO(RAD_E_SHAPE);
-  if (kv->rank != 4 || kv->shape[1] != nkv || kv->shape[2] != bs || kv->shape[3] != hd * r16 / 16)
-    return R4D_NO(RAD_E_SHAPE);
-  const long long M = qg ? qg->shape[0] : k->shape[0];
-  long long Mv = 0;
-  const long long v_ld = r4d_rows_pitch(v, nkv * hd, &Mv);
-  if (v_ld < 0) return R4D_NO(RAD_E_STRIDE);
-  if (Mv < M || r4d_numel(sm) != M) return R4D_NO(RAD_E_SHAPE);
-  const double ks = r4d_getf(args, "k_scale", 1.0);
-  const double vs = r4d_getf(args, "v_scale", 1.0);
-  if (!(ks > 0.0) || !(vs > 0.0)) return R4D_NO(RAD_E_INVAL);
   QkKvStore kvs{};
   kvs.v          = (const __hip_bfloat16*)r4d_p(v);
   kvs.slot       = (const int32_t*)r4d_p(sm);
@@ -571,16 +442,27 @@ static int qk_kv_q4(const RadArgs* args, RadStream stream, int k6) {
   kvs.v_pitch    = (int)v_ld;
   kvs.block_size = (int)bs;
   kvs.n_blocks   = (int)kv->shape[0];
-  kvs.k_inv      = 1.0f / (float)ks;
-  kvs.v_inv      = 1.0f / (float)vs;
-  kvs.row        = (int)(hd * r16 / 16);
-  return k6 ? qk_body<QK_KV_K6V4>(args, stream, kvs) : qk_body<QK_KV_F8V4>(args, stream, kvs);
+  if (!streamed)
+    return i8 ? qk_body<QK_KV_I8>(args, stream, kvs) : qk_body<QK_KV_BF16>(args, stream, kvs);
+
+  /* One block of one layer: the mirror's row pitch and the ring's slot pitch are the same bytes,
+   * so the store addresses both with one row arithmetic. */
+  const long long row    = nkv * bs * rowe * (i8 ? 1 : 2);
+  const long long blocks = ho->shape[0];
+  if (blocks <= 0 || kvs.n_blocks <= 0 || row <= 0) return R4D_NO(RAD_E_SHAPE);
+  if (ho->shape[1] != row || ho->stride[0] != row) return R4D_NO(RAD_E_STRIDE);
+  if (r4d_numel(res) < blocks) return R4D_NO(RAD_E_SHAPE);
+  kvs.res    = (const int32_t*)r4d_p(res);
+  kvs.host   = r4d_wp(ho);
+  kvs.blocks = (int)blocks;
+  return i8 ? qk_body<QK_KV_STREAMED_I8>(args, stream, kvs)
+            : qk_body<QK_KV_STREAMED_BF16>(args, stream, kvs);
 }
-extern "C" int r4d_rad_qk_norm_rope_gate_kv_store_fp8v4(const RadArgs* args, RadStream stream) {
-  return qk_kv_q4(args, stream, 0);
+extern "C" int r4d_rad_qk_norm_rope_gate_kv_store(const RadArgs* args, RadStream stream) {
+  return qk_kv_store(args, stream, false);
 }
-extern "C" int r4d_rad_qk_norm_rope_gate_kv_store_k6v4(const RadArgs* args, RadStream stream) {
-  return qk_kv_q4(args, stream, 1);
+extern "C" int r4d_rad_qk_norm_rope_gate_kv_store_streamed(const RadArgs* args, RadStream stream) {
+  return qk_kv_store(args, stream, true);
 }
 
 // The cos/sin plane the fused prologue reads: one launch a step, against `rope`'s one per layer.
@@ -622,7 +504,12 @@ extern "C" int r4d_rad_rope_table(const RadArgs* args, RadStream stream) {
   const float rscale = (float)r4d_getf(args, "scale", 1.0);
   const RadYarn yarn = rad_yarn_args(args);
   if (!rad_yarn_valid(yarn) || (yarn.factor != 0.0f && rscale != 1.0f)) return R4D_NO(RAD_E_INVAL);
-  return R4D_EMIT(stream, r4d_qk_rope_table_kernel, dim3((int)M), dim3(64), 0,
-                  r4d_p(po), r4d_wp(cs), (long)(r4d_numel(cs) / rot), (int)rot, (int)den, theta,
-                  rscale, cs->dtype == RAD_F32 ? 1 : 0, po->dtype == RAD_I64 ? 1 : 0, yarn);
+#define R4D_RT(CH_)                                                                              \
+  R4D_EMIT(stream, r4d_qk_rope_table_kernel<CH_>, dim3((int)M), dim3(64), 0,                     \
+           r4d_p(po), r4d_wp(cs), (long)(r4d_numel(cs) / rot), (int)rot, (int)den, theta,        \
+           rscale, cs->dtype == RAD_F32 ? 1 : 0, po->dtype == RAD_I64 ? 1 : 0, yarn)
+  const int rc = r4d_geti_or(args, "chain", 0) != 0 && M <= 64 ? R4D_RT(r4dchain)
+                                                               : R4D_RT(R4dUnchained);
+#undef R4D_RT
+  return rc;
 }

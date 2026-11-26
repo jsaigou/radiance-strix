@@ -68,7 +68,7 @@ __global__ __launch_bounds__(r4d_f32::kThr) void gemm_f32_bias_kernel(
     for (int j = 0; j < TN; ++j) {
         const int n = n0 + (j / CW) * 16 * CW + tx * CW + j % CW;
         const int nc = n < N ? n : N - 1;
-        bc[j] = bias_f32 ? ((const float*)bias)[nc] : bf16_to_f32(((const uint16_t*)bias)[nc]);
+        bc[j] = !bias ? 0.0f : bias_f32 ? ((const float*)bias)[nc] : bf16_to_f32(((const uint16_t*)bias)[nc]);
     }
     auto ep = [&](int r, int c, int cnt, float4 q, int g) {
         const int m = m0 + r, n = n0 + c;
@@ -99,23 +99,23 @@ __global__ __launch_bounds__(r4d_f32::kThr) void gemm_f32_bias_kernel(
 // ============================================================== the plugin ABI entry point
 enum { GF_A = 0, GF_W, GF_BIAS, GF_RES, GF_Y };
 
-extern "C" int r4d_rad_gemm_f32_nt_bias(const RadArgs* a, RadStream stream) {
+static int gemm_f32_emit(const RadArgs* a, RadStream stream, bool plain) {
     const RadTensor* A = r4d_opt(a, GF_A);
     const RadTensor* W = r4d_opt(a, GF_W);
     const RadTensor* B = r4d_opt(a, GF_BIAS);
     const RadTensor* R = r4d_opt(a, GF_RES);
     const RadTensor* Y = r4d_opt(a, GF_Y);
-    if (!A || !W || !B || !Y) return R4D_NO(RAD_E_INVAL);
+    if (!A || !W || !Y || (!B && !plain)) return R4D_NO(RAD_E_INVAL);
     /* f32 A and W; C f32 or bf16, the residual C's dtype; the bias f32 or bf16. */
     if (A->dtype != RAD_F32 || W->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
     if (Y->dtype != RAD_F32 && Y->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
-    if (B->dtype != RAD_F32 && B->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (B && B->dtype != RAD_F32 && B->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
     if (R && R->dtype != Y->dtype) return R4D_NO(RAD_E_DTYPE);
-    if (!r4d_contig(W) || !r4d_contig(B)) return R4D_NO(RAD_E_STRIDE);
+    if (!r4d_contig(W) || (B && !r4d_contig(B))) return R4D_NO(RAD_E_STRIDE);
 
     const long long K = r4d_geti_or(a, "K", r4d_dim(W, (int)W->rank - 1));
     const long long N = r4d_geti_or(a, "N", r4d_numel(W) / (K > 0 ? K : 1));
-    if (K <= 0 || N <= 0 || r4d_numel(W) < N * K || r4d_numel(B) < N) return R4D_NO(RAD_E_SHAPE);
+    if (K <= 0 || N <= 0 || r4d_numel(W) < N * K || (B && r4d_numel(B) < N)) return R4D_NO(RAD_E_SHAPE);
     long long M = 0, Ma = 0, Mr = 0;
     const long long ldc = r4d_rows_pitch(Y, N, &M);
     const long long lda = r4d_rows_pitch(A, K, &Ma);
@@ -135,7 +135,7 @@ extern "C" int r4d_rad_gemm_f32_nt_bias(const RadArgs* a, RadStream stream) {
         else if (!std::strcmp(act_s, "gelu_tanh")) act = 2;
         else if (std::strcmp(act_s, "none")) return R4D_NO(RAD_E_SCHEMA);
     }
-    const int bias_f32 = B->dtype == RAD_F32;
+    const int bias_f32 = B && B->dtype == RAD_F32;
     const bool f32 = Y->dtype == RAD_F32;
     /* Whole-run stores where every row starts aligned to a run of four. */
     const unsigned run_bytes = f32 ? 16u : 8u;
@@ -160,4 +160,15 @@ extern "C" int r4d_rad_gemm_f32_nt_bias(const RadArgs* a, RadStream stream) {
     if (tn == 4) GF_L(4, uint16_t);
     GF_L(2, uint16_t);
 #undef GF_L
+}
+
+extern "C" int r4d_rad_gemm_f32_nt_bias(const RadArgs* a, RadStream stream) {
+    return gemm_f32_emit(a, stream, false);
+}
+
+extern "C" int r4d_rad_gemm_f32_nt(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 3) return R4D_NO(RAD_E_INVAL);
+    const RadTensor t[] = {a->t[0], a->t[1], {}, {}, a->t[2]};
+    RadArgs b = *a; b.t = t; b.n_t = 5;
+    return gemm_f32_emit(&b, stream, true);
 }

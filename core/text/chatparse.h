@@ -50,7 +50,7 @@
 #pragma once
 #include "rad_internal.h"
 
-#include <nlohmann/json_fwd.hpp>
+#include "util/json.h"
 
 #include <cstdint>
 #include <memory>
@@ -111,7 +111,7 @@ struct ReplyOptions {
     bool        extract_reasoning = true;
     /* The request's tools, OpenAI-shaped; null or empty parses no calls, and call syntax in the
      * reply is then content. Read once, when the parser is created. */
-    const nlohmann::ordered_json* tools = nullptr;
+    const Json* tools = nullptr;
     bool        parallel_tool_calls = true;
     /* A response_format was requested: the reply is one JSON document, optionally fenced as
      * ```json ... ```, and the document is the content. */

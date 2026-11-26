@@ -2,6 +2,7 @@
 #include "loras.h"
 #include "rad_internal.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 
@@ -29,15 +30,15 @@ bool split_entry(const std::string& s, std::string* name, double* w) {
 
 }  /* namespace */
 
-int parse_loras(const nlohmann::json& body, std::string* prompt,
+int parse_loras(const Json& body, std::string* prompt,
                 std::vector<std::pair<std::string, double>>* out, std::string* field,
                 std::string* why) {
     out->clear();
     const char* key = body.contains("loras") ? "loras" : "lora";
     if (body.contains(key) && !body[key].is_null()) {
         *field = key;
-        const nlohmann::json& v = body[key];
-        auto entry = [&](const nlohmann::json& e) -> bool {
+        const Json& v = body[key];
+        auto entry = [&](const Json& e) -> bool {
             std::string name;
             double w = 1.0;
             if (e.is_string()) {
@@ -58,7 +59,7 @@ int parse_loras(const nlohmann::json& body, std::string* prompt,
             return true;
         };
         if (v.is_array()) {
-            for (const nlohmann::json& e : v)
+            for (const Json& e : v)
                 if (!entry(e)) {
                     *why = "each entry is a name, \"name:strength\" or {\"name\", \"weight\"}";
                     return RAD_E_INVAL;
@@ -71,6 +72,9 @@ int parse_loras(const nlohmann::json& body, std::string* prompt,
                 }
                 out->push_back({ it.key(), it.value().get<double>() });
             }
+            /* By name, not as written: the adapters apply in the order they are listed, and a
+             * {name: strength} object has none of its own. */
+            std::sort(out->begin(), out->end());
         } else if (!entry(v)) {
             *why = "expected a list of adapters (names, \"name:strength\" or {\"name\", \"weight\"})";
             return RAD_E_INVAL;

@@ -1,0 +1,9 @@
+# flux-3-klein-bf16.recipe -- FLUX.3 [klein] (or its base) as the release holds it, bf16.
+#
+#   rad-convert <flux-3-image-klein pipeline directory> --recipe data/recipes/flux-3-klein-bf16.recipe \
+#       -o flux-3-klein-bf16.rad
+#
+# Every linear stays the checkpoint's bf16; the one rule casts the VAE, which the release stores
+# f32 and the decoder's kernels read bf16.
+
+vae.*                                cast dtype=bf16

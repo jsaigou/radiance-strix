@@ -32,9 +32,11 @@
 #include "text/chatfmt.h"
 #include "text/chatparse.h"
 
+#include <arch/rad_museglimmer_chat.h>
 #include <arch/rad_deepseek41_chat.h>
+#include <arch/rad_gemma4_chat.h>
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <chrono>
@@ -52,7 +54,7 @@
 
 using namespace rad;
 using namespace rad::chatdiff;
-using json = nlohmann::ordered_json;
+using json = Json;
 
 /* ================================================================== fixtures */
 
@@ -1326,7 +1328,7 @@ TEST(a_tool_name_holding_the_format_delimiter_is_refused_at_admission) {
  *
  * What a streaming client assembles from the SSE chunks (content, reasoning, each call's id, name
  * and arguments) equals the buffered answer, for every reply cut a byte at a time. Delta chunks
- * are written directly rather than through a JSON tree, and must match nlohmann's bytes. */
+ * are written directly rather than through a JSON tree, and must match the DOM writer's bytes. */
 TEST(what_a_streaming_client_assembles_is_the_buffered_answer) {
     for (const Model& m : models()) {
         Bench* b = bench(m, ChatRequest{});
@@ -1420,7 +1422,8 @@ static server::ChatRender bridge_render(const server::ChatTemplateBridge& br, co
     server::ChatRender out;
     std::string w;
     const json msgs = json::array({ { { "role", "user" }, { "content", "Fix the failing test in /work." } } });
-    if (br.apply(msgs, tools, opt, &out, why ? why : &w) < 0) out.prompt.clear();
+    if (br.apply(msgs, tools, opt, &out, why ? why : &w) < 0)
+        out.prompt.clear();
     return out;
 }
 
@@ -1476,6 +1479,54 @@ TEST(the_chat_bridge_derives_the_whole_request_from_one_format) {
 }
 
 /* The declared format preserves HYV3's outer section and all of its argument markers. */
+/* A checkpoint that lists the tool-call close in generation_config.json's eos ids cannot serve a
+ * second call, or a reply that quotes the tag: the turn ends where the call does. The format's
+ * own delimiters among the end-of-generation ids are found, and the vocabulary gives up those it
+ * holds only by that list; the turn's terminator stays. */
+TEST(a_call_delimiter_is_not_a_turn_terminator) {
+    VocabBuild vb;
+    vb.tokens = { "a", "<|im_end|>", "<tool_call>", "</tool_call>" };
+    vb.types  = { RAD_TT_NORMAL, RAD_TT_CONTROL, RAD_TT_CONTROL, RAD_TT_CONTROL };
+    vb.eos    = 1;
+    vb.eos_ids = { 3 };                   /* the close, listed as terminal by the checkpoint */
+    vb.chat_template = fixture("glm53");
+    auto v = std::make_shared<Vocab>();
+    REQUIRE(v->load(std::move(vb)) >= 0);
+    REQUIRE(v->is_eog(3));
+
+    const std::vector<int32_t> marks = server::ChatTemplateBridge::eog_call_markers(*v, nullptr);
+    REQUIRE(marks.size() == 1);
+    CHECK_EQ(marks[0], 3);
+    const std::vector<int32_t> dropped = v->drop_named_eog(marks);
+    REQUIRE(dropped.size() == 1);
+    CHECK_EQ(dropped[0], 3);
+    CHECK(!v->is_eog(3));
+    CHECK(v->is_eog(1));
+    CHECK(v->drop_named_eog(marks).empty());
+
+    /* The bridge built over the settled vocabulary keeps the template's terminator and no longer
+     * strips the close as one. */
+    server::ChatTemplateBridge br;
+    REQUIRE(br.init(*v) >= 0);
+    CHECK(br.supports_tools());
+
+    /* The header's eos is never given up, whatever the format writes: a turn keeps an end. */
+    VocabBuild eb;
+    eb.tokens = { "a", "</tool_call>", "<tool_call>" };
+    eb.types  = { RAD_TT_NORMAL, RAD_TT_CONTROL, RAD_TT_CONTROL };
+    eb.eos    = 1;
+    eb.chat_template = fixture("glm53");
+    auto ev = std::make_shared<Vocab>();
+    REQUIRE(ev->load(std::move(eb)) >= 0);
+    CHECK(ev->drop_named_eog({ 1 }).empty());
+    CHECK(ev->is_eog(1));
+
+    /* A template with no tool calls has no call delimiters. */
+    std::shared_ptr<Vocab> plain_v = vocab_with("");
+    REQUIRE(plain_v != nullptr);
+    CHECK(server::ChatTemplateBridge::eog_call_markers(*plain_v, nullptr).empty());
+}
+
 TEST(hyv3_plugin_format_runs_through_the_chat_template_bridge) {
     std::shared_ptr<Vocab> v = vocab_with(fixture("hyv3"));
     REQUIRE(v != nullptr);
@@ -1522,7 +1573,8 @@ TEST(hyv3_plugin_format_splits_requested_reasoning_before_native_tools) {
     opt.template_kwargs["reasoning_effort"] = json("high").dump();
     server::ChatRender out;
     std::string why;
-    CHECK_OK(br.apply(msgs, agent_tools(), opt, &out, &why));
+    CHECK_OK(br.apply(msgs, agent_tools(), opt, &out,
+                      &why));
     REQUIRE(out.parser != nullptr);
     CHECK(out.generation_prompt.ends_with("<think>"));
     auto rd = out.parser->open();
@@ -2377,6 +2429,78 @@ TEST(glm53_derives_a_name_the_opener_opens) {
     CHECK(why.find("name_suffix") != std::string::npos);
 }
 
+/* Ling 3.0's template ends the function name with a newline and only then writes the argument
+ * tags, so the analysis derives a name_suffix of whitespace alone. The reader treats that as the
+ * suffixless ending -- the name stops at the first argument tag, whitespace trimmed -- while the
+ * grammar keeps the newline the template writes. Before it was allowed, every request carrying
+ * tools was refused: "name_suffix must end the function name with something besides
+ * whitespace". */
+TEST(ling3_reads_a_name_that_ends_at_whitespace) {
+    ChatFormat f;
+    std::string why, refused;
+    CHECK_OK(chat_format_from_template(fixture("ling3"), "", "<|role_end|>", &f, &refused, &why));
+    CHECK(refused.empty());
+    /* The spellings of this shape are pinned by glm53_derives_a_name_the_opener_opens; Ling's
+     * difference is the newline between the name and the first argument tag. */
+    CHECK(f.call_open.empty() && f.call_close.empty());
+    CHECK(!f.name_prefix.empty() && f.name_prefix[0] == '<');
+    CHECK(!f.name_suffix.empty() &&
+          f.name_suffix.find_first_not_of(" \t\r\n") == std::string::npos);
+    CHECK(!f.call_end.empty());
+    CHECK(!f.arg_prefix.empty() && !f.arg_name_suffix.empty() && !f.arg_value_prefix.empty() &&
+          !f.arg_value_suffix.empty());
+    CHECK_OK(chat_format_check(f, &why));
+
+    ChatGrammarRequest gq;
+    gq.tools = &agent_tools();
+    ChatGrammar g;
+    CHECK_OK(chat_format_grammar(f, gq, &g, &why));
+    CHECK(g.lazy);
+    CHECK(!g.trigger_words.empty());
+
+    /* A reply built the way the template writes it reads back as the calls it renders, newline
+     * after the name and no whitespace between one argument's close and the next argument's
+     * tag. */
+    std::string reply = "Look.";
+    auto arg = [&](const std::string& k, const std::string& v) {
+        return f.arg_prefix + k + f.arg_name_suffix + f.arg_value_prefix + v + f.arg_value_suffix;
+    };
+    reply += f.name_prefix + "read" + f.name_suffix + arg("path", "/a") + arg("limit", "3") +
+             f.call_end;
+    reply += f.name_prefix + "ping" + f.name_suffix + f.call_end;
+
+    ReplyOptions ro;
+    ro.tools = &agent_tools();
+    ro.terminators = { "<|role_end|>" };
+    const std::shared_ptr<const ReplyParser> p = parser_of(f, ro);
+    REQUIRE(p != nullptr);
+    bool strict = false;
+    const ReplyMessage m = reply_parse(*p, reply, &strict);
+    CHECK_EQ(m.content, std::string("Look."));
+    REQUIRE(m.calls.size() == 2);
+    CHECK_EQ(m.calls[0].name, std::string("read"));
+    CHECK_EQ(m.calls[0].arguments, std::string("{\"path\":\"/a\",\"limit\":3}"));
+    CHECK(m.calls[0].closed);
+    CHECK_EQ(m.calls[1].name, std::string("ping"));
+    CHECK(m.calls[1].closed);
+    CHECK(strict);
+    const std::string stream_error = stream_all(*p, reply);
+    if (!stream_error.empty()) ::radtest::fail(__FILE__, __LINE__, stream_error);
+}
+
+/* The relaxation is for the tagged family only: an object family's name ends at its `{`, so a
+ * whitespace suffix there still describes a format nothing reads. */
+TEST(a_whitespace_name_suffix_is_refused_for_object_arguments) {
+    ChatFormat f;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(rad::arch::gemma4_chat_format(), &f, &why));
+    CHECK(f.object_args());
+    CHECK_OK(chat_format_check(f, &why));
+    f.name_suffix = "\n";
+    CHECK(chat_format_check(f, &why) < 0);
+    CHECK(why.find("whitespace") != std::string::npos);
+}
+
 TEST(glm53_replies_read_back_as_the_messages_they_render) {
     const Glm* g = glm();
     REQUIRE(g != nullptr);
@@ -2579,8 +2703,11 @@ static double stream_bytes(const ReplyParser& p, const std::string& text, size_t
     return seconds_to([&] {
         std::unique_ptr<ReplyStream> s = p.open();
         std::vector<ReplyEvent> ev;
+        /* The clock only when a call's time is asked for: on a host whose clocksource is HPET
+         * (the TSC marked unstable) a read is a system call of about a microsecond, as much as
+         * the feed it would time. */
         for (size_t at = 0; at < text.size(); at += piece) {
-            const auto t0 = std::chrono::steady_clock::now();
+            const auto t0 = per_call ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             s->feed(std::string_view(text).substr(at, std::min(piece, text.size() - at)), &ev);
             if (per_call)
                 per_call->push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
@@ -2663,5 +2790,129 @@ TEST(a_long_reply_holds_a_constant_number_of_bytes) {
     }
 }
 
-RAD_TEST_MAIN()
+/* ================================================================== Muse's channels
+ *
+ * The model opens its own channel after `<|start|>assistant`: ` to=self<|message|>` reasoning
+ * first, or ` to=user<|message|>` straight into the answer when it does not reason
+ * (arch/rad_museglimmer_chat.h). The header of an answer that follows reasoning is reasoning_close's;
+ * the header of an answer that does not is content_open's. */
 
+static std::shared_ptr<const ReplyParser> muse_parser(bool tools, bool extract = true) {
+    static const json t = agent_tools();
+    ChatFormat f;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(museglimmer::muse_chat_format(), &f, &why));
+    ReplyOptions ro;
+    ro.extract_reasoning = extract;
+    ro.terminators = { "<|eot|>" };
+    if (tools) ro.tools = &t;
+    return parser_of(f, ro);
+}
+
+/* `reply` read whole, then streamed at every cut: the answer must come out as `content`, with
+ * `reasoning` split off and no call. */
+static void muse_reads(const std::shared_ptr<const ReplyParser>& rp, const std::string& reply,
+                       const std::string& content, const std::string& reasoning = "") {
+    REQUIRE(rp);
+    const ReplyMessage m = reply_parse(*rp, reply);
+    if (m.content != content || m.reasoning != reasoning || !m.calls.empty())
+        ::radtest::fail(__FILE__, __LINE__, "reply " + quote(reply) + " read as content " +
+                        quote(m.content) + ", reasoning " + quote(m.reasoning) + ", " +
+                        std::to_string(m.calls.size()) + " calls");
+    const std::string e = stream_all(*rp, reply);
+    if (!e.empty()) ::radtest::fail(__FILE__, __LINE__, "reply " + quote(reply) + ": " + e);
+    ++::radtest::checks();
+}
+
+/* A reply with no reasoning opens on the user channel, and the header is not content. */
+TEST(a_muse_reply_that_opens_on_the_content_channel_drops_its_header) {
+    for (bool tools : { false, true }) {
+        const auto rp = muse_parser(tools);
+        muse_reads(rp, " to=user<|message|>Here are five prime numbers: 2, 3, 5, 7, 11.<|eot|>",
+                   "Here are five prime numbers: 2, 3, 5, 7, 11.");
+        muse_reads(rp, "to=user<|message|>Hi", "Hi");
+        muse_reads(rp, "\n to=user<|message|>\nHi there\n", "\nHi there");
+        muse_reads(rp, " to=user<|message|>", "");
+        /* The header's words later in the answer are the answer's. */
+        muse_reads(rp, " to=user<|message|>write to=user<|message|> next", "write to=user<|message|> next");
+    }
+    /* Reasoning kept inline (reasoning_format none): the answer's header is still dropped. */
+    muse_reads(muse_parser(false, false), " to=user<|message|>Hi<|eot|>", "Hi");
+}
+
+/* Text that starts like the header but is not it is the reply, unchanged, and nothing of it is
+ * held back for good. */
+TEST(a_muse_reply_that_only_starts_like_the_content_header_is_unchanged) {
+    for (bool tools : { false, true }) {
+        const auto rp = muse_parser(tools);
+        for (const char* r : { "to=users are asked to wait", "to=user", "to=user<|message", "to=",
+                               "to=user<|message|", "to=user <|message|>x", "to=use", "t",
+                               "to=user<|messages|>x", "to=self", "to=sel", "x to=user<|message|>y",
+                               "to=user to=user<|message|>y" })
+            muse_reads(rp, r, r);
+        muse_reads(rp, "to=users are asked to wait<|eot|>", "to=users are asked to wait");
+        muse_reads(rp, "to=user\n<|message|>x", "to=user\n<|message|>x");
+    }
+}
+
+/* Reasoning first, then the user channel: the header after the block is reasoning_close's, and
+ * a header-shaped string inside the answer stays. */
+TEST(a_muse_reply_that_reasons_first_reads_as_before) {
+    for (bool tools : { false, true }) {
+        const auto rp = muse_parser(tools);
+        muse_reads(rp, " to=self<|message|>Five primes.<|eom|><|start|>assistant to=user<|message|>2, 3, 5, 7, 11.<|eot|>",
+                   "2, 3, 5, 7, 11.", "Five primes.");
+        muse_reads(rp, " to=self<|message|>r<|eom|><|start|>assistant to=user<|message|>to=user<|message|>x",
+                   "to=user<|message|>x", "r");
+    }
+}
+
+/* A tool call after reasoning is handed off exactly as before: the channel header is framing, the
+ * call is a call, and the content is empty. */
+TEST(a_muse_tool_call_after_reasoning_is_unchanged) {
+    const auto rp = muse_parser(true);
+    REQUIRE(rp);
+    const std::string reply =
+        " to=self<|message|>Look at it.<|eom|><|start|>assistant to=read<|message|>"
+        "<atem:function_calls>\n<atem:invoke name=\"read\">\n"
+        "<atem:parameter name=\"path\">a.txt</atem:parameter>\n</atem:invoke>\n"
+        "</atem:function_calls>";
+    const ReplyMessage m = reply_parse(*rp, reply);
+    CHECK_EQ(m.content, std::string());
+    CHECK_EQ(m.reasoning, std::string("Look at it."));
+    REQUIRE_EQ(m.calls.size(), (size_t)1);
+    CHECK_EQ(m.calls[0].name, std::string("read"));
+    CHECK_EQ(m.calls[0].arguments, std::string("{\"path\":\"a.txt\"}"));
+    const std::string e = stream_all(*rp, reply);
+    CHECK(e.empty());
+    if (!e.empty()) std::fprintf(stderr, "%s\n", e.c_str());
+}
+
+/* The header is a declared literal like any other: it travels in the ABI struct, reads as absent
+ * from a struct that ends before it, and a format without one reads a reply as it always did. */
+TEST(the_content_header_is_declared_through_the_abi_struct) {
+    ChatFormat f;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(museglimmer::muse_chat_format(), &f, &why));
+    CHECK_EQ(f.content_open, std::string("to=user<|message|>"));
+    CHECK_OK(chat_format_check(f, &why));
+    const std::vector<std::string> mk = chat_format_markers(f);
+    CHECK(std::find(mk.begin(), mk.end(), "to=user<|message|>") != mk.end());
+    /* A plugin compiled before the field: struct_size stops short of it. */
+    RadChatFormat old = *museglimmer::muse_chat_format();
+    old.struct_size = (uint32_t)offsetof(RadChatFormat, content_open);
+    ChatFormat g;
+    CHECK_OK(chat_format_from_abi(&old, &g, &why));
+    CHECK(g.content_open.empty());
+    CHECK_EQ(g.reasoning_open, f.reasoning_open);
+    CHECK(chat_format_describe(g).find("content") == std::string::npos);
+    /* Without it the header is content, as before. */
+    std::shared_ptr<const ReplyFormat> rf;
+    CHECK_OK(ReplyFormat::compile(g, &rf, &why));
+    ReplyOptions ro;
+    std::shared_ptr<const ReplyParser> rp;
+    CHECK_OK(ReplyParser::create(rf, ro, &rp, &why));
+    CHECK_EQ(reply_parse(*rp, " to=user<|message|>Hi").content, std::string("to=user<|message|>Hi"));
+}
+
+RAD_TEST_MAIN()

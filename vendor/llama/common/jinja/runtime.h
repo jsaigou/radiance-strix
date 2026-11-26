@@ -69,18 +69,17 @@ struct context {
 
     context(const context & parent) : context() {
         // inherit variables (for example, when entering a new scope)
-        auto & pvar = parent.env->as_ordered_object();
-        for (const auto & pair : pvar) {
-            set_val(pair.first, pair.second);
-        }
+        env->copy_entries_from(*parent.env);
         current_time = parent.current_time;
         is_get_stats = parent.is_get_stats;
         src = parent.src;
     }
 
     value get_val(const std::string & name) {
-        value default_val = mk_val<value_undefined>(name);
-        return env->at(name, default_val);
+        if (value * v = env->find_string_key(name)) {
+            return *v;
+        }
+        return mk_val<value_undefined>(name);
     }
 
     void set_val(const std::string & name, const value & val) {
@@ -316,30 +315,37 @@ struct identifier : public expression {
 
 // Literals
 
+/* A literal's value made once, at parse time: literals sit inside the loops a template runs
+ * per message, and allocating a fresh value (and copying the text) for every evaluation was
+ * thousands of allocations per render for values nothing ever mutates -- every operation on
+ * a string works on an as_string() copy, and numbers are only read. */
 struct integer_literal : public expression {
     int64_t val;
-    explicit integer_literal(int64_t val) : val(val) {}
+    value cached;
+    explicit integer_literal(int64_t val) : val(val), cached(mk_val<value_int>(val)) {}
     std::string type() const override { return "IntegerLiteral"; }
     value execute_impl(context &) override {
-        return mk_val<value_int>(val);
+        return cached;
     }
 };
 
 struct float_literal : public expression {
     double val;
-    explicit float_literal(double val) : val(val) {}
+    value cached;
+    explicit float_literal(double val) : val(val), cached(mk_val<value_float>(val)) {}
     std::string type() const override { return "FloatLiteral"; }
     value execute_impl(context &) override {
-        return mk_val<value_float>(val);
+        return cached;
     }
 };
 
 struct string_literal : public expression {
     std::string val;
-    explicit string_literal(const std::string & val) : val(val) {}
+    value cached;
+    explicit string_literal(const std::string & val) : val(val), cached(mk_val<value_string>(val)) {}
     std::string type() const override { return "StringLiteral"; }
     value execute_impl(context &) override {
-        return mk_val<value_string>(val);
+        return cached;
     }
 };
 
@@ -598,19 +604,35 @@ struct rethrown_exception : public std::exception {
 static void gather_string_parts_recursive(const value & val, value_string & parts) {
     // TODO: probably allow print value_none as "None" string? currently this breaks some templates
     if (is_val<value_string>(val)) {
-        const auto & str_val = cast_val<value_string>(val)->val_str;
-        parts->val_str.append(str_val);
+        // A uniquely owned string is a statement result being consumed by this gather; move its
+        // parts instead of copying every byte again at each nesting level. A shared one is an
+        // input value the context still holds, and is copied as before.
+        if (val.use_count() == 1) {
+            auto & src = const_cast<value_string_t *>(cast_val<value_string>(val))->val_str.parts;
+            auto & dst = parts->val_str.parts;
+            dst.reserve(dst.size() + src.size());
+            for (auto & part : src) {
+                dst.push_back(std::move(part));
+            }
+            src.clear();
+        } else {
+            const auto & str_val = cast_val<value_string>(val)->val_str;
+            parts->val_str.append(str_val);
+        }
     } else if (is_val<value_int>(val) || is_val<value_float>(val) || is_val<value_bool>(val)) {
         std::string str_val = val->as_string().str();
         parts->val_str.append(str_val);
     } else if (is_val<value_array>(val)) {
-        auto items = cast_val<value_array>(val)->as_array();
+        const auto & items = cast_val<value_array>(val)->as_array();
         for (const auto & item : items) {
             /* RADIANCE: `val` is a block's statement results, and every block statement returns
              * a string, so a list or a dict among them is the value of an expression the template
              * prints. jinja2 prints its repr; flattening it ran its strings together and printed
-             * nothing for a dict. */
-            if (is_val<value_array>(item) || is_val<value_object>(item)) {
+             * nothing for a dict. A statement-results carrier is the one array that is not a
+             * value: flattening it is its whole purpose. */
+            if (is_val<value_stmt_results>(item)) {
+                gather_string_parts_recursive(item, parts);
+            } else if (is_val<value_array>(item) || is_val<value_object>(item)) {
                 parts->val_str.append(item->as_string().str());
             } else {
                 gather_string_parts_recursive(item, parts);
@@ -620,11 +642,54 @@ static void gather_string_parts_recursive(const value & val, value_string & part
 }
 
 static std::string render_string_parts(const value_string & parts) {
-    std::ostringstream oss;
+    std::string out;
+    out.reserve(parts->val_str.length());
     for (const auto & part : parts->val_str.parts) {
-        oss << part.val;
+        out += part.val;
     }
-    return oss.str();
+    return out;
+}
+
+// The flat text of a statement-result tree, gathered without building a parts list: the parts
+// (and their is_input flags) matter to the capability probe, but a caller that only wants the
+// rendered string otherwise pays to copy every byte into parts, join them, and copy them out.
+static size_t gather_string_length_recursive(const value & val) {
+    if (is_val<value_string>(val)) {
+        return cast_val<value_string>(val)->val_str.length();
+    } else if (is_val<value_int>(val) || is_val<value_float>(val) || is_val<value_bool>(val)) {
+        return val->as_string().str().size();
+    } else if (is_val<value_array>(val)) {
+        size_t len = 0;
+        for (const auto & item : cast_val<value_array>(val)->as_array()) {
+            if (!is_val<value_stmt_results>(item) &&
+                (is_val<value_array>(item) || is_val<value_object>(item))) {
+                len += item->as_string().str().size();
+            } else {
+                len += gather_string_length_recursive(item);
+            }
+        }
+        return len;
+    }
+    return 0;
+}
+
+static void gather_string_recursive(const value & val, std::string & out) {
+    if (is_val<value_string>(val)) {
+        for (const auto & part : cast_val<value_string>(val)->val_str.parts) {
+            out += part.val;
+        }
+    } else if (is_val<value_int>(val) || is_val<value_float>(val) || is_val<value_bool>(val)) {
+        out += val->as_string().str();
+    } else if (is_val<value_array>(val)) {
+        for (const auto & item : cast_val<value_array>(val)->as_array()) {
+            if (!is_val<value_stmt_results>(item) &&
+                (is_val<value_array>(item) || is_val<value_object>(item))) {
+                out += item->as_string().str();
+            } else {
+                gather_string_recursive(item, out);
+            }
+        }
+    }
 }
 
 struct runtime {
@@ -643,17 +708,28 @@ struct runtime {
     static value_string gather_string_parts(const value & val) {
         value_string parts = mk_val<value_string>();
         gather_string_parts_recursive(val, parts);
-        // join consecutive parts with the same type
+        // Join consecutive parts with the same type, in one compaction pass: erasing each
+        // merged part from the middle shifts the rest of the vector every time.
         auto & p = parts->val_str.parts;
-        for (size_t i = 1; i < p.size(); ) {
-            if (p[i].is_input == p[i - 1].is_input) {
-                p[i - 1].val += p[i].val;
-                p.erase(p.begin() + i);
-            } else {
-                i++;
+        if (!p.empty()) {
+            size_t w = 0;
+            for (size_t r = 1; r < p.size(); ++r) {
+                if (p[r].is_input == p[w].is_input) {
+                    p[w].val += p[r].val;
+                } else {
+                    p[++w] = std::move(p[r]);
+                }
             }
+            p.resize(w + 1);
         }
         return parts;
+    }
+
+    static std::string gather_string(const value & val) {
+        std::string out;
+        out.reserve(gather_string_length_recursive(val));
+        gather_string_recursive(val, out);
+        return out;
     }
 };
 

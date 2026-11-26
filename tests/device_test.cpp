@@ -21,7 +21,10 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <functional>
+#include <random>
 #include <vector>
+#include <sys/stat.h>
 #include <unistd.h>
 
 using rad::DirectFile;
@@ -130,8 +133,190 @@ TEST(chained_launches_follow_the_plugins_ask_on_the_aql_backend_only) {
     CHECK_EQ(rad_dev_chain_enabled(), 0);
     rad_dev_chain_infer(1);
     CHECK_EQ(rad_dev_chain_enabled(), aql ? 1 : 0);
+    /* Their packets go unfenced only where the engine says every chained form fences itself (2),
+     * and only where launches chain at all. */
+    CHECK_EQ(rad_dev_chain_unfenced(), 0);
+    rad_dev_chain_infer(2);
+    CHECK_EQ(rad_dev_chain_enabled(), aql ? 1 : 0);
+    CHECK_EQ(rad_dev_chain_unfenced(), aql ? 1 : 0);
     rad_dev_chain_infer(0);
     CHECK_EQ(rad_dev_chain_enabled(), 0);
+    CHECK_EQ(rad_dev_chain_unfenced(), 0);
+}
+
+/* A chained kernel reads behind its wait what the launch in front of it wrote, a value all its
+ * lanes share included. The compiler loads such a value through the scalar data cache, which no
+ * fence it emits empties: only the packet processor's acquire did, when the kernel was launched,
+ * before the launch in front had written. A chained launch whose packet goes unfenced
+ * (rad_dev_chain_infer(2)) must therefore empty that cache behind its wait (chain_kernel.h), or
+ * every reader here sees the value the reader before it loaded: 1797 launches in 1800 did on an
+ * R9700 before the wait emptied it. Behind a gate, so the card has the readers launched ahead of
+ * the stores they wait for, as a played pass has them. */
+TEST(a_chained_kernel_sees_a_shared_value_the_launch_in_front_wrote) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("launches chain on the AQL backend only");
+    const unsigned pairs = 400, blocks = 256;
+    Stream st;
+    DevBuf<unsigned> x(64 * sizeof(unsigned), RAD_MEM_DEVICE);
+    DevBuf<unsigned> seen((int64_t)pairs * blocks * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(x && seen);
+    std::vector<unsigned> got((size_t)pairs * blocks);
+    for (int fenced = 0; fenced < 2; ++fenced) {
+        /* 2: the packets go unfenced, as an engine whose libraries fence in the kernel issues
+         * them. 1: they keep the packet processor's fences, and the readers must see the same. */
+        rad_dev_chain_infer(fenced ? 1 : 2);
+        CHECK_OK(rad_memset_async(x, 0, 64 * sizeof(unsigned), st.s));
+        CHECK_OK(rad_memset_async(seen, 0, (int64_t)pairs * blocks * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        void* gate = nullptr;
+        REQUIRE_EQ(rad_stream_gate(st.s, &gate), RAD_OK);
+        REQUIRE(rad_gate_room(st.s) >= (int64_t)2 * pairs);
+        CHECK_OK(rad::aql::chain_probe(st.s, x, seen, pairs, blocks));
+        CHECK_OK(rad_gate_open(gate));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)pairs * blocks * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        int64_t stale = 0;
+        for (unsigned i = 0; i < pairs; ++i)
+            for (unsigned b = 0; b < blocks; ++b) stale += got[(size_t)i * blocks + b] != i + 1u;
+        CHECK_EQ(stale, 0);
+    }
+    rad_dev_chain_infer(0);
+}
+
+/* A chained launch reads its own arguments and its chain record from a slot of the argument ring
+ * that the host wrote and that another launch read a lap of the ring ago; the L2 still holds what
+ * that launch read. Only a system-scope acquire of the packet processor's makes the card forget
+ * it: the one the ring asks for every half lap, which a chained packet keeps while it goes
+ * without every other. Three laps of launches that each store where their own arguments say,
+ * with no host wait between them: without that acquire every launch past the first lap stores
+ * where the launch a lap before did (as they do on a prefetch stream, which never takes one and
+ * counts on the pass beside it to have turned the L2 over). */
+/* The prefetch stream (rad_xp_stream_create, agent-scope acquires) also reads its own arguments
+ * from a host-written ring: across three laps every launch must see its own slot. */
+TEST(a_prefetch_stream_launch_reads_its_own_arguments_after_the_ring_has_lapped) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("the prefetch stream is an AQL stream");
+    const unsigned n = 3 * 4096 + 517;
+    RadStream xs = nullptr;
+    if (rad_xp_stream_create(&xs) != RAD_OK || !xs) SKIP("no prefetch stream on this device");
+    DevBuf<unsigned> seen((int64_t)n * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(!!seen);
+    std::vector<unsigned> got(n);
+    {
+        rad_dev_chain_infer(1);
+        CHECK_OK(rad_memset_async(seen, 0, (int64_t)n * sizeof(unsigned), xs));
+        CHECK_OK(rad_stream_sync(xs));
+        CHECK_OK(rad::aql::chain_marks(xs, seen, n));
+        CHECK_OK(rad_stream_sync(xs));
+        CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)n * sizeof(unsigned), xs));
+        CHECK_OK(rad_stream_sync(xs));
+        unsigned wrong = 0;
+        for (unsigned i = 0; i < n; ++i) wrong += got[i] != i + 1u;
+        CHECK_EQ(wrong, 0u);
+    }
+    rad_dev_chain_infer(0);
+    rad_stream_destroy(xs);
+}
+
+TEST(a_chained_launch_reads_its_own_arguments_after_the_ring_has_lapped) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("launches chain on the AQL backend only");
+    const unsigned n = 3 * 4096 + 517;
+    Stream st;
+    DevBuf<unsigned> seen((int64_t)n * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(!!seen);
+    std::vector<unsigned> got(n);
+    for (int fenced = 0; fenced < 2; ++fenced) {
+        rad_dev_chain_infer(fenced ? 1 : 2);
+        CHECK_OK(rad_memset_async(seen, 0, (int64_t)n * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK_OK(rad::aql::chain_marks(st.s, seen, n));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)n * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        unsigned wrong = 0;
+        for (unsigned i = 0; i < n; ++i) wrong += got[i] != i + 1u;
+        CHECK_EQ(wrong, 0u);
+    }
+    rad_dev_chain_infer(0);
+}
+
+/* The host writes a launch's arguments and chain record into VRAM through the BAR, and the card's
+ * host data path keeps such a write until it is flushed (aql.cpp, host_writes_out). A launch the
+ * card starts within a microsecond or two of its doorbell otherwise reads the slot as it was. What
+ * it reads first is its chain record, so that is what this asks every launch for, on every card:
+ * a lap of card-side copies with chaining off leaves every slot with their arguments and a record
+ * no kernel accepts; then the same copies chained and 50 us apart, the host quiet between them as
+ * the mover is between the copies of a loan recall, each saying whether it found a record. One
+ * that does not would count nothing and stall the queue; the probe counts for it. With the
+ * packets unacquired and with the packet processor's acquire on them. */
+TEST(a_copy_issued_after_a_pause_finds_the_record_written_for_it) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("the AQL backend's argument ring");
+    const unsigned lap = 4096 + 64, words = 8192;
+    const int64_t bytes = 256 * 1024;
+    for (int card = 0; card < rad_dev_count(); ++card) {
+        REQUIRE_EQ(rad_dev_set(card), RAD_OK);
+        DevBuf<unsigned> seen((int64_t)words * sizeof(unsigned), RAD_MEM_DEVICE);
+        DevBuf<uint8_t> src(bytes, RAD_MEM_DEVICE), dst(bytes, RAD_MEM_DEVICE);
+        REQUIRE(seen && src && dst);
+        std::vector<unsigned> got(words);
+        for (int fenced = 0; fenced < 2; ++fenced) {
+            /* Without the flush four runs in five of this many found unacquired launches that
+             * had read the old slot on an R9700, a few or tens of them at a time. */
+            const unsigned n = fenced ? 1500 : 6000;
+            Stream st;
+            rad_dev_chain_infer(0);
+            CHECK_OK(rad::aql::chain_asks(st.s, src, dst, (uint64_t)bytes, seen, lap));
+            CHECK_OK(rad_memset_async(seen, 0, (int64_t)words * sizeof(unsigned), st.s));
+            CHECK_OK(rad_stream_sync(st.s));
+            rad_dev_chain_infer(fenced ? 1 : 2);
+            for (unsigned i = 0; i < n; ++i) {
+                /* In runs of eight with a host wait between them, as a recall ends in one. */
+                if (i % 8 == 0) CHECK_OK(rad_stream_sync(st.s));
+                const auto t0 = std::chrono::steady_clock::now();
+                while (std::chrono::steady_clock::now() - t0 < std::chrono::microseconds(50)) {}
+                CHECK_OK(rad::aql::chain_asks(st.s, src, dst, (uint64_t)bytes, seen + i, 1));
+            }
+            CHECK_OK(rad_stream_sync(st.s));
+            CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)words * sizeof(unsigned), st.s));
+            CHECK_OK(rad_stream_sync(st.s));
+            /* A launch that read the slot as the lap left it stores where that launch did. */
+            unsigned without = 0, missing = 0;
+            for (unsigned i = 0; i < words; ++i) {
+                without += (got[i] & 0x80000000u) != 0;
+                missing += i < n && got[i] != 1u;
+            }
+            CHECK_EQ(without, 0u);
+            CHECK_EQ(missing, 0u);
+        }
+        rad_dev_chain_infer(0);
+    }
+    rad_dev_set(0);
+}
+
+/* An engine of more than one rank claims its cards (rad_dev_cards_claim). The claim that makes a
+ * card shared returns only once everything issued on that card's queues before it has finished:
+ * from then on no chained launch waits on the card behind a collective, and nothing issued under
+ * the old rule is left. A backend that never launches ahead has nothing to wait for and accepts
+ * any claim. */
+TEST(a_claim_that_shares_a_card_returns_with_the_cards_queues_drained) {
+    const bool aql = std::strcmp(rad::device_backend_name(), "aql") == 0;
+    const int card = 0;
+    CHECK_EQ(rad_dev_cards_claim(nullptr, 1, 1), RAD_E_INVAL);
+    CHECK_EQ(rad_dev_cards_claim(&card, 0, 1), RAD_E_INVAL);
+    CHECK_OK(rad_dev_set(card));
+    const int64_t big = 256 << 20;
+    Stream st;
+    Event done;
+    DevBuf<uint8_t> fat(big, RAD_MEM_DEVICE);
+    CHECK(!!fat);
+    if (!fat) return;
+    CHECK_OK(rad_dev_cards_claim(&card, 1, 1));            /* the first engine: the card is its own */
+    for (int k = 0; k < 24; ++k) CHECK_OK(rad_memset_async(fat, k, big, st.s));
+    CHECK_OK(rad_event_record(done.e, st.s));
+    CHECK_OK(rad_dev_cards_claim(&card, 1, 1));            /* a second: shared from here */
+    if (aql) CHECK_EQ(rad_event_query(done.e), 1);
+    CHECK_OK(rad_dev_cards_claim(&card, 1, 0));
+    CHECK_OK(rad_dev_cards_claim(&card, 1, 0));
+    CHECK_OK(rad_stream_sync(st.s));
 }
 
 TEST(host_vram_budget_comes_from_the_environment) {
@@ -195,6 +380,33 @@ TEST(alloc_free_roundtrip) {
     CHECK(rad_dev_alloc(16, 99) == nullptr);
     rad_dev_free(nullptr, RAD_MEM_HOST);   /* must not fault */
     CHECK(rad_dev_host_ptr(nullptr) == nullptr);
+}
+
+/* A kernel library's free hook (rad_plugin_freed) is registered by every registry that loads the
+ * library and goes with the last of them: a library closed and opened again can sit at another
+ * address, and a hook left behind called into memory nothing mapped. */
+namespace {
+std::atomic<int> g_hook_calls{0};
+void count_free(const void*, int64_t) { ++g_hook_calls; }
+}  // namespace
+
+TEST(a_free_hook_goes_with_its_last_registration) {
+    auto one_free = [] {
+        void* p = rad_dev_alloc(4096, RAD_MEM_DEVICE);
+        REQUIRE(p != nullptr);
+        rad_dev_free(p, RAD_MEM_DEVICE);
+    };
+    rad::rad_dev_on_free(count_free);
+    rad::rad_dev_on_free(count_free);
+    one_free();
+    CHECK_EQ(g_hook_calls.load(), 1);
+    rad::rad_dev_off_free(count_free);
+    one_free();
+    CHECK_EQ(g_hook_calls.load(), 2);
+    rad::rad_dev_off_free(count_free);
+    one_free();
+    CHECK_EQ(g_hook_calls.load(), 2);
+    rad::rad_dev_off_free(count_free);   /* one too many: nothing to take back */
 }
 
 /* A pinned range larger than one pin is locked in pieces (core/device/aql.cpp, pin_pieces),
@@ -1609,6 +1821,687 @@ TEST(a_damaged_code_object_is_refused_not_misread) {
     auto nolist = elf_with_note(m.b);
     CHECK(!rad::aql::code_object_kernels(nolist.data(), nolist.size(), &ks, &why));
     CHECK(has(why, "amdhsa.kernels"));
+}
+
+/* ------------------------------------------------------------------ parking (paging.cpp)
+ *
+ * An engine's large device allocations are mapped in chunks a park can take off the card and put
+ * back at the same address. Whatever route a chunk's bytes take while it is out (a host copy, the
+ * disk tier, a copy kept from an earlier park, the container it was loaded from), they must come
+ * back exact.
+ */
+namespace {
+
+/* The paging chunk (paging.cpp's kChunk). */
+constexpr int64_t kParkChunk = (int64_t)64 << 20;
+
+/* One pageable allocation under engine owner `owner`, and in `want` the pattern it should hold
+ * (upload() writes it). The owner's scope stays current for the object's life, so further
+ * allocations join the same owner. */
+struct Paged {
+    rad::EngineScope es;
+    int owner;
+    int64_t n;
+    void* d = nullptr;
+    std::vector<uint8_t> want;
+    RadStream s = nullptr;
+    Paged(int o, int64_t bytes, uint32_t seed)
+        : es(o, "paging-test"), owner(o), n(bytes), want((size_t)bytes) {
+        rad_dev_set(0);
+        fill(want.data(), n, seed);
+        d = rad_dev_alloc(n, RAD_MEM_DEVICE);
+        rad_stream_create(&s, 0);
+    }
+    ~Paged() {
+        if (d) rad_dev_free(d, RAD_MEM_DEVICE);
+        if (s) rad_stream_destroy(s);
+    }
+    /* Through pinned memory: an async copy reads its host side when it runs. */
+    int upload() {
+        void* h = rad_dev_alloc(n, RAD_MEM_HOST_PINNED);
+        if (!h) return RAD_E_NOMEM;
+        std::memcpy(h, want.data(), (size_t)n);
+        int rc = rad_memcpy_async(d, h, n, s);
+        if (rc >= 0) rc = rad_stream_sync(s);
+        rad_dev_free(h, RAD_MEM_HOST_PINNED);
+        return rc;
+    }
+    /* Index of the first byte that differs from `want`, -1 when none does, -2 when the copy back
+     * fails. */
+    int64_t first_bad() {
+        std::vector<uint8_t> got((size_t)n);
+        void* h = rad_dev_alloc(n, RAD_MEM_HOST_PINNED);
+        if (!h) return -2;
+        const bool ok = rad_memcpy_async(h, d, n, s) >= 0 && rad_stream_sync(s) >= 0;
+        if (ok) std::memcpy(got.data(), h, (size_t)n);
+        rad_dev_free(h, RAD_MEM_HOST_PINNED);
+        if (!ok) return -2;
+        int64_t first = -1, count = 0;
+        for (int64_t i = 0; i < n; ++i)
+            if (got[(size_t)i] != want[(size_t)i]) {
+                if (first < 0) first = i;
+                ++count;
+            }
+        if (first >= 0) {
+            std::fprintf(stderr, "    %lld of %lld bytes differ, first at %lld (got %02x, want %02x); by chunk:",
+                         (long long)count, (long long)n, (long long)first, got[(size_t)first],
+                         want[(size_t)first]);
+            for (int64_t c0 = 0; c0 < n; c0 += kParkChunk) {
+                int64_t b = 0;
+                for (int64_t i = c0; i < std::min(n, c0 + kParkChunk); ++i) b += got[(size_t)i] != want[(size_t)i];
+                std::fprintf(stderr, " %lld", (long long)b);
+            }
+            std::fprintf(stderr, "\n");
+        }
+        return first;
+    }
+};
+
+/* A disk tier of the case's own, under the binary's temporary directory. */
+std::string park_dir() {
+    static int n = 0;
+    const std::string d = radtest::tmpdir() + "/park-" + std::to_string(++n);
+    return ::mkdir(d.c_str(), 0700) == 0 ? d : "";
+}
+
+}  // namespace
+
+/* Three and a bit chunks, so the last one is short. */
+constexpr int64_t kParkBytes = 3 * kParkChunk + (5 << 20);
+
+/* Chunks mapped again at their old addresses and written at once: until the cards' translation
+ * caches are flushed in full the writes land nowhere (Linux 7.1 with gfx1201), so the maps are
+ * followed by dev_settle_maps's flush before anything writes them. This is the page-in's order:
+ * every chunk released, then all mapped, then each written. */
+TEST(a_chunk_remapped_right_after_its_release_keeps_what_is_written) {
+    if (!need_vmem()) return;
+    const int64_t c = kParkChunk;
+    const int K = 4;
+    rad_dev_set(0);
+    const auto* be = rad::active_backend();
+    char* res = (char*)be->vmem_reserve(K * c, rad::VMem::granularity());
+    CHECK(res != nullptr);
+    RadStream s = nullptr;
+    CHECK_OK(rad_stream_create(&s, 0));
+    std::vector<uint8_t> want((size_t)(K * c));
+    fill(want.data(), K * c, 99u);
+    uint8_t* h = (uint8_t*)rad_dev_alloc(K * c, RAD_MEM_HOST_PINNED);
+    CHECK(h != nullptr);
+    for (int round = 0; round < 3; ++round) {
+        for (int k = 0; k < K; ++k) CHECK_OK(be->vmem_commit(res + k * c, c));
+        for (int k = K - 1; k >= 0; --k) CHECK_OK(be->vmem_decommit(res + k * c, c));
+        std::memcpy(h, want.data(), (size_t)(K * c));
+        for (int k = 0; k < K; ++k) CHECK_OK(be->vmem_commit(res + k * c, c));
+        CHECK_OK(rad::dev_settle_maps());
+        for (int k = 0; k < K; ++k) CHECK_OK(rad_memcpy_async(res + k * c, h + k * c, c, s));
+        CHECK_OK(rad_stream_sync(s));
+        std::memset(h, 0, (size_t)(K * c));
+        CHECK_OK(rad_memcpy_async(h, res, K * c, s));
+        CHECK_OK(rad_stream_sync(s));
+        for (int k = 0; k < K; ++k)
+            CHECK_EQ(std::memcmp(h + k * c, want.data() + k * c, (size_t)c), 0);
+        for (int k = 0; k < K; ++k) CHECK_OK(be->vmem_decommit(res + k * c, c));
+    }
+    rad_dev_free(h, RAD_MEM_HOST_PINNED);
+    be->vmem_release(res, K * c);
+    rad_stream_destroy(s);
+}
+
+TEST(a_parked_allocation_comes_back_exact_from_host_copies) {
+    if (!need_vmem()) return;
+    Paged a(9101, kParkBytes, 11u);
+    CHECK(a.d != nullptr);
+    CHECK_OK(a.upload());
+    CHECK_EQ(a.first_bad(), -1);   /* the round trip itself, before any park */
+    rad::PageOut req;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_EQ(res.disk, 0);
+    CHECK(res.host >= kParkBytes);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+TEST(a_parked_allocation_comes_back_exact_from_the_disk_tier) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    CHECK(!dir.empty());
+    Paged a(9102, kParkBytes, 12u);
+    CHECK_OK(a.upload());
+    rad::PageOut req;
+    req.host_budget = 0;
+    req.dir = dir;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_EQ(res.host, 0);
+    CHECK(res.disk >= kParkBytes);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+    /* Sealed, the disk copy stays good for the next park, which writes nothing. */
+    rad::dev_page_seal(a.d);
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_EQ(res.disk, 0);
+    CHECK(res.reused >= kParkBytes);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+/* More chunks than a page-out batch (16) and than the read-back's staging ring (16), so buffers
+ * are reused on both sides. */
+TEST(a_large_parked_allocation_comes_back_exact_from_the_disk_tier) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    const int64_t n = 18 * kParkChunk + (3 << 20);
+    Paged a(9105, n, 15u);
+    CHECK(a.d != nullptr);
+    CHECK_OK(a.upload());
+    rad::PageOut req;
+    req.host_budget = 0;
+    req.dir = dir;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK(res.disk >= n);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+/* An engine owns several pageable allocations, each with its own page file. */
+TEST(two_allocations_of_one_owner_come_back_exact_from_the_disk_tier) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    const int64_t n = 6 * kParkChunk + (3 << 20);
+    Paged a(9106, n, 21u);
+    void* d2 = rad_dev_alloc(n / 2, RAD_MEM_DEVICE);   /* same owner: a's scope is current */
+    CHECK(a.d != nullptr && d2 != nullptr);
+    std::vector<uint8_t> want2((size_t)(n / 2));
+    fill(want2.data(), n / 2, 22u);   /* not 20: the filler sets the seed's low bit, so 20 is 21 */
+    {
+        void* h = rad_dev_alloc(n / 2, RAD_MEM_HOST_PINNED);
+        std::memcpy(h, want2.data(), (size_t)(n / 2));
+        CHECK_OK(rad_memcpy_async(d2, h, n / 2, a.s));
+        CHECK_OK(rad_stream_sync(a.s));
+        rad_dev_free(h, RAD_MEM_HOST_PINNED);
+    }
+    CHECK_OK(a.upload());
+    rad::PageOut req;
+    req.host_budget = 0;
+    req.dir = dir;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK(res.disk >= n + n / 2);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+    {
+        void* h = rad_dev_alloc(n / 2, RAD_MEM_HOST_PINNED);
+        CHECK_OK(rad_memcpy_async(h, d2, n / 2, a.s));
+        CHECK_OK(rad_stream_sync(a.s));
+        CHECK_EQ(std::memcmp(h, want2.data(), (size_t)(n / 2)), 0);
+        rad_dev_free(h, RAD_MEM_HOST_PINNED);
+    }
+    rad_dev_free(d2, RAD_MEM_DEVICE);
+}
+
+TEST(a_partial_park_takes_only_what_is_asked_and_comes_back_exact) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    Paged a(9103, kParkBytes, 13u);
+    CHECK_OK(a.upload());
+    const int dev = 0;   /* Paged allocates on card 0 */
+    rad::PageOut req;
+    req.want[dev] = (int64_t)100 << 20;
+    req.host_budget = kParkChunk;  /* what does not fit goes to disk */
+    req.dir = dir;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    /* Whole chunks, from the top: the short last one and two more, not all four. */
+    CHECK(res.freed[dev] >= ((int64_t)100 << 20));
+    CHECK(res.freed[dev] < kParkBytes);
+    CHECK_EQ(res.host + res.disk, res.freed[dev]);
+    CHECK(res.host <= kParkChunk);
+    CHECK(res.disk > 0);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+TEST(a_chunk_loaded_from_a_container_parks_against_it) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    Paged a(9104, kParkBytes, 14u);
+    /* The container holds the bytes at an offset that is not chunk-aligned, as weights are; the
+     * last 5 MiB of the allocation never came from it and are zero. */
+    const int64_t at = 3 * 4096 + 512, from = kParkBytes - (5 << 20);
+    std::memset(a.want.data() + from, 0, (size_t)(kParkBytes - from));
+    const std::string path = dir + "/container.bin";
+    {
+        FILE* f = std::fopen(path.c_str(), "wb");
+        CHECK(f != nullptr);
+        std::vector<uint8_t> pad((size_t)at, 0x7e);
+        std::fwrite(pad.data(), 1, pad.size(), f);
+        std::fwrite(a.want.data(), 1, (size_t)from, f);
+        std::fclose(f);
+    }
+    CHECK_OK(a.upload());
+    const int fid = rad::dev_page_file(path.c_str());
+    /* As the load's sweep records it (engine_bringup.cpp): a run as a single piece, and one as
+     * strided rows. */
+    rad::dev_page_source(a.d, fid, at, (int64_t)100 << 20, 1, 0);
+    const int64_t rows = (from - ((int64_t)100 << 20)) / 4096;
+    rad::dev_page_source((char*)a.d + ((int64_t)100 << 20), fid, at + ((int64_t)100 << 20), 4096, rows, 4096);
+    rad::PageOut req;
+    req.host_budget = 0;
+    req.dir = dir;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK(res.file >= 3 * kParkChunk);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+    /* A write since the load: that chunk no longer matches, and goes to disk instead. */
+    a.want[70 << 20] ^= 0xff;
+    CHECK_OK(a.upload());
+    rad::dev_page_invalidate((char*)a.d + (70 << 20), 1);
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK(res.disk >= kParkChunk);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+/* A write into a sealed chunk after a park leaves its copy exact but for the blocks written: the
+ * next park moves only those, into the host copy or onto the disk copy. */
+TEST(a_write_after_a_park_moves_only_its_blocks_back_out) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    CHECK(!dir.empty());
+    const int64_t blk = (int64_t)64 << 10;
+    /* Two writes: one byte in chunk 1, and 20 bytes across a block boundary in chunk 2. */
+    auto scribble = [&](Paged& a, uint8_t x) {
+        a.want[(size_t)(70 << 20)] ^= x;
+        for (int k = 0; k < 20; ++k) a.want[(size_t)((130 << 20) - 10 + k)] ^= x;
+        CHECK_OK(a.upload());
+        rad::dev_page_invalidate((char*)a.d + (70 << 20), 1);
+        rad::dev_page_invalidate((char*)a.d + (130 << 20) - 10, 20);
+    };
+    for (int host = 0; host < 2; ++host) {
+        Paged a(9107 + host, kParkBytes, 31u + 2 * host);
+        CHECK_OK(a.upload());
+        rad::dev_page_seal(a.d);
+        rad::PageOut req;
+        req.host_budget = host ? ((int64_t)1 << 30) : 0;
+        req.dir = dir;
+        rad::PageResult res;
+        CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+        CHECK_OK(rad::dev_page_in(a.owner));
+        scribble(a, 0x5a);
+        CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+        CHECK_EQ(host ? res.host : res.disk, 3 * blk);
+        CHECK_EQ(host ? res.disk : res.host, 0);
+        CHECK_EQ(res.reused, res.freed[0] - 3 * blk);   /* the span: kParkBytes rounded up */
+        CHECK_OK(rad::dev_page_in(a.owner));
+        CHECK_EQ(a.first_bad(), -1);
+    }
+}
+
+/* An allocation its owner refills (a weights pool and its container) leaves the card with nothing
+ * copied, whatever host room or disk tier there is; the page-in maps it back and hands it to the
+ * owner, which here writes it again; a page-in that would not hand it back refuses. */
+TEST(an_allocation_its_owner_refills_parks_with_no_copy_and_comes_back_to_be_filled) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    CHECK(!dir.empty());
+    Paged a(9111, kParkBytes, 53u);
+    CHECK_OK(a.upload());
+    rad::dev_page_seal(a.d);
+    rad::dev_page_refilled(a.d);
+    CHECK_EQ(rad::dev_page_uncopied(a.owner), 0);
+    for (int round = 0; round < 2; ++round) {
+        rad::PageOut req;
+        req.host_budget = (int64_t)1 << 30;
+        req.dir = dir;
+        rad::PageResult res;
+        CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+        CHECK_EQ(res.host, 0);
+        CHECK_EQ(res.disk, 0);
+        CHECK_EQ(res.file, res.freed[0]);
+        CHECK(res.freed[0] >= kParkBytes);
+        CHECK_EQ(rad::dev_page_in(a.owner), RAD_E_STATE);   /* nobody to fill it */
+        std::vector<rad::PageSpan> spans;
+        CHECK_OK(rad::dev_page_in(a.owner, &spans));
+        REQUIRE_EQ(spans.size(), (size_t)1);                  /* adjacent chunks merged */
+        CHECK(spans[0].p == (char*)a.d);
+        CHECK(spans[0].bytes >= kParkBytes);
+        CHECK_EQ(spans[0].device, 0);
+        CHECK_OK(a.upload());
+        CHECK_EQ(a.first_bad(), -1);
+    }
+    /* A partial park takes chunks from the top (the short last one, then a whole one) and hands
+     * back only those. */
+    rad::PageOut part;
+    part.want[0] = kParkChunk;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, part, &res));
+    CHECK(res.file >= kParkChunk);
+    CHECK(res.file < res.freed[0] + 1 && res.file < kParkBytes);
+    std::vector<rad::PageSpan> spans;
+    CHECK_OK(rad::dev_page_in(a.owner, &spans));
+    REQUIRE_EQ(spans.size(), (size_t)1);
+    CHECK_EQ(spans[0].bytes, res.file);
+    CHECK(spans[0].p > (char*)a.d);
+    CHECK_OK(a.upload());
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+/* Runtime LoRA state is a mutable arena allocation, separate from the container-backed base
+ * weights. Refilling base weights must neither discard nor overwrite the occupied adapter. */
+TEST(container_weights_and_mutable_adapters_survive_park_and_refill) {
+    if (!need_vmem()) return;
+    Paged weights(9125, kParkChunk + (3 << 20), 63u);
+    Paged adapter(9125, kParkChunk + (1 << 20), 79u);
+    REQUIRE(weights.d && adapter.d);
+    CHECK_OK(weights.upload());
+    rad::dev_page_seal(weights.d);
+    rad::dev_page_refilled(weights.d);
+    for (int round = 0; round < 2; ++round) {
+        fill(adapter.want.data(), adapter.n, (uint32_t)(79 + 2 * round));
+        CHECK_OK(adapter.upload());
+        rad::PageOut request;
+        request.host_budget = (int64_t)1 << 30;
+        rad::PageResult result;
+        CHECK_OK(rad::dev_page_out(weights.owner, request, &result));
+        CHECK(result.file >= weights.n);
+        CHECK(result.host >= adapter.n);
+        CHECK(result.host < weights.n + adapter.n);
+        CHECK_EQ(result.disk, 0);
+        std::vector<rad::PageSpan> refill;
+        CHECK_OK(rad::dev_page_in(weights.owner, &refill));
+        REQUIRE_EQ(refill.size(), (size_t)1);
+        CHECK(refill[0].p == (char*)weights.d);
+        CHECK(refill[0].bytes >= weights.n);
+        CHECK_EQ(adapter.first_bad(), -1);       /* its slot bytes already came back independently */
+        CHECK_OK(weights.upload());             /* the owner supplies the original base weights */
+        CHECK_EQ(weights.first_bad(), -1);
+        CHECK_EQ(adapter.first_bad(), -1);
+    }
+}
+
+/* A host fill of an allocation its owner refills: host memory mapped at its parked chunks, filled by
+ * the owner (here a copy from the card's side, as the refill's DMA writes it), comes back over the
+ * link with nothing handed back; the copy stays exact, so the next park leaves by the swap; once
+ * the host copies are dropped the chunks are the owner's to refill again. */
+TEST(a_refilled_allocation_fills_into_host_memory_and_keeps_that_copy) {
+    if (!need_vmem()) return;
+    Paged a(9113, kParkBytes, 59u);
+    CHECK_OK(a.upload());
+    rad::dev_page_seal(a.d);
+    rad::dev_page_refilled(a.d);
+    rad::PageOut req;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    const std::vector<rad::PageSpan> pend = rad::dev_page_refill_chunks(a.owner);
+    CHECK_EQ(pend.size(), (size_t)4);
+    CHECK(rad::dev_page_fillable(a.owner) >= kParkBytes);
+    CHECK_OK(rad::dev_page_fill_begin(a.owner, pend));
+    CHECK_OK(a.upload());   /* into the host memory now mapped at the chunks */
+    rad::dev_page_fill_end(a.owner, pend, true);
+    CHECK_EQ(rad::dev_page_fillable(a.owner), 0);
+    CHECK(rad::dev_page_refill_chunks(a.owner).empty());
+    std::vector<rad::PageSpan> spans;
+    CHECK_OK(rad::dev_page_in(a.owner, &spans));
+    CHECK(spans.empty());
+    CHECK_EQ(a.first_bad(), -1);
+    /* The kept copy is exact: the park swaps, copies nothing, and the restore copies it back. */
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_EQ(res.reused, res.freed[0]);
+    CHECK_EQ(res.file, 0);
+    CHECK_EQ(res.host, 0);
+    CHECK_OK(rad::dev_page_in(a.owner, &spans));
+    CHECK(spans.empty());
+    CHECK_EQ(a.first_bad(), -1);
+    /* Dropped while parked, the copies leave the chunks to the owner again. */
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK(rad::dev_page_drop_host(a.owner) >= kParkBytes);
+    CHECK_EQ(rad::dev_page_refill_chunks(a.owner).size(), (size_t)4);
+    CHECK_OK(rad::dev_page_in(a.owner, &spans));
+    REQUIRE_EQ(spans.size(), (size_t)1);
+    CHECK_OK(a.upload());
+    CHECK_EQ(a.first_bad(), -1);
+    /* A fill that fails gives its host memory back and leaves the chunks to be refilled. */
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    const int64_t host0 = rad::dev_page_host_bytes();
+    const std::vector<rad::PageSpan> again = rad::dev_page_refill_chunks(a.owner);
+    CHECK_OK(rad::dev_page_fill_begin(a.owner, again));
+    CHECK(rad::dev_page_host_bytes() >= host0 + kParkBytes);
+    rad::dev_page_fill_end(a.owner, again, false);
+    CHECK_EQ(rad::dev_page_host_bytes(), host0);
+    CHECK_EQ(rad::dev_page_refill_chunks(a.owner).size(), (size_t)4);
+    spans.clear();
+    CHECK_OK(rad::dev_page_in(a.owner, &spans));
+    CHECK_EQ(spans.size(), (size_t)1);
+    CHECK_OK(a.upload());
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+/* Parked to host memory, the allocation stays mapped at its address: the card reads it and writes
+ * it there, over the link, and a restore brings back what was written meanwhile. A second park
+ * of the sealed allocation, its host copy kept, leaves by a swap of mappings and copies nothing. */
+TEST(a_parked_chunk_is_read_and_written_in_place_from_host_memory) {
+    if (!need_vmem()) return;
+    Paged a(9109, kParkBytes, 41u);
+    CHECK_OK(a.upload());
+    rad::dev_page_seal(a.d);
+    rad::PageOut req;
+    req.host_budget = (int64_t)1 << 30;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK(res.host >= kParkBytes);
+    CHECK(rad::dev_page_host_bytes() >= kParkBytes);
+    CHECK_EQ(a.first_bad(), -1);            /* read in place, out of host memory */
+    a.want[(size_t)(100 << 20)] ^= 0x3c;    /* written in place */
+    CHECK_OK(a.upload());
+    rad::dev_page_invalidate((char*)a.d + (100 << 20), 1);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_EQ(res.host, 0);
+    CHECK_EQ(res.reused, res.freed[0]);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+    /* The kept copies go; the host memory with them. */
+    const int64_t before = rad::dev_page_host_bytes();
+    CHECK(rad::dev_page_drop_copies(a.owner) >= kParkBytes);
+    CHECK(rad::dev_page_host_bytes() <= before - kParkBytes);
+}
+
+/* A live restore leaves a sealed allocation's chunks in host memory, read in place; promotion
+ * moves them onto the card in a quiet window. A write that lands between the promotion's copy and
+ * its swap (here, inside the quiet hook before the swap runs) is copied again, not lost. */
+TEST(a_live_restore_serves_from_host_memory_until_promoted) {
+    if (!need_vmem()) return;
+    Paged a(9110, kParkBytes, 51u);
+    CHECK_OK(a.upload());
+    rad::dev_page_seal(a.d);
+    rad::PageOut req;
+    req.host_budget = (int64_t)1 << 30;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    int64_t left = 0;
+    CHECK_OK(rad::dev_page_in_live(a.owner, &left));
+    CHECK_EQ(left, res.freed[0]);
+    CHECK_EQ(rad::dev_page_live_bytes(a.owner), left);
+    CHECK_EQ(a.first_bad(), -1);
+    bool wrote = false;
+    auto quiet = [&](const std::function<int()>& fn) -> int {
+        if (!wrote) {
+            wrote = true;
+            a.want[(size_t)(10 << 20)] ^= 0x77;
+            if (a.upload() < 0) return RAD_E_DEVICE;
+            rad::dev_page_invalidate((char*)a.d + (10 << 20), 1);
+        }
+        return fn();
+    };
+    /* One chunk at a time: the write lands in the first. */
+    int64_t moved = 0;
+    for (int k = 0; k < 8; ++k) {
+        const int64_t n = rad::dev_page_promote(a.owner, kParkChunk, quiet);
+        CHECK(n >= 0);
+        if (n <= 0) break;
+        moved += n;
+    }
+    CHECK_EQ(moved, left);
+    CHECK_EQ(rad::dev_page_live_bytes(a.owner), 0);
+    CHECK_EQ(a.first_bad(), -1);
+    /* Promoted with its host copy kept: the next park is a swap. */
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_EQ(res.host, 0);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+/* Parked to the disk tier alone, then read into host memory while it waits: the chunks are
+ * readable in place there, and the restore copies them over the link. */
+TEST(a_chunk_parked_on_the_drive_fills_into_host_memory_and_comes_back_exact) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    CHECK(!dir.empty());
+    Paged a(9111, kParkBytes, 61u);
+    CHECK_OK(a.upload());
+    rad::PageOut req;
+    req.host_budget = 0;
+    req.dir = dir;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_EQ(res.host, 0);
+    const int64_t out = res.freed[0];
+    CHECK_EQ(rad::dev_page_fillable(a.owner), out);
+    const int64_t held = rad::dev_page_host_bytes();
+    /* One chunk, then the rest. */
+    CHECK_EQ(rad::dev_page_fill_host(a.owner, 1), kParkChunk);
+    CHECK_EQ(rad::dev_page_fillable(a.owner), out - kParkChunk);
+    CHECK_EQ(rad::dev_page_fill_host(a.owner, INT64_MAX), out - kParkChunk);
+    CHECK_EQ(rad::dev_page_fillable(a.owner), 0);
+    CHECK_EQ(rad::dev_page_fill_host(a.owner, INT64_MAX), 0);
+    CHECK_EQ(rad::dev_page_host_bytes() - held, out);
+    CHECK_EQ(a.first_bad(), -1);   /* read in place from host memory */
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+    CHECK_EQ(rad::dev_page_host_bytes(), held);
+}
+
+/* A chunk read in place from host memory and written there (a live restore after a fill from the
+ * drive) has its host copy as its only exact one: the drive's copy is stale. Promoted onto the
+ * card and its host copy then let go, the next park writes it again rather than unmapping it
+ * against the drive, and it comes back with the write. */
+TEST(a_chunk_written_in_place_does_not_go_out_against_its_stale_drive_copy) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    CHECK(!dir.empty());
+    Paged a(9112, kParkBytes, 71u);
+    CHECK_OK(a.upload());
+    rad::dev_page_seal(a.d);
+    rad::PageOut req;
+    req.host_budget = 0;
+    req.dir = dir;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    const int64_t out = res.freed[0];
+    CHECK_EQ(rad::dev_page_fill_host(a.owner, INT64_MAX), out);
+    int64_t left = 0;
+    CHECK_OK(rad::dev_page_in_live(a.owner, &left));
+    CHECK_EQ(left, out);
+    a.want[(size_t)(10 << 20)] ^= 0x5a;    /* written in place, in host memory */
+    CHECK_OK(a.upload());
+    rad::dev_page_invalidate((char*)a.d + (10 << 20), 1);
+    int64_t moved = 0;
+    for (int k = 0; k < 64; ++k) {
+        const int64_t n = rad::dev_page_promote(a.owner, INT64_MAX,
+                                                [](const std::function<int()>& fn) { return fn(); });
+        CHECK(n >= 0);
+        if (n <= 0) break;
+        moved += n;
+    }
+    CHECK_EQ(moved, left);
+    CHECK_EQ(a.first_bad(), -1);
+    (void)rad::dev_page_drop_copies(a.owner);
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK(res.disk >= kParkChunk);          /* the written chunk, at least, went to the drive again */
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+/* Granules mapped and unmapped at random, so the physical pages a freed granule held come back
+ * under other addresses and addresses come back on other pages: each live granule must hold only
+ * what was last written to it. On Linux 7.1 with gfx1201 an address mapped again kept its previous
+ * page until the cards' translations were flushed in full (dev_settle_maps, which VMem::commit
+ * runs): two live granules then shared a page and one's writes showed in the other. A process that
+ * opens the render node meanwhile (rocm-smi) made the alias far more frequent, so this is also run
+ * beside one. */
+TEST(granules_remapped_at_random_never_share_a_page) {
+    if (!need_vmem()) return;
+    const int64_t g = rad::VMem::granularity();
+    constexpr int kGranules = 128, kCycles = 1000;
+    /* Each granule's head and tail are written and read back: a page two granules share shows
+     * at both ends. */
+    constexpr int64_t kProbe = 4096;
+    rad_dev_set(0);
+    rad::VMem v;
+    CHECK_OK(v.reserve(kGranules * g));
+    RadStream s = nullptr;
+    CHECK_OK(rad_stream_create(&s, 0));
+    uint32_t* stage = static_cast<uint32_t*>(rad_dev_alloc(kProbe, RAD_MEM_HOST_PINNED));
+    uint32_t* back = static_cast<uint32_t*>(rad_dev_alloc(kGranules * 2 * kProbe, RAD_MEM_HOST_PINNED));
+    CHECK(stage && back);
+    std::vector<uint32_t> tag(kGranules, 0);   /* the word a live granule holds; 0: unmapped */
+    uint32_t next = 1;
+    std::mt19937 rng(20261106u);
+    char* const base = static_cast<char*>(v.base());
+    auto map = [&](int i) -> int {
+        if (const int rc = v.commit(i * g, g); rc < 0) return rc;
+        tag[i] = next++;
+        std::fill(stage, stage + kProbe / 4, tag[i]);
+        if (const int rc = rad_memcpy_async(base + i * g, stage, kProbe, s); rc < 0) return rc;
+        if (const int rc = rad_memcpy_async(base + (i + 1) * g - kProbe, stage, kProbe, s); rc < 0) return rc;
+        return rad_stream_sync(s);
+    };
+    for (int i = 0; i < kGranules; i += 2) CHECK_OK(map(i));
+    int bad = 0, first_bad_cycle = -1, first_bad_granule = -1;
+    for (int c = 0; c < kCycles && bad == 0; ++c) {
+        std::vector<int> live, dead;
+        for (int i = 0; i < kGranules; ++i) (tag[i] ? live : dead).push_back(i);
+        if (!live.empty() && (dead.empty() || rng() % 2)) {
+            const int i = live[rng() % live.size()];
+            CHECK_OK(v.decommit(i * g, g));
+            tag[i] = 0;
+            continue;
+        }
+        CHECK_OK(map(dead[rng() % dead.size()]));
+        /* Every live granule's head and tail, in one batch. */
+        int k = 0;
+        for (int i = 0; i < kGranules; ++i) {
+            if (!tag[i]) continue;
+            char* dst = reinterpret_cast<char*>(back) + (int64_t)k * 2 * kProbe;
+            CHECK_OK(rad_memcpy_async(dst, base + i * g, kProbe, s));
+            CHECK_OK(rad_memcpy_async(dst + kProbe, base + (i + 1) * g - kProbe, kProbe, s));
+            ++k;
+        }
+        CHECK_OK(rad_stream_sync(s));
+        k = 0;
+        for (int i = 0; i < kGranules; ++i) {
+            if (!tag[i]) continue;
+            const uint32_t* w = back + (int64_t)k * 2 * kProbe / 4;
+            for (int64_t j = 0; j < 2 * kProbe / 4; ++j)
+                if (w[j] != tag[i]) {
+                    if (bad++ == 0) { first_bad_cycle = c; first_bad_granule = i; }
+                    break;
+                }
+            ++k;
+        }
+    }
+    if (bad) fprintf(stderr, "    %d granule(s) held another's bytes, first granule %d at cycle %d\n", bad,
+                     first_bad_granule, first_bad_cycle);
+    CHECK_EQ(bad, 0);
+    rad_dev_free(stage, RAD_MEM_HOST_PINNED);
+    rad_dev_free(back, RAD_MEM_HOST_PINNED);
+    rad_stream_destroy(s);
 }
 
 RAD_TEST_MAIN_HOST_KARGS()

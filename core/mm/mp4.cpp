@@ -50,7 +50,15 @@ struct MemReader {
     int64_t  pos = 0;
 };
 
-int mem_write(void* op, const uint8_t* buf, int n) {
+/* avio_alloc_context's write_packet takes a const buffer from libavformat 61 and a mutable one
+ * before it; the callback is declared as the library at hand wants it. */
+#if LIBAVFORMAT_VERSION_MAJOR >= 61
+using WriteBuf = const uint8_t*;
+#else
+using WriteBuf = uint8_t*;
+#endif
+
+int mem_write(void* op, WriteBuf buf, int n) {
     MemFile* f = static_cast<MemFile*>(op);
     const int64_t end = f->pos + n;
     if (end > (int64_t)f->data.size()) f->data.resize((size_t)end);

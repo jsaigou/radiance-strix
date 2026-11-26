@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="radiance" fill="currentColor">
+  <!-- The mark in the colour of the text around it. -->
+  <rect x="17" y="11" width="8" height="42"/>
+  <path d="M29 11h7a12.5 12.5 0 0 1 0 25h-7v-8h7a4.5 4.5 0 0 0 0-9h-7z"/>
+  <path d="M33 40h9l8 13h-9z"/>
+</svg>

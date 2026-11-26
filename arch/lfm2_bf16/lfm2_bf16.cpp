@@ -28,8 +28,9 @@
  * block E4M3 (`codes=fp8_e4m3 block=128x128 scale=bf16`) is `gemm_nt_q` at fp8a8 over the
  * activation quantised per 128 columns (one quant_act_fp8 per activation, shared by the linears
  * that read it); int8 (`codes=i8 group=128 scale=bf16`) is `gemm_nt_q` at i8a8, each linear
- * quantising its input. The trunk's format is read off layer 0's down projection and every linear
- * must match it. The convolution, the norms and attention stay bf16; the lm_head is read at its
+ * quantising its input, and IQ8R (rotated int8 with a scale per 256 of K,
+ * data/recipes/d1-3b-iq8r.recipe) the same at i8a8h with the activation pairs at the weights'
+ * group. The trunk's format is read off layer 0's first linear and every linear must match it. The convolution, the norms and attention stay bf16; the lm_head is read at its
  * stored codes (bf16, or E4M3 / int8 where a recipe made it so; logits_gemm_fp8 / _i8). At d1-3B
  * the linears are 5.8 of the 6.3 GB a token reads, so 8-bit codes nearly halve decode and short
  * prefill, both bound by that read.
@@ -106,6 +107,8 @@ struct Model {
     /* The trunk's format, read off layer 0's first linear. `fused`: the fp8 trunk's fused
      * producers (see the head of the file). */
     bool q_fp8 = false, q_i8 = false, fused = false;
+    /* An int8 trunk's scale group along K, which its activation pairs share (ActFP8::g8). */
+    int64_t g8 = RAD_FP8_BLOCK;
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
     rad_op op_embed = 0, op_gather = 0, op_final_norm = 0, op_logits = 0;
@@ -118,7 +121,7 @@ struct Model {
     MediaRows mrows{};
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* A text_config key first, then the top level: a VL checkpoint nests the text model's settings
  * and a text checkpoint does not. */
@@ -166,7 +169,9 @@ static int read_schedule(const RadModelMeta* m, int64_t n_layer, std::vector<Lay
 }
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
-    if (!b || !meta || !ctx || ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (!b || !meta || !ctx || ctx->rank < 0 || ctx->rank >= MAX_RANKS ||
+        rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
     if (ctx->world_size > 1) {
         fprintf(stderr, "radiance: lfm2_bf16 serves one rank; run it with --tp 1\n");
         return RAD_E_UNSUPPORTED;
@@ -178,7 +183,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_UNSUPPORTED;
     }
 
-    Model& m = g_model[ctx->rank];
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     Names& nm = m.nm;
@@ -290,14 +295,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                       enc.plane[0].dtype == RAD_BF16);
         g.w_bf16 = plain;
         m.q_i8   = !plain && L0.in.probed_i8;
+        if (m.q_i8) m.g8 = L0.in.probed_g8;
         m.q_fp8  = !plain && !m.q_i8;
         m.fused  = m.q_fp8;
     }
+    if (m.q_i8 && (g.n_embd % m.g8 || g.q_dim() % m.g8 || g.n_ff % m.g8)) {
+        fprintf(stderr, "radiance: lfm2: the int8 trunk keeps one scale a %lld of K, which does not "
+                        "divide this model's widths (hidden %lld, attention %lld, feed-forward "
+                        "%lld)\n",
+                (long long)m.g8, (long long)g.n_embd, (long long)g.q_dim(), (long long)g.n_ff);
+        return RAD_E_UNSUPPORTED;
+    }
     m.a_h.x = m.b_h; m.a_attn.x = m.b_attn; m.a_conv.x = m.b_conv_out; m.a_ffn.x = m.b_ffn;
-    RAD_ARCH_TRY(m.a_h.declare_qs(b, nm, g, "h", g.n_embd, 0, m.q_i8));
-    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "attn_out", g.q_dim(), 0, m.q_i8));
-    RAD_ARCH_TRY(m.a_conv.declare_qs(b, nm, g, "conv_out", g.n_embd, 0, m.q_i8));
-    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff, 0, m.q_i8));
+    RAD_ARCH_TRY(m.a_h.declare_qs(b, nm, g, "h", g.n_embd, 0, m.q_i8, true, m.g8));
+    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "attn_out", g.q_dim(), 0, m.q_i8, true, m.g8));
+    RAD_ARCH_TRY(m.a_conv.declare_qs(b, nm, g, "conv_out", g.n_embd, 0, m.q_i8, true, m.g8));
+    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff, 0, m.q_i8, true, m.g8));
     /* An E4M3 activation is quantised once by the model and read by every linear on it; an int8
      * linear quantises its own input (LinearFP8::op_q), and a bf16 one reads the bf16 plane. */
     auto quant = [&](QuantFP8& q, const ActFP8& a, int64_t n) {
@@ -471,7 +484,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             ms.up   = nm.ckpt(ffn_fmt, pre, l, "w3.weight");
             ms.down = nm.ckpt(ffn_fmt, pre, l, "w2.weight");
             const bool last = l + 1 == (int)m.layers.size();
-            /* The whole prompt in the fold: gemm_nt_q_gated_wide serves every M, so a prefill
+            /* The whole prompt in the fold (`wide_fold`): its row serves every M, so a prefill
              * chunk does not fall back to the pair past 64 rows. */
             RAD_ARCH_TRY(L.mlp8.declare(b, nm, g, l, mw, ms, /*fold=*/true, /*add_out=*/last,
                                         0, false, 0, /*wide_fold=*/true));
@@ -572,7 +585,7 @@ static void conv_step(const Model& m, const Layer& L, RadCtx* c, const RadBatch*
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
+    const Model& m = g_model[rad_slot(c)];
     const Geom& g = m.g;
     if (batch->draft_pass || batch->spec_parent ||
         (!m.media && (batch->enc || batch->n_mm_rows > 0))) {
@@ -663,9 +676,23 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 }
 
+/* Chained launches pay on the plain-bf16 trunk: its GEMMs, norms and elementwise kernels have
+ * chained forms (libr4d's rad_kernel_chain); the head norms, the rotary and the convolution keep
+ * their plain rows, with which the long GEMMs between them run faster. The 3B text model on one
+ * R9700, ms a decode step unchained / chained: 12.14 / 11.31 at one sequence and 12.54 / 11.60 at
+ * four. */
+static int probe(const RadModelMeta* meta, RadArchProbe* out) {
+    if (!meta || !out) return RAD_E_INVAL;
+    out->chain_pays = RAD_CHAIN_ALWAYS;
+    return RAD_OK;
+}
+
 }  /* namespace lfm2_bf16 */
 
 #ifndef RAD_ARCH_NO_EXPORTS
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
+RAD_ARCH_PROBE(lfm2_bf16)
 RAD_ARCH_PLUGIN(lfm2_bf16, "lfm2", "", "0.2.0",
                 "LiquidAI LFM2 / LFM2-VL, bf16, or with block-fp8 or int8 linears from a recipe: "
                 "short gated convolutions and GQA attention in the checkpoint's own schedule, one "

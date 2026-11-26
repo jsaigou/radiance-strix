@@ -33,6 +33,7 @@
 // counters: there is no split across blocks (the gated folds at the end of the file, at 1..8 rows and
 // at 9..64, have both).
 #include "r4d.h"
+#include "r4d_keyed.h"
 #include "r4d_gemm_args.h"
 #include "r4d_common.h"
 #include "r4d_mxfp4.h"
@@ -670,89 +671,7 @@ void r4d_gemm_mxfp4a8_gatedw_kernel(
 }
 
 namespace {
-// The arrival counters, one block per output buffer, as the decode row's (mxd_out_ctr): not in the
-// scratch, which other ops overwrite, since they must be zero at entry. One allocation per (device,
-// output), kept zero by the reducer and never freed (a recorded pass replays the pointer).
-unsigned* mxgg_out_ctr(const void* out) {
-  static std::mutex mu;
-  static std::map<std::pair<int, const void*>, unsigned*> blocks;
-  int dev = 0;
-  if (hipGetDevice(&dev) != hipSuccess) return nullptr;
-  const auto key = std::make_pair(dev, out);
-  {
-    // Not held while the block is made, as in split_ctr (r4d_gemm_fp8a8.hip): the zeroing waits
-    // for the card.
-    std::lock_guard<std::mutex> lk(mu);
-    if (auto it = blocks.find(key); it != blocks.end()) return it->second;
-  }
-  unsigned* p = nullptr;
-  if (hipMalloc((void**)&p, R4D_MXGG_MAX_GROUPS * sizeof(unsigned)) != hipSuccess) return nullptr;
-  // Zero before any launch reads it: the memset is on the null stream, which the engine's streams
-  // need not wait for, so wait here (as mxd_out_ctr and r4d_moe.hip's router counters do).
-  if (hipMemset(p, 0, R4D_MXGG_MAX_GROUPS * sizeof(unsigned)) != hipSuccess ||
-      hipDeviceSynchronize() != hipSuccess) {
-    (void)hipFree(p);
-    return nullptr;
-  }
-  unsigned* kept = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(mu);
-    const auto [it, fresh] = blocks.emplace(key, p);
-    if (fresh) return it->second;
-    kept = it->second;
-  }
-  (void)hipFree(p);  // another thread made this key's block in the meantime
-  return kept;
-}
 
-// The scratch: the bf16 product [M, n], then each tile's per-row amax [n / 16][M] fp32.
-long long mxgg_h_bytes(long long M, long long n) { return (M * n * 2 + 255) / 256 * 256; }
-long long mxgg_scratch_bytes(long long M, long long n) {
-  return mxgg_h_bytes(M, n) + (n / 16) * M * (long long)sizeof(float);
-}
-
-void mxgg_launch(bool ablk, int act, const void* a, const void* as, const void* w, const void* ws,
-                 const void* wr, void* q, void* s, void* y, void* scratch, unsigned* cnt, int M,
-                 int K, int n, int as_rs, int lda, int ldws, int q_ld, int s_ld, int y_ld,
-                 RadStream stream) {
-  const dim3 grid((uint32_t)(n / 16)), block(2 * R4D_MXG_KW * 32);
-  hipStream_t st = (hipStream_t)stream;
-  uint16_t* h = (uint16_t*)scratch;
-  float* x = (float*)((char*)scratch + mxgg_h_bytes(M, n));
-#define MXGG_L(AB_, ACT_)                                                                         \
-  hipLaunchKernelGGL((r4d_gemm_mxfp4a8_gated_kernel<AB_, ACT_>), grid, block, 0, st,             \
-                     (const unsigned char*)a, (const float*)as, (const unsigned char*)w,          \
-                     (const unsigned char*)ws, (const unsigned char*)wr, (uint8_t*)q, (float*)s,  \
-                     (uint16_t*)y, h, x, cnt, M, K, n, as_rs, lda, ldws, q_ld, s_ld, y_ld)
-  if (act == 0) { if (ablk) MXGG_L(true, 0); else MXGG_L(false, 0); }
-  else          { if (ablk) MXGG_L(true, 1); else MXGG_L(false, 1); }
-#undef MXGG_L
-}
-
-// The wide form: one block of eight K waves a 16-column tile of the gated output, ceil(M / 16) row
-// tiles.
-void mxggw_launch(bool ablk, int act, const void* a, const void* as, const void* w, const void* ws,
-                  const void* wr, void* q, void* s, void* y, void* scratch, unsigned* cnt, int M,
-                  int K, int n, int as_rs, int lda, int ldws, int q_ld, int s_ld, int y_ld,
-                  RadStream stream) {
-  const dim3 grid((uint32_t)(n / 16)), block(R4D_MXG_KW * 32);
-  hipStream_t st = (hipStream_t)stream;
-  uint16_t* h = (uint16_t*)scratch;
-  float* x = (float*)((char*)scratch + mxgg_h_bytes(M, n));
-  const int rt = (M + 15) / 16;
-#define MXGW_L(AB_, ACT_, RT_)                                                                    \
-  hipLaunchKernelGGL((r4d_gemm_mxfp4a8_gatedw_kernel<AB_, ACT_, RT_>), grid, block, 0, st,       \
-                     (const unsigned char*)a, (const float*)as, (const unsigned char*)w,          \
-                     (const unsigned char*)ws, (const unsigned char*)wr, (uint8_t*)q, (float*)s,  \
-                     (uint16_t*)y, h, x, cnt, M, K, n, as_rs, lda, ldws, q_ld, s_ld, y_ld)
-#define MXGW_RT(AB_, ACT_)                                                                        \
-  { if (rt <= 1) MXGW_L(AB_, ACT_, 1); else if (rt == 2) MXGW_L(AB_, ACT_, 2);                     \
-    else if (rt == 3) MXGW_L(AB_, ACT_, 3); else MXGW_L(AB_, ACT_, 4); }
-  if (act == 0) { if (ablk) MXGW_RT(true, 0) else MXGW_RT(false, 0) }
-  else          { if (ablk) MXGW_RT(true, 1) else MXGW_RT(false, 1) }
-#undef MXGW_RT
-#undef MXGW_L
-}
 }  // namespace
 
 /* The gated GEMM's shim. Operand indices are `gemm_nt_q_gated_mx`'s (oGemmNtQGatedMx in
@@ -761,96 +680,3 @@ void mxggw_launch(bool ablk, int act, const void* a, const void* as, const void*
 enum { MXGG_A = 0, MXGG_AS = 1, MXGG_B = 2, MXGG_BS = 3, MXGG_BR = 4, MXGG_Q = 5, MXGG_S = 6,
        MXGG_Y = 7 };
 
-/* Both rows' entry: the narrow form at 1..8 rows (gemm_mxfp4a8_gated_gemv), the wide one at 9..64
- * (gemm_mxfp4a8_gated_gemv_wide), each refusing the other's band as its GEMM row does. */
-static int mxgg_entry(const RadArgs* a, RadStream s, bool wide) {
-    const RadTensor* x  = r4d_opt(a, MXGG_A);
-    const RadTensor* xs = r4d_opt(a, MXGG_AS);
-    const RadTensor* w  = r4d_opt(a, MXGG_B);
-    const RadTensor* ws = r4d_opt(a, MXGG_BS);
-    const RadTensor* wr = r4d_opt(a, MXGG_BR);
-    const RadTensor* q  = r4d_opt(a, MXGG_Q);
-    const RadTensor* sc = r4d_opt(a, MXGG_S);
-    const RadTensor* y  = r4d_opt(a, MXGG_Y);
-    if (!x || !xs || !w || !ws || !wr || !q || !sc) return R4D_NO(RAD_E_INVAL);
-    if (x->dtype != RAD_F8E4M3 || xs->dtype != RAD_F32 || q->dtype != RAD_F8E4M3 ||
-        sc->dtype != RAD_F32 || (y && y->dtype != RAD_BF16))
-        return R4D_NO(RAD_E_DTYPE);
-    if (q->rank != 2 || sc->rank != 2 || x->rank != 2) return R4D_NO(RAD_E_SHAPE);
-    if (y && y->rank != 2) return R4D_NO(RAD_E_SHAPE);
-    if (r4d_geti_or(a, "group", 32) != 32) return R4D_NO(RAD_E_SHAPE);
-    /* silu (the SwiGLU MLP) or gelu_tanh (GeGLU, gelu_mul's). The GeGLU chain's bf16 plane is
-     * gelu_mul's output, which the fold's replaces-hook cannot hand to the optional `out_bf16`, so
-     * that form writes none. */
-    const char* act = r4d_gets(a, "act");
-    const int actm = !act ? -1 : !std::strcmp(act, "silu") ? 0 : !std::strcmp(act, "gelu_tanh") ? 1 : -1;
-    if (actm < 0) return R4D_NO(RAD_E_UNSUPPORTED);
-    if (actm == 1 && y) return R4D_NO(RAD_E_UNSUPPORTED);
-
-    /* The gated width from `q`, the buffer written; N and K from the op's parameters, since the
-     * weight operands are packed bytes. */
-    const long long M = q->shape[0], nout = q->shape[1];
-    const long long N = r4d_geti_or(a, "N", 0), K = r4d_geti_or(a, "K", 0);
-    const long long m_lo = wide ? R4D_MXG_MAX_M + 1 : 1, m_hi = wide ? R4D_MXG_WMMA_MAX_M : R4D_MXG_MAX_M;
-    if (M < m_lo || M > m_hi || nout < 128 || nout % 128 || nout / 128 > R4D_MXGG_MAX_GROUPS)
-        return R4D_NO(RAD_E_SHAPE);
-    if (N != 2 * nout || K < 128 || K % 128) return R4D_NO(RAD_E_SHAPE);
-    if (x->shape[0] != M || r4d_numel(x) != M * K) return R4D_NO(RAD_E_SHAPE);
-    if (sc->shape[0] != M || sc->shape[1] != nout / 128) return R4D_NO(RAD_E_SHAPE);
-    if (y && (y->shape[0] != M || y->shape[1] != nout)) return R4D_NO(RAD_E_SHAPE);
-    /* The activation scale grid as the gemm_nt_q rows read it (mx_ascale_grid), so the fold and the
-     * GEMM it replaces take every scale plane the same way. */
-    GemmOps go{};
-    go.ascale = xs; go.M = M; go.K = K;
-    int as_group = 0, as_rs_i = 1;
-    if (mx_ascale_grid(go, &as_group, &as_rs_i) != RAD_OK) return R4D_NO(RAD_E_SHAPE);
-    const bool ablk = as_group == 128;
-    const long long as_rs = as_rs_i;
-    /* Row pitches; r4d_row_pitch is -1 for a tensor not contiguous past its leading axis. A is read
-     * a dword at a time. */
-    const long long lda = r4d_row_pitch(x), qp = r4d_row_pitch(q), sp = r4d_row_pitch(sc);
-    const long long yp = y ? r4d_row_pitch(y) : 0;
-    if (lda < K || lda % 4 || qp < nout || sp < nout / 128 || (y && yp < nout))
-        return R4D_NO(RAD_E_STRIDE);
-    if (!r4d_aligned(x->data, 16) || !r4d_aligned(w->data, 16) || !r4d_aligned(q->data, 4) ||
-        !r4d_aligned(ws->data, 4) || !r4d_aligned(wr->data, 4) || qp % 4)
-        return R4D_NO(RAD_E_ALIGN);
-    /* The cross-block product and amaxes are the op's scratch (sized by the hook below); a
-     * shorter one is refused. */
-    if (!a->scratch || a->scratch_bytes < mxgg_scratch_bytes(M, nout)) return R4D_NO(RAD_E_SCRATCH);
-    unsigned* cnt = mxgg_out_ctr(q->data);
-    if (!cnt) return R4D_NO(RAD_E_NOMEM);
-
-    if (wide)
-        R4D_TRY("gemm_mxfp4a8_gated_wide",
-            mxggw_launch(ablk, actm, x->data, xs->data, w->data, ws->data, wr->data, q->data, sc->data,
-                         y ? y->data : nullptr, a->scratch, cnt, (int)M, (int)K, (int)nout, (int)as_rs,
-                         (int)lda, (int)N, (int)qp, (int)sp, (int)yp, s));
-    else
-        R4D_TRY("gemm_mxfp4a8_gated",
-            mxgg_launch(ablk, actm, x->data, xs->data, w->data, ws->data, wr->data, q->data, sc->data,
-                        y ? y->data : nullptr, a->scratch, cnt, (int)M, (int)K, (int)nout, (int)as_rs,
-                        (int)lda, (int)N, (int)qp, (int)sp, (int)yp, s));
-    return RAD_OK;
-}
-
-extern "C" int r4d_rad_gemm_mxfp4a8_gated(const RadArgs* a, RadStream s) {
-    return mxgg_entry(a, s, false);
-}
-extern "C" int r4d_rad_gemm_mxfp4a8_gated_wide(const RadArgs* a, RadStream s) {
-    return mxgg_entry(a, s, true);
-}
-
-/* The op's scratch: the product and amaxes at the band's widest M, from N (twice the gated
- * width). */
-static int64_t mxgg_scratch(const RadArgs* a, long long m_hi) {
-    const long long M = r4d_geti_or(a, "M", 0), N = r4d_geti_or(a, "N", 0);
-    if (M < 1 || M > m_hi || N < 256 || N % 256) return 0;
-    return (int64_t)mxgg_scratch_bytes(M, N / 2);
-}
-extern "C" int64_t r4d_rad_gemm_mxfp4a8_gated_scratch(const RadArgs* a) {
-    return mxgg_scratch(a, R4D_MXG_MAX_M);
-}
-extern "C" int64_t r4d_rad_gemm_mxfp4a8_gated_wide_scratch(const RadArgs* a) {
-    return mxgg_scratch(a, R4D_MXG_WMMA_MAX_M);
-}

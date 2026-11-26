@@ -223,8 +223,7 @@ bool stage_src(Ctx* ctx, int group, const RadKVGroupBatch* kvb, int layer, Stage
          * attention then reads a row that is part copy and part stale. The clamp is the
          * memory-safe answer; this is the promise that it is never a silent one. */
         static std::atomic<bool> said{false};
-        bool expected = false;
-        if (said.compare_exchange_strong(expected, true))
+        if (log_once(said))
             RAD_WARN("kvstream: group %d stage runs reach past the host layer's end (%lld of "
                      "%lld bytes): the stage drops what lies past it, and staged attention "
                      "reads stale bytes there (first of possibly many)",

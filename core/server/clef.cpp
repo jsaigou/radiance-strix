@@ -10,7 +10,7 @@
 
 #include "rad_clef.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cmath>

@@ -47,7 +47,7 @@
 #pragma once
 #include "rad_internal.h"
 
-#include <nlohmann/json_fwd.hpp>
+#include "util/json.h"
 
 #include <cstdint>
 #include <string>
@@ -100,6 +100,9 @@ struct ChatFormat {
      * reasoning there; a close with no block open is dropped. Gemma 4 sometimes writes an empty
      * block after its answer, or a lone close. Needs `reasoning_open`. */
     bool        reasoning_anywhere = false;
+    /* A header the model writes first when it answers without reasoning; dropped when the reply
+     * starts with it. Empty: none. */
+    std::string content_open;
 
     /* ------------------------------------------------------------------ tool calls
      * `name_prefix` is what opens a call (after `call_open`, when there is one). Empty means the
@@ -113,7 +116,9 @@ struct ChatFormat {
     std::string call_open, call_close;
     /* "<function=", ">\n". name_suffix may be empty: in the object family the name then ends at
      * the object's `{`; in the tagged family, where name_prefix must open the call (no
-     * call_open), at the first arg_prefix or call_end, which stay part of the call's body. */
+     * call_open), at the first arg_prefix or call_end, which stay part of the call's body. A
+     * suffix of only whitespace is read as that second ending: the name stops at the whitespace
+     * (`<tool_call>NAME\n<arg_key>`, Ling 3.0), which the grammar still writes. */
     std::string name_prefix, name_suffix;
     std::string call_end;                     /* "</function>\n"; may be empty for an object */
 
@@ -185,8 +190,8 @@ std::string chat_format_describe(const ChatFormat& f);
  * the whole reply. Rule names and structure follow the vendored generator, so both produce the
  * same grammar for a template-analysed format. */
 struct ChatGrammarRequest {
-    const nlohmann::ordered_json* tools = nullptr;        /* the request's tools, or null */
-    const nlohmann::ordered_json* json_schema = nullptr;  /* a response format's schema, or null */
+    const Json* tools = nullptr;        /* the request's tools, or null */
+    const Json* json_schema = nullptr;  /* a response format's schema, or null */
     std::string generation_prompt;
     bool        parallel_tool_calls = true;
     bool        extract_reasoning = true;  /* reasoning_format != "none" */
@@ -204,7 +209,7 @@ struct ChatGrammar {
 
 /* A tool the grammar and the reply parser both read, {"type":"function","function":{...}}; both
  * skip any other. */
-bool chat_function_tool(const nlohmann::ordered_json& tool);
+bool chat_function_tool(const Json& tool);
 
 /* RAD_OK, or RAD_E_INVAL with *why when a tool or schema cannot be expressed. */
 int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, ChatGrammar* out,

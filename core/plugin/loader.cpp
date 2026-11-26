@@ -107,7 +107,7 @@ void Registry::err_(const char* f, ...) {
     va_start(ap, f);
     vsnprintf(msg, sizeof msg, f, ap);
     va_end(ap);
-    load_errors_.emplace_back(msg);
+    set_->load_errors.emplace_back(msg);
     RAD_ERR("%s", msg);
 }
 
@@ -185,7 +185,7 @@ void Registry::unstage_(Staged& s) {
 
 /* ------------------------------------------------------------------ registration */
 int Registry::commit_(Staged& s, int order) {
-    for (const Plugin& p : plugins_) {
+    for (const Plugin& p : set_->plugins) {
         if (p.name == s.name) {
             err_("two plugins claim the name '%s': %s and %s -- refusing the second",
                  s.name.c_str(), p.path.c_str(), s.path.c_str());
@@ -206,6 +206,7 @@ int Registry::commit_(Staged& s, int order) {
     p.order        = order;
     p.handle       = s.handle;
     p.close        = dl_fn<RadPluginCloseFn>(s.handle, "rad_plugin_close");
+    p.freed        = dl_fn<RadPluginFreedFn>(s.handle, "rad_plugin_freed");
 
     std::vector<const RadOpSchema*> staged_schemas;
     std::vector<std::pair<const RadKernelInfo*, int>> staged_rows;   /* the row and its index */
@@ -238,6 +239,9 @@ int Registry::commit_(Staged& s, int order) {
         /* Optional: absent means the plugin may serve an imported quantisation (startup.h). */
         if (auto i_fn = dl_fn<int (*)(void)>(s.handle, "rad_arch_serves_imports"))
             p.arch_serves_imports = i_fn() != 0;
+        /* Optional: absent means one engine at a time (rad_engine_claim). */
+        if (auto m_fn = dl_fn<int (*)(void)>(s.handle, "rad_arch_multi_instance"))
+            p.arch_multi_instance = m_fn() != 0;
 
         /* Optional: answers what the core needs before it builds the RadBuildCtx for declare.
          * Absent means every answer is zero (rad_builder.h). */
@@ -265,7 +269,7 @@ int Registry::commit_(Staged& s, int order) {
         /* The (architecture id, quantisation) pair selects the plugin, so no two plugins may claim
          * the same pair (§2.4). Sharing an id at different quantisations is normal (qwen35_bf16
          * and qwen35_fp8). */
-        for (const Plugin& q : plugins_) {
+        for (const Plugin& q : set_->plugins) {
             if (q.arch_id == p.arch_id && q.arch_quant == p.arch_quant) {
                 err_("architecture id '%s' at quantisation '%s' is claimed by both '%s' and '%s' "
                      "-- refusing the second", p.arch_id.c_str(),
@@ -320,8 +324,8 @@ int Registry::commit_(Staged& s, int order) {
                 }
             }
             std::string diff;
-            auto it = schemas_.find(sch->op);
-            if (it != schemas_.end()) {
+            auto it = set_->schemas.find(sch->op);
+            if (it != set_->schemas.end()) {
                 if (!schema_same(*it->second.schema, *sch, &diff)) {
                     /* Disagreeing positional schemas would silently change a call's meaning
                      * (§2.3). The whole plugin is refused, not just the op: it was built against
@@ -424,7 +428,7 @@ int Registry::commit_(Staged& s, int order) {
         int n_device = 0;
         for (const auto& r : staged_rows) n_device += r.first->domain == RAD_DOMAIN_DEVICE;
         std::string why;
-        if (no_device_code_)
+        if (set_->no_device_code)
             why = "no card is visible, so this process runs on the host backend and no GPU code "
                   "object runs here";
         /* The code range decides only the per-card test: on the host backend the rows go even when
@@ -432,15 +436,15 @@ int Registry::commit_(Staged& s, int order) {
          * mapped by another registry). */
         const bool no_code_here =
             n_device > 0 &&
-            (no_device_code_ ||
+            (set_->no_device_code ||
              (s.code_to > s.code_from &&
-              rad::dev_code_runs(s.code_from, s.code_to, code_device_, &why) == 0));
+              rad::dev_code_runs(s.code_from, s.code_to, set_->code_device, &why) == 0));
         if (no_code_here) {
             std::vector<std::pair<const RadKernelInfo*, int>> keep;
             for (const auto& r : staged_rows)
                 if (r.first->domain != RAD_DOMAIN_DEVICE) keep.push_back(r);
             RAD_WARN("kernel plugin '%s' has no device code for device %d: %s. Its %d device "
-                     "kernel(s) are left out of selection here%s.", p.name.c_str(), code_device_,
+                     "kernel(s) are left out of selection here%s.", p.name.c_str(), set_->code_device,
                      why.c_str(), n_device,
                      keep.empty() ? "" : fmt(" and its %zu host kernel(s) stay", keep.size()).c_str());
             staged_rows.swap(keep);
@@ -467,7 +471,7 @@ int Registry::commit_(Staged& s, int order) {
             /* Quantiser names are unique, so a recipe means the same thing whatever the load
              * order. */
             auto clash = [&](const char* other) { return std::strcmp(other, q->name) == 0; };
-            for (const QuantRow& r : quants_)
+            for (const QuantRow& r : set_->quants)
                 if (clash(r.info->name)) {
                     err_("quantiser '%s' is offered by both '%s' and '%s' -- refusing '%s'",
                          q->name, r.plugin.c_str(), p.name.c_str(), p.name.c_str());
@@ -511,9 +515,9 @@ int Registry::commit_(Staged& s, int order) {
      * answers which plugin fixed an op. */
     p.n_schemas = n_declared_schemas;
     p.n_kernels = (int)staged_rows.size();
-    for (const RadOpSchema* sch : staged_schemas) schemas_[sch->op] = SchemaEntry{sch, p.name};
+    for (const RadOpSchema* sch : staged_schemas) set_->schemas[sch->op] = SchemaEntry{sch, p.name};
     for (const RadQuantizerInfo* q : staged_quants) {
-        quants_.push_back(QuantRow{ q, p.name });
+        set_->quants.push_back(QuantRow{ q, p.name });
         /* Register its decoder so every weight reader can decode its schemes. */
         if (q->decode) enc_add_decoder(q->decode);
     }
@@ -534,8 +538,10 @@ int Registry::commit_(Staged& s, int order) {
         row.collective   = coll != 0;
         row.releases_link = coll == 2;
         row.reference    = kern_ref ? kern_ref(sr.second) != 0 : p.reference;
-        row.chain        = chainable && chainable(sr.second) != 0;
-        rows_.push_back(row);
+        const int chains = chainable ? chainable(sr.second) : 0;
+        row.chain        = chains != 0;
+        row.chain_fenced = chains == 2;
+        set_->rows.push_back(row);
     }
 
     /* A library built for another card fails at every launch with an unhelpful driver error;
@@ -545,7 +551,7 @@ int Registry::commit_(Staged& s, int order) {
     if (p.kind == RAD_PLUGIN_KERNEL && s.code_to == s.code_from && !p.build_target.empty() &&
         p.build_target != "host") {
         RadDeviceProps dp{};
-        if (rad_dev_count() > code_device_ && rad_dev_props(code_device_, &dp) == RAD_OK &&
+        if (rad_dev_count() > set_->code_device && rad_dev_props(set_->code_device, &dp) == RAD_OK &&
             dp.arch[0] && !target_covers(p.build_target, dp.arch))
             RAD_WARN("kernel plugin '%s' declares it was built for %s and this machine reports %s. "
                      "Its kernels will fail to launch; build it for %s, or leave it out with "
@@ -556,7 +562,8 @@ int Registry::commit_(Staged& s, int order) {
     RAD_DEBUG("plugin %d: %s %s (%s) -- %d kernels, %d schemas, %zu fat binaries, %s", order,
               p.name.c_str(), p.version.c_str(), p.path.c_str(), p.n_kernels, p.n_schemas,
               s.code_to - s.code_from, p.build_target.empty() ? "portable" : p.build_target.c_str());
-    plugins_.push_back(std::move(p));
+    if (p.freed) rad_dev_on_free(p.freed);
+    set_->plugins.push_back(std::move(p));
     index_rows_();
     s.handle = nullptr;   /* the Plugin owns it now */
     return RAD_OK;
@@ -565,9 +572,9 @@ int Registry::commit_(Staged& s, int order) {
 /* The per-op index select() walks, in (hierarchy order, declaration order). Rebuilt whole on
  * every registration; there are only hundreds of rows, at startup. */
 void Registry::index_rows_() {
-    by_op_.clear();
-    for (const KernelRow& r : rows_) by_op_[r.info->op].push_back(&r);
-    for (auto& kv : by_op_) {
+    set_->by_op.clear();
+    for (const KernelRow& r : set_->rows) set_->by_op[r.info->op].push_back(&r);
+    for (auto& kv : set_->by_op) {
         std::stable_sort(kv.second.begin(), kv.second.end(),
                          [](const KernelRow* a, const KernelRow* b) {
                              if (a->plugin_order != b->plugin_order)
@@ -578,7 +585,17 @@ void Registry::index_rows_() {
 }
 
 /* ------------------------------------------------------------------ the public loading API */
+Registry::Registry() : set_(std::make_shared<Set>()) {}
+
+std::unique_ptr<Registry> Registry::share() const {
+    return std::unique_ptr<Registry>(new Registry(set_));
+}
+
 int Registry::load_plugin(const std::string& path, int order) {
+    if (shared()) {
+        err_("%s: the plugin set is shared by a running engine; it is loaded once, before the first", path.c_str());
+        return RAD_E_STATE;
+    }
     Staged s;
     int st = stage_(path, &s);
     if (st < 0) return st;
@@ -591,6 +608,10 @@ int Registry::load_dir(const std::string& dir, const std::vector<std::string>& h
 
 int Registry::load_dirs(const std::vector<std::string>& dirs,
                         const std::vector<std::string>& hierarchy) {
+    if (shared()) {
+        err_("the plugin set is shared by a running engine; it is loaded once, before the first");
+        return RAD_E_STATE;
+    }
     int first_error = RAD_OK;
 
     /* Directories in the given order, files in filename order, so an unconfigured set loads
@@ -706,7 +727,7 @@ int Registry::load_dirs(const std::vector<std::string>& dirs,
     /* Continue from what is already loaded, so loading kernels/ then architectures/ does not put
      * two plugins at position 0. */
     int order = 0;
-    for (const Plugin& p : plugins_) order = std::max(order, p.order + 1);
+    for (const Plugin& p : set_->plugins) order = std::max(order, p.order + 1);
 
     for (size_t i : idx) {
         int st = commit_(staged[i], order);
@@ -726,11 +747,11 @@ int Registry::load_dirs(const std::vector<std::string>& dirs,
 /* ------------------------------------------------------------------ the tuning cache (§15) */
 int Registry::load_tune(const std::string& radiance_home, const std::string& machine) {
     const std::string key = machine.empty() ? rad_machine_key() : machine;
-    const int s = tune_.load(radiance_home, key);
+    const int s = set_->tune.load(radiance_home, key);
     if (s < 0) return s;
     /* `load` refuses a file whose machine key (line 2, tunecache.h) is another machine's, so
      * these rows are this machine's. */
-    return (int)tune_.rows().size();
+    return (int)set_->tune.rows().size();
 }
 
 /* A row whose op has no schema in the loaded set cannot have its parameters checked, so a typo
@@ -738,8 +759,8 @@ int Registry::load_tune(const std::string& radiance_home, const std::string& mac
  * rely on the schema of a plugin below it, which loads later. */
 int Registry::check_complete() {
     int st = RAD_OK;
-    for (const KernelRow& r : rows_) {
-        if (schemas_.find(r.info->op) == schemas_.end()) {
+    for (const KernelRow& r : set_->rows) {
+        if (set_->schemas.find(r.info->op) == set_->schemas.end()) {
             err_("kernel '%s' in plugin '%s' implements op '%s', which no loaded plugin declares a "
                  "schema for", r.info->name, r.plugin.c_str(), r.info->op);
             st = RAD_E_NOSCHEMA;
@@ -750,38 +771,46 @@ int Registry::check_complete() {
 
 /* ------------------------------------------------------------------ lookup and teardown */
 const Plugin* Registry::plugin(std::string_view name) const {
-    for (const Plugin& p : plugins_)
+    for (const Plugin& p : set_->plugins)
         if (p.name == name || p.file == name) return &p;
     return nullptr;
 }
 
 const Registry::QuantRow* Registry::quantizer(std::string_view name) const {
-    for (const QuantRow& q : quants_)
+    for (const QuantRow& q : set_->quants)
         if (name == q.info->name) return &q;
     return nullptr;
 }
 
 const std::vector<const KernelRow*>* Registry::rows_for(std::string_view op) const {
-    auto it = by_op_.find(std::string(op));
-    return it == by_op_.end() ? nullptr : &it->second;
+    auto it = set_->by_op.find(std::string(op));
+    return it == set_->by_op.end() ? nullptr : &it->second;
 }
 
 void Registry::close() {
     fini_instances();
-    for (const QuantRow& q : quants_)
+    clear_selections();
+    device_facts_ = Geometry{};
+    /* Another registry still selects from the set: leave it loaded and take an empty one. Engines
+     * are created and destroyed by one thread (the fleet), so the count cannot race a share(). */
+    if (shared()) {
+        set_ = std::make_shared<Set>();
+        return;
+    }
+    for (const QuantRow& q : set_->quants)
         if (q.info && q.info->decode) enc_remove_decoder(q.info->decode);
     /* Reverse load order: a later plugin may depend on state an earlier one established. */
-    for (auto it = plugins_.rbegin(); it != plugins_.rend(); ++it) {
+    for (auto it = set_->plugins.rbegin(); it != set_->plugins.rend(); ++it) {
+        if (it->freed) rad_dev_off_free(it->freed);
         if (it->close) it->close();
         if (it->handle) dlclose(it->handle);
     }
-    plugins_.clear();
-    rows_.clear();
-    quants_.clear();
-    by_op_.clear();
-    schemas_.clear();
-    load_errors_.clear();
-    clear_selections();
+    set_->plugins.clear();
+    set_->rows.clear();
+    set_->quants.clear();
+    set_->by_op.clear();
+    set_->schemas.clear();
+    set_->load_errors.clear();
 }
 
 Registry::~Registry() { close(); }

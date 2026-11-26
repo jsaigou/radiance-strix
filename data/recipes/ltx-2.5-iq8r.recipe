@@ -1,0 +1,39 @@
+# ltx-2.5-iq8r.recipe -- LTX-2.5 (the base or the distilled DiT) with IQ8R linears.
+#
+#   rad-convert <LTX-2.5 diffusers pipeline directory> --recipe data/recipes/ltx-2.5-iq8r.recipe \
+#       -o ltx-2.5-iq8r.rad
+#
+# Every linear of the text encoder (Gemma 4), of the two connectors and of the DiT's 48 blocks
+# becomes rotated int8: codes in -127..127 in the 128-wide Hadamard domain with a u8 scale per
+# [1 x 256] of K under a bf16 scale a row, read at i8a8h against int8 activations quantised under
+# the same rotation with one scale per (row, 256); the biases stay bf16 and are added after. Round
+# to nearest with a scale search; no calibration data is read. What stays bf16 is small or read
+# once a step: the attention gates' logits, the q and k norms, the patch projections, the timestep
+# MLPs and the tables, the connectors' registers, both VAEs and the latent upsampler. The vocoders
+# are cast to f32, which their convolutions and anti-aliased activations run in (a pipeline saved
+# in bf16 holds them bf16); the spectrogram bases stay bf16.
+
+te.blk.*.attn_q.weight               rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.attn_k.weight               rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.attn_v.weight               rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.attn_output.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.ffn_gate_up.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.ffn_down.weight             rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+conn.*.proj.weight                   rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+conn.*.blk.*.qkv.weight              rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+conn.*.blk.*.out.weight              rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+conn.*.blk.*.ff_up.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+conn.*.blk.*.ff_down.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dit.blk.*.qkv.weight                 rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dit.blk.*.q.weight                   rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dit.blk.*.kv.weight                  rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dit.blk.*.out.weight                 rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dit.blk.*.ff_up.weight               rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dit.blk.*.ff_down.weight             rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dit.blk.*.audio_ff_up.weight         rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dit.blk.*.audio_ff_down.weight       rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+voc.conv_*                           cast dtype=f32
+voc.upsamplers.*                     cast dtype=f32
+voc.resnets.*                        cast dtype=f32
+voc.act_out.*                        cast dtype=f32
+bwe.*                                cast dtype=f32

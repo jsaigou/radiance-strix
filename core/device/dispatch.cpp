@@ -7,6 +7,7 @@
  * with ROCm headers and no /dev/kfd); the chosen backend is logged at Info.
  */
 #include "device.h"
+#include "directio.h"
 #include "../rad_internal.h"
 
 #include <algorithm>
@@ -18,10 +19,18 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <string>
 #include <utility>
+#include <vector>
+#include <thread>
+#include <chrono>
 #include <cstdint>
+#include <unistd.h>
+
+/* The device rad_dev_set last bound on this thread. */
+static thread_local int t_device = 0;
 
 namespace rad {
 
@@ -147,23 +156,42 @@ Ledger g_ledger[4];        /* indexed by RAD_MEM_*; rad_dev_alloc bounds the kin
 /* Each live allocation's size, so rad_dev_free (which has none) takes it back off the ledger's
  * bytes: pinned ranges are freed and taken again during bring-up, and the pin-cap check reads the
  * ledger as what the process holds. Allocations are rare, never per step. */
-struct LiveAlloc { int64_t bytes; int kind; };
+struct LiveAlloc { int64_t bytes; int kind; int owner; int device; };
+/* Device bytes each engine holds on each card (dev_owner_bytes): its rad_dev_alloc allocations and
+ * its elastic ranges' backing. */
+std::mutex                               g_owner_mu;
+std::map<std::pair<int, int>, int64_t>   g_owner_bytes;
+void owner_add(int owner, int device, int64_t n) {
+    if (owner <= 0 || n == 0) return;
+    std::lock_guard<std::mutex> lk(g_owner_mu);
+    g_owner_bytes[{ owner, device }] += n;
+}
 std::mutex                           g_ledger_mu;
 std::unordered_map<void*, LiveAlloc> g_ledger_live;
 
-void ledger_add(void* p, int64_t bytes, int kind) {
+void ledger_add(void* p, int64_t bytes, int kind, int owner, int device) {
     g_ledger[kind].bytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (kind == RAD_MEM_DEVICE) owner_add(owner, device, bytes);
     std::lock_guard<std::mutex> lk(g_ledger_mu);
-    g_ledger_live[p] = LiveAlloc{ bytes, kind };
+    g_ledger_live[p] = LiveAlloc{ bytes, kind, owner, device };
 }
-void ledger_drop(void* p) {
-    if (!p) return;
+/* The allocation's bytes, or 0 when the ledger does not know it. */
+int64_t ledger_drop(void* p) {
+    if (!p) return 0;
     std::lock_guard<std::mutex> lk(g_ledger_mu);
     const auto it = g_ledger_live.find(p);
-    if (it == g_ledger_live.end()) return;
-    g_ledger[it->second.kind].bytes.fetch_sub(it->second.bytes, std::memory_order_relaxed);
+    if (it == g_ledger_live.end()) return 0;
+    const int64_t bytes = it->second.bytes;
+    g_ledger[it->second.kind].bytes.fetch_sub(bytes, std::memory_order_relaxed);
+    if (it->second.kind == RAD_MEM_DEVICE) owner_add(it->second.owner, it->second.device, -bytes);
     g_ledger_live.erase(it);
+    return bytes;
 }
+
+/* rad_dev_on_free's hooks and how many registrations each has. Registered at plugin load and
+ * read on every device free, which holds the lock shared while it calls them. */
+std::shared_mutex                                                 g_free_hooks_mu;
+std::vector<std::pair<void (*)(const void*, int64_t), int>>       g_free_hooks;
 
 /* Live event handles, counted here so the number is backend-independent; the only place an
  * event leaked at teardown shows. */
@@ -224,6 +252,24 @@ const char* kind_name(int kind) {
 
 }  /* namespace */
 
+void rad_dev_on_free(void (*fn)(const void* base, int64_t bytes)) {
+    if (!fn) return;
+    std::unique_lock<std::shared_mutex> lk(g_free_hooks_mu);
+    for (auto& h : g_free_hooks)
+        if (h.first == fn) { ++h.second; return; }
+    g_free_hooks.push_back({ fn, 1 });
+}
+
+void rad_dev_off_free(void (*fn)(const void* base, int64_t bytes)) {
+    if (!fn) return;
+    std::unique_lock<std::shared_mutex> lk(g_free_hooks_mu);
+    for (auto it = g_free_hooks.begin(); it != g_free_hooks.end(); ++it)
+        if (it->first == fn) {
+            if (--it->second == 0) g_free_hooks.erase(it);
+            return;
+        }
+}
+
 void rad_dev_alloc_totals(int kind, int64_t* bytes, int64_t* count) {
     if (kind < 0 || kind >= (int)std::size(g_ledger)) {
         if (bytes) *bytes = 0;
@@ -243,7 +289,18 @@ int64_t rad_dev_host_blocks(void) { return g_host_blocks.load(std::memory_order_
 
 namespace {
 std::atomic<int64_t> g_vmem_committed{0};
+
+/* Elastic ranges (VMem) reserved on a thread working for an engine are filed under it, so its
+ * park (paging.cpp) finds them. */
+std::mutex                 g_page_mu;
+std::map<VMem*, int>       g_vmem_owner;
 }  /* namespace */
+
+static int vmem_owner_of(const VMem* v) {
+    std::lock_guard<std::mutex> lk(g_page_mu);
+    auto it = g_vmem_owner.find(const_cast<VMem*>(v));
+    return it == g_vmem_owner.end() ? 0 : it->second;
+}
 
 int64_t rad_dev_vmem_committed(void) { return g_vmem_committed.load(std::memory_order_relaxed); }
 
@@ -274,18 +331,34 @@ int VMem::reserve(int64_t bytes, int64_t align) {
     size_ = want;
     committed_ = 0;
     ext_.clear();
+    device_ = t_device;
+    if (const int owner = engine_owner(); owner > 0) {
+        std::lock_guard<std::mutex> lk(g_page_mu);
+        g_vmem_owner[this] = owner;
+    }
     return RAD_OK;
 }
 
+void VMem::rekey(VMem* from, VMem* to) {
+    std::lock_guard<std::mutex> lk(g_page_mu);
+    auto it = g_vmem_owner.find(from);
+    if (it == g_vmem_owner.end()) return;
+    const int owner = it->second;
+    g_vmem_owner.erase(it);
+    if (to) g_vmem_owner[to] = owner;
+}
+
 void VMem::release() {
+    owner_add(vmem_owner_of(this), device_, -committed_);
+    rekey(this, nullptr);
+    copy_.release();
+    parked_.clear();
     if (!base_) { size_ = 0; committed_ = 0; ext_.clear(); return; }
     /* Decommit before release: releasing a range with pages still mapped leaks them, and some
-     * drivers refuse the free. One granule at a time, as each was mapped. */
-    const int64_t g = granularity();
+     * drivers refuse the free. An extent is a run of whole mappings (one a granule), so it goes in
+     * one unmap. */
     for (const auto& e : ext_) {
-        if (dev()->vmem_decommit && g > 0)
-            for (int64_t o = e.first; o < e.first + e.second; o += g)
-                (void)dev()->vmem_decommit((char*)base_ + o, g);
+        if (dev()->vmem_decommit) (void)dev()->vmem_decommit((char*)base_ + e.first, e.second);
         g_vmem_committed.fetch_sub(e.second, std::memory_order_relaxed);
     }
     if (dev()->vmem_release) dev()->vmem_release(base_, size_);
@@ -293,6 +366,22 @@ void VMem::release() {
     size_ = 0;
     committed_ = 0;
     ext_.clear();
+}
+
+int64_t VMem::committed_bytes(int64_t off, int64_t bytes) const {
+    if (off < 0 || bytes <= 0 || off > size_ || bytes > size_ - off) return 0;
+    const int64_t end = off + bytes;
+    int64_t total = 0;
+    for (const auto& extent : ext_)
+        total += std::max<int64_t>(0, std::min(end, extent.first + extent.second) -
+                                      std::max(off, extent.first));
+    return total;
+}
+
+int64_t VMem::committed_suffix() const {
+    if (ext_.empty()) return 0;
+    const auto& last = ext_.back();
+    return last.first + last.second == size_ ? last.second : 0;
 }
 
 bool VMem::is_committed(int64_t off, int64_t bytes) const {
@@ -311,6 +400,23 @@ bool VMem::is_committed(int64_t off, int64_t bytes) const {
  *   - Access cannot be granted per granule: a granule adjacent to an accessible one is refused on
  *     its own. Access is granted once per merged extent the new granules belong to; re-granting
  *     access to a range is free. */
+namespace {
+thread_local int  t_map_batch = 0;
+thread_local bool t_map_due = false;
+}
+
+MapBatch::MapBatch() { ++t_map_batch; }
+
+MapBatch::~MapBatch() { (void)end(); }
+
+int MapBatch::end() {
+    if (ended_) return RAD_OK;
+    ended_ = true;
+    if (--t_map_batch > 0 || !t_map_due) return RAD_OK;
+    t_map_due = false;
+    return dev_settle_maps();
+}
+
 int VMem::commit(int64_t off, int64_t bytes) {
     if (!base_ || bytes <= 0) return bytes <= 0 ? RAD_OK : RAD_E_INVAL;
     const int64_t g = granularity();
@@ -328,13 +434,27 @@ int VMem::commit(int64_t off, int64_t bytes) {
     if (want.empty()) return RAD_OK;
 
     /* On a failure part way, what already mapped stays mapped and recorded: a partial grow is
-     * usable, untracked mappings are not. */
+     * usable, untracked mappings are not. A contiguous run goes in one call; one that fails (the
+     * card lacks room for all of it) is backed a granule at a time, so it grows by what fits.
+     * `took`: the granules of `want` backed, a prefix of it. */
     int rc = RAD_OK;
     size_t took = 0;
-    for (; took < want.size(); ++took) {
-        rc = dev()->vmem_commit((char*)base_ + want[took], g);
-        if (rc < 0) break;
-        add_extent(want[took], g);
+    while (took < want.size() && rc >= 0) {
+        size_t j = took + 1;
+        while (j < want.size() && want[j] == want[j - 1] + g) ++j;
+        const int64_t run = (int64_t)(j - took) * g;
+        if (j - took > 1 && dev()->vmem_commit_units &&
+            dev()->vmem_commit_units((char*)base_ + want[took], run, g) >= 0) {
+            add_extent(want[took], run);
+            took = j;
+            continue;
+        }
+        for (; took < j; ++took) {
+            rc = dev()->vmem_commit((char*)base_ + want[took], g);
+            if (rc < 0) break;
+            rc = RAD_OK;   /* recycled memory (1) is fine here: a pool's contents are written before they are read */
+            add_extent(want[took], g);
+        }
     }
 
     /* Grant access even if the grow stopped short, so the granules that did map are usable. */
@@ -355,6 +475,10 @@ int VMem::commit(int64_t off, int64_t bytes) {
         }
         return prc;
     }
+    if (took > 0) {
+        if (t_map_batch > 0) t_map_due = true;
+        else if (const int src = dev_settle_maps(); src < 0) return src;
+    }
     return rc;
 }
 
@@ -368,20 +492,30 @@ int VMem::decommit(int64_t off, int64_t bytes) {
     if (hi > size_) hi = size_;
     if (lo >= hi) return RAD_OK;
 
-    /* Gathered first and unmapped per granule, as in commit. */
+    /* Gathered first; each contiguous run of granules (a mapping each) goes in one unmap. */
     std::vector<int64_t> drop;
     for (int64_t o = lo; o < hi; o += g)
         if (is_committed(o, g)) drop.push_back(o);
 
-    for (const int64_t o : drop) {
-        const int rc = dev()->vmem_decommit((char*)base_ + o, g);
-        if (rc < 0) return rc;
-        drop_extent(o, g);
+    for (size_t i = 0; i < drop.size();) {
+        size_t j = i + 1;
+        while (j < drop.size() && drop[j] == drop[j - 1] + g) ++j;
+        const int64_t run = (int64_t)(j - i) * g;
+        if (const int rc = dev()->vmem_decommit((char*)base_ + drop[i], run); rc < 0) return rc;
+        drop_extent(drop[i], run);
+        i = j;
     }
     return RAD_OK;
 }
 
+int64_t dev_owner_bytes(int owner, int device) {
+    std::lock_guard<std::mutex> lk(g_owner_mu);
+    auto it = g_owner_bytes.find({ owner, device });
+    return it == g_owner_bytes.end() ? 0 : it->second;
+}
+
 void VMem::add_extent(int64_t off, int64_t bytes) {
+    owner_add(vmem_owner_of(this), device_, bytes);
     committed_ += bytes;
     g_vmem_committed.fetch_add(bytes, std::memory_order_relaxed);
     /* Insert in order, then merge touching neighbours, so is_committed() stays a short scan
@@ -401,9 +535,215 @@ void VMem::add_extent(int64_t off, int64_t bytes) {
     }
 }
 
+int64_t VMem::page_out(RadStream s, bool discard) {
+    if (!base_ || ext_.empty() || !parked_.empty()) return 0;
+    int64_t total = 0;
+    for (const auto& e : ext_) total += e.second;
+    if (discard) {
+        /* Nothing in the range is kept: back it again on page_in with whatever the pages hold. */
+        parked_ = ext_;
+        discarded_ = true;
+        for (const auto& e : parked_)
+            if (const int rc = decommit(e.first, e.second); rc < 0) return rc;
+        return 0;
+    }
+    discarded_ = false;
+    if (const int rc = copy_.alloc(total); rc < 0) return rc;
+    int64_t at = 0;
+    for (const auto& e : ext_) {
+        if (const int rc = rad_memcpy_async((char*)copy_.host + at, (char*)base_ + e.first, e.second, s); rc < 0)
+            return rc;
+        at += e.second;
+    }
+    if (const int rc = rad_stream_sync(s); rc < 0) return rc;
+    parked_ = ext_;
+    for (const auto& e : parked_)
+        if (const int rc = decommit(e.first, e.second); rc < 0) return rc;
+    return total;
+}
+
+int dev_current() { return t_device; }
+
+int64_t dev_vmem_trim(int device) {
+    return dev()->vmem_trim ? dev()->vmem_trim(device) : 0;
+}
+
+void dev_stream_counts(int device, int* open, int* idle) {
+    if (open) *open = 0;
+    if (idle) *idle = 0;
+    if (dev()->stream_counts) dev()->stream_counts(device, open, idle);
+}
+
+int dev_stream_trim(int device, int keep) {
+    return dev()->stream_trim ? dev()->stream_trim(device, keep) : 0;
+}
+
+std::string dev_page_where(uintptr_t a);
+
+std::string dev_fault_where(const void* p) {
+    const uintptr_t a = (uintptr_t)p;
+    std::string s = dev_page_where(a);
+    std::unique_lock<std::mutex> lk(g_page_mu, std::try_to_lock);
+    if (!lk.owns_lock()) return s;
+    for (const auto& [v, owner] : g_vmem_owner) {
+        const uintptr_t b = (uintptr_t)v->base();
+        if (!b || a < b || a >= b + (uintptr_t)v->size()) continue;
+        const int64_t off = (int64_t)(a - b), g = std::max<int64_t>(VMem::granularity(), 1);
+        return (s.empty() ? s : s + "; ") + fmt("elastic reservation of owner %d card %d, %s long, %s backed, +%s %s", owner, v->device(),
+                   humanb(v->size()).c_str(), humanb(v->committed()).c_str(), humanb(off).c_str(),
+                   v->is_committed(off / g * g, g) ? "is backed" : "is NOT backed");
+    }
+    return s;
+}
+
+int dev_settle_maps() {
+    if (device_is_host()) return RAD_OK;
+    void* x = dev()->alloc(4096, RAD_MEM_HOST_PINNED);
+    if (!x) {
+        device_set_error("vmem: no page of pinned host memory to flush the cards' translations with");
+        return RAD_E_NOMEM;
+    }
+    dev()->free(x, RAD_MEM_HOST_PINNED);
+    return RAD_OK;
+}
+
+int VMem::page_in(RadStream s) {
+    if (parked_.empty()) return RAD_OK;
+    MapBatch maps;
+    if (discarded_) {
+        for (const auto& e : parked_)
+            if (const int rc = commit(e.first, e.second); rc < 0) return rc;
+        if (const int rc = maps.end(); rc < 0) return rc;
+        parked_.clear();
+        discarded_ = false;
+        return RAD_OK;
+    }
+    if (const int rc = copy_.load(); rc < 0) return rc;
+    for (const auto& e : parked_)
+        if (const int rc = commit(e.first, e.second); rc < 0) return rc;
+    if (const int rc = maps.end(); rc < 0) return rc;
+    int64_t at = 0;
+    for (const auto& e : parked_) {
+        if (const int rc = rad_memcpy_async((char*)base_ + e.first, (char*)copy_.host + at, e.second, s); rc < 0)
+            return rc;
+        at += e.second;
+    }
+    if (const int rc = rad_stream_sync(s); rc < 0) return rc;
+    parked_.clear();
+    copy_.release();
+    return RAD_OK;
+}
+
+/* ---- HostCopy */
+
+namespace {
+std::atomic<uint64_t> g_copy_seq{0};
+/* The unit of a copy's file I/O: what one write asks the gate about, what one reader takes. */
+constexpr int64_t kCopyPiece = (int64_t)64 << 20;
+}
+
+int HostCopy::alloc(int64_t n) {
+    release();
+    bytes = n;
+    host = rad_dev_alloc(align_up(n, DirectFile::alignment()), RAD_MEM_HOST_PINNED);
+    if (!host) {
+        device_set_error("parking: no pinned host memory for %s", humanb(n).c_str());
+        return RAD_E_NOMEM;
+    }
+    return RAD_OK;
+}
+
+int HostCopy::spill(const std::string& dir, const std::function<int()>& gate) {
+    if (on_disk || !host || bytes <= 0) return RAD_OK;
+    /* Not the page files' name: their counter is another one (paging.cpp). */
+    const std::string path = dir + "/radiance-vmem-" + std::to_string((long long)getpid()) + "-" +
+                             std::to_string((unsigned long long)g_copy_seq.fetch_add(1)) + ".bin";
+    DirectFile f;
+    if (const int rc = f.open(path.c_str(), RAD_DIO_WRITE | RAD_DIO_CREATE | RAD_DIO_TRUNC); rc < 0)
+        return rc;
+    const int64_t n = align_up(bytes, DirectFile::alignment());
+    int rc = RAD_OK;
+    for (int64_t at = 0; at < n; at += kCopyPiece) {
+        int g = gate ? gate() : 0;
+        while (g == 1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            g = gate();
+        }
+        if (g < 0) { rc = RAD_E_STATE; break; }
+        if ((rc = f.write_at((const char*)host + at, at, std::min(kCopyPiece, n - at))) < 0) break;
+    }
+    f.close();
+    if (rc < 0) {
+        ::unlink(path.c_str());
+        return rc;
+    }
+    file = path;
+    on_disk = true;
+    return RAD_OK;
+}
+
+void HostCopy::drop_host() {
+    if (!on_disk || !host) return;
+    rad_dev_free(host, RAD_MEM_HOST_PINNED);
+    host = nullptr;
+}
+
+int HostCopy::load() {
+    if (host) return RAD_OK;
+    if (!on_disk) {
+        device_set_error("parking: a copy has neither host memory nor a file");
+        return RAD_E_STATE;
+    }
+    const int64_t n = align_up(bytes, DirectFile::alignment());
+    host = rad_dev_alloc(n, RAD_MEM_HOST_PINNED);
+    if (!host) {
+        device_set_error("parking: no pinned host memory to read %s back", humanb(bytes).c_str());
+        return RAD_E_NOMEM;
+    }
+    /* A read that fails leaves no host memory behind, so the next load() reads again instead of
+     * taking a partial copy as the copy. */
+    auto fail = [&](int rc) {
+        rad_dev_free(host, RAD_MEM_HOST_PINNED);
+        host = nullptr;
+        return rc;
+    };
+    DirectFile f;
+    if (const int rc = f.open(file.c_str(), RAD_DIO_READ); rc < 0) return fail(rc);
+    /* Four readers over the file: one stream of O_DIRECT reads leaves an NVMe drive half idle. */
+    std::atomic<int64_t> next{0};
+    std::atomic<int> err{RAD_OK};
+    auto reader = [&] {
+        DirectFile g;
+        if (g.open(file.c_str(), RAD_DIO_READ) < 0) { err.store(RAD_E_IO); return; }
+        for (;;) {
+            const int64_t at = next.fetch_add(kCopyPiece);
+            if (at >= n || err.load() < 0) return;
+            if (g.read_at((char*)host + at, at, std::min(kCopyPiece, n - at)) < 0) { err.store(RAD_E_IO); return; }
+        }
+    };
+    std::vector<std::thread> th;
+    for (int i = 0; i < 4; ++i) th.emplace_back(reader);
+    for (auto& t : th) t.join();
+    if (err.load() < 0) {
+        device_set_error("parking: reading %s back failed", file.c_str());
+        return fail(err.load());
+    }
+    return RAD_OK;
+}
+
+void HostCopy::release() {
+    if (host) rad_dev_free(host, RAD_MEM_HOST_PINNED);
+    host = nullptr;
+    if (!file.empty()) ::unlink(file.c_str());
+    file.clear();
+    on_disk = false;
+    bytes = 0;
+}
+
 /* Precondition: the piece lies wholly inside one extent (decommit only drops committed granules).
  * What remains of that extent is nothing, a head, a tail, or both. */
 void VMem::drop_extent(int64_t off, int64_t bytes) {
+    owner_add(vmem_owner_of(this), device_, -bytes);
     committed_ -= bytes;
     g_vmem_committed.fetch_sub(bytes, std::memory_order_relaxed);
     for (size_t i = 0; i < ext_.size(); ++i) {
@@ -416,6 +756,16 @@ void VMem::drop_extent(int64_t off, int64_t bytes) {
     }
 }
 
+const DeviceBackend* active_backend() { return dev(); }
+
+std::vector<VMem*> vmems_of(int owner) {
+    std::vector<VMem*> v;
+    std::lock_guard<std::mutex> lk(g_page_mu);
+    for (auto& [m, o] : g_vmem_owner)
+        if (o == owner) v.push_back(m);
+    return v;
+}
+
 }  /* namespace rad */
 
 /* ------------------------------------------------------------------ the ABI surface */
@@ -425,8 +775,7 @@ using rad::dev;
 extern "C" {
 
 int  rad_dev_count(void)                          { return dev()->count(); }
-/* The device this thread last selected, for the poison fill's stream (rad_dev_alloc). */
-static thread_local int t_device = 0;
+/* This thread's stream for the poison fill (rad_dev_alloc), one per device. */
 static thread_local std::map<int, RadStream> t_poison_stream;
 int  rad_dev_set(int device) {
     const int st = dev()->set(device);
@@ -440,9 +789,16 @@ void* rad_dev_alloc(int64_t bytes, int kind) {
     /* Poison ordinals are per thread: each rank allocates in a fixed order on its own thread, but
      * threads interleave, so a process-wide ordinal would not be repeatable. */
     thread_local int64_t t_device_ordinal = 0;
-    void* p = dev()->alloc(bytes, kind);
+    void* p = nullptr;
+    const int owner = rad::engine_owner();
+    /* A large device allocation for an engine is mapped in chunks it can be parked by
+     * (paging.cpp). Where the backend has no virtual memory manager it is an ordinary allocation,
+     * and the model parks only by unloading. */
+    if (kind == RAD_MEM_DEVICE && bytes >= rad::kPageMin && owner > 0 && rad::VMem::supported())
+        p = rad::page_alloc(bytes, owner, t_device);
+    if (!p) p = dev()->alloc(bytes, kind);
     if (p && kind >= 0 && kind < (int)std::size(rad::g_ledger)) {
-        rad::ledger_add(p, bytes, kind);
+        rad::ledger_add(p, bytes, kind, owner, t_device);
         const int64_t total = rad::g_ledger[kind].count.fetch_add(1, std::memory_order_relaxed) + 1;
         const int64_t ordinal = kind == RAD_MEM_DEVICE ? ++t_device_ordinal : total;
         const int64_t floor_ = rad::trace_floor();
@@ -468,8 +824,13 @@ void* rad_dev_alloc(int64_t bytes, int kind) {
     return p;
 }
 void  rad_dev_free(void* p, int kind) {
-    rad::ledger_drop(p);
-    dev()->free(p, kind);
+    const int64_t bytes = rad::ledger_drop(p);
+    if (!(p && kind == RAD_MEM_DEVICE && rad::page_free(p))) dev()->free(p, kind);
+    /* Kernel libraries drop state they keep for addresses in the freed range (rad_plugin_freed). */
+    if (p && bytes > 0 && kind == RAD_MEM_DEVICE) {
+        std::shared_lock<std::shared_mutex> lk(rad::g_free_hooks_mu);
+        for (const auto& h : rad::g_free_hooks) h.first(p, bytes);
+    }
 }
 void* rad_dev_host_ptr(void* p)                   { return dev()->host_ptr(p); }
 void* rad_dev_device_ptr(void* p)                 { return dev()->device_ptr(p); }
@@ -529,6 +890,9 @@ std::string dev_pci_address(int device) {
     if (!dev()->pci_address) return std::string();
     return dev_string(64, [&](char* b, int n) { return dev()->pci_address(device, b, n); });
 }
+std::atomic<int64_t> dev_stuck_exit_ms{60000};
+std::atomic<bool> dev_engine_ready{false};
+std::atomic<int> dev_pinned_numa_node{-1};
 int64_t dev_stuck_ms() {
     const auto f = dev()->stuck_ms;
     return f ? f() : 0;
@@ -587,26 +951,57 @@ int  rad_event_sync(RadEvent e) {
 }
 void rad_dev_host_wrote(void)                     { dev()->host_wrote(); }
 
-/* Whether launches chain, from the engine (rad_dev_chain_infer), and the answer once taken. Only
- * where the backend chains: the AQL backend writes the record a chained form reads, while a HIP
- * launch carries only the kernel's own arguments. */
-static std::atomic<int> g_chain_pays{0};
-static std::atomic<int> g_chain{-1};
+/* The VRAM the runtime keeps as queue scratch on `p`'s card once kernels with a private segment
+ * (spill, or a local array: step_advance's) have been dispatched: the runtime hands a queue
+ * scratch memory at the first such dispatch, and the card showed +114 MiB after the first
+ * speculative step and kept it, 150 MiB with a larger segment. Left out of the budget, it is
+ * taken from the margin: serving ran with 27-65 MiB of a card free. 5 MiB a CU (the R9700 reports
+ * 32), 160 MiB, over the measured. */
+extern "C" int64_t rad_dev_resident_scratch_bytes(const RadDeviceProps* p) {
+    if (!p || p->is_host_backend || p->unified) return 0;
+    return (int64_t)p->n_cu * (5LL * 1024 * 1024);
+}
+
+/* Whether launches chain, by engine: rad_dev_chain_infer on a thread of an engine (EngineScope)
+ * records that engine's answer and rad_dev_chain_enabled on any of its threads reads it. A process
+ * serves several models, each with its own plugin's answer; a single answer for the process was
+ * the answer of whichever model started last. Owner 0 is a thread outside every engine (a tool, a
+ * test). Only where the backend chains: the AQL backend writes the record a chained form reads,
+ * while a HIP launch carries only the kernel's own arguments. The answer is 2 where every chained
+ * form the engine can launch fences itself (RadKernelChainFn saying 2), which
+ * rad_dev_chain_unfenced reads. */
+static std::mutex              g_chain_mu;
+static std::map<int, int>      g_chain_pays;    /* by owner: 0, 1, or 2 (their packets unacquired) */
+static std::atomic<uint64_t>   g_chain_gen{1};
 void rad_dev_chain_infer(int pays) {
-    g_chain_pays.store(pays ? 1 : 0, std::memory_order_relaxed);
-    g_chain.store(-1, std::memory_order_relaxed);
-}
-int rad_dev_chain_enabled(void) {
-    int on = g_chain.load(std::memory_order_relaxed);
-    if (on < 0) {
-        on = g_chain_pays.load(std::memory_order_relaxed) != 0 &&
-                     std::strcmp(rad::device_backend_name(), "aql") == 0
-                 ? 1
-                 : 0;
-        g_chain.store(on, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(g_chain_mu);
+        g_chain_pays[rad::engine_owner()] = pays == 2 ? 2 : pays ? 1 : 0;
     }
-    return on;
+    g_chain_gen.fetch_add(1, std::memory_order_release);
 }
+/* The calling thread's engine's answer where the backend chains, else 0: asked on every launch,
+ * so a thread keeps it until some answer changes. */
+static int chain_mode() {
+    thread_local uint64_t seen = 0;
+    thread_local int      owner = -1, mode = 0;
+    const uint64_t gen = g_chain_gen.load(std::memory_order_acquire);
+    const int      o = rad::engine_owner();
+    if (seen != gen || owner != o) {
+        int pays = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_chain_mu);
+            const auto it = g_chain_pays.find(o);
+            if (it != g_chain_pays.end()) pays = it->second;
+        }
+        mode = pays && std::strcmp(rad::device_backend_name(), "aql") == 0 ? pays : 0;
+        seen = gen;
+        owner = o;
+    }
+    return mode;
+}
+int rad_dev_chain_enabled(void)  { return chain_mode() != 0; }
+int rad_dev_chain_unfenced(void) { return chain_mode() == 2; }
 
 int  rad_event_elapsed_ms(RadEvent a, RadEvent b, float* out) {
     return dev()->event_elapsed_ms(a, b, out);
@@ -642,6 +1037,14 @@ int rad_link_hold(RadStream s, int on) {
 void* rad_link_gate(RadStream s) {
     if (const auto f = dev()->link_gate) return f(s);
     return nullptr;
+}
+void rad_dev_peer_launch(int on) {
+    if (const auto f = dev()->peer_launch) f(on);
+}
+int rad_dev_cards_claim(const int* cards, int n, int on) {
+    if (!cards || n <= 0) return RAD_E_INVAL;
+    if (const auto f = dev()->cards_claim) return f(cards, n, on);
+    return RAD_OK;
 }
 int rad_xp_supported(int device) {
     const auto* d = dev();
@@ -685,7 +1088,7 @@ void* rad_dev_map_file(int fd, int64_t foff, int64_t bytes) {
     }
     void* p = f(fd, foff, bytes);
     if (p) {
-        rad::ledger_add(p, bytes, RAD_MEM_HOST_MAPPED);
+        rad::ledger_add(p, bytes, RAD_MEM_HOST_MAPPED, 0, t_device);
         rad::g_ledger[RAD_MEM_HOST_MAPPED].count.fetch_add(1, std::memory_order_relaxed);
     }
     return p;

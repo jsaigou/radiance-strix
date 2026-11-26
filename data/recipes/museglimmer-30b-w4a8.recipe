@@ -1,0 +1,22 @@
+# museglimmer-30b-w4a8.recipe -- Meta Muse Glimmer 30B from the bf16 release: an int4 trunk on
+# the same grid gemma4's CT-INT4 release uses (i4 codes, an f16 scale per 128 columns, least
+# squares scale search), with attention value and the feed-forward's down projection at int8
+# where int4 costs more than it saves. About 15.7 GiB: 10.2 GiB of int4 trunk, 90 MiB of int8
+# value projections, 5.4 GiB of bf16 embedding and head (the head is where int4 hurts most on a
+# 202k vocabulary; keep it until a measured reason says otherwise).
+#
+#   rad-convert <Muse-Glimmer-30B> --recipe data/recipes/museglimmer-30b-w4a8.recipe \
+#       --set quantization_config.quant_method=compressed-tensors -o muse-glimmer-30b-w4a8.rad
+#
+# The --set selects the plugin registered at ("museglimmer", "compressed-tensors"), which serves
+# both this encoding and plain bf16. Norms, the embedding and the lm_head match no rule and stay
+# bf16. A linear may be held at int8 on the same grid (gemm_nt_q w8a8):
+#     blk.*.attn_output.weight  rtn  codes=i8 group=128 scale=f16 rule=search
+
+blk.*.attn_q.weight       rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.attn_k.weight       rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.attn_v.weight       rtn  codes=i8 group=128 scale=f16 rule=search
+blk.*.attn_gate.weight    rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.attn_output.weight  rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.ffn_gate_up.weight  rtn  codes=i4 group=128 scale=f16 rule=search
+blk.*.ffn_down.weight     rtn  codes=i4 group=128 scale=f16 rule=search

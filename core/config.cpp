@@ -4,6 +4,7 @@
  * (spec §6).
  */
 #include "rad_core.h"
+#include "sched/draft_depth.h"   /* the --draft-depth-load lists */
 #include "kld.h"
 #include "format/rope_override.h"
 #include "sample/host_ref.h"
@@ -13,7 +14,7 @@
 #include "util/kernel_list.h"
 #include "place/planner.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cctype>
@@ -30,11 +31,7 @@
 
 namespace rad {
 
-struct Flag {
-    const char* name;
-    const char* arg;     /* null for a boolean */
-    const char* help;
-};
+using Flag = ConfigFlag;
 
 /* Built from kDraftWindowDefault so the default is stated once. Defined before the table that
  * points at it, which fixes their initialisation order. */
@@ -80,6 +77,12 @@ static const Flag g_flags[] = {
                                         "of the chunk step's time, auto:SHARE in SHARE of it (0-4];\n"
                                         "0 lets every step carry a chunk; served default auto:1\n"
                                         "(0 under --deterministic, KL mode, generators)" },
+    { "--mixed-step-target-ms", "N",    "soft duration target in milliseconds for a mixed prefill/decode\n"
+                                        "step. The scheduler learns an aggregate prefill cap from\n"
+                                        "completed mixed steps; 0 (default) is off" },
+    { "--prefill-room-gate",  "MODE",   "on: a fresh prefill starts only when its whole prompt plus one\n"
+                                        "decode position fits beside every runner; off (the default)\n"
+                                        "admits a prompt when its first chunk fits" },
     { "--preempt-wait-ms",    "N",      "how long a preempted prefill may wait for the whole-\n"
                                         "recompute gate before reclaiming cache blocks and\n"
                                         "preempting the lowest-priority running request; 0\n"
@@ -93,21 +96,19 @@ static const Flag g_flags[] = {
                                         "Not with --gpu-headroom-mib" },
     { "--gpu-headroom-mib",   "N",      "VRAM left unclaimed on every card (default 96).\n"
                                         "Not with --gpu-memory-mib" },
-    { "--kv-cache-dtype",     "T",      "bf16 | fp8 | fp8_v4 | k6_v4 -- fp8 halves what a token of\n"
-                                        "context costs; fp8_v4 keeps V in 4 bits (0.78 of fp8), k6_v4\n"
-                                        "also K in 6 (0.69); both Qwen3.8-27B and -Flash-Next" },
+    { "--kv-cache-dtype",     "T",      "bf16 (default) | i8 | fp8 -- i8 halves what a token of\n"
+                                        "context costs: K and V as int8 with one scale each per token\n"
+                                        "and head. fp8 (E4M3) is GLM-5.3's latent cache only" },
     { "--state-cache-dtype",  "T",      "f32 (default) | f16 -- the recurrent state cache (delta net):\n"
                                         "f16 halves the state pool, its checkpoints and its traffic,\n"
                                         "and is lossy; the qwen35 plugins serve it" },
-    { "--attn-prefill-fp8",   "MODE",   "off (default) | qk | pv | both -- the prefill attention's\n"
-                                        "Q.K^T, P.V or both as e4m3 WMMA over an fp8, fp8_v4 or\n"
-                                        "k6_v4 cache: faster at long context, and lossy" },
     { "--kv-resident",        "N",      "stream the sparse attention group's KV from host memory,\n"
     "                                    keeping N tokens of it in a VRAM ring (0, the default, is\n"
     "                                    off). Raised to 32768 and to what one decode step selects;\n"
     "                                    a ring that covers the context (sequences x\n"
     "                                    --max-model-len) streams nothing" },
-    { "--host-pool-mib",      "N",      "pinned host tier" },
+    { "--host-pool-mib",      "N",      "pinned host tier for weights, in all: the ranks of a model\n"
+    "                                    pin equal shares of it (N / --tp each)" },
     { "--host-headroom-mib",  "N",      "host RAM to leave free for the system when radiance\n"
     "                                    pins its host memory at startup (default 4096)" },
     { "--embedding-placement", "WHERE", "ram (default) | vram: where the token embedding lives. ram\n"
@@ -165,6 +166,10 @@ static const Flag g_flags[] = {
     "                                    disabled -- the default, also with no flag at all -- loads\n"
     "                                    nothing: no projection op is declared, and a request that\n"
     "                                    asks for the vector is refused" },
+    { "--control-vector-variant", "NAME", "list MODEL:NAME, a name of this model whose\n"
+    "                                    requests run with the control vector on; the model's\n"
+    "                                    own name keeps --control-vector's default. Needs\n"
+    "                                    --control-vector off or on" },
     { "--deterministic",      nullptr,  "pin placement to the plan the loader made, so the resident\n"
     "                                    set cannot change under the heat engine. The sampler is\n"
     "                                    already order-independent and needs no pinning; note that\n"
@@ -173,10 +178,33 @@ static const Flag g_flags[] = {
     { "--checkpoint-interval","N",      "linear-attention state checkpoint interval, in tokens" },
     { "--prefill-span",       "N",      "checkpoint intervals one step may carry of a prefill alone\n"
     "                                    in its step, from the prompt's second interval on (default\n"
-    "                                    1); needs --max-num-batched-tokens of N intervals. Every\n"
+    "                                    1); needs --max-num-batched-tokens of N intervals. Prompts\n"
+    "                                    prefilling side by side with nothing decoding take such\n"
+    "                                    steps one at a time, the fewest tokens left first. Every\n"
     "                                    other step is planned at the budget less the extra\n"
     "                                    intervals, and the checkpoints inside a span are not\n"
     "                                    written" },
+    { "--prefill-span-pass",  "MODE",   "piece (default) | step -- the routed (MoE) block's pass of a\n"
+    "                                    spanned step: a pass an interval, or one pass over the\n"
+    "                                    whole step where the model runs such a step serially\n"
+    "                                    (Flash-Next at one or two ranks). Each expert's weight is\n"
+    "                                    then read once for all the step's rows; the arena grows by\n"
+    "                                    the expert planes' extra rows and the output differs from\n"
+    "                                    piece passes at tie level. Needs --prefill-span above 1" },
+    { "--prefill-tail-snapshot", "MODE", "on (default): a prompt's last chunk ends where the\n"
+    "                                    next turn's linear-state snapshot goes (prefix resume\n"
+    "                                    nearest), leaving its last tokens a step of their own (a\n"
+    "                                    lone spanned prefill on a model that snapshots inside a step\n"
+    "                                    takes it inside the chunk, no step more); off: the last chunk\n"
+    "                                    runs to the prompt's end, one step fewer, and a next turn\n"
+    "                                    resumes up to an interval earlier" },
+    { "--prefill-span-first", "MODE",   "off (default) | on -- whether a lone prefill may span from\n"
+    "                                    its first token; on: the first interval rides the span (its\n"
+    "                                    rows read QSA's selection, the same keys as the dense pass\n"
+    "                                    below the exactness bound, summed in another order)" },
+    { "--prefill-span-min",   "N",     "the shortest prompt, in tokens, a prefill spans for: auto\n"
+    "                                    (default) is 8 intervals where routed experts are read from\n"
+    "                                    host memory and 0 elsewhere; 0 spans every lone prefill" },
     /* A total, not per sequence: the snapshot store is one pool of N slots
      * (KVManager::set_checkpoint_store). */
     { "--checkpoint-slots",   "N",      "linear-state or sliding-window snapshots the server holds in\n"
@@ -215,6 +243,63 @@ static const Flag g_flags[] = {
     "                                    couples the target's draw to it: more accepted drafts on sampled\n"
     "                                    requests, the same output law, other tokens than off for a fixed\n"
     "                                    seed" },
+    { "--draft-verify",       "MODE",   "token (default, alias rowwise) | block | traversal -- how a coupled draft chain is\n"
+    "                                    verified: token decides each row on its own (maximal coupling);\n"
+    "                                    block decides the whole chain at once (Block Verification, arXiv\n"
+    "                                    2403.10444; switches --draft-coupling on); traversal decides a\n"
+    "                                    root-to-leaf path bottom-up (Traversal Verification, arXiv\n"
+    "                                    2505.12398; needs --draft-coupling on). The same output law in\n"
+    "                                    every mode, more drafts accepted per step in block and traversal" },
+    { "--draft-depth",        "MODE",   "fixed (default) | adaptive -- a coupled serial chain stops within\n"
+    "                                    the step once the product of the head's probabilities along it falls\n"
+    "                                    below --draft-depth-stop, and the next verify carries only the drafts\n"
+    "                                    made (1 .. --draft-depth-max). Same output law (the rule reads the\n"
+    "                                    draft's own laws only); switches --draft-coupling on (an explicit\n"
+    "                                    off is refused) and needs --draft-window fixed (both choose the\n"
+    "                                    depth, so they are not served together)" },
+    { "--draft-depth-max",    "N",      "--draft-depth adaptive: the deepest chain (default 0 =\n"
+                                        "num-speculative-tokens)" },
+    { "--draft-depth-min",    "N",      "--draft-depth adaptive: rounds that always run (default 1)" },
+    { "--draft-depth-stop",   "P",      "--draft-depth adaptive: the chain goes on while its confidence\n"
+                                        "is at least P (default 0.85)" },
+    { "--draft-depth-lag",    "K",      "--draft-depth adaptive: rounds the decision trails the chain,\n"
+                                        "0 or 1 (default 1: the host decides while the next round runs)" },
+    { "--draft-depth-stat",   "S",      "--draft-depth adaptive: top (default, each round's largest\n"
+                                        "probability) | path (the probability of the token it drew)" },
+    { "--draft-depth-load",   "MODE",   "off (default) | on -- --draft-depth adaptive with several sequences\n"
+    "                                    in a step: draft round j only for the rows whose expected accepted\n"
+    "                                    drafts pay their verify\n"
+    "                                    rows, the kernel tile they open and the round, at the measured\n"
+    "                                    throughput; fewer sequences than --draft-depth-load-from keep the\n"
+    "                                    stop rule. Same output law" },
+    { "--draft-depth-load-from", "N",   "--draft-depth-load: the fewest drafting sequences of a step the\n"
+                                        "load-aware rule decides (default 5)" },
+    { "--draft-depth-load-min", "N",    "--draft-depth-load: rounds a load-aware step always runs (default 2)" },
+    { "--draft-depth-load-late", "MODE", "on (default) | off -- --draft-depth-load: choose each row's verified\n"
+                                        "drafts again when the next verify is issued, from the laws read by then" },
+    { "--draft-depth-load-calib", "MODE", "--draft-depth-load: online (default; acceptance by confidence,\n"
+    "                                    throughput and row/round/tile prices follow the running server) |\n"
+    "                                    static (the built-in or given tables only)" },
+    { "--draft-depth-load-tok-ms", "LIST", "--draft-depth-load: tokens a millisecond by drafting sequences\n"
+                                        "1..8, comma-separated (a short list repeats its last; default built in)" },
+    { "--draft-depth-load-row-ms", "LIST", "--draft-depth-load: a verify row's milliseconds, by drafting\n"
+                                        "sequences 1..8" },
+    { "--draft-depth-load-round-ms", "LIST", "--draft-depth-load: a draft round's milliseconds, by drafting\n"
+                                        "sequences 1..8" },
+    { "--draft-depth-load-jump-ms", "LIST", "--draft-depth-load: what a verify of more than 16, 32, 48, 64\n"
+                                        "rows costs on top, in milliseconds (four numbers)" },
+    { "--draft-suffix",       "MODE",   "off (default) | on -- SuffixDecoding as a step selector on a serial head's chain: when the\n"
+                                        "sequence's last --draft-suffix-min-match tokens occurred earlier in\n"
+                                        "its own prompt ++ output, a host-built step verifies the earlier\n"
+                                        "continuation (a chain, up to --draft-suffix-max rows) instead of the\n"
+                                        "head's draft. Lossless; works beside the fixed chain, --draft-verify\n"
+                                        "traversal and --draft-depth adaptive, not --draft-verify block" },
+    { "--draft-suffix-min-match", "L",  "shortest suffix match that selects a suffix step (default 6)" },
+    { "--draft-suffix-max",   "N",      "most rows of a suffix step (default 7; the verify window becomes\n"
+                                        "max(--num-speculative-tokens, N), the head still drafts its own)" },
+    { "--draft-suffix-min-score", "D",  "cut the suffix chain where its path score (the product of the\n"
+                                        "follower frequencies along it, SuffixDecoding's D) falls under D\n"
+                                        "(default 0.3)" },
     { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
 
     { "--host",               "ADDR",   "listen address" },
@@ -231,8 +316,9 @@ static const Flag g_flags[] = {
     "                                    never access; repeatable" },
     { "--served-model-name",  "NAME",   "the model id /v1/models lists and responses carry; default the container's name" },
     { "--mm-max-patches",     "N",      "patches one encoder pass carries, and so the largest image (a patch is 16x16\n"
-                                        "pixels). Default `auto`: 16384 when the container carries a vision tower. 0\n"
-                                        "serves text only and keeps the tower off the card" },
+                                        "pixels). Default `auto`: 16384 when the container carries a vision tower (0 in a build\n"
+                                        "without a media decoder, which would refuse every media part). 0 serves text\n"
+                                        "only and keeps the tower off the card" },
     { "--image-gen-max-pixels", "N",    "an image generator's largest image, in pixels (1048576: 1024 x 1024).\n"
       "                              Default: the model's. Its per-image buffers, and the activation\n"
       "                              arena with them, are sized for it; larger requests are refused" },
@@ -342,6 +428,25 @@ static const Flag g_flags[] = {
     { "--kld-lora-sources",   "PREFIX", "--kld-lora only for documents whose source starts with PREFIX; the\n"
     "                                    rest run as the base, in the same steps (a mixed batch)" },
 
+    { "--diagnose",           "DIR",    "instead of serving, run a fixed workload on this engine and write\n"
+    "                                    diagnose.json and diagnose.md to DIR: decode by prompt category,\n"
+    "                                    a concurrency sweep, a prefill sweep with decode at each depth and\n"
+    "                                    a prompt arriving into running streams -- step times, tokens a\n"
+    "                                    step, draft acceptance, TTFT, emission intervals, jitter. Prompts\n"
+    "                                    are salted so the prefix cache serves none of them" },
+    { "--diagnose-tokens",    "N",      "tokens a --diagnose decode stream generates (default 256)" },
+    { "--diagnose-runs",      "N",      "measured runs of every --diagnose point, after one unmeasured (default 3)" },
+    { "--diagnose-concurrency", "LIST", "stream counts of the concurrency sweep, comma-separated (default\n"
+    "                                    1,2,4,8; counts above --max-num-seqs are skipped and reported)" },
+    { "--diagnose-prefill",   "LIST",   "prompt lengths of the prefill sweep in tokens, comma-separated\n"
+    "                                    (default 1024,4096,16384,65536; lengths the context cannot hold\n"
+    "                                    are skipped and reported)" },
+    { "--diagnose-corpus",    "FILE",   "JSONL of category prompts, one {\"category\", \"messages\" or \"prompt\",\n"
+    "                                    \"max_tokens\"?} a line; default: a built-in set of code, reasoning,\n"
+    "                                    prose, json, file_edit and summarization prompts" },
+    { "--diagnose-baseline",  "FILE",   "an earlier diagnose.json of the same workload: compare every request's\n"
+    "                                    tokens with it and fail the run on any difference (parity)" },
+
     { "--debug-graph",        nullptr,  "print the entire declared graph and exit-quality detail" },
     { "--debug-selection",    nullptr,  "print the selection table" },
     { "--debug-placement",    nullptr,  "print the placement plan" },
@@ -380,6 +485,11 @@ static const Flag g_flags[] = {
     { "-vv",                  nullptr,  "very verbose" },
     { "--help",               nullptr,  "this" },
 };
+
+const ConfigFlag* config_flags(size_t* n) {
+    *n = sizeof g_flags / sizeof g_flags[0];
+    return g_flags;
+}
 
 void config_usage(const char* argv0) {
     fprintf(stderr, "usage: %s --model FILE [options]\n\n", argv0);
@@ -444,6 +554,25 @@ static bool parse_int(const char* flag, const char* v, int64_t lo, int64_t hi, i
     return true;
 }
 
+/* A comma-separated list of whole numbers (--diagnose-concurrency, --diagnose-prefill). An empty
+ * element, a trailing comma or a value out of range refuses the list rather than dropping it. */
+static bool parse_int_list(const char* flag, const char* v, int64_t lo, int64_t hi,
+                           std::vector<int>* out) {
+    std::vector<int> got;
+    const char* p = v;
+    for (;;) {
+        const char* comma = std::strchr(p, ',');
+        const std::string one(p, comma ? (size_t)(comma - p) : std::strlen(p));
+        int64_t n = 0;
+        if (!parse_int(flag, one.c_str(), lo, hi, &n)) return false;
+        got.push_back((int)n);
+        if (!comma) break;
+        p = comma + 1;
+    }
+    *out = std::move(got);
+    return true;
+}
+
 /* Sampler defaults are checked against the request range (server::sampler_value_ok) at startup;
  * an out-of-range default would 400 every request that omits the field. */
 static bool sampler_num(const char* flag, const char* field, const char* v, double* out) {
@@ -486,7 +615,7 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
         src += " " + text.substr(1);
         text = ss.str();
     }
-    const nlohmann::json j = nlohmann::json::parse(text, nullptr, false);
+    const Json j = Json::parse(text, nullptr, false);
     if (j.is_discarded() || !j.is_object()) {
         RAD_ERR("%s takes a JSON object, such as '{\"enable_thinking\": false}'", src.c_str());
         return false;
@@ -508,9 +637,22 @@ static bool parse_template_kwargs(const char* v, std::map<std::string, std::stri
     return true;
 }
 
+/* A name a request may give as `model`, by the rule a fleet applies to model ids and aliases
+ * (fleet::valid_name, in a file this one does not include): not empty, and no ':' (reserved for
+ * base:adapter), whitespace or control character. */
+static bool plain_name(const char* s) {
+    if (!*s) return false;
+    for (; *s; ++s) {
+        const unsigned char ch = (unsigned char)*s;
+        if (ch == ':' || std::isspace(ch) || std::iscntrl(ch)) return false;
+    }
+    return true;
+}
+
 /* Returns 0 on success, 1 for --help (caller exits 0), negative on a bad argument. An unknown flag
  * is an error, not a warning, since a mistyped budget flag changes the plan. */
 int config_parse(int argc, char** argv, Config* c) {
+    bool pool_all = false;   /* --host-pool-mib was given: a total, split among the ranks at the end */
     /* --help wins from anywhere on the line, even after an otherwise fatal argument. */
     for (int i = 1; i < argc; ++i)
         if (!std::strcmp(argv[i], "--help") || !std::strcmp(argv[i], "-h")) return 1;
@@ -589,6 +731,13 @@ int config_parse(int argc, char** argv, Config* c) {
             }
             else if (!parse_int(a.c_str(), v, 0, 64, &c->prefill_interleave)) return RAD_E_INVAL;
         }
+        else if (S("--mixed-step-target-ms"))  { if (!num(0, 60000, &c->mixed_step_target_ms)) return RAD_E_INVAL; }
+        else if (S("--prefill-room-gate")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))   c->prefill_room_gate = true;
+            else if (!std::strcmp(v, "off"))  c->prefill_room_gate = false;
+            else { RAD_ERR("--prefill-room-gate takes on or off -- got '%s'", v); return RAD_E_INVAL; }
+        }
         else if (S("--preempt-wait-ms"))       { if (!num(0, INT64_MAX, &c->preempt_wait_ms)) return RAD_E_INVAL; }
         else if (S("--max-num-seqs"))          { if (!num(1, INT64_MAX, &c->max_seqs)) return RAD_E_INVAL; }
         else if (S("--max-model-len"))         { if (!num(0, INT64_MAX, &c->max_ctx)) return RAD_E_INVAL; }
@@ -619,9 +768,13 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--host-headroom-mib"))      { if (!num(0, INT64_MAX, &c->host_headroom_mib)) return RAD_E_INVAL; }
         else if (S("--kv-cache-dtype")) {
             if (!(v = need(i))) return RAD_E_INVAL;
-            if (std::strcmp(v, "bf16") && std::strcmp(v, "fp8") && std::strcmp(v, "fp8_v4") &&
-                std::strcmp(v, "k6_v4")) {
-                RAD_ERR("--kv-cache-dtype takes bf16, fp8, fp8_v4 or k6_v4, not '%s'", v);
+            if (!std::strcmp(v, "fp8_v4") || !std::strcmp(v, "k6_v4")) {
+                RAD_ERR("--kv-cache-dtype %s: the packed caches are no longer served; i8 is the "
+                        "8-bit cache (int8 K and V, a scale each per token and head)", v);
+                return RAD_E_INVAL;
+            }
+            if (std::strcmp(v, "bf16") && std::strcmp(v, "i8") && std::strcmp(v, "fp8")) {
+                RAD_ERR("--kv-cache-dtype takes bf16, i8 or fp8, not '%s'", v);
                 return RAD_E_INVAL;
             }
             c->kv_cache_dtype = v;
@@ -634,19 +787,8 @@ int config_parse(int argc, char** argv, Config* c) {
             }
             c->state_cache_dtype = v;
         }
-        else if (S("--attn-prefill-fp8")) {
-            if (!(v = need(i))) return RAD_E_INVAL;
-            if      (!std::strcmp(v, "off"))  c->attn_prefill_fp8 = 0;
-            else if (!std::strcmp(v, "qk"))   c->attn_prefill_fp8 = RAD_ATTN_FP8_QK;
-            else if (!std::strcmp(v, "pv"))   c->attn_prefill_fp8 = RAD_ATTN_FP8_PV;
-            else if (!std::strcmp(v, "both")) c->attn_prefill_fp8 = RAD_ATTN_FP8_QK | RAD_ATTN_FP8_PV;
-            else {
-                RAD_ERR("--attn-prefill-fp8 takes off, qk, pv or both, not '%s'", v);
-                return RAD_E_INVAL;
-            }
-        }
         else if (S("--kv-resident"))           { if (!num(0, INT64_MAX, &c->kv_resident)) return RAD_E_INVAL; }
-        else if (S("--host-pool-mib"))         { if (!num(0, INT64_MAX, &c->host_pool_mib)) return RAD_E_INVAL; }
+        else if (S("--host-pool-mib"))         { if (!num(0, INT64_MAX, &c->host_pool_mib)) return RAD_E_INVAL; pool_all = true; }
         else if (S("--embedding-placement") || S("--ngram-placement")) {
             const bool emb = S("--embedding-placement");
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -771,9 +913,50 @@ int config_parse(int argc, char** argv, Config* c) {
             }
             c->control_vector = v;
         }
+        else if (S("--control-vector-variant")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!plain_name(v)) {
+                RAD_ERR("--control-vector-variant takes a name with no ':' or whitespace -- "
+                        "got '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->control_vector_variant = v;
+        }
         else if (S("--deterministic"))         c->deterministic = true;
         else if (S("--checkpoint-interval"))   { if (!num(0, INT64_MAX, &c->checkpoint_interval)) return RAD_E_INVAL; }
         else if (S("--prefill-span"))          { if (!num(1, INT32_MAX, &c->prefill_span)) return RAD_E_INVAL; }
+        else if (S("--prefill-span-pass")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "piece")) c->prefill_span_step = false;
+            else if (!std::strcmp(v, "step"))  c->prefill_span_step = true;
+            else {
+                RAD_ERR("--prefill-span-pass takes piece or step, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--prefill-tail-snapshot")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->prefill_tail_snapshot = true;
+            else if (!std::strcmp(v, "off")) c->prefill_tail_snapshot = false;
+            else {
+                RAD_ERR("--prefill-tail-snapshot takes on or off, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--prefill-span-first")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->prefill_span_first = true;
+            else if (!std::strcmp(v, "off")) c->prefill_span_first = false;
+            else {
+                RAD_ERR("--prefill-span-first takes on or off, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--prefill-span-min")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "auto")) c->prefill_span_min = -1;
+            else if (!parse_int(a.c_str(), v, 0, INT64_MAX, &c->prefill_span_min)) return RAD_E_INVAL;
+        }
         else if (S("--checkpoint-slots")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (!std::strcmp(v, "auto")) {
@@ -842,6 +1025,107 @@ int config_parse(int argc, char** argv, Config* c) {
                 RAD_ERR("--draft-coupling takes off or on, not '%s'", v);
                 return RAD_E_INVAL;
             }
+        }
+        else if (S("--draft-verify")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "token") || !std::strcmp(v, "rowwise")) {
+                c->draft_verify_block = false;
+                c->draft_verify_traversal = false;
+            }
+            else if (!std::strcmp(v, "block"))     { c->draft_verify_block = true;  c->draft_verify_traversal = false; }
+            else if (!std::strcmp(v, "traversal")) { c->draft_verify_block = false; c->draft_verify_traversal = true; }
+            else {
+                RAD_ERR("--draft-verify takes token (rowwise), block or traversal, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-depth")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "fixed"))    c->draft_depth_adaptive = false;
+            else if (!std::strcmp(v, "adaptive")) c->draft_depth_adaptive = true;
+            else {
+                RAD_ERR("--draft-depth takes fixed or adaptive, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-depth-max"))       { if (!num(0, 16, &c->draft_depth_max)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-min"))       { if (!num(1, 16, &c->draft_depth_min)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-lag"))       { if (!num(0, 1, &c->draft_depth_lag)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-stop")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            double d = 0;
+            if (!parse_num(a.c_str(), v, &d)) return RAD_E_INVAL;
+            if (!(d >= 0.0 && d <= 1.0)) {
+                RAD_ERR("--draft-depth-stop must be a probability in [0, 1], not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->draft_depth_stop = d;
+        }
+        else if (S("--draft-depth-stat")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "top"))  c->draft_depth_stat = 0;
+            else if (!std::strcmp(v, "path")) c->draft_depth_stat = 1;
+            else {
+                RAD_ERR("--draft-depth-stat takes top or path, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-depth-load") || S("--draft-depth-load-late")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            bool b = false;
+            if      (!std::strcmp(v, "off")) b = false;
+            else if (!std::strcmp(v, "on"))  b = true;
+            else { RAD_ERR("%s takes off or on, not '%s'", a.c_str(), v); return RAD_E_INVAL; }
+            (S("--draft-depth-load") ? c->draft_depth_load : c->draft_depth_load_late) = b;
+        }
+        else if (S("--draft-depth-load-from")) { if (!num(2, 64, &c->draft_depth_load_from)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-load-min"))  { if (!num(1, 16, &c->draft_depth_load_min)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-load-calib")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "online")) c->draft_depth_load_online = true;
+            else if (!std::strcmp(v, "static")) c->draft_depth_load_online = false;
+            else {
+                RAD_ERR("--draft-depth-load-calib takes online or static, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-depth-load-tok-ms") || S("--draft-depth-load-row-ms") ||
+                 S("--draft-depth-load-round-ms") || S("--draft-depth-load-jump-ms")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            const bool jump = S("--draft-depth-load-jump-ms");
+            double probe[DraftDepthCfg::kLoadSeqs];
+            const int cap = jump ? (int)DraftDepthCfg::kJumps : (int)DraftDepthCfg::kLoadSeqs;
+            /* a price may be zero (a tile that costs nothing); a rate may not */
+            if (*v && draft_depth_parse_list(v, probe, cap, jump ? 0.0 : 1e-6, 1000.0) < 1) {
+                RAD_ERR("%s takes 1..%d comma-separated %s numbers, not '%s'", a.c_str(), cap,
+                        jump ? "non-negative" : "positive", v);
+                return RAD_E_INVAL;
+            }
+            (S("--draft-depth-load-tok-ms") ? c->draft_depth_load_tok_ms
+             : S("--draft-depth-load-row-ms") ? c->draft_depth_load_row_ms
+             : S("--draft-depth-load-round-ms") ? c->draft_depth_load_round_ms
+             : c->draft_depth_load_jump_ms) = v;
+        }
+        else if (S("--draft-suffix")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "off")) c->draft_suffix = false;
+            else if (!std::strcmp(v, "on"))  c->draft_suffix = true;
+            else {
+                RAD_ERR("--draft-suffix takes off or on, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-suffix-min-match")) { if (!num(1, 12, &c->draft_suffix_min_match)) return RAD_E_INVAL; }
+        else if (S("--draft-suffix-max"))       { if (!num(1, 32, &c->draft_suffix_max)) return RAD_E_INVAL; }
+        else if (S("--draft-suffix-min-score")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            char* end = nullptr;
+            const double d = std::strtod(v, &end);
+            if (end == v || *end || !(d >= 0.0 && d <= 1.0)) {
+                RAD_ERR("--draft-suffix-min-score takes a number in [0, 1], not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->draft_suffix_min_score = (float)d;
         }
         else if (S("--draft-model")) {
             /* Refused, not ignored: separate draft models are not supported (spec §10), and the
@@ -991,7 +1275,7 @@ int config_parse(int argc, char** argv, Config* c) {
         }
         else if (S("--dry-sequence-breakers")) {
             if (!(v = need(i))) return RAD_E_INVAL;
-            const nlohmann::json j = nlohmann::json::parse(v, nullptr, false);
+            const Json j = Json::parse(v, nullptr, false);
             bool strings = j.is_array();
             if (strings) for (const auto& e : j) strings = strings && e.is_string();
             if (!strings) {
@@ -1097,6 +1381,29 @@ int config_parse(int argc, char** argv, Config* c) {
             c->calib_layer_hi = hi;
         }
         else if (S("--kld-out"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_out = v; }
+        else if (S("--diagnose"))              { if (!(v = need(i))) return RAD_E_INVAL; c->diagnose = v; }
+        else if (S("--diagnose-tokens")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int64_t n = 0;
+            if (!parse_int(a.c_str(), v, 2, 1 << 20, &n)) return RAD_E_INVAL;
+            c->diagnose_tokens = (int)n;
+        }
+        else if (S("--diagnose-runs")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int64_t n = 0;
+            if (!parse_int(a.c_str(), v, 1, 100, &n)) return RAD_E_INVAL;
+            c->diagnose_runs = (int)n;
+        }
+        else if (S("--diagnose-concurrency")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!parse_int_list(a.c_str(), v, 1, 4096, &c->diagnose_concurrency)) return RAD_E_INVAL;
+        }
+        else if (S("--diagnose-prefill")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!parse_int_list(a.c_str(), v, 16, 1 << 24, &c->diagnose_prefill)) return RAD_E_INVAL;
+        }
+        else if (S("--diagnose-corpus"))       { if (!(v = need(i))) return RAD_E_INVAL; c->diagnose_corpus = v; }
+        else if (S("--diagnose-baseline"))     { if (!(v = need(i))) return RAD_E_INVAL; c->diagnose_baseline = v; }
         else if (S("--kld-lora"))              { if (!(v = need(i))) return RAD_E_INVAL; c->kld_lora = v; }
         else if (S("--kld-lora-sources"))      { if (!(v = need(i))) return RAD_E_INVAL; c->kld_lora_sources = v; }
         else if (S("--debug-graph"))           { c->debug_graph = true; c->debug_selection = true; }
@@ -1205,6 +1512,21 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--calib-corpus records into --calib-dir; give one");
         return RAD_E_INVAL;
     }
+    if (!c->control_vector_variant.empty()) {
+        if (c->control_vector == "disabled") {
+            RAD_ERR("--control-vector-variant needs --control-vector off or on: with no vector "
+                    "loaded, '%s' would have nothing to switch on",
+                    c->control_vector_variant.c_str());
+            return RAD_E_INVAL;
+        }
+        /* An adapter is named the same way, `base:name`, so the two must differ. */
+        for (const auto& [name, dir] : c->lora.adapters)
+            if (name == c->control_vector_variant) {
+                RAD_ERR("--control-vector-variant '%s' is also a --lora adapter's name, so a "
+                        "request naming it could mean either; rename one", name.c_str());
+                return RAD_E_INVAL;
+            }
+    }
     if ((!c->calib_dir.empty() || c->calib_layer_hi) && !c->calib() && c->kld_record.empty()) {
         RAD_ERR("--calib-dir and --calib-layers belong to a --calib-corpus or --kld-record run");
         return RAD_E_INVAL;
@@ -1223,6 +1545,19 @@ int config_parse(int argc, char** argv, Config* c) {
     }
     if (!c->kld_out.empty() && c->kld_ref.empty()) {
         RAD_ERR("--kld-out is the --kld-ref report");
+        return RAD_E_INVAL;
+    }
+
+    /* ONE MODE A RUN. Each replaces serving with its own driver, so two given together would have
+     * to pick one silently; --debug-graph returns before either runs. */
+    if (!c->diagnose_mode() && (!c->diagnose_corpus.empty() || !c->diagnose_baseline.empty())) {
+        RAD_ERR("--diagnose-corpus and --diagnose-baseline belong to the --diagnose workload; give "
+                "--diagnose DIR as well");
+        return RAD_E_INVAL;
+    }
+    if (c->diagnose_mode() && (c->kld() || c->calib() || c->debug_graph)) {
+        RAD_ERR("--diagnose runs its own workload; it cannot be combined with --kld-record, --kld-ref, "
+                "--calib-corpus or --debug-graph");
         return RAD_E_INVAL;
     }
 
@@ -1299,18 +1634,74 @@ int config_parse(int argc, char** argv, Config* c) {
         RAD_ERR("--video-min-pixels is above --video-max-pixels"); return RAD_E_INVAL; }
     if (c->video_min_frames && c->video_max_frames && *c->video_min_frames > *c->video_max_frames) {
         RAD_ERR("--video-min-frames is above --video-max-frames"); return RAD_E_INVAL; }
+    /* --prefill-span-pass step and --prefill-span-min shape a span, so they need one. */
+    if (c->prefill_span_step && c->prefill_span <= 1) {
+        RAD_ERR("--prefill-span-pass step is the routed pass of a spanned step and needs "
+                "--prefill-span above 1");
+        return RAD_E_INVAL;
+    }
+    if (c->prefill_span_min >= 0 && c->prefill_span <= 1) {
+        RAD_ERR("--prefill-span-min is the shortest prompt a span is taken for and needs "
+                "--prefill-span above 1");
+        return RAD_E_INVAL;
+    }
+    /* --draft-depth adaptive reads the coupled chain's laws and chooses the chain's depth itself. */
+    if (c->draft_depth_adaptive) {
+        if (c->given.count("--draft-coupling") && !c->draft_coupling) {
+            RAD_ERR("--draft-depth adaptive needs the coupled drafting (--draft-coupling on): the "
+                    "stop rule reads the law each draft was drawn from");
+            return RAD_E_INVAL;
+        }
+        if (c->draft_window == DraftWindow::Adaptive) {
+            RAD_ERR("--draft-depth adaptive and --draft-window adaptive both choose the chain's "
+                    "depth; serve one of them");
+            return RAD_E_INVAL;
+        }
+        if (c->draft_verify_block) {
+            RAD_ERR("--draft-depth adaptive is verified token by token or by traversal "
+                    "(--draft-verify token | traversal), not as a fixed block");
+            return RAD_E_INVAL;
+        }
+        if (c->draft_depth_min > 1 && c->draft_depth_max > 0 && c->draft_depth_min > c->draft_depth_max) {
+            RAD_ERR("--draft-depth-min is above --draft-depth-max");
+            return RAD_E_INVAL;
+        }
+        c->draft_coupling = true;
+    }
+    /* --draft-depth-load weighs the adaptive chain's rounds; its late choice reads each round's
+     * largest probability, the one statistic that is not the drawn token's own. */
+    if (c->draft_depth_load) {
+        if (!c->draft_depth_adaptive) {
+            RAD_ERR("--draft-depth-load on needs --draft-depth adaptive: it decides the adaptive "
+                    "chain's rounds for a step of several sequences");
+            return RAD_E_INVAL;
+        }
+        if (c->draft_depth_stat != 0) {
+            RAD_ERR("--draft-depth-load on needs --draft-depth-stat top: its tables and the late "
+                    "choice of the verify's rows read each round's largest probability");
+            return RAD_E_INVAL;
+        }
+    }
+    /* --draft-verify block verifies a linear chain with the coupled drafting's states, so it
+     * switches the coupling on; traversal needs it and says so rather than switching it on. */
+    if (c->draft_verify_block) {
+        if (c->given.count("--draft-coupling") && !c->draft_coupling) {
+            RAD_ERR("--draft-verify block needs the coupled drafting (--draft-coupling on); "
+                    "--draft-coupling off contradicts it");
+            return RAD_E_INVAL;
+        }
+        c->draft_coupling = true;
+    }
+    if (c->draft_verify_traversal && !c->draft_coupling) {
+        RAD_ERR("--draft-verify traversal requires --draft-coupling on: the walk needs the draft's "
+                "law Q, which only a coupled draft carries");
+        return RAD_E_INVAL;
+    }
+    /* --host-pool-mib is what the model pins for its weights in all; Config::host_pool_mib is a
+     * rank's share of it, whichever of the two options came first. */
+    if (pool_all) c->host_pool_mib /= std::max(c->tp, 1);
 
     return RAD_OK;
-}
-
-const char* attn_prefill_fp8_name(int bits) {
-    switch (bits) {
-        case 0:                                   return "off";
-        case RAD_ATTN_FP8_QK:                     return "qk";
-        case RAD_ATTN_FP8_PV:                     return "pv";
-        case RAD_ATTN_FP8_QK | RAD_ATTN_FP8_PV:  return "both";
-    }
-    return "?";
 }
 
 /* ------------------------------------------------------------------ the startup report's rows */
@@ -1366,6 +1757,10 @@ const ShowRow kShow[] = {
           return c.prefill_interleave > 0 ? num(c.prefill_interleave)
                : c.prefill_interleave < 0 ? "auto:" + std::to_string(c.prefill_interleave_share)
                                           : std::string("off"); } },
+    { "--mixed-step-target-ms", [](const Config& c) {
+          return c.mixed_step_target_ms > 0 ? num(c.mixed_step_target_ms) : std::string("off"); } },
+    { "--prefill-room-gate", [](const Config& c) {
+          return c.prefill_room_gate ? std::string("on") : std::string("off"); } },
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
     { "--max-model-len",      [](const Config& c) {
@@ -1376,11 +1771,9 @@ const ShowRow kShow[] = {
     { "--gpu-headroom-mib",   [](const Config& c) { return num(c.gpu_headroom_mib); } },
     { "--kv-cache-dtype",     [](const Config& c) { return c.kv_cache_dtype; } },
     { "--state-cache-dtype",  [](const Config& c) { return c.state_cache_dtype; } },
-    { "--attn-prefill-fp8",   [](const Config& c) {
-          return std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)); } },
     { "--kv-resident",        [](const Config& c) {
           return c.kv_resident > 0 ? num(c.kv_resident) : std::string("0 (off)"); } },
-    { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib); } },
+    { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib * std::max(c.tp, 1)); } },
     { "--host-headroom-mib",  [](const Config& c) { return num(c.host_headroom_mib); } },
     { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },
     { "--ngram-placement",    [](const Config& c) {
@@ -1409,9 +1802,16 @@ const ShowRow kShow[] = {
           return o.empty() ? std::string(c.lora.enabled() ? "the adapters' own" : "-") : o; } },
     { "--placement",          [](const Config& c) { return c.placement; } },
     { "--control-vector",     [](const Config& c) { return c.control_vector; } },
+    { "--control-vector-variant", [](const Config& c) {
+          return or_none(c.control_vector_variant, "none: no variant listed"); } },
     { "--deterministic",      [](const Config& c) { return onoff(c.deterministic); } },
     { "--checkpoint-interval", [](const Config& c) { return num(c.checkpoint_interval); } },
     { "--prefill-span",       [](const Config& c) { return num(c.prefill_span); } },
+    { "--prefill-span-pass",  [](const Config& c) { return std::string(c.prefill_span_step ? "step" : "piece"); } },
+    { "--prefill-tail-snapshot", [](const Config& c) { return onoff(c.prefill_tail_snapshot); } },
+    { "--prefill-span-first", [](const Config& c) { return onoff(c.prefill_span_first); } },
+    { "--prefill-span-min",   [](const Config& c) {
+          return c.prefill_span_min < 0 ? std::string("auto") : num(c.prefill_span_min); } },
     { "--checkpoint-slots",   [](const Config& c) {
           return c.checkpoint_slots < 0 ? std::string("auto") : num(c.checkpoint_slots); } },
     { "--no-prefix-cache",    [](const Config& c) {
@@ -1429,6 +1829,29 @@ const ShowRow kShow[] = {
           return c.draft_short_from < 0 ? std::string("auto")
                : c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },
     { "--draft-coupling",     [](const Config& c) { return onoff(c.draft_coupling); } },
+    { "--draft-verify",       [](const Config& c) {
+          return std::string(c.draft_verify_block ? "block" : c.draft_verify_traversal ? "traversal" : "token"); } },
+    { "--draft-depth",        [](const Config& c) { return std::string(c.draft_depth_adaptive ? "adaptive" : "fixed"); } },
+    { "--draft-depth-max",    [](const Config& c) {
+          return c.draft_depth_max > 0 ? num(c.draft_depth_max) : std::string("auto"); } },
+    { "--draft-depth-min",    [](const Config& c) { return num(c.draft_depth_min); } },
+    { "--draft-depth-stop",   [](const Config& c) { return fnum(c.draft_depth_stop); } },
+    { "--draft-depth-lag",    [](const Config& c) { return num(c.draft_depth_lag); } },
+    { "--draft-depth-stat",   [](const Config& c) { return std::string(c.draft_depth_stat == 1 ? "path" : "top"); } },
+    { "--draft-depth-load",   [](const Config& c) { return onoff(c.draft_depth_load); } },
+    { "--draft-depth-load-from", [](const Config& c) { return num(c.draft_depth_load_from); } },
+    { "--draft-depth-load-min", [](const Config& c) { return num(c.draft_depth_load_min); } },
+    { "--draft-depth-load-late", [](const Config& c) { return onoff(c.draft_depth_load_late); } },
+    { "--draft-depth-load-calib", [](const Config& c) {
+          return std::string(c.draft_depth_load_online ? "online" : "static"); } },
+    { "--draft-depth-load-tok-ms", [](const Config& c) { return or_none(c.draft_depth_load_tok_ms, "builtin"); } },
+    { "--draft-depth-load-row-ms", [](const Config& c) { return or_none(c.draft_depth_load_row_ms, "builtin"); } },
+    { "--draft-depth-load-round-ms", [](const Config& c) { return or_none(c.draft_depth_load_round_ms, "builtin"); } },
+    { "--draft-depth-load-jump-ms", [](const Config& c) { return or_none(c.draft_depth_load_jump_ms, "builtin"); } },
+    { "--draft-suffix",       [](const Config& c) { return onoff(c.draft_suffix); } },
+    { "--draft-suffix-min-match", [](const Config& c) { return num(c.draft_suffix_min_match); } },
+    { "--draft-suffix-max",   [](const Config& c) { return num(c.draft_suffix_max); } },
+    { "--draft-suffix-min-score", [](const Config& c) { return fnum(c.draft_suffix_min_score); } },
     { "--draft-model",        [](const Config&) { return std::string("not implemented (the container's own drafter)"); } },
     { "--host",               [](const Config& c) { return c.host; } },
     { "--port",               [](const Config& c) { return num(c.port); } },
@@ -1469,8 +1892,8 @@ const ShowRow kShow[] = {
     { "--dry-sequence-breakers", [](const Config& c) {
           /* Invalid UTF-8 is replaced, not thrown on: these strings come from outside. */
           return c.sample_dry_seq_breakers
-                     ? nlohmann::json(*c.sample_dry_seq_breakers)
-                           .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)
+                     ? Json(*c.sample_dry_seq_breakers)
+                           .dump(-1, ' ', false, Json::error_handler_t::replace)
                      : std::string("the request default"); } },
     { "--xtc-probability",    [](const Config& c) { return opt(c.sample_xtc_probability, "the request default"); } },
     { "--xtc-threshold",      [](const Config& c) { return opt(c.sample_xtc_threshold, "the request default"); } },
@@ -1518,6 +1941,19 @@ const ShowRow kShow[] = {
     { "--kld-out",            [](const Config& c) { return or_none(c.kld_out, "none"); } },
     { "--kld-lora",           [](const Config& c) { return or_none(c.kld_lora, "none (the base)"); } },
     { "--kld-lora-sources",   [](const Config& c) { return or_none(c.kld_lora_sources, "every document"); } },
+    { "--diagnose",           [](const Config& c) { return or_none(c.diagnose, "off (serve)"); } },
+    { "--diagnose-tokens",    [](const Config& c) { return num(c.diagnose_tokens); } },
+    { "--diagnose-runs",      [](const Config& c) { return num(c.diagnose_runs); } },
+    { "--diagnose-concurrency", [](const Config& c) {
+          std::string s;
+          for (int n : c.diagnose_concurrency) s += (s.empty() ? "" : ",") + num(n);
+          return s; } },
+    { "--diagnose-prefill",   [](const Config& c) {
+          std::string s;
+          for (int n : c.diagnose_prefill) s += (s.empty() ? "" : ",") + num(n);
+          return s; } },
+    { "--diagnose-corpus",    [](const Config& c) { return or_none(c.diagnose_corpus, "the built-in set"); } },
+    { "--diagnose-baseline",  [](const Config& c) { return or_none(c.diagnose_baseline, "none"); } },
     { "--debug-graph",        [](const Config& c) { return onoff(c.debug_graph); } },
     { "--debug-selection",    [](const Config& c) { return onoff(c.debug_selection); } },
     { "--debug-placement",    [](const Config& c) { return onoff(c.debug_placement); } },

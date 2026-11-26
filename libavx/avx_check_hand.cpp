@@ -379,6 +379,29 @@ void shape_cases(std::vector<Hand>& hs) {
          .pi("window", 0).ps("q_dtype", "f32").ps("kv_dtype", "f32");
         hs.push_back(std::move(h));
     }
+    /* ---- attn_paged_rel (Inkling 2): a ragged prefill with cu_seqlens, the keys past the
+     * extent (contexts of 40 against an extent of 24), GQA 3 over 2 KV heads at head_dim 16. The
+     * window variant takes the local layers' sliding window over the same batch. ------------- */
+    for (int window : { 0, 16 }) {
+        const int64_t S = 2, T = 8, KVH = 2, G = 3, NH = KVH * G, HD = 16, BS = 16, NB = 6;
+        const int64_t DR = 4, EXT = 24, MB = 3;
+        Hand h(window ? "attn_paged_rel ragged, window 16" : "attn_paged_rel ragged, window 0",
+               "attn_paged_rel", 1e-4);
+        h.dense(RAD_F32, { T, NH, HD }, hfill(31))
+         .dense(RAD_F32, { NB, KVH, BS, 2 * HD }, hfill(32))
+         .dense(RAD_I32, { S, MB }, [](int64_t i) { return (float)((i * 5) % 6); })
+         .idx({ 40, 20 })
+         .none().none()
+         .dense(RAD_I32, { S + 1 }, [](int64_t i) { return i == 0 ? 0.0f : i == 1 ? 3.0f : 8.0f; })
+         .dense(RAD_F32, { T, NH, DR }, hfill(33))
+         .dense(RAD_F32, { DR, EXT }, hfill(34))
+         .dense(RAD_F32, { T, NH }, hfill(35))
+         .dense(RAD_F32, { T, NH, HD }, hfill(36), true)
+         .pi("q_len", 5).pi("head_dim", HD).pi("gqa", G).pi("block_size", BS).pi("causal", 1)
+         .pi("window", window).pi("d_rel", DR).pi("extent", EXT)
+         .ps("q_dtype", "f32").ps("kv_dtype", "f32");
+        hs.push_back(std::move(h));
+    }
     /* ---- attention and the KV write over column slices of a fused [q|k|v] projection ------- */
     {
         const int64_t T = 5, NH = 2, KVH = 1, HD = 16, W = (NH + 2 * KVH) * HD, BS = 4, NB = 4;
@@ -533,6 +556,22 @@ void shape_cases(std::vector<Hand>& hs) {
          .pi("M", BAND).pi("n", N).pi("width", CW).ps("dtype", "f32");
         hs.push_back(std::move(k));
 
+        /* Inkling 2's short convolution with its residual and dynamic taps: the same window as
+         * the causal case, with 4 heads of 8 channels each (dyn is [T, heads * k]). */
+        const int64_t SH = 4, SK = 4, SSL = SK - 1 + 2;
+        Hand sc("M = 64 over 5 rows, verifies of 3 and 2, dynamic taps", "sconv_res", 1e-5);
+        sc.dense(RAD_F32, { T, N }, hfill(64))
+          .dense(RAD_F32, { N, SK }, hfill(65, 0.5f))
+          .dense(RAD_F32, { 2, N, SSL }, hfill(66), true)
+          .idx({ 0, 3, 5 })
+          .dense(RAD_F32, { T, SH * SK }, hfill(67, 0.5f))
+          .idx({ 1, 0 })
+          .idx({ 7, 9 })
+          .idx({ 2, 3 })
+          .dense(RAD_F32, { T, N }, hfill(68), true)
+          .pi("M", BAND).pi("n", N).pi("width", SK).pi("heads", SH).ps("dtype", "f32");
+        hs.push_back(std::move(sc));
+
         /* The antialiased resample upscaling a 4 x 4 table (drawn grids never exceed the table),
          * one row downscaling it, and a 1 x 1 grid. */
         static const int32_t kAaCrd[4][6] = { { 0, 6, 3, 1, 0, 5 }, { 0, 8, 4, 2, 0, 1 },
@@ -555,6 +594,37 @@ void shape_cases(std::vector<Hand>& hs) {
           .dense(RAD_F32, { 3, N }, hfill(63))
           .pi("M", 6).pi("n", N).pi("side", 4).pi("n_prefix", 3).ps("dtype", "f32");
         hs.push_back(std::move(gc));
+
+        /* Muse's zero-padded resample: a 4 x 4 table onto rows of an 8 x 8 grid, whose top row
+         * and right column reach taps off the table (zero-weight) and blend the rest. */
+        static const int32_t kPadCrd[4][6] = { { 0, 7, 1, 4, 7, 3 }, { 0, 7, 3, 2, 0, 7 },
+                                               { 8, 8, 8, 8, 8, 8 }, { 8, 8, 8, 8, 8, 8 } };
+        Hand gp("a 4 x 4 table onto an 8 x 8 grid, off-table taps weighted zero", "grid_embed_pad",
+                1e-6);
+        gp.dense(RAD_F32, { 6, N }, hfill(64), true)
+          .dense(RAD_F32, { 16, N }, hfill(65))
+          .dense(RAD_I32, { 4, 6 }, [](int64_t i) { return (float)kPadCrd[i / 6][i % 6]; })
+          .pi("M", 6).pi("n", N).pi("side", 4).ps("dtype", "f32");
+        hs.push_back(std::move(gp));
+
+        /* Muse's window permutation: a 12 x 10 segment and an 8 x 8 one, window 8 (the first
+         * segment's right and bottom windows are ragged). */
+        constexpr int64_t WP = 12 * 10 + 8 * 8;
+        Hand gw("12 x 10 and 8 x 8 segments, window 8", "window_order", 0.0);
+        gw.dense(RAD_I32, { 4, WP }, [=](int64_t i) {
+                   const int64_t p = i % WP, cplx = i / WP;
+                   const int seg = p < 120 ? 0 : 1, base = seg ? 120 : 0;
+                   const int gh = seg ? 8 : 12, gw_ = seg ? 8 : 10;
+                   const int q = (int)(p - base), r = q / gw_, c = q % gw_;
+                   return (float)(cplx == 0 ? r : cplx == 1 ? c : cplx == 2 ? gh : gw_);
+               })
+          .dense(RAD_I32, { 3 }, [](int64_t i) { return i == 0 ? 0.0f : i == 1 ? 120.0f : 184.0f; })
+          .dense(RAD_I32, { WP }, [](int64_t) { return 0.0f; }, true)
+          .dense(RAD_I32, { WP }, [](int64_t) { return 0.0f; }, true)
+          .dense(RAD_I32, { 2, WP }, [](int64_t) { return 0.0f; }, true)
+          .dense(RAD_I32, { WP + 1 }, [](int64_t) { return 0.0f; }, true)
+          .pi("M", WP).pi("window", 8);
+        hs.push_back(std::move(gw));
 
         /* LiLiCorr's candidates over two ranks' sample_logprobs rows: a merge that interleaves the
          * ranks, an equal value on both (the lower id first), a rank with an unfilled slot. Rows
@@ -947,54 +1017,114 @@ void shape_cases(std::vector<Hand>& hs) {
          .pi("M", 4).pi("n", 33).ps("dtype", "i4");
         hs.push_back(std::move(g));
     }
+}
 
-    /* ---- ParoQuant's rotation over real pairings: each stage of each group is a permutation of
-     * its 128 columns read as pairs; two parts of three stages. The dense form uses a drawn matrix
-     * per (part, group). ------------------------------------------------------------------------ */
-    {
-        const int64_t M = 5, K = 256, S = 3, P = 2, G = 128;
-        std::vector<int32_t> pr((size_t)(P * S * K));
-        for (int64_t ps = 0; ps < P * S; ++ps)
-            for (int64_t g = 0; g < K / G; ++g) {
-                std::vector<int32_t> perm((size_t)G);
-                for (int64_t i = 0; i < G; ++i) perm[(size_t)i] = (int32_t)i;
-                uint64_t x = 0x9E3779B97F4A7C15ull * (uint64_t)(ps * 31 + g + 1);
-                for (int64_t i = G - 1; i > 0; --i) {
-                    x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 29;
-                    std::swap(perm[(size_t)i], perm[(size_t)(x % (uint64_t)(i + 1))]);
-                }
-                for (int64_t i = 0; i < G; ++i)
-                    pr[(size_t)(ps * K + g * G + i)] = (int32_t)(g * G + perm[(size_t)i]);
+/* Raw i8 latent rows contain two f16 scales, which a homogeneous integer fill cannot draw.
+ * Both libraries receive the same bytes; hand-computed D2/D512 answers also prevent a shared
+ * missing-scale implementation from passing solely because the libraries agree. */
+void mla_latent_cases(std::vector<Hand>& hs) {
+    for (int64_t d : { 2LL, 512LL })
+        for (int part : { -1, 0, 1 }) {
+            const int64_t row = d + 4;
+            std::vector<uint8_t> cache((size_t)(4 * row));
+            auto put = [&](int t, int a, int b, float s0, float s1) {
+                const int64_t at = t * row;
+                cache[(size_t)at] = (uint8_t)(int8_t)a;
+                cache[(size_t)(at + d / 2)] = (uint8_t)(int8_t)b;
+                const uint16_t sc[] = { rad_f32_to_f16(s0), rad_f32_to_f16(s1) };
+                std::memcpy(cache.data() + at + d, sc, sizeof sc);
+            };
+            put(0, 1, 2, 2, 3);
+            put(1, 3, 1, 1, 4);
+            put(2, 127, 127, NAN, NAN);
+            put(3, 127, 127, NAN, NAN);
+            const double w = part < 0 ? 0.5 : part == 0 ? 1 / (1 + std::exp(1.0))
+                                                                    : 1 / (1 + std::exp(-2.0));
+            const std::string name = "i8 MLA analytical D" + std::to_string(d) + " qhalf " +
+                                     std::to_string(part);
+            Hand h(name.c_str(), "mla_attn", 1e-5);
+            h.dense(RAD_F32, { 1, 1, d }, [=](int64_t c) {
+                 return part >= 0 && c == part * (d / 2) ? 1.0f : 0.0f;
+             })
+             .raw(RAD_I8, { 1, 1, 4, row }, cache.data())
+             .dense(RAD_I32, { 1, 1 }, [](int64_t) { return 0.0f; })
+             .idx({ 2 })
+             .dense(RAD_F32, { 1, 1, d }, [](int64_t) { return -1.0f; }, true)
+             .pi("M", 32).pi("latent_dim", d).pi("heads", 1).pi("blocks", 1).pi("block_size", 4)
+             .pf("scale", 1).ps("dtype", "f32").ps("kv_dtype", "i8");
+            h.oracle_opd = 4;
+            h.oracle_tol = 1e-5;
+            h.oracle.assign((size_t)d, 0);
+            h.oracle[0] = (float)(2 * w + 3 * (1 - w));
+            h.oracle[(size_t)(d / 2)] = (float)(6 * w + 4 * (1 - w));
+            hs.push_back(std::move(h));
+        }
+
+    struct Shape { int64_t rows, heads; };
+    const Shape shapes[] = { { 1, 1 }, { 1, 8 }, { 3, 16 }, { 3, 64 }, { 32, 1 }, { 32, 8 } };
+    for (const Shape& sh : shapes)
+        for (uint32_t dt : { (uint32_t)RAD_F32, (uint32_t)RAD_BF16 })
+            for (bool padded : { false, true }) {
+                constexpr int64_t d = 512, bs = 4, pages = 3, blocks = 3;
+                const int64_t row = d + 4 + (padded ? 3 : 0), page = bs * row + (padded ? 5 : 0);
+                std::vector<uint8_t> cache((size_t)(pages * page), 0x5a);
+                for (int64_t p = 0; p < pages; ++p)
+                    for (int64_t t = 0; t < bs; ++t) {
+                        const int64_t at = p * page + t * row;
+                        const float s0 = p == 2 && t == 0 ? 0.0f : 0.015f * (float)(1 + p + t);
+                        const float s1 = 0.003f * (float)(1 + 2 * p + t);
+                        for (int64_t c = 0; c < d; ++c) {
+                            const int code = (int)(((p * bs + t) * 37 + c * 13) % 255) - 127;
+                            cache[(size_t)(at + c)] = (uint8_t)(int8_t)(c < d / 2 && s0 == 0 ? 0 : code);
+                        }
+                        const uint16_t sc[] = { rad_f32_to_f16(s0), rad_f32_to_f16(s1) };
+                        // The padded case deliberately puts some f16 scales at odd addresses.
+                        std::memcpy(cache.data() + at + d, sc, sizeof sc);
+                    }
+                const int64_t qh = d + (padded ? 3 : 0), qr = sh.heads * qh + (padded ? 5 : 0);
+                const int64_t oh = d + (padded ? 5 : 0), orow = sh.heads * oh + (padded ? 7 : 0);
+                const std::string name = "i8 MLA " + std::to_string(sh.rows) + "x" +
+                    std::to_string(sh.heads) + (dt == RAD_F32 ? " f32" : " bf16") +
+                    (padded ? " padded byte pitches" : " tight 516-byte rows");
+                Hand h(name.c_str(), "mla_attn", dt == RAD_F32 ? 1e-5 : 0.01);
+                h.view(dt, { sh.rows, sh.heads, d }, { qr, qh, 1 }, sh.rows * qr,
+                       [](int64_t i) { return (float)((int)(i % 31) - 15) / 64.0f; })
+                 .bytes(RAD_I8, { pages, 1, bs, d + 4 }, { page, bs * row, row, 1 },
+                        pages * page, std::move(cache), false)
+                 .dense(RAD_I32, { sh.rows, blocks }, [](int64_t i) {
+                     const int64_t r = i / blocks;
+                     if (r % 5 == 2) return i % blocks == 0 ? -1.0f : 99.0f;
+                     return (float)((i % blocks + 2 + r) % pages);
+                 })
+                 .dense(RAD_I32, { sh.rows }, [](int64_t r) {
+                     const int lengths[] = { 5, 0, 12, 3, 4, 7, 1, 15, -1 };
+                     return (float)lengths[r % 9];
+                 })
+                 .view(dt, { sh.rows, sh.heads, d }, { orow, oh, 1 }, sh.rows * orow,
+                       [](int64_t) { return -0.25f; }, true)
+                 .pi("M", 2048).pi("latent_dim", d).pi("heads", sh.heads).pi("blocks", blocks)
+                 .pi("block_size", bs).pf("scale", 0.0625)
+                 .ps("dtype", dt == RAD_F32 ? "f32" : "bf16").ps("kv_dtype", "i8");
+                hs.push_back(std::move(h));
             }
-        const auto h63 = hfill(63);
-        const auto scl = [h63](int64_t i) { return 1.25f + 0.75f * h63(i); };   /* (0.5, 2) */
-        const auto zero = [](int64_t) { return 0.0f; };
-        for (uint32_t ydt : { (uint32_t)RAD_F16, (uint32_t)RAD_F32 }) {
-            Hand h(ydt == RAD_F16 ? "two parts of three stages, y f16" : "two parts of three stages, y f32",
-                   "givens_rotate", 1e-5);
-            h.dense(RAD_BF16, { M, K }, hfill(61))
-             .dense(RAD_I32, { P * S, K }, [pr](int64_t i) { return (float)pr[(size_t)i]; })
-             .dense(RAD_F32, { P * S, K / 2 }, hfill(62, 3.0f))
-             .dense(RAD_F32, { P, K }, scl)
-             .dense(ydt, { M, P * K }, zero, true)
-             .pi("M", M).pi("n", K).pi("group", G).ps("dtype", "bf16").pi("stages", S)
-             .pi("parts", P);
-            hs.push_back(std::move(h));
-        }
-        /* libref sums in f64 and libavx in f32, so a code on a rounding edge can differ by one
-         * grid step; the tolerance allows a few such codes in 2560. */
-        for (const char* outq : { "fp8", "i8" }) {
-            const bool i8 = outq[0] == 'i';
-            Hand h(i8 ? "two parts, i8" : "two parts, fp8", "givens_dense_quant", 5e-3);
-            h.dense(RAD_BF16, { M, K }, hfill(64))
-             .dense(RAD_F16, { P * K, G }, hfill(65, 0.1f))
-             .dense(RAD_F32, { P, K }, scl)
-             .dense(i8 ? RAD_I8 : RAD_F8E4M3, { M, P * K }, zero, true)
-             .dense(RAD_F32, { M, P * K / G }, zero, true)
-             .pi("M", M).pi("n", K).pi("group", G).ps("dtype", "bf16").pi("parts", P)
-             .ps("out", outq);
-            hs.push_back(std::move(h));
-        }
+
+    // Both libraries must reject malformed i8 layouts without writing any output.
+    for (int bad = 0; bad < 5; ++bad) {
+        const int64_t d = bad == 1 ? 3 : 2, width = bad == 0 ? d : d + 4;
+        const int64_t token = bad == 3 ? width - 1 : width;
+        const int64_t page = bad == 4 ? 4 * token - 1 : 4 * token;
+        const std::string name = "i8 MLA refused layout " + std::to_string(bad);
+        Hand h(name.c_str(), "mla_attn", 0);
+        h.dense(RAD_F32, { 1, 1, d }, [](int64_t) { return 0.0f; })
+         .bytes(RAD_I8, { 1, 1, 4, width }, { page, page, token, bad == 2 ? 2 : 1 },
+                64, std::vector<uint8_t>(64, 0), false)
+         .dense(RAD_I32, { 1, 1 }, [](int64_t) { return 0.0f; })
+         .idx({ 1 })
+         .dense(RAD_F32, { 1, 1, d }, [](int64_t) { return -71.0f; }, true)
+         .pi("M", 1).pi("latent_dim", d).pi("heads", 1).pi("blocks", 1).pi("block_size", 4)
+         .pf("scale", 1).ps("dtype", "f32").ps("kv_dtype", "i8")
+         .refuses(bad < 2 ? RAD_E_SHAPE : RAD_E_STRIDE);
+        hs.push_back(std::move(h));
     }
 }
 
@@ -1067,23 +1197,31 @@ void format_cases(std::vector<Hand>& hs) {
         hs.push_back(std::move(h));
     }
 
-    /* ---- an fp8 cache read with per-(sequence, head) descales ------------------------------- *
-     * Decode and a uniform verify of 5 over two sequences, both descales present and different per
-     * KV head, which libref's description always leaves absent. */
+    /* ---- the int8 cache: each key's codes against its own K and V scales -------------------- *
+     * Decode and a uniform verify of 5 over two sequences. The cache is laid out by hand, a row
+     * of head_dim K codes, head_dim V codes and two f16 scales (a power of two times 1, 1.5 or
+     * 1.25, so every key's differ), which libref's description does not draw. */
     for (int64_t ql : { 1, 5 }) {
-        const int64_t S = 2, KVH = 2, G = 2, HD = 64, BS = 16, NB = 4;
-        Hand h(ql == 1 ? "fp8 cache, k_descale and v_descale, decode"
-                       : "fp8 cache, k_descale and v_descale, verify of 5", "attn_paged", 2e-2);
+        const int64_t S = 2, KVH = 2, G = 2, HD = 64, BS = 16, NB = 4, ROW = 2 * HD + 4;
+        Hand h(ql == 1 ? "int8 cache, a scale of K and of V per key, decode"
+                       : "int8 cache, a scale of K and of V per key, verify of 5", "attn_paged",
+               2e-2);
         h.dense(RAD_BF16, { S * ql, KVH * G, HD }, hfill(80))
-         .dense(RAD_F8E4M3, { NB, KVH, BS, 2 * HD }, hfill(81, 2.0f))
+         .dense(RAD_I8, { NB, KVH, BS, ROW }, [=](int64_t i) {
+             const int64_t r = i / ROW, c = i % ROW;
+             if (c < 2 * HD) return (float)((int)((i * 37 + r * 11) % 255) - 127);
+             /* the f16's low byte 0, its high byte: 0x2C00 = 2^-4, 0x2E00 = 1.5 * 2^-4,
+              * 0x2D00 = 1.25 * 2^-4, K's and V's from different residues */
+             static const int hi[3] = { 0x2C, 0x2E, 0x2D };
+             const int half = (int)((c - 2 * HD) / 2);
+             return (c & 1) ? (float)hi[(r + half) % 3] : 0.0f;
+         })
          .dense(RAD_I32, { S, 2 }, [](int64_t i) { return (float)((i * 3 + 2) % 4); })
          .idx({ 20, 9 })
-         .dense(RAD_F32, { S, KVH }, [](int64_t i) { return (float)(0.25 * (1 + (i * 5) % 7)); })
-         .dense(RAD_F32, { S, KVH }, [](int64_t i) { return (float)(0.5 * (1 + (i * 3) % 5)); })
-         .none()
+         .none().none().none()
          .dense(RAD_BF16, { S * ql, KVH * G, HD }, zero, true)
          .pi("q_len", ql).pi("head_dim", HD).pi("gqa", G).pi("block_size", BS).pi("causal", 1)
-         .pi("window", 0).ps("q_dtype", "bf16").ps("kv_dtype", "fp8_e4m3").pf("scale", 0.125);
+         .pi("window", 0).ps("q_dtype", "bf16").ps("kv_dtype", "i8").pf("scale", 0.125);
         hs.push_back(std::move(h));
     }
 
@@ -1198,6 +1336,27 @@ void format_cases(std::vector<Hand>& hs) {
              .ps("dtype", form == 0 ? "w4a8" : "fp8a8");
             hs.push_back(std::move(h));
         }
+        /* NVFP4 experts: every e2m1 code in turn, an E4M3-shaped scale per 16 of K (here as the
+         * product with the expert's level, the logical form), against an int8 activation at one
+         * scale per 64. The codes are one plane, two a byte, element k in the low nibble. */
+        const int64_t NV = NE / 2;
+        std::vector<uint8_t> codes((size_t)(NV * N * K / 2), 0);
+        for (int64_t i = 0; i < NV * N * K; ++i)
+            rad_store_code(codes.data(), RAD_FP4E2M1, i, (int)((i * 7 + 3) % 16));
+        Hand h("nvfp4 experts, every code, scales per 16 of K, against an int8 activation",
+               "moe_gemm_q", 8e-3);
+        h.dense(RAD_I8, { M, K }, [](int64_t i) { return (float)((i * 37) % 255) - 127.0f; })
+         .dense(RAD_F32, { M, K / 64 }, [](int64_t i) { return 0.01f + 0.003f * (float)i; })
+         .raw(RAD_FP4E2M1, { NV, N, K }, codes.data())
+         .dense(RAD_F32, { NV, N, K / 16 }, [](int64_t i) { return 0.25f + 0.25f * (float)(i % 5); })
+         .idx(sorted)
+         .idx(off)
+         .raw(RAD_FP4E2M1, { NV, N, K }, codes.data())
+         .dense(RAD_F32, { NV, N, K / 16 }, [](int64_t i) { return 0.5f + 0.125f * (float)(i % 3); })
+         .dense(RAD_BF16, { T, N }, zero, true)
+         .pi("M", M).pi("N", N).pi("K", K).pi("n_expert", NE).pi("top_k", TOPK)
+         .pi("group", 64).ps("a_order", "token").ps("dtype", "nvfp4a8i8");
+        hs.push_back(std::move(h));
     }
 }
 
@@ -2058,26 +2217,6 @@ void gen_cases(std::vector<Hand>& hs) {
              .dense(dt, { R, D }, hfill(214), true)
              .pi("M", R).pi("n", D).ps("dtype", dn);
             hs.push_back(std::move(g));
-
-            for (const bool gated : { true, false }) {
-                Hand q((std::string(gated ? "gated" : "the first block's, no branch") +
-                        ", three entries, 4D pitch" + sfx).c_str(), "ln_mod_quant_fp8", 1e-2);
-                if (gated) {
-                    q.dense(dt, { R, D }, hfill(215))
-                     .view(dt, { 3, D }, { W, 1 }, 3 * W, hfill(216));
-                } else {
-                    q.none().none();
-                }
-                q.view(dt, { 3, D }, { W, 1 }, 3 * W, hfill(217, 0.5f))
-                 .idx({ 0, 4, 4, R })
-                 .dense(dt, { R, D }, hfill(218, 2.0f), true)
-                 .dense(RAD_F8E4M3, { R, D }, zero, true)
-                 .dense(RAD_F32, { R, D / 32 }, zero, true)
-                 .dense(RAD_BF16, { R, D }, zero, true)
-                 .pi("M", R).pi("n", D).pf("eps", 1e-6).pi("group", 32)
-                 .pi("gated", gated ? 1 : 0).ps("dtype", dn);
-                hs.push_back(std::move(q));
-            }
         }
 
         /* ---- the sampler's state: seeds, flags, pairs and lanes ----------------------------- */
@@ -2374,26 +2513,6 @@ void gen_cases(std::vector<Hand>& hs) {
         }
     }
 
-    /* ---- an fp8 cache read with per-(entry, kv head) descales ------------------------------ */
-    {
-        const int64_t T = 20, kvh = 2, gqa = 1, hd = 64, BS = 16;
-        Hand h("fp8 cache, k and v descales, bf16 rows", "attn_prefix_self", 2e-2);
-        h.dense(RAD_BF16, { T, kvh * gqa * hd }, hfill(270))
-         .dense(RAD_BF16, { T, kvh * hd }, hfill(271))
-         .dense(RAD_BF16, { T, kvh * hd }, hfill(272))
-         .dense(RAD_F8E4M3, { 4, kvh, BS, 2 * hd }, hfill(273, 8.0f))
-         .dense(RAD_I32, { 2, 2 }, [](int64_t i) { return (float)i; })
-         .idx({ 30, 17 })
-         .idx({ 0, 12, T })
-         .dense(RAD_F32, { 4 }, [](int64_t i) { return 0.1f + 0.05f * (float)i; })
-         .dense(RAD_F32, { 4 }, [](int64_t i) { return 0.2f - 0.03f * (float)i; })
-         .none().none()
-         .dense(RAD_BF16, { T, kvh * gqa * hd }, zero, true)
-         .pi("q_len", T).pi("head_dim", hd).pi("gqa", gqa).pi("block_size", BS).pi("causal", 0)
-         .ps("q_dtype", "bf16").ps("kv_dtype", "fp8_e4m3").pf("scale", 0.125);
-        hs.push_back(std::move(h));
-    }
-
     /* ---- scatter_add_rows: a repeated destination adds in index order ----------------------- */
     {
         Hand h("a destination three times, one skip", "scatter_add_rows", 0.0);
@@ -2488,25 +2607,6 @@ void video_cases(std::vector<Hand>& hs) {
                  .pi("M", R).pi("n", D).pf("eps", 1e-5).pi("gated", gated ? 1 : 0)
                  .ps("dtype", dn);
                 hs.push_back(std::move(h));
-
-                Hand q((std::string(gated ? "gated" : "ungated") + ", quantised, three entries" +
-                        sfx).c_str(), "rms_mod_quant_fp8", 1e-2);
-                if (gated) {
-                    q.dense(dt, { R, D }, hfill(414))
-                     .view(dt, { 3, D }, { W6, 1 }, 3 * W6, hfill(415, 0.5f));
-                } else {
-                    q.none().none();
-                }
-                q.view(dt, { 3, 2 * D }, { W6, 1 }, 3 * W6, hfill(416, 0.5f))
-                 .dense(dt, { D }, [](int64_t i) { return 0.8f + 0.003f * (float)i; })
-                 .idx({ 0, 4, 4, R })
-                 .dense(dt, { R, D }, hfill(417, 2.0f), true)
-                 .dense(RAD_F8E4M3, { R, D }, zero, true)
-                 .dense(RAD_F32, { R, D / 32 }, zero, true)
-                 .dense(RAD_BF16, { R, D }, zero, true)
-                 .pi("M", R).pi("n", D).pf("eps", 1e-5).pi("group", 32)
-                 .pi("gated", gated ? 1 : 0).ps("dtype", dn);
-                hs.push_back(std::move(q));
             }
         }
 
@@ -3693,7 +3793,7 @@ Hand store(const char* name, int64_t blocks, int64_t slots, int64_t bs, int64_t 
            std::vector<int64_t> sm, std::vector<int64_t> res) {
     const int64_t M    = (int64_t)sm.size();
     const int64_t lane = kvh * hd;
-    const int64_t row  = kvh * bs * 2 * hd;
+    const int64_t row  = kvh * bs * (2 * hd + 4);
     const int64_t span = M * 2 * lane;
     Hand h(name, "kv_store_streamed", 0.0);
     h.view(RAD_BF16, { M, lane }, { 2 * lane, 1 }, span,
@@ -3701,13 +3801,13 @@ Hand store(const char* name, int64_t blocks, int64_t slots, int64_t bs, int64_t 
      .view(RAD_BF16, { M, lane }, { 2 * lane, 1 }, span,
            [](int64_t i) { return (float)((int)(i % 13) - 6) * 0.25f; })           /* v */
      .idx(sm)
-     .dense(RAD_F8E4M3, { slots, kvh, bs, 2 * hd },
+     .dense(RAD_I8, { slots, kvh, bs, 2 * hd + 4 },
             [](int64_t i) { return (float)((int)(i % 5) + 1); }, true)            /* the ring */
      .idx(res)
      .dense(RAD_U8, { blocks, row },
             [](int64_t i) { return (float)(int)((i * 37) % 251); }, true)         /* the mirror */
      .pi("M", M).pi("head_dim", hd).pi("n_head_kv", kvh).pi("block_size", bs)
-     .ps("kv_dtype", "fp8_e4m3");
+     .ps("kv_dtype", "i8");
     return h;
 }
 
@@ -3740,33 +3840,38 @@ void kvstream_cases(std::vector<Hand>& hs) {
         hs.push_back(std::move(h));
     }
     /* The mirror's exact bytes, laid out by hand: four tokens fill both blocks at both offsets
-     * with constants, so the paged layout [kv_heads][block_size][2 * head_dim] and the E4M3
+     * with constants, so the paged layout [kv_heads][block_size][2 * head_dim + 4] and the int8
      * encoding are pinned against an answer no library computes: agreement alone cannot catch a
-     * store that writes the right values to the wrong address or at the wrong scale. */
+     * store that writes the right values to the wrong address or at the wrong scale. Each head's
+     * larger element is 127 times a power of two, so its scale is that power exactly and the
+     * codes are the elements over it. */
     {
-        const int64_t blocks = 2, slots = 2, bs = 2, kvh = 1, hd = 2, M = 4;
-        const int64_t lane = kvh * hd, row = kvh * bs * 2 * hd, span = M * 2 * lane;
-        const float kd[M][2] = { { 1, 2 }, { 3, 4 }, { 5, 6 }, { 7, 8 } };
-        const float vd[M][2] = { { -1, -2 }, { -3, -4 }, { -5, -6 }, { -7, -8 } };
-        Hand h("the mirror's bytes, block-id addressing and E4M3", "kv_store_streamed", 0.0);
+        const int64_t blocks = 2, slots = 2, bs = 2, kvh = 1, hd = 2, M = 4, rowe = 2 * hd + 4;
+        const int64_t lane = kvh * hd, row = kvh * bs * rowe, span = M * 2 * lane;
+        const float kd[M][2] = { { 63.5f, 127 }, { -254, 64 }, { 31.75f, 5 }, { 508, -100 } };
+        const float vd[M][2] = { { -127, 1 }, { 2, 254 }, { -63.5f, -8 }, { 15.875f, 3 } };
+        /* scale (a power of two, as an f16's high byte with a zero low byte) and codes */
+        const uint8_t ksh[M] = { 0x3C, 0x40, 0x34, 0x44 }, vsh[M] = { 0x3C, 0x40, 0x38, 0x30 };
+        const int8_t kc[M][2] = { { 64, 127 }, { -127, 32 }, { 127, 20 }, { 127, -25 } };
+        const int8_t vc[M][2] = { { -127, 1 }, { 1, 127 }, { -127, -16 }, { 127, 24 } };
+        Hand h("the mirror's bytes, block-id addressing and the int8 rows", "kv_store_streamed", 0.0);
         h.view(RAD_BF16, { M, lane }, { 2 * lane, 1 }, span,
                [&](int64_t i) { return i % 4 < 2 ? kd[i / 4][i % 4] : 0.0f; })
          .view(RAD_BF16, { M, lane }, { 2 * lane, 1 }, span,
                [&](int64_t i) { return i % 4 < 2 ? vd[i / 4][i % 4] : 0.0f; })
          .idx({ 0, 1, 2, 3 })
-         .dense(RAD_F8E4M3, { slots, kvh, bs, 2 * hd }, [](int64_t) { return 0.0f; }, true)
+         .dense(RAD_I8, { slots, kvh, bs, rowe }, [](int64_t) { return 0.0f; }, true)
          .idx({ 0, 1 })
          .dense(RAD_U8, { blocks, row }, [](int64_t) { return 0.0f; }, true)  /* the mirror */
          .pi("M", M).pi("head_dim", hd).pi("n_head_kv", kvh).pi("block_size", bs)
-         .ps("kv_dtype", "fp8_e4m3");
+         .ps("kv_dtype", "i8");
         std::vector<uint8_t> want((size_t)(blocks * row), 0);
         for (int64_t t = 0; t < M; ++t) {
-            const float pair[2 * hd] = { kd[t][0], kd[t][1], vd[t][0], vd[t][1] };
-            uint8_t enc[2 * hd] = {};
-            h_narrow(pair, RAD_F8E4M3, 2 * hd, enc);
             const int64_t blk = t / bs, off = t % bs;
-            for (int64_t j = 0; j < 2 * hd; ++j)
-                want[(size_t)(blk * row + off * 2 * hd + j)] = enc[j];
+            uint8_t* w = &want[(size_t)(blk * row + off * rowe)];
+            w[0] = (uint8_t)kc[t][0]; w[1] = (uint8_t)kc[t][1];
+            w[2] = (uint8_t)vc[t][0]; w[3] = (uint8_t)vc[t][1];
+            w[4] = 0; w[5] = ksh[t]; w[6] = 0; w[7] = vsh[t];
         }
         h.expect_bytes(5, want);
         hs.push_back(std::move(h));
@@ -3808,19 +3913,19 @@ void kvstream_cases(std::vector<Hand>& hs) {
     }
     /* A mirror row that is not the block's pitch: a write would spill into the next block. */
     {
-        const int64_t blocks = 2, slots = 1, bs = 2, kvh = 1, hd = 2, row = 8;
+        const int64_t blocks = 2, slots = 1, bs = 2, kvh = 1, hd = 2, row = 16;
         Hand h("a padded mirror row is refused", "kv_store_streamed", 0.0);
         h.view(RAD_BF16, { 2, 2 }, { 4, 1 }, 8,
                [](int64_t i) { return (float)((int)(i % 7) - 3); })
          .view(RAD_BF16, { 2, 2 }, { 4, 1 }, 8,
                [](int64_t i) { return (float)((int)(i % 5) - 2); })
          .idx({ 0, 1 })
-         .dense(RAD_F8E4M3, { slots, kvh, bs, 2 * hd }, [](int64_t) { return 1.0f; }, true)
+         .dense(RAD_I8, { slots, kvh, bs, 2 * hd + 4 }, [](int64_t) { return 1.0f; }, true)
          .idx({ -1, -1 })
          .view(RAD_U8, { blocks, row }, { row + 4, 1 }, blocks * (row + 4),
                [](int64_t i) { return (float)(int)(i % 251); }, true)
          .pi("M", 2).pi("head_dim", hd).pi("n_head_kv", kvh).pi("block_size", bs)
-         .ps("kv_dtype", "fp8_e4m3")
+         .ps("kv_dtype", "i8")
          .refuses(RAD_E_STRIDE);
         hs.push_back(std::move(h));
     }
@@ -5045,11 +5150,132 @@ void audio_cases(std::vector<Hand>& hs) {
     }
 }
 
+/* attn_res_mix's contract in double over the inputs as the buffers hold them (rounded to their
+ * dtype), so the oracle and both libraries start from the same values. */
+std::vector<float> attn_res_oracle(const std::vector<float>& st, int64_t MT, int64_t nS,
+                                   const std::vector<float>& cur, const std::vector<float>* add,
+                                   const std::vector<float>& q, const std::vector<float>* w,
+                                   int64_t M, int64_t n, int64_t nQ, double eps) {
+    std::vector<float> y((size_t)(nQ * M * n));
+    for (int64_t t = 0; t < M; ++t) {
+        std::vector<std::vector<double>> v;
+        for (int64_t i = 0; i <= nS; ++i) {
+            std::vector<double> x((size_t)n);
+            for (int64_t c = 0; c < n; ++c)
+                x[(size_t)c] = i < nS ? st[(size_t)(i * MT * n + t * n + c)]
+                                      : (double)cur[(size_t)(t * n + c)] +
+                                            (add ? (double)(*add)[(size_t)(t * n + c)] : 0.0);
+            double ms = 0;
+            for (double e : x) ms += e * e;
+            const double r = 1.0 / std::sqrt(ms / n + eps);
+            for (double& e : x) e *= r;
+            v.push_back(x);
+        }
+        for (int64_t qq = 0; qq < nQ; ++qq) {
+            std::vector<double> sc;
+            double mx = -1e300;
+            for (auto& x : v) {
+                double d = 0;
+                for (int64_t c = 0; c < n; ++c) d += x[(size_t)c] * q[(size_t)(qq * n + c)];
+                sc.push_back(d / std::sqrt((double)n));
+                mx = std::max(mx, sc.back());
+            }
+            double den = 0;
+            for (double& s : sc) { s = std::exp(s - mx); den += s; }
+            std::vector<double> m((size_t)n, 0.0);
+            for (size_t i = 0; i < v.size(); ++i)
+                for (int64_t c = 0; c < n; ++c) m[(size_t)c] += sc[i] / den * v[i][(size_t)c];
+            if (w) {
+                double ms = 0;
+                for (double e : m) ms += e * e;
+                const double r = 1.0 / std::sqrt(ms / n + eps);
+                for (int64_t c = 0; c < n; ++c)
+                    m[(size_t)c] = m[(size_t)c] * r * (*w)[(size_t)(qq * n + c)];
+            }
+            for (int64_t c = 0; c < n; ++c)
+                y[(size_t)((qq * M + t) * n + c)] = (float)m[(size_t)c];
+        }
+    }
+    return y;
+}
+
+/* attn_res_mix over pitched state planes (a [max_blocks, max_tok, n] buffer of which the first
+ * n_state planes and M rows are read), with and without the addend, the gain, and at depth 0. The
+ * oracle is the double-precision contract above; both libraries are held to it. */
+void attnres_cases(std::vector<Hand>& hs) {
+    struct Geo { int64_t M, n, nS, nQ, MB, MT; const char* dt; };
+    const Geo geos[] = {
+        { 3, 8, 2, 2, 4, 5, "f32" },
+        { 3, 8, 2, 2, 4, 5, "bf16" },
+        { 5, 16, 1, 1, 2, 9, "bf16" },
+        { 4, 8, 8, 3, 9, 6, "bf16" },
+        { 2, 8, 0, 4, 1, 2, "f32" },
+    };
+    for (const Geo& g : geos) {
+        const bool bf = std::string(g.dt) == "bf16";
+        const uint32_t dt = bf ? RAD_BF16 : RAD_F32;
+        const double tol = bf ? 8e-3 : 2e-5;
+        const double eps = 1e-6;
+        /* Values as the buffers hold them. */
+        auto fit = [&](std::vector<float> v) {
+            if (bf) for (float& e : v) e = rad_bf16_to_f32(rad_f32_to_bf16(e));
+            return v;
+        };
+        std::vector<float> st((size_t)(g.MB * g.MT * g.n)), cur((size_t)(g.M * g.n)),
+                           add((size_t)(g.M * g.n)), q((size_t)(g.nQ * g.n)), w((size_t)(g.nQ * g.n));
+        for (size_t i = 0; i < st.size(); ++i) st[i] = std::sin(0.37f * (float)i) * (1.0f + (float)(i % 4));
+        for (size_t i = 0; i < cur.size(); ++i) { cur[i] = std::cos(0.91f * (float)i); add[i] = 0.1f * (float)i - 0.4f; }
+        for (size_t i = 0; i < q.size(); ++i) { q[i] = std::sin(1.3f * (float)i + 0.2f); w[i] = 1.0f + 0.05f * (float)i; }
+        st = fit(st); cur = fit(cur); add = fit(add);
+        /* The query and gain are f32 whatever the activations are. */
+        for (int with : { 0, 1 }) {
+            const std::vector<float>* ad = with ? &add : nullptr;
+            const std::vector<float>* wp = with ? &w : nullptr;
+            const std::string nm = std::string("pitched states, n_state ") + std::to_string(g.nS) +
+                                   (with ? ", addend and gain" : ", no addend or gain") + ", " + g.dt;
+            Hand h(nm.c_str(), "attn_res_mix", tol);
+            if (g.nS > 0)
+                h.view(dt, { g.MB, g.MT, g.n }, { g.MT * g.n, g.n, 1 }, g.MB * g.MT * g.n,
+                       [&st](int64_t i) { return st[(size_t)i]; });
+            else
+                h.none();
+            h.dense(dt, { g.M, g.n }, [&cur](int64_t i) { return cur[(size_t)i]; });
+            if (with) h.dense(dt, { g.M, g.n }, [&add](int64_t i) { return add[(size_t)i]; });
+            else      h.none();
+            h.dense(RAD_F32, { g.nQ, g.n }, [&q](int64_t i) { return q[(size_t)i]; });
+            if (with) h.dense(RAD_F32, { g.nQ, g.n }, [&w](int64_t i) { return w[(size_t)i]; });
+            else      h.none();
+            h.dense(dt, { g.nQ, g.M, g.n }, [](int64_t) { return 0.0f; }, true)
+             .pi("M", g.M).pi("n", g.n).pi("n_state", g.nS).pi("n_query", g.nQ)
+             .ps("dtype", g.dt).pf("eps", eps);
+            /* The query and gain are f32, unrounded, as the oracle reads them. */
+            h.oracle_opd = 5;
+            h.oracle = attn_res_oracle(st, g.MT, g.nS, cur, ad, q, wp, g.M, g.n, g.nQ, eps);
+            h.oracle_tol = bf ? 6e-3 : 1e-5;
+            hs.push_back(std::move(h));
+        }
+    }
+
+    /* SiTU with gates and ups far past both caps (sigma 60 against caps of 4 and 25), and at the
+     * caps themselves: the softcaps saturate, the sigmoid does not, and both libraries must agree
+     * on where the saturation starts. */
+    for (const char* dt : { "f32", "bf16" }) {
+        const uint32_t d = std::string(dt) == "bf16" ? RAD_BF16 : RAD_F32;
+        Hand h(std::string(dt) == "bf16" ? "situ far past both caps, bf16" : "situ far past both caps, f32",
+               "situ_mul", 6e-3);
+        h.dense(d, { 4, 2 * 64 }, hfill(401, 60.0f))
+         .dense(d, { 4, 64 }, [](int64_t) { return 0.0f; }, true)
+         .pi("M", 4).pi("n", 64).ps("dtype", dt).pf("gate_cap", 4.0).pf("up_cap", 25.0);
+        hs.push_back(std::move(h));
+    }
+}
+
 }  // namespace
 
 bool hand_cases(const Check& ck) {
     std::vector<Hand> hs;
     shape_cases(hs);
+    mla_latent_cases(hs);
     format_cases(hs);
     anchor_cases(hs);
     packed_cases(hs);
@@ -5062,6 +5288,7 @@ bool hand_cases(const Check& ck) {
     kvstream_cases(hs);
     encoder_cases(hs);
     audio_cases(hs);
+    attnres_cases(hs);
     Broken broken;
     planes_cases(ck, hs, broken);
 

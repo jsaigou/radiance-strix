@@ -158,7 +158,7 @@ std::string Bench::render_reply_uncached(const ojson& assistant) const {
 }
 
 static std::string q(const std::string& s) {
-    return nlohmann::json(s).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    return Json(s).dump(-1, ' ', false, Json::error_handler_t::replace);
 }
 
 std::string show(const ReplyMessage& m) {
@@ -206,7 +206,7 @@ Verdict compare(const Bench& b, const std::string& text) {
      * new one makes every complete value JSON (chatparse.cpp, ValueOut); the decided shapes and
      * streaming checks cover the new reader there. */
     auto args_agree = [](const std::string& old_a, const std::string& new_a) {
-        if (old_a == new_a || !nlohmann::json::accept(old_a)) return true;
+        if (old_a == new_a || !Json::accept(old_a)) return true;
         /* One allowed difference: a leading newline the old reader stripped from a value after
          * a tag that already ends with one (Qwen's `<parameter=NAME>\n`), which the template
          * writes when the value itself starts with a newline. Every other byte must agree. */
@@ -333,7 +333,7 @@ std::string check_stream(const ReplyParser& p, const std::string& text,
      * wrote, for any valid UTF-8 reply (the decoder sanitises every reply). */
     if (sanitize(text) == text)
         for (const ReplyCall& c : expect.calls)
-            if (c.closed && !nlohmann::json::accept(c.arguments))
+            if (c.closed && !Json::accept(c.arguments))
                 return "a closed call's arguments are no JSON: " + q(c.arguments);
     return std::string();
 }

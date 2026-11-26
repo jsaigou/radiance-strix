@@ -1,0 +1,80 @@
+# minimax-h3-i8.recipe -- MiniMax-H3 with no E4M3 weight: every quantised linear int8.
+#
+# The text encoder's and the token refiner's linears become IQ8R (codes in -127..127 in the
+# 128-wide Hadamard domain, a u8 scale per [1 x 256] of K under a bf16 scale a row), read at i8a8h
+# against int8 activations quantised under the same rotation; the modulation projections, whose K
+# is the 2688-wide timestep embedding and not whole 256s, the same grid with a bf16 scale per
+# (row, 128). The DiT's four per-token linears are unrotated int8 with a bf16 scale per (row, 128),
+# served w8a8, whose modulated norm quantises in its own pass. Round to nearest (the rotated grids
+# with a scale search); no calibration data is read.
+#
+#   rad-convert <MiniMax-H3 pipeline directory> --recipe data/recipes/minimax-h3-i8.recipe \
+#       -o minimax-h3-i8.rad
+#
+# The directory needs the text-to-video-and-audio components only: text_encoder/, transformer/,
+# vae/, audio_vae/, the processor or tokenizer and both scheduler folders (transformer_ref/ and
+# the original-layout FL2VA/ and Ref2VA/ are not read).
+#
+# FastVideo's FastH3 releases (the denoiser distilled to eight steps with video sparse attention)
+# take the same recipe: their text encoder and decoders are MiniMax-H3's files, so a container of
+# the base model can supply them, with every transformer tensor listed as changed:
+#
+#   rad-convert <FastH3 directory> --recipe data/recipes/minimax-h3-i8.recipe \
+#       --reuse minimax-h3-i8.rad --changed <the transformer's tensor names, "transformer." first> \
+#       -o fasth3-8-step-v2-i8.rad
+#
+# LBH-123-AI's latent upscaler (Minimax_h3_latent_Upscaler, Apache-2.0) is a companion folder:
+# put its config.json (minimax_h3_latent_upscaler_3d_conv_v1/config.json) and its bf16 weights,
+# named diffusion_pytorch_model.safetensors, in latent_upscaler/ of the pipeline directory. It
+# converts with the rest, or is appended to a container converted without it, which keeps every
+# weight the container holds where it is:
+#
+#   rad-convert <pipeline directory> --recipe data/recipes/minimax-h3-i8.recipe \
+#       --reuse minimax-h3-i8.rad --in-place
+#
+# What keeps the checkpoint's precision is read once a step or less: the embedding table,
+# context_embedder and norm_out (bf16), the timestep MLP and the four patch projections (f32),
+# every norm and bias. The video decoder's linears are cast to bf16 from the checkpoint's f32, its
+# norms, layer scales, biases and register tokens stay f32; the audio decoder stays f32 (its weight
+# norms folded at convert). The VAEs' encoders, which keyframes and reference media go through,
+# are the encoder halves of vae/ and audio_vae/ and convert with the rest.
+te.blk.*.attn_qkv.weight             rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.attn_output.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.ffn_gate_up.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.ffn_down.weight             rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+te.blk.*.attn_norm.weight            cast dtype=f32
+te.blk.*.ffn_norm.weight             cast dtype=f32
+ref.blk.*.attn_qkv.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+ref.blk.*.attn_output.weight         rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+ref.blk.*.ffn_gate_up.weight         rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+ref.blk.*.ffn_down.weight            rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dit.blk.*.attn_qkv.weight            rtn  codes=i8 group=128 scale=bf16 clamp=sym
+dit.blk.*.attn_output.weight         rtn  codes=i8 group=128 scale=bf16 clamp=sym
+dit.blk.*.ffn_gate_up.weight         rtn  codes=i8 group=128 scale=bf16 clamp=sym
+dit.blk.*.ffn_down.weight            rtn  codes=i8 group=128 scale=bf16 clamp=sym
+dit.blk.*.ada*.weight                rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+vae.blk.*.attn_qkv.weight            cast dtype=bf16
+vae.blk.*.attn_out.weight            cast dtype=bf16
+vae.blk.*.ffn_up.weight              cast dtype=bf16
+vae.blk.*.ffn_down.weight            cast dtype=bf16
+vae.proj_out.*                       cast dtype=bf16
+aud.*.weight                         cast dtype=f32
+# The audio encoder's strided downsamplers and its attention and MLP block run in bf16 inside the
+# f32 chain (declare_aenc): conv1d, layernorm and gemm take one dtype for every operand, so their
+# weights are cast. The chain's own convolutions are stored f32, their weight norms folded.
+aenc.d*.w                            cast dtype=bf16
+aenc.d*.b                            cast dtype=bf16
+aenc.pb.*                            cast dtype=bf16
+aenc.b*.u*.c1.weight                 cast dtype=f32
+aenc.b*.u*.c2.weight                 cast dtype=f32
+aenc.cin.weight                      cast dtype=f32
+aenc.fin.weight                      cast dtype=f32
+# The video encoder's 3x3x3 convolutions are bf16, as the implicit-GEMM kernel reads them;
+# conv_in (three input channels) and the 1x1x1 shortcut and quant convolutions read their f32
+# weights as they are, and the norms and biases need no rule.
+venc.l*.b*.c1w                       cast dtype=bf16
+venc.l*.b*.c2w                       cast dtype=bf16
+venc.l*.dnw                          cast dtype=bf16
+venc.cout.weight                     cast dtype=bf16
+ups.embed.*                          cast dtype=f32
+ups.*.emb_layers.*                   cast dtype=f32

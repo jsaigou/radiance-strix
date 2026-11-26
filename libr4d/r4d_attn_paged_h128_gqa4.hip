@@ -31,16 +31,19 @@ extern "C" long r4d_attn_decode_h128_gqa4_scratch_bytes(const R4DArgs* a) {
     return r4d_decode_scratch(a, r4d_decode_splits_win(a, B_TILE), B_OPT);
 }
 
-extern "C" int r4d_attn_decode_h128_gqa4_fp8kv(const R4DArgs* a, hipStream_t s) {
-    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT, 0>(a, s);
-}
 extern "C" int r4d_attn_decode_h128_gqa4_bf16kv(const R4DArgs* a, hipStream_t s) {
     return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT, 1>(a, s);
 }
+// The int8 cache (int8 K and V, an f16 scale each per token and head): K is widened from the paged
+// cache a fragment at a time, so without the one-round raw K loads.
+extern "C" int r4d_attn_decode_h128_gqa4_i8kv(const R4DArgs* a, hipStream_t s) {
+    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, (B_OPT & ~O_KRAW) | O_KVI8, 0>(a, s);
+}
 // The same over a cache holding each kv head once for kv_rep query groups (O_KVREP), q at
 // R4DArgs::q_ld (O_QLD): gqa 8 on this gqa-4 kernel, under attn_paged_qrow.
-extern "C" int r4d_attn_decode_h128_gqa4_rep_fp8kv(const R4DArgs* a, hipStream_t s) {
-    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT | O_QLD | O_KVREP, 0>(a, s);
+extern "C" int r4d_attn_decode_h128_gqa4_rep_i8kv(const R4DArgs* a, hipStream_t s) {
+    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, (B_OPT & ~O_KRAW) | O_KVI8 | O_QLD | O_KVREP,
+                                 0>(a, s);
 }
 extern "C" int r4d_attn_decode_h128_gqa4_rep_bf16kv(const R4DArgs* a, hipStream_t s) {
     return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT | O_QLD | O_KVREP, 1>(a, s);

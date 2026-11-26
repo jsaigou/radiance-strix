@@ -7,6 +7,16 @@ patch was REWRITTEN into core/ under our own name instead, so this directory sta
 The bottom half of this file is the list of things that went the other way, and why -- that list
 is as much a part of the record as the lifts are.
 
+One exception, taken deliberately: the chat lift (common/chat*, the auto-parser, jinja/ and
+json-schema-to-grammar) is maintained directly in place. Its former patch series (0002-0021)
+was verified applied -- the whole stack reverses cleanly on a copy of the tree it was removed
+from, and on the directly edited tree only context lines of 0012 and 0015 have moved -- and the
+patch files were then removed: the code itself is the change, the PATCH SERIES notes at the
+bottom keep the rationale for each former patch by its old name, and the diffs are in git
+history at 008eed4f, the last commit that has vendor/patches/0002-0021. Later changes -- the
+render-path work that cut a chat request from three template renders to two and made the
+Jinja string machinery move instead of copy -- are likewise direct edits. A refresh of those files is therefore a manual port, not a re-copy and re-apply.
+
 The mechanical half of the promise is vendor/SHA256SUMS: every file under this directory -- lifts,
 patch series, this record -- hashed, recomputed by tests/vendor_sums.sh (ctest: vendor_sums). A
 file that differs, or arrived unrecorded, fails the suite: an unrecorded change to a lifted
@@ -23,10 +33,11 @@ UPSTREAM
               ("tests : add support for qwen3 SSM archs (#24031)")
               MIT.
 
-To refresh: check out the new upstream commit, re-copy the files listed below to the same paths,
-re-apply patches/*.patch with `patch -p1` from vendor/llama/, and update the commit above. Paths
-under vendor/llama/ mirror the upstream tree exactly so a patch generated with `git diff` in
-llama.cpp applies here unchanged.
+To refresh the lifts still under the rule: check out the new upstream commit, re-copy the files
+listed below to the same paths, re-apply patches/*.patch with `patch -p1` from vendor/llama/,
+and update the commit above. Paths under vendor/llama/ mirror the upstream tree exactly so a
+patch generated with `git diff` in llama.cpp applies here unchanged. The chat lift is the
+exception above: do not re-copy it; port by hand.
 
 
 LIFTED FILES
@@ -68,11 +79,34 @@ vendor/llama/common/jinja/                   <- llama.cpp common/jinja/
     utils.h README.md
 
     The Jinja engine and the template capability probe (spec §12: 5.0k + 0.5k lines). It depends
-    on nlohmann/json and common/unicode.h and on nothing else in llama.cpp -- no ggml, no
-    llama.h, no common.h -- which is why it lifts cleanly and chat.cpp did not.
+    on the tree's JSON DOM (core/util/json.h; nlohmann/json when lifted) and common/unicode.h
+    and on nothing else in llama.cpp -- no ggml, no llama.h, no common.h -- which is why it
+    lifts cleanly and chat.cpp did not.
 
-    LOCAL CHANGES: patches/0015-jinja-print-a-list-or-a-dict-as-its-repr.patch
-                   patches/0021-jinja-a-dotted-integer-is-an-index.patch
+    LOCAL CHANGES: maintained directly (see the chat exception at the top of this file). The
+                   former patches 0006 (min/max over a sequence), 0015 (print a list or dict
+                   as its repr) and 0021 (a dotted integer is an index), `unique` over a sequence
+                   with jinja2's semantics (upstream's is a stub that throws, which the capability
+                   probe reports as a template without tool support: GLM-5.3-Flash's), the probe's
+                   first exception under tools kept (caps::probe_error,
+                   common_chat_templates_get_probe_error), then the string/render
+                   hot paths: parts are moved instead of copied through the gather, appends no
+                   longer return a copy, the parts join is one compaction pass, the flat render
+                   is gathered without a parts list, and loop/member lookups stop rehashing.
+                   Added 2026-11: budgets. A container's chat template is server-side attacker
+                   data and the engine ran it without any: parse_any and parse_expression
+                   recursed once per nesting block/paren with no bound -- tens of KB of `{{ (((`
+                   or `{% if %}{% if %}` stack-overflowed whoever parsed, the capability probe
+                   or the first render, past every catch -- so both now share one 128-level cap
+                   whose throw is the same exception class a malformed template already raises.
+                   An elif chain counts against the same cap: parse_if_statement calls itself
+                   once per elif without passing through parse_any.
+                   And range() emitted one array element per step uncapped -- `range(4000000000)`
+                   OOMed per render -- so it refuses above 65536 values, far past any template
+                   that exists. String repetition is that cap's sibling -- `'x' * 4000000000`
+                   appended one step at a time, uncapped, and chained repetitions multiply past
+                   any bound -- so a repetition whose result passes 64 MiB throws the same
+                   exception, at any step of the chain.
 
 vendor/llama/common/chat.{h,cpp}
 vendor/llama/common/chat-auto-parser.h
@@ -97,23 +131,17 @@ vendor/llama/common/regex-partial.{h,cpp}    <- llama.cpp common/*
     files in core/ that include any of these, which keeps a vendor refresh from rippling into the
     server.
 
-    LOCAL CHANGES: patches/0002-chat-unclosed-reasoning-must-not-swallow-a-tool-call.patch
-                   patches/0003-json-schema-pattern-must-not-hang-or-index-empty.patch
-                   patches/0004-json-schema-refuse-what-it-cannot-enforce.patch
-                   patches/0005-chat-an-xml-argument-value-owns-its-indentation.patch
-                   patches/0006-jinja-min-and-max-over-a-sequence.patch
-                   patches/0007-autoparser-split-the-per-argument-suffix-from-the-call-close.patch
-                   patches/0008-autoparser-tagged-calls-separate-on-space-and-named-args-in-any-order.patch
-                   patches/0009-chat-a-cdata-section-is-punctuation-not-content.patch
-                   patches/0011-chat-add_bos-must-come-from-the-inputs.patch
-                   patches/0012-json-schema-a-schema-no-value-satisfies.patch
-                   patches/0013-json-schema-a-count-past-int-is-no-bound.patch
-                   patches/0014-json-schema-a-not-of-every-type-is-never.patch
-                   patches/0016-chat-analyse-a-template-once.patch
-                   patches/0017-json-schema-a-pattern-without-anchors-searches.patch
-                   patches/0018-json-schema-shorthand-classes-are-written-out.patch
-                   patches/0019-json-schema-identity-escapes-of-punctuation.patch
-                   patches/0020-json-schema-control-escapes-and-unloadable-class-escapes.patch
+    LOCAL CHANGES: maintained directly (see the chat exception at the top of this file). The
+                   former patches 0002-0005 and 0007-0020 (listed with their rationale under
+                   PATCH SERIES below), then in place: the generation-prompt render reuse and
+                   the dropped message_spans computation. The
+                   whole lift's JSON type is now the tree's own DOM (core/util/json.h,
+                   rad::Json) where upstream spells nlohmann::ordered_json (and
+                   nlohmann::json in peg-parser's to_json/save, whose text now keeps
+                   insertion order instead of sorting keys), and
+                   json-partial.cpp's error locator is a small structural scanner where
+                   upstream drives nlohmann's SAX interface; a refresh re-applies both by
+                   renaming the type and keeping the scanner.
 
     On 0003: a `pattern` in a `response_format` reaches _visit_pattern() as client data, and three
     of its paths do not survive that. `front()`/`back()` run on an empty string; `seq.back()` runs
@@ -124,6 +152,12 @@ vendor/llama/common/regex-partial.{h,cpp}    <- llama.cpp common/*
     read off the end of a container are the two things a catch cannot turn into a 400. The patch
     adds a size test, two empty-container guards, and a did-we-consume-a-byte test at the bottom
     of the loop, each recording an error the existing check_errors() already turns into a throw.
+
+    Added 2026-11 on 0003's footing: the same client `pattern` can also KILL the worker by
+    recursion -- transform() calls itself once per nested '(', no cap anywhere, and no JSON
+    depth bound helps because the brackets are string content, not JSON nesting. A pattern of
+    tens of KB of '(' is an uncatchable stack overflow. A nesting counter caps the recursion
+    at 64 groups and records one more error the existing check_errors() turns into a refusal.
 
     On 0004: three things upstream ACCEPTS and then gets wrong, each now refused by name.
     A remote $ref is fetched through a callback the public entry point stubs out, so it silently
@@ -142,24 +176,19 @@ vendor/llama/common/regex-partial.{h,cpp}    <- llama.cpp common/*
     serves every structured-output request was the unhardened one. The fork is deleted and its
     refusals are here, which is where they were needed all along.
 
-vendor/nlohmann/json.hpp
-vendor/nlohmann/json_fwd.hpp                 <- llama.cpp vendor/nlohmann/nlohmann/*
-vendor/nlohmann/LICENSE.MIT                  <- nlohmann/json LICENSE.MIT at v3.12.0, the release
-                                                json.hpp names; llama.cpp does not carry it
-
 vendor/cpp-httplib/httplib.h
 vendor/cpp-httplib/httplib.cpp
 vendor/cpp-httplib/LICENSE                   <- llama.cpp vendor/cpp-httplib/cpp-httplib/*
 
-    Header-only JSON, byte for byte as lifted, and the HTTP library at cpp-httplib v0.64.0 SPLIT from
-    upstream's single ~24,300-line header into a .h/.cpp pair, so one translation unit pays for it.
-    Apart from the split the httplib pair matches upstream exactly when it was lifted; the split itself
-    drops two decorative `// ----` separator comment lines, moves `inline` from definitions to
-    declarations, and adds the .cpp's `#include "httplib.h"` and namespace brace. The only difference
-    from upstream for both is the PATH: llama.cpp nests them one directory deeper
-    (vendor/nlohmann/nlohmann/) and puts the outer directory on the include path. Flattening lets
-    `<nlohmann/json.hpp>` and `<cpp-httplib/httplib.h>` resolve with vendor/ alone on the path, which
-    is the one include directory core/CMakeLists.txt already adds.
+    The HTTP library at cpp-httplib v0.66.0, carried as the .h/.cpp SPLIT pair llama.cpp
+    distributes (v0.64.0 split upstream's single ~24,300-line header into a pair so that one
+    translation unit pays for it). Apart from the split mechanics the split itself introduced
+    (two decorative `// ----` separator lines dropped, `inline` moved from definitions to
+    declarations, the .cpp's `#include "httplib.h"` and namespace brace added) and patch 0022
+    below, the pair is llama.cpp's bytes at the recorded commit, byte for byte. The PATH is
+    ours: llama.cpp nests the pair one directory deeper; flattening lets
+    `<cpp-httplib/httplib.h>` resolve with vendor/ alone on the path, which is the one include
+    directory core/CMakeLists.txt already adds.
 
     cpp-httplib's own CMakeLists.txt is NOT carried. vendor/CMakeLists.txt builds httplib.cpp
     itself, because upstream's version reaches for llama.cpp's license and compile-flag helpers
@@ -168,24 +197,90 @@ vendor/cpp-httplib/LICENSE                   <- llama.cpp vendor/cpp-httplib/cpp
     vendor/CMakeLists.txt sets, so a future disagreement between them would have been invisible --
     the copy nobody builds is the copy nobody checks.
 
-    Upstream tracked: cpp-httplib tag v0.64.0 (yhirose/cpp-httplib); the split pair as carried by
-    llama.cpp commit 1ab23c33b ("vendor : update cpp-httplib to 0.64.0 (#31400)"). Earlier this pair
-    sat at v0.46.1 -- what llama.cpp carried at the lifted commit -- and carried patches/0022; the
-    bump retires most of that patch, because 0.64.0 natively closes the connection on every 4xx/5xx
-    response (the "Connection: close" option is honored by a scope_exit in write_response), skips
-    the keep-alive drain for any response that committed to close, bounds the drain that does run
-    (CPPHTTPLIB_UNREAD_PAYLOAD_MAX_LENGTH, the connection timeout as a total max_timeout, and a
-    close for a part-read body), and routes exceptions from the pre-routing handler and the
-    WebSocket upgrade through the exception handler. What survives is the budget the library still
-    ties to the connection's own timeout and cannot lower without capping uploads too: see below.
+    Upstream tracked: cpp-httplib tag v0.66.0 (yhirose/cpp-httplib); the split pair as carried by
+    llama.cpp commit b8abe41a5 ("vendor: update cpp-httplib to 0.66.0 (#32049)"). Earlier this pair
+    sat at v0.46.1 -- what llama.cpp carried at the lifted commit -- and carried patches/0022, and
+    at v0.64.0; the v0.64.0 bump retired most of that patch, because 0.64.0 natively closes the
+    connection on every 4xx/5xx response (the "Connection: close" option is honored by a scope_exit
+    in write_response), skips the keep-alive drain for any response that committed to close, bounds
+    the drain that does run (CPPHTTPLIB_UNREAD_PAYLOAD_MAX_LENGTH, the connection timeout as a
+    total max_timeout, and a close for a part-read body), and routes exceptions from the pre-routing
+    handler and the WebSocket upgrade through the exception handler. What survived is the budget the
+    library still ties to the connection's own timeout and cannot lower without capping uploads
+    too: see below. The v0.66.0 bump is for its ThreadPool, which
+    wraps the dynamic worker's creation in try/catch (std::system_error) and keeps the job queued
+    when the thread budget runs out, where 0.64.0 let the exception escape the accept loop into
+    std::terminate -- thread exhaustion was a process abort. radiance's socket gate and drain
+    budget narrowed that window; they never closed it.
 
     LOCAL CHANGES: patches/0022-httplib-the-drain-keeps-a-five-second-budget.patch
 
     On 0022: a response whose body the handler left unread drains on the keep-alive socket, and
-    0.64.0 bounds that drain only by the connection's read timeout -- the same knob that bounds a
+    upstream bounds that drain only by the connection's read timeout -- the same knob that bounds a
     whole request's reads, uploads included, so radiance cannot simply lower it. A client dribbling
     one byte per gap paces a worker for that full timeout after the response was already sent.
     0022 caps the drain's total budget at 5 s (or the connection timeout, whichever is smaller).
+    Re-verified against 0.66.0: the hunk lands at the same site with a +26-line offset and no
+    fuzz, and upstream changed nothing around it -- the drain is still bound only by the
+    connection's timeout, so the patch stands. The six CPPHTTPLIB_* defines vendor/CMakeLists.txt
+    passes were each re-checked as live knobs in the 0.66.0 pair.
+
+vendor/yyjson/yyjson.h
+vendor/yyjson/yyjson.c
+vendor/yyjson/LICENSE                        <- ibireme/yyjson src/* and LICENSE at tag 0.13.0
+                                                (commit 138b4a7e757426bbbaa11ca37f257ce8d8489007)
+
+    The reader inside the tree's JSON DOM. Parsing a large agent-turn body with the DOM
+    library this replaced cost ~340 MB/s -- the largest single host item on the serving path
+    once rendering was optimised -- and almost all of it was the lexer, not the tree. The
+    DOM now lives in core/util/json.{h,cpp} (rad::Json, ours): yyjson reads under a
+    byte-budgeted allocator and a converter rebuilds the value tree, enforcing the value
+    budget and depth cap the request path's bounded parse promises. That displaced the old
+    DOM everywhere -- server, chat templates, the vendored lift above, config and
+    checkpoint files, tests -- and vendor/nlohmann is gone with it. The behavioural
+    contract carried over (typing, refusals, boundaries, dump bytes bar a float's digits
+    where the old ones were not the shortest that read back) is recorded in
+    tests/json_test.cpp. MIT.
+
+    Upstream tracked: yyjson tag 0.13.0. To refresh: re-copy src/yyjson.{h,c} and LICENSE from
+    the new tag, keep the include spelled <yyjson/yyjson.h>, and re-run the parse contract
+    cases (tests/json_test.cpp, tests/wire_test.cpp) -- the converter and the budget
+    arithmetic in core/util/json.cpp assume yyjson's reader allocates an input copy plus
+    one value buffer and nothing else, which a refresh must re-confirm.
+
+    LOCAL CHANGES: none.
+
+
+vendor/rapidyaml/ryml.hpp                    <- rapidyaml v0.16.0 release asset
+                                                rapidyaml.v0.16.0.singlehdr.hpp (biojppm/rapidyaml),
+                                                renamed; byte-identical
+vendor/rapidyaml/LICENSE.txt                 <- rapidyaml LICENSE.txt at tag v0.16.0
+vendor/shim/ryml_impl.cpp                    ours: defines RYML_SINGLE_HDR_DEFINE_NOW and includes
+                                                the header, the one TU holding the implementation
+
+    The YAML configuration reader (core/fleet/config.cpp) is the only user. The amalgamated header
+    carries c4core and fast_float inside it, so nothing else is fetched. MIT.
+
+    LOCAL CHANGES: none.
+
+
+vendor/shim/common.h                       ours -- NOT a lift -- but MIT-derived all the same:
+vendor/shim/ggml.h                             common.h transcribes, unchanged, the string helpers
+vendor/shim/llama.h                             the lifted chat and PEG-parser sources need from
+vendor/shim/log.h                              llama.cpp's common/common.{h,cpp} (06938ac12); the
+vendor/shim/llama_shim.cpp                     other four declare the small macros, types and log
+                                               surface those lifts reach for outside themselves.
+                                               Each file's own header says why the shim exists: the
+                                               lifts compile byte-for-byte without the CLI
+                                               argument machinery, the engine being replaced, or
+                                               upstream's logging subsystem. Recorded beside the
+                                               lifts because upstream's code or upstream's shape
+                                               lives in them -- this file is where lifted
+                                               provenance lives, and the manifest under which
+                                               vendor_sums hashes them is the tamper check.
+
+    LOCAL CHANGES: n/a -- maintained in place. A vendor refresh re-derives what the lifts expect
+                   of these headers (their comments enumerate the needs); nothing is re-copied.
 
 
 REWRITTEN INTO core/ INSTEAD
@@ -231,6 +326,10 @@ core/ under our own name, with a comment at the top naming what it was read from
 
 PATCH SERIES
 ------------
+
+Only 0001 and 0022 still live in patches/. The entries for 0002-0021 keep the rationale for
+changes that are now maintained directly in the chat lift (see the top of this file); their
+headings name the removed patch files, whose diffs are in git history.
 
   patches/0001-unicode-reject-codepoints-above-U-10FFFF.patch
 
@@ -613,3 +712,14 @@ PATCH SERIES
       connection closes with the unread bytes still on it. Tests: transport_test
       (a_stalled_drain_dies_on_its_deadline, a_refusal_closes_the_connection,
       the_inflight_body_budget).
+
+  patches/0023-jinja-tojson-sort-keys.patch
+
+      llama.cpp's e1925b36 ("jinja: support json sort_keys=true (#32366)"), after the lifted
+      commit; drop it on the next refresh. tojson threw "tojson sort_keys=true not implemented".
+      Inkling 2 Mini's template writes its tool list with tojson(sort_keys=true), so the probe
+      failed, as 0006 describes, and every request with `tools` was refused. value_to_json takes
+      sort_keys and orders each object's keys by their UTF-8 bytes, nested objects and objects in
+      arrays too. tests/chat_test.cpp (tojson_sorts_object_keys_when_sort_keys_is_true,
+      a_template_that_sorts_its_tools_reports_tool_support,
+      inklings_tool_declaration_renders_its_tools_with_sorted_keys).

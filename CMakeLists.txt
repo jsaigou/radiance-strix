@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 # VERSION is the server release that /version reports. The plugin ABI version is separate and is
 # read from abi/rad_abi.h below.
-project(radiance VERSION 1.17.0 LANGUAGES C CXX)
+project(radiance VERSION 2.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -163,7 +163,7 @@ file(MAKE_DIRECTORY ${RAD_PLUGIN_OUT}/kernels ${RAD_PLUGIN_OUT}/architectures)
 # Recorded kernel fixtures, copied into the build's $RADIANCE_HOME (where rad-kbench looks; an
 # installed prefix has no source tree). data/kernels.rkb lets rad-kbench run with no model: it holds
 # geometries, input seeds and libref's answers reduced to a norm and a sample. Re-record with a 27B
-# container:
+# IQ8R container that carries its DFlash2 drafter:
 #
 #   rad-kbench -m <model.rad> --max-cases 1 --record data/kernels.rkb
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/data/kernels.rkb)
@@ -174,8 +174,8 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/data/kernels.rkb)
 endif()
 
 # A recording covers one container's geometries, and no single model declares the whole vocabulary.
-# The 27B is dense with a DFlash2 drafter and gqa 6; the 35B-A3B is routed (moe_gemm_q,
-# router_topk, moe_scatter, moe_gather, scale_rows) with an MTP head and gqa 8. Re-record with
+# The 27B is dense with a DFlash2 drafter and gqa 6; the 35B-A3B IQ8R container is routed
+# (moe_gemm_q, the fused router, moe_gather, scale_rows) with an MTP head and gqa 8. Re-record with
 #
 #   rad-kbench -m <model.rad> --max-cases 1 --record data/kernels_moe.rkb
 #
@@ -209,8 +209,8 @@ endforeach()
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/vectors/LICENSE.qwen-community-1.0.txt
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/third_party RENAME qwen-community.LICENSE)
 
-# The downloader behind `radiance --model <owner/name>` (core/hf_model.cpp). The engine looks in
-# <bin>/../libexec/radiance/, so the build tree mirrors that layout.
+# The downloader behind a model source naming a repo, `model: <owner/name>` (core/hf_model.cpp).
+# The engine looks in <bin>/../libexec/radiance/, so the build tree mirrors that layout.
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/scripts/hfget.sh
                ${CMAKE_BINARY_DIR}/libexec/radiance/hfget.sh COPYONLY)
 install(PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/scripts/hfget.sh
@@ -325,6 +325,8 @@ add_subdirectory(arch)
 # spechub: the linear-MTP coupling kernels (--draft-coupling). Built by default; without the flag
 # no op resolves to its rows.
 add_subdirectory(plugin/spechub)
+# glm: GLM-5.3-Flash's own fused kernels, ops only glm5next issues where a library declares them.
+add_subdirectory(plugin/glm)
 add_subdirectory(tools)
 if(RAD_BUILD_TESTS)
   enable_testing()
@@ -389,9 +391,11 @@ install(FILES
 install(FILES LICENSE NOTICE DESTINATION ${CMAKE_INSTALL_DOCDIR})
 install(FILES vendor/llama/LICENSE
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/third_party RENAME llama.cpp.LICENSE)
-install(FILES vendor/nlohmann/LICENSE.MIT
-        DESTINATION ${CMAKE_INSTALL_DOCDIR}/third_party RENAME nlohmann-json.LICENSE)
+install(FILES vendor/yyjson/LICENSE
+        DESTINATION ${CMAKE_INSTALL_DOCDIR}/third_party RENAME yyjson.LICENSE)
 install(FILES vendor/cpp-httplib/LICENSE
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/third_party RENAME cpp-httplib.LICENSE)
 install(FILES core/server/LICENSE.lfm
         DESTINATION ${CMAKE_INSTALL_DOCDIR}/third_party RENAME liquidai-d1.LICENSE)
+install(FILES dashboard/THIRD-PARTY-LICENSES.txt
+        DESTINATION ${CMAKE_INSTALL_DOCDIR}/third_party RENAME dashboard.LICENSES)

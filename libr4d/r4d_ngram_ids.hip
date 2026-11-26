@@ -19,6 +19,7 @@
 // change to make if a model hashes at prefill width with many more heads.
 #include "r4d.h"
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "r4d_emit.h"
 
 #include <cstdint>
@@ -47,15 +48,15 @@ enum { kNgMaxShift = 8, kNgThreads = 256 };
  *
  * At decode this op's cost is the dispatch itself (flat from M=1 to M=512), so avoiding a second
  * launch for the write-back is most of the saving. */
-__global__ __launch_bounds__(kNgThreads) void ngram_ids_kernel(
-    const int32_t* __restrict__ tok, int32_t* __restrict__ state,
-    const int32_t* __restrict__ cu, const long long* __restrict__ mult,
-    const long long* __restrict__ vsz, const long long* __restrict__ off,
-    const int32_t* __restrict__ sidx, const int32_t* __restrict__ hini,
-    const int32_t* __restrict__ nacc, int32_t* __restrict__ ids,
-    uint32_t heads, uint32_t ngram, uint32_t per, uint32_t W,
-    long long eos, uint32_t ids_ld, int32_t* __restrict__ ahead, uint32_t n_ahead,
-    uint32_t ahead_ld) {
+#define NGRAM_IDS_PARAMS                                                                        \
+    const int32_t* __restrict__ tok, int32_t* __restrict__ state,                               \
+    const int32_t* __restrict__ cu, const long long* __restrict__ mult,                         \
+    const long long* __restrict__ vsz, const long long* __restrict__ off,                       \
+    const int32_t* __restrict__ sidx, const int32_t* __restrict__ hini,                         \
+    const int32_t* __restrict__ nacc, int32_t* __restrict__ ids, uint32_t heads,                \
+    uint32_t ngram, uint32_t per, uint32_t W, long long eos, uint32_t ids_ld,                   \
+    int32_t* __restrict__ ahead, uint32_t n_ahead, uint32_t ahead_ld
+__device__ __forceinline__ void ngram_ids_body(NGRAM_IDS_PARAMS) {
 
     const uint32_t s   = blockIdx.y;
     const uint32_t bos = (uint32_t)cu[s];
@@ -146,6 +147,111 @@ __global__ __launch_bounds__(kNgThreads) void ngram_ids_kernel(
     for (uint32_t k = 0; k < ctx; ++k) win[k] = (int32_t)keep[k];
 }
 
+/* The kernel around the body, whose blocks return where their work ends: CH `r4dchain` is the
+ * chained form (r4d_chain.h). */
+template <class CH>
+__global__ __launch_bounds__(kNgThreads)
+void ngram_ids_kernel(NGRAM_IDS_PARAMS) {
+    if (CH::on) r4d_chain_wait();
+    ngram_ids_body(tok, state, cu, mult, vsz, off, sidx, hini, nacc, ids, heads, ngram, per, W, eos, ids_ld, ahead, n_ahead, ahead_ld);
+    if (CH::on) r4d_chain_done();
+}
+#undef NGRAM_IDS_PARAMS
+
+/* ngram_hint: the row ids of each sequence's NEWEST token on a draft head's pass, ahead of the
+ * verify step that will run it, so the rows can be fetched while the head drafts.
+ *
+ * A verify step's rows are the token the last verify chose and the head's proposals. The head
+ * proposes one a pass: its history pass ends at the chosen token, each later round reads the
+ * proposal before it. So all but the last proposal are known a pass or more before ngram_ids
+ * hashes them, and a table read from a drive has that long to deliver their rows.
+ *
+ * One thread a sequence. `tail` holds, per state slot, the `ngram - 1` committed ids up to the
+ * chosen token and the same count of ids up to the newest proposal, each newest last:
+ *
+ *   hist   the pass's last row is the chosen token; rows at its position are repeats of it
+ *          (the history pass pads a run to the furthest the verify could have committed), and
+ *          the rows before them hold the ids committed just before, in order. Ids further back
+ *          come from the committed tail. Both tails then end at the chosen token.
+ *   else   the row is the proposal before this round's; the ids before it are the chain tail,
+ *          which then ends at it.
+ *
+ * The hash is ngram_ids'. The ids are a hint: a slot whose tail belongs to another request (the
+ * first pass after a prompt) hashes other history and names rows nobody reads, which costs their
+ * fetch and nothing else, so there is no cold-window rule here. */
+#define NGRAM_HINT_PARAMS                                                                        \
+    const int32_t* __restrict__ tok, const int32_t* __restrict__ pos,                            \
+    const int32_t* __restrict__ cu, const long long* __restrict__ mult,                          \
+    const long long* __restrict__ vsz, const long long* __restrict__ off,                        \
+    const int32_t* __restrict__ sidx, int32_t* __restrict__ tail, int32_t* __restrict__ ids,     \
+    uint32_t n_seq, uint32_t heads, uint32_t ngram, uint32_t per, long long eos,                 \
+    uint32_t ids_ld, uint32_t hist, uint32_t slots
+__device__ __forceinline__ void ngram_hint_body(NGRAM_HINT_PARAMS) {
+    const uint32_t s = blockIdx.x * kNgThreads + threadIdx.x;
+    if (s >= n_seq) return;
+    const uint32_t bos = (uint32_t)cu[s], eot = (uint32_t)cu[s + 1];
+    const int32_t slot = sidx ? sidx[s] : (int32_t)s;
+    int32_t* const row = ids + (long long)s * ids_ld;
+    /* A sequence with nothing to hint still gets ids a gather can read: its heads' first rows. */
+    if (eot <= bos || slot < 0) {
+        for (uint32_t h = 0; h < heads; ++h) row[h] = (int32_t)off[h];
+        return;
+    }
+    const uint32_t ctx = ngram - 1u;
+    /* Two slots that meet in `tail` (a state slot past its rows) swap hints, no more. */
+    int32_t* const commit = tail + (long long)((uint32_t)slot % slots) * 2 * ctx;
+    int32_t* const chain  = commit + ctx;
+
+    /* `back[k]` is the id k + 1 places before the newest. */
+    const uint32_t last = eot - 1u;
+    const long long x = (long long)tok[last];
+    long long back[kNgMaxShift];
+    if (hist) {
+        uint32_t first = last;
+        const int32_t at = pos[last];
+        while (first > bos && pos[first - 1u] == at) --first;
+        const uint32_t have = first - bos;
+        for (uint32_t k = 0; k < ctx; ++k)
+            back[k] = k < have ? (long long)tok[first - 1u - k]
+                               : (long long)commit[ctx - 1u - (k - have)];
+    } else {
+        for (uint32_t k = 0; k < ctx; ++k) back[k] = (long long)chain[ctx - 1u - k];
+    }
+    for (uint32_t k = 0; k < ctx; ++k) {
+        const int32_t v = k + 1u < ctx ? (int32_t)back[ctx - 2u - k] : (int32_t)x;
+        if (hist) commit[k] = v;
+        chain[k] = v;
+    }
+
+    long long sh[kNgMaxShift];
+    sh[0] = x;
+    bool cut = false;
+    for (uint32_t k = 1; k < ngram; ++k) {
+        if (cut || sh[k - 1] == eos) { cut = true; sh[k] = eos; continue; }
+        sh[k] = back[k - 1u];
+    }
+    long long mixed = 0;
+    for (uint32_t k = 0; k < ngram; ++k) {
+        const long long term = ng_wrap_mul(sh[k], mult[k]);
+        mixed = k == 0 ? term : (mixed ^ term);
+        if (k == 0) continue;
+        for (uint32_t j = 0; j < per; ++j) {
+            const uint32_t h = (k - 1u) * per + j;
+            row[h] = (int32_t)(ng_floor_mod(mixed, vsz[h]) + off[h]);
+        }
+    }
+}
+
+template <class CH>
+__global__ __launch_bounds__(kNgThreads)
+void ngram_hint_kernel(NGRAM_HINT_PARAMS) {
+    if (CH::on) r4d_chain_wait();
+    ngram_hint_body(tok, pos, cu, mult, vsz, off, sidx, tail, ids, n_seq, heads, ngram, per, eos,
+                    ids_ld, hist, slots);
+    if (CH::on) r4d_chain_done();
+}
+#undef NGRAM_HINT_PARAMS
+
 }  // namespace
 
 enum { NG_TOK = 0, NG_STATE, NG_CU, NG_MULT, NG_VSZ, NG_OFF, NG_CIDX, NG_HINIT, NG_NACC, NG_IDS,
@@ -206,15 +312,76 @@ extern "C" int r4d_rad_ngram_ids(const RadArgs* a, RadStream stream) {
      * any one sequence's; a short sequence's extra blocks find their rows past its end. A
      * per-sequence count would mean reading `cu` on the host. */
     const uint32_t tiles = (uint32_t)((T + A + kNgThreads - 1) / kNgThreads);
-    return R4D_EMIT(stream, ngram_ids_kernel, dim3(tiles, (uint32_t)N), dim3(kNgThreads), 0,
-                       (const int32_t*)r4d_addr(tok), (int32_t*)r4d_addr(st),
-                       (const int32_t*)r4d_addr(cu), (const long long*)r4d_addr(mult),
-                       (const long long*)r4d_addr(vsz), (const long long*)r4d_addr(off),
-                       cidx ? (const int32_t*)r4d_addr(cidx) : nullptr,
-                       hini ? (const int32_t*)r4d_addr(hini) : nullptr,
-                       nacc ? (const int32_t*)r4d_addr(nacc) : nullptr,
-                       (int32_t*)r4d_addr(ids), (uint32_t)heads, (uint32_t)ngram,
-                       (uint32_t)per, (uint32_t)W, eos, (uint32_t)ids_ld,
-                       A > 0 ? (int32_t*)r4d_addr(ahd) : nullptr, (uint32_t)A,
-                       (uint32_t)ahead_ld);
+#define R4D_NGI(CH_)                                                                             \
+    R4D_EMIT(stream, ngram_ids_kernel<CH_>, dim3(tiles, (uint32_t)N), dim3(kNgThreads),         \
+             0,                                                                                  \
+             (const int32_t*)r4d_addr(tok), (int32_t*)r4d_addr(st),                              \
+             (const int32_t*)r4d_addr(cu), (const long long*)r4d_addr(mult),                     \
+             (const long long*)r4d_addr(vsz), (const long long*)r4d_addr(off),                   \
+             cidx ? (const int32_t*)r4d_addr(cidx) : nullptr,                                    \
+             hini ? (const int32_t*)r4d_addr(hini) : nullptr,                                    \
+             nacc ? (const int32_t*)r4d_addr(nacc) : nullptr,                                    \
+             (int32_t*)r4d_addr(ids), (uint32_t)heads, (uint32_t)ngram,                          \
+             (uint32_t)per, (uint32_t)W, eos, (uint32_t)ids_ld,                                  \
+             A > 0 ? (int32_t*)r4d_addr(ahd) : nullptr, (uint32_t)A,                             \
+             (uint32_t)ahead_ld)
+    const int rc = r4d_geti_or(a, "chain", 0) != 0 && T <= 64 ? R4D_NGI(r4dchain)
+                                                               : R4D_NGI(R4dUnchained);
+#undef R4D_NGI
+    return rc;
+}
+
+enum { NH_TOK = 0, NH_POS, NH_CU, NH_MULT, NH_VSZ, NH_OFF, NH_CIDX, NH_TAIL, NH_IDS };
+
+extern "C" int r4d_rad_ngram_hint(const RadArgs* a, RadStream stream) {
+    const RadTensor* tok  = r4d_opt(a, NH_TOK);
+    const RadTensor* pos  = r4d_opt(a, NH_POS);
+    const RadTensor* cu   = r4d_opt(a, NH_CU);
+    const RadTensor* mult = r4d_opt(a, NH_MULT);
+    const RadTensor* vsz  = r4d_opt(a, NH_VSZ);
+    const RadTensor* off  = r4d_opt(a, NH_OFF);
+    const RadTensor* cidx = r4d_opt(a, NH_CIDX);
+    const RadTensor* tail = r4d_opt(a, NH_TAIL);
+    const RadTensor* ids  = r4d_opt(a, NH_IDS);
+    if (!tok || !pos || !cu || !mult || !vsz || !off || !tail || !ids) return R4D_NO(RAD_E_INVAL);
+    if (tok->dtype != RAD_I32 || pos->dtype != RAD_I32 || cu->dtype != RAD_I32 ||
+        tail->dtype != RAD_I32 || ids->dtype != RAD_I32 || (cidx && cidx->dtype != RAD_I32))
+        return R4D_NO(RAD_E_DTYPE);
+    if (mult->dtype != RAD_I64 || vsz->dtype != RAD_I64 || off->dtype != RAD_I64)
+        return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(tok) || !r4d_contig(pos) || !r4d_contig(cu) || !r4d_contig(tail))
+        return R4D_NO(RAD_E_STRIDE);
+
+    const long long heads = r4d_geti_or(a, "heads", 0);
+    const long long ngram = r4d_geti_or(a, "ngram", 0);
+    const long long eos   = r4d_geti_or(a, "eos", -1);
+    const long long hist  = r4d_geti_or(a, "hist", 0);
+    if (heads <= 0 || ngram < 2 || eos < 0) return R4D_NO(RAD_E_SHAPE);
+    if (ngram > kNgMaxShift) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (heads % (ngram - 1)) return R4D_NO(RAD_E_SHAPE);
+    const long long per = heads / (ngram - 1);
+
+    /* A row of ids a sequence, counted from the operand (`M` is ranged). */
+    const long long N = r4d_numel(cu) - 1;
+    long long rows = 0;
+    const long long ids_ld = r4d_rows_pitch(ids, heads, &rows);
+    if (ids_ld < 0 || N <= 0 || rows < N) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(mult) < ngram || r4d_numel(vsz) < heads || r4d_numel(off) < heads)
+        return R4D_NO(RAD_E_SHAPE);
+    if (cidx && r4d_numel(cidx) < N) return R4D_NO(RAD_E_SHAPE);
+    const long long slots = r4d_numel(tail) / (2 * (ngram - 1));
+    if (slots < 1) return R4D_NO(RAD_E_SHAPE);
+
+    const uint32_t blocks = (uint32_t)((N + kNgThreads - 1) / kNgThreads);
+#define R4D_NGH(CH_)                                                                             \
+    R4D_EMIT(stream, ngram_hint_kernel<CH_>, dim3(blocks), dim3(kNgThreads), 0,                  \
+             (const int32_t*)r4d_addr(tok), (const int32_t*)r4d_addr(pos),                       \
+             (const int32_t*)r4d_addr(cu), (const long long*)r4d_addr(mult),                     \
+             (const long long*)r4d_addr(vsz), (const long long*)r4d_addr(off),                   \
+             cidx ? (const int32_t*)r4d_addr(cidx) : nullptr, (int32_t*)r4d_addr(tail),          \
+             (int32_t*)r4d_addr(ids), (uint32_t)N, (uint32_t)heads, (uint32_t)ngram,             \
+             (uint32_t)per, eos, (uint32_t)ids_ld, (uint32_t)(hist ? 1 : 0), (uint32_t)slots)
+    const int rc = r4d_geti_or(a, "chain", 0) != 0 ? R4D_NGH(r4dchain) : R4D_NGH(R4dUnchained);
+#undef R4D_NGH
+    return rc;
 }

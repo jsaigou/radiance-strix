@@ -23,6 +23,9 @@ enum { SC_LOGITS = 0, SC_QUERY = 1, SC_U = 2, SC_DRAW = 3 };
 struct Fp8Ops {
     const RadTensor *a, *ascale, *b, *bscale, *y;
     long long M, N, K, nkb;
+    /* The scale group along K: R4D_FP8_BLOCK, or R4D_I8_GROUP_WIDE for an int8 row-scale weight
+     * whose op says `group` 256 (IQ8R). Both scale planes have K / group columns. */
+    long long group;
     long a_ld, sa_ld, w_ld, sw_ld;    /* a_ld / w_ld in elements here; see the note at each use */
 };
 
@@ -61,7 +64,10 @@ static inline int fp8_ops(const RadArgs* a, Fp8Ops* g, int want_ascale,
      * a mismatch would be a silently wrong scale grid. */
     const long long blk = r4d_gemm_fp8a8_block();
     if (blk != R4D_FP8_BLOCK) return R4D_NO(RAD_E_SHAPE);
-    g->nkb = (g->K + blk - 1) / blk;
+    g->group = wscale == FP8_OPS_ROW_SCALE ? r4d_geti_or(a, "group", blk) : blk;
+    if (g->group != blk && g->group != R4D_I8_GROUP_WIDE) return R4D_NO(RAD_E_SHAPE);
+    if (g->group != blk && g->K % g->group) return R4D_NO(RAD_E_SHAPE);
+    g->nkb = (g->K + g->group - 1) / g->group;
     /* Check the scale plane's extents: a wrong grid still reads plausible numbers. A trellis
      * weight's two-level scale (E4M3 per row per 128 K under a second level) is a view of two
      * planes, declared at the weight's logical extents [N][K] (which no one-level scale is); its

@@ -73,8 +73,11 @@ public:
     /* ------------------------------------------------------------------ producer: scheduler */
 
     /* Returns false only on overflow, which also marks the request failed. `lp` is the token's
-     * logprobs when the request asked for them (enable_logprobs), and null otherwise. */
-    bool push(int32_t token, const TokenLogprobs* lp = nullptr);
+     * logprobs when the request asked for them (enable_logprobs), and null otherwise. `now`, a
+     * sink_now_ns() reading, is the token's time; negative reads the clock. A step's tokens share
+     * one reading: where the clocksource is HPET (the TSC marked unstable) a read is a system call
+     * of about a microsecond, a token's whole cost here. */
+    bool push(int32_t token, const TokenLogprobs* lp = nullptr, int64_t now = -1);
 
     /* Terminal and idempotent: the first call wins, so a cancel racing a natural stop does not
      * produce two finish reasons. */
@@ -189,13 +192,16 @@ private:
 
     std::mutex              m_;
     std::condition_variable cv_;
+    std::atomic<bool>       asleep_{false};   /* the consumer is inside cv_.wait_for */
 };
 
 /* The scheduler's call sites, so core/sched needs no casts. A null sink means nobody is
  * listening (an offline or benchmark request). */
-inline bool sink_push(void* s, int32_t token, const TokenLogprobs* lp = nullptr) {
-    return s ? static_cast<Sink*>(s)->push(token, lp) : true;
+inline bool sink_push(void* s, int32_t token, const TokenLogprobs* lp = nullptr, int64_t now = -1) {
+    return s ? static_cast<Sink*>(s)->push(token, lp, now) : true;
 }
+/* The clock a sink's times are on, for push's `now`. */
+int64_t sink_now_ns();
 inline void sink_finish(void* s, Finish f) {
     if (s) static_cast<Sink*>(s)->finish(f);
 }

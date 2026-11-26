@@ -4,7 +4,7 @@
 # Sources are globbed per subdirectory with CONFIGURE_DEPENDS. Re-run cmake if a new file does not
 # appear.
 set(RAD_CORE_DIRS util device plugin build runtime mem sched place sample text server format mm diag gen
-                  lora kvstream)
+                  lora kvstream fleet)
 
 set(RAD_CORE_SRC "")
 foreach(d ${RAD_CORE_DIRS})
@@ -20,8 +20,54 @@ file(GLOB _top CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 list(REMOVE_ITEM _top ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 list(APPEND RAD_CORE_SRC ${_top})
 
+# util/simd_kernels.cpp compiled once per ISA level, like libavx: the shipped binary runs on
+# machines it was not built on, so the level is picked at runtime (util/simd.cpp, baseline) and
+# no object outside these may carry a -m flag. The kernels plus the dispatcher form their own
+# small library rather than objects inside rad_core, because a no-core test compiles the
+# tokenizer translation units directly and still needs them. Off x86-64 only the scalar level
+# is built and the dispatcher never selects another.
+list(REMOVE_ITEM RAD_CORE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/util/simd.cpp
+                              ${CMAKE_CURRENT_SOURCE_DIR}/util/simd_kernels.cpp
+                              ${CMAKE_CURRENT_SOURCE_DIR}/util/json.cpp)
 add_library(rad_core STATIC ${RAD_CORE_SRC})
 target_link_libraries(rad_core PUBLIC rad_abi ${CMAKE_DL_LIBS} Threads::Threads)
+
+add_library(rad_simd STATIC ${CMAKE_CURRENT_SOURCE_DIR}/util/simd.cpp)
+target_include_directories(rad_simd PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+                                           ${CMAKE_SOURCE_DIR}/abi)
+set_property(TARGET rad_simd PROPERTY POSITION_INDEPENDENT_CODE ON)
+set(RAD_SIMD_FLAGS_0 "")
+set(RAD_SIMD_FLAGS_1 -msse4.1 -msse4.2 -mpopcnt)
+set(RAD_SIMD_FLAGS_2 -mavx -mpopcnt)
+set(RAD_SIMD_FLAGS_3 -mavx2 -mfma -mf16c -mpopcnt)
+set(RAD_SIMD_FLAGS_4 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx2 -mfma -mf16c -mpopcnt)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  set(RAD_SIMD_LEVELS 0 1 2 3 4)
+  target_compile_definitions(rad_simd PRIVATE RAD_SIMD_HAVE_X86_LEVELS=1)
+else()
+  set(RAD_SIMD_LEVELS 0)
+endif()
+foreach(lvl ${RAD_SIMD_LEVELS})
+  add_library(rad_simd_lvl${lvl} OBJECT ${CMAKE_CURRENT_SOURCE_DIR}/util/simd_kernels.cpp)
+  target_compile_definitions(rad_simd_lvl${lvl} PRIVATE RAD_SIMD_LEVEL=${lvl})
+  target_include_directories(rad_simd_lvl${lvl} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+                             ${CMAKE_SOURCE_DIR}/abi)
+  target_compile_options(rad_simd_lvl${lvl} PRIVATE ${RAD_SIMD_FLAGS_${lvl}})
+  set_property(TARGET rad_simd_lvl${lvl} PROPERTY POSITION_INDEPENDENT_CODE ON)
+  target_sources(rad_simd PRIVATE $<TARGET_OBJECTS:rad_simd_lvl${lvl}>)
+endforeach()
+target_link_libraries(rad_core PUBLIC rad_simd)
+
+# The ordered JSON DOM (util/json.h), its own small library for the same reason rad_simd is:
+# the no-core test that compiles server/tokenizer units directly still needs it, and the
+# vendor chat lift links it without linking the core. yyjson stays an implementation detail
+# of util/json.cpp, so the link is private.
+add_library(rad_json STATIC ${CMAKE_CURRENT_SOURCE_DIR}/util/json.cpp)
+target_include_directories(rad_json PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+                                           ${CMAKE_SOURCE_DIR}/abi)
+set_property(TARGET rad_json PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(rad_json PRIVATE rad_vendor_yyjson rad_simd)
+target_link_libraries(rad_core PUBLIC rad_json)
 target_compile_definitions(rad_core PUBLIC RAD_VERSION="${PROJECT_VERSION}")
 if(RAD_ENABLE_KV_ROLLBACK_TEST_HOOK)
   # Scheduler is embedded in Engine and its test-only callback changes its class layout.

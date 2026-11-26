@@ -11,6 +11,9 @@
 
 #include "gen/video.h"
 #include "mm/media.h"
+#include "server/front.h"
+#include "cpp-httplib/httplib.h"
+
 
 #include <chrono>
 #include <thread>
@@ -20,6 +23,8 @@ namespace {
 struct FakeVideoGen : IVideoGen {
     VideoGenInfo inf;
     int         finish_status = RAD_OK;
+    int         submit_status = RAD_OK;
+    bool        hold_completion = false;
     std::string finish_why;
     std::vector<std::unique_ptr<gen::VideoRequest>> got;
     mutable std::mutex got_m;
@@ -49,11 +54,13 @@ struct FakeVideoGen : IVideoGen {
         inf.max_ref_images = 9;
         inf.max_ref_videos = 3;
         inf.max_ref_audios = 3;
+        inf.max_enc_samples = 480000;
         inf.shift_video = 12.0;
         inf.shift_audio = 3.0;
     }
     const VideoGenInfo& info() const override { return inf; }
     int submit(std::unique_ptr<gen::VideoRequest> r, std::string*) override {
+        if (submit_status < 0) return submit_status;
         std::lock_guard<std::mutex> lk(got_m);
         gen::VideoTicket& t = *r->ticket;
         /* Three frames of the request's size and a tenth of a second of sound, whatever it asked:
@@ -62,8 +69,8 @@ struct FakeVideoGen : IVideoGen {
         t.width = r->width;
         t.height = r->height;
         t.steps = 2;
-        t.sample_rate = 32000;
-        t.channels = 2;
+        t.sample_rate = inf.sample_rate;
+        t.channels = inf.channels;
         t.fps = 24.0;
         if (r->upscale > 1.0) {
             t.small_width = (int32_t)(r->width / r->upscale) / 32 * 32;
@@ -84,13 +91,15 @@ struct FakeVideoGen : IVideoGen {
                 e.steps_done = s;
                 t.push(std::move(e));
             }
-            gen::VideoEvent a;
-            a.kind = gen::VideoEvent::AUDIO;
-            for (int i = 0; i < 3200; ++i) {
-                a.samples.push_back(0.1f * (float)std::sin(i * 0.05));
-                a.samples.push_back(-0.1f * (float)std::sin(i * 0.05));
+            if (t.channels > 0) {
+                gen::VideoEvent a;
+                a.kind = gen::VideoEvent::AUDIO;
+                for (int i = 0; i < 3200; ++i) {
+                    a.samples.push_back(0.1f * (float)std::sin(i * 0.05));
+                    a.samples.push_back(-0.1f * (float)std::sin(i * 0.05));
+                }
+                t.push(std::move(a));
             }
-            t.push(std::move(a));
             gen::VideoEvent f;
             f.kind = gen::VideoEvent::FRAMES;
             f.first = 0;
@@ -99,7 +108,7 @@ struct FakeVideoGen : IVideoGen {
             for (size_t i = 0; i < f.rgb.size(); ++i) f.rgb[i] = (uint8_t)(i * 7);
             t.push(std::move(f));
         }
-        t.finish(finish_status, finish_why);
+        if (!hold_completion) t.finish(finish_status, finish_why);
         got.push_back(std::move(r));
         return RAD_OK;
     }
@@ -232,6 +241,24 @@ TEST(the_generator_gets_the_size_the_chunks_and_the_steps) {
     CHECK_EQ(v.gen.last().height, 1344);
     CHECK_EQ(v.gen.last().chunks, 14);     /* 240 frames: 17 * 14 + 5 = 243 */
     v.wait(str_at(json::parse(r.body, nullptr, false), "id"));
+}
+
+TEST(a_short_first_chunk_is_counted_in_the_video_api_duration) {
+    Videos v;
+    auto& d = v.gen.inf;
+    d.fps_num = 16;
+    d.frames_per_chunk = 4;
+    d.frames_tail = -3;
+    d.min_chunks = d.default_chunks = 1;
+    d.max_chunks = 3;
+
+    for (const auto& [seconds, chunks] : std::vector<std::pair<double, int>>{
+             {0.0625, 1}, {0.20, 2}, {0.33, 3}}) {
+        const auto r = v.create(Videos::body({{"seconds", seconds}, {"size", "256x256"}}));
+        REQUIRE_EQ(r.status, 200);
+        CHECK_EQ(v.gen.last().chunks, chunks);
+    }
+    CHECK_EQ(v.refused(Videos::body({{"seconds", 0.6}})), std::string("seconds"));
 }
 
 /* `shift`/`audio_shift` thread to the request and echo back; omitted, the request carries 0 (the
@@ -603,6 +630,7 @@ TEST(ref2va_videos_and_audios_are_encoded_and_spoken) {
     CHECK_EQ(mm.n_ienc, 1);
     CHECK_EQ(mm.n_venc, 1);
     CHECK_EQ(mm.n_aenc, 2);
+    CHECK_EQ(mm.aenc_channels, 1);   /* reference soundtracks stay mono */
 
     const gen::VideoRequest& g = gen.last();
     REQUIRE_EQ(g.refs.size(), (size_t)4);   /* sorted (kind, index): image, video, video_audio, audio */
@@ -1006,6 +1034,141 @@ TEST(ref2va_requests_are_refused_naming_the_part) {
 
 namespace {
 
+/* A generator with both VAE encoders, behind a fake processor: 256x256 at the default 7 chunks
+ * is 124 frames. */
+struct GuideServer {
+    FakeMultimodal mm;
+    FakeVideoGen gen;
+    std::unique_ptr<Fixture> f;
+    GuideServer() {
+        mm.expand = { 900, 901 };
+        gen.inf.enc_ratio = 16;
+        gen.inf.max_enc_side = 256;
+        gen.inf.max_enc_frames = 289;
+        gen.inf.max_enc_samples = 500000;
+        f.reset(new Fixture(Fixture::Tweak{ [this](ServerOptions& o, Deps& d) {
+            d.videos = &gen;
+            d.mm = &mm;
+            o.video_model = true;
+        } }));
+    }
+    HttpResponse post(const std::vector<FormPart>& extra) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/videos";
+        q.form = { FormPart{ "prompt", "", "", "fox" }, FormPart{ "size", "", "", "256x256" } };
+        q.form.insert(q.form.end(), extra.begin(), extra.end());
+        return f->srv->router().dispatch(q);
+    }
+    std::string refused(const std::vector<FormPart>& extra) {
+        HttpResponse r = post(extra);
+        CHECK_EQ(r.status, 400);
+        return str_at(json::parse(r.body, nullptr, false)["error"], "param");
+    }
+};
+
+const FormPart kSong{ "guide_audio", "song.wav", "audio/wav", "RIFF" };
+
+}  /* namespace */
+
+/* A song guide (ComfyUI's MiniMaxH3AddGuide) rides a ref2va request: the song is decoded in
+ * stereo, channel-major, at most the encoder's samples, and reaches the generator last, at its
+ * frame counted from the end (124 - 24). It is not named in the prompt. */
+TEST(a_song_guide_rides_reference_media) {
+    GuideServer s;
+    HttpResponse r = s.post({ FormPart{ "task", "", "", "ref2va" },
+                              FormPart{ "ref_image_1", "a.png", "image/png", "PA" }, kSong,
+                              FormPart{ "guide_frame", "", "", "-24" } });
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(s.mm.n_aenc, 1);
+    CHECK_EQ(s.mm.aenc_max, (int64_t)500000);
+    CHECK_EQ(s.mm.aenc_channels, 2);
+    const gen::VideoRequest& g = s.gen.last();
+    REQUIRE_EQ(g.refs.size(), (size_t)2);
+    CHECK_EQ((int)g.refs[0].kind, (int)gen::VideoRefMedia::IMAGE);
+    CHECK_EQ((int)g.refs[1].kind, (int)gen::VideoRefMedia::GUIDE_AUDIO);
+    CHECK_EQ(g.refs[1].name, std::string("guide_audio"));
+    CHECK_EQ(g.refs[1].frame, 100);
+    CHECK_EQ(g.refs[1].enc_channels, 2);
+    CHECK_EQ(g.refs[1].enc_n, (int64_t)850);
+    CHECK_EQ(g.refs[1].enc_samples.size(), (size_t)2 * 850);
+    CHECK_EQ(g.refs[1].enc_samples[0], 0.5f);     /* the left channel */
+    CHECK_EQ(g.refs[1].enc_samples[850], 1.5f);   /* the right, its own samples */
+    std::vector<int32_t> want;
+    auto chars = [&](const std::string& t) { for (unsigned char c : t) want.push_back((int32_t)c); };
+    chars("<v>");
+    chars("<Picture 1>: ");
+    want.insert(want.end(), s.mm.expand.begin(), s.mm.expand.end());
+    chars("fox");
+    CHECK(g.tokens == want);
+    json o = json::parse(r.body, nullptr, false);
+    CHECK_EQ(str_at(o, "task"), std::string("ref2va"));
+    REQUIRE_EQ(o["refs"].size(), (size_t)2);
+    CHECK_EQ(o["refs"][1].get<std::string>(), std::string("guide_audio"));
+}
+
+/* A song guide goes with keyframes too, after them, and alone with a text prompt; guide_frame is
+ * 0 by default. */
+TEST(a_song_guide_rides_keyframes_and_text) {
+    GuideServer s;
+    HttpResponse r = s.post({ FormPart{ "task", "", "", "fl2va" },
+                              FormPart{ "first_frame", "f.png", "image/png", "PF" },
+                              FormPart{ "last_frame", "l.png", "image/png", "PL" }, kSong });
+    REQUIRE_EQ(r.status, 200);
+    {
+        const gen::VideoRequest& g = s.gen.last();
+        REQUIRE_EQ(g.refs.size(), (size_t)3);
+        CHECK_EQ((int)g.refs[0].kind, (int)gen::VideoRefMedia::FIRST_FRAME);
+        CHECK_EQ((int)g.refs[1].kind, (int)gen::VideoRefMedia::LAST_FRAME);
+        CHECK_EQ((int)g.refs[2].kind, (int)gen::VideoRefMedia::GUIDE_AUDIO);
+        CHECK_EQ(g.refs[2].frame, 0);
+        CHECK_EQ(g.refs[2].enc_n, (int64_t)850);
+        REQUIRE(g.media != nullptr);
+        CHECK_EQ(g.media->items.size(), (size_t)2);   /* the two frames; no song in the prompt */
+    }
+    r = s.post({ kSong, FormPart{ "guide_frame", "", "", "123" } });
+    REQUIRE_EQ(r.status, 200);
+    const gen::VideoRequest& g = s.gen.last();
+    REQUIRE_EQ(g.refs.size(), (size_t)1);
+    CHECK_EQ(g.refs[0].frame, 123);
+    CHECK(g.media == nullptr);
+    std::vector<int32_t> want;
+    for (unsigned char c : std::string("<v>fox")) want.push_back((int32_t)c);
+    CHECK(g.tokens == want);
+    CHECK_EQ(str_at(json::parse(r.body, nullptr, false), "task"), std::string("t2va"));
+}
+
+/* Everything about a song guide that cannot be right is refused naming its field, before anything
+ * is queued; keyframes and reference media still exclude each other, guide or not. The capability
+ * says whether the model takes one. */
+TEST(a_song_guide_is_refused_naming_its_field) {
+    GuideServer s;
+    CHECK_EQ(s.refused({ kSong, FormPart{ "guide_frame", "", "", "124" } }), std::string("guide_frame"));
+    CHECK_EQ(s.refused({ kSong, FormPart{ "guide_frame", "", "", "-125" } }), std::string("guide_frame"));
+    CHECK_EQ(s.refused({ kSong, FormPart{ "guide_frame", "", "", "1.5" } }), std::string("guide_frame"));
+    CHECK_EQ(s.refused({ FormPart{ "guide_frame", "", "", "0" } }), std::string("guide_frame"));
+    CHECK_EQ(s.refused({ FormPart{ "guide_audio", "", "", "RIFF" } }), std::string("guide_audio"));
+    CHECK_EQ(s.refused({ kSong, kSong }), std::string("guide_audio"));
+    CHECK_EQ(s.refused({ FormPart{ "guide_audio", "s.wav", "audio/wav", "" } }),
+             std::string("guide_audio"));
+    CHECK_EQ(s.refused({ FormPart{ "task", "", "", "ref2va" },
+                         FormPart{ "ref_image_1", "a.png", "image/png", "PA" },
+                         FormPart{ "first_frame", "f.png", "image/png", "PF" }, kSong }),
+             std::string("first_frame"));
+    HttpRequest mq;
+    mq.method = "GET";
+    mq.path = "/v1/models";
+    CHECK_EQ(json::parse(s.f->srv->router().dispatch(mq).body, nullptr,
+                         false)["data"][0]["capabilities"]["video_guide_audio"], true);
+    s.gen.inf.max_enc_samples = 0;
+    CHECK_EQ(s.refused({ kSong }), std::string("guide_audio"));
+    CHECK_EQ(json::parse(s.f->srv->router().dispatch(mq).body, nullptr,
+                         false)["data"][0]["capabilities"]["video_guide_audio"], false);
+    CHECK_EQ(s.gen.got.size(), (size_t)0);
+}
+
+namespace {
+
 /* A PNG of w x h, every pixel (r, g, b). */
 std::string png_rgb(int32_t w, int32_t h, uint8_t r, uint8_t g, uint8_t b) {
     std::vector<uint8_t> px;
@@ -1161,6 +1324,166 @@ TEST(input_reference_takes_the_models_h264_round_trip) {
     REQUIRE_EQ(mm::h264_roundtrip(in, 18, &out, &why), (int)RAD_OK);
     CHECK_EQ(out.w, 6);
     CHECK_EQ(out.h, 4);
+}
+
+TEST(a_fleet_video_holds_its_model_until_the_result_is_kept) {
+    if (!mm::decoder_available()) SKIP("this build has no video codec support");
+    Front front(TransportOptions{}, 0);
+    FakeVideoGen gen;
+    gen.hold_completion = true;
+    Fixture f(Fixture::Tweak{[&](ServerOptions& options, Deps& deps) {
+        options.model_id = "fleet-video";
+        options.video_model = true;
+        deps.videos = &gen;
+        deps.front = &front;
+    }});
+    front.attach("fleet-video", {}, f.srv.get());
+    gen.submit_status = RAD_E_DEVICE;
+    CHECK_EQ(f.post("/v1/videos", Videos::body().dump()).status, 503);
+    CHECK_EQ(front.activity("fleet-video").leases, 0);
+    gen.submit_status = RAD_OK;
+    const HttpResponse created = f.post("/v1/videos", Videos::body().dump());
+    REQUIRE_EQ(created.status, 200);
+    HttpRequest poll;
+    poll.path = "/v1/videos/" + str_at(json::parse(created.body), "id");
+    const int64_t active_leases = front.activity("fleet-video").leases;
+    const bool detached_before_completion = front.detach("fleet-video", 0);
+    CHECK_EQ(f.get(poll.path.c_str()).status, 200);
+    gen.last().ticket->finish(RAD_OK, {});
+    REQUIRE(front.detach("fleet-video", 5000));
+    const Handler kept = front.kept_job(poll);
+    REQUIRE(kept);
+    const json result = json::parse(kept(poll).body);
+    if (str_at(result, "status") == "failed" &&
+        has(str_at(result["error"], "message"), "no libavcodec"))
+        SKIP("this build has no libavcodec to write the video");
+    CHECK_EQ(active_leases, 1);
+    CHECK(!detached_before_completion);
+    REQUIRE_EQ(str_at(result, "status"), "completed");
+    poll.path += "/content";
+    CHECK_EQ(kept(poll).status, 200);
+}
+
+
+TEST(video_job_routes_skip_a_cold_default_and_survive_the_owner_draining) {
+    if (!mm::decoder_available()) SKIP("this build has no video codec support");
+    TransportOptions options;
+    options.host = "127.0.0.1";
+    options.port = 0;
+    options.n_threads = 2;
+    Front front(options, 0);
+    std::atomic<int> demands{0};
+    front.add("cold-text", {"default"}, 5, false);
+    front.set_demand([&](const std::string&) { ++demands; });
+    Fixture text;
+    front.attach("resident-text", {}, text.srv.get());
+    FakeVideoGen gen;
+    gen.hold_completion = true;
+    Fixture video(Fixture::Tweak{[&](ServerOptions& o, Deps& deps) {
+        o.model_id = "video-owner";
+        o.video_model = true;
+        deps.videos = &gen;
+        deps.front = &front;
+    }});
+    front.attach("video-owner", {}, video.srv.get());
+    std::thread listener([&] { front.run(); });
+    struct StopListener {
+        Front& front;
+        std::thread& thread;
+        ~StopListener() { front.stop(); thread.join(); }
+    } stop{front, listener};
+    for (int i = 0; i < 200 && front.port() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    REQUIRE(front.port() > 0);
+    httplib::Client client("127.0.0.1", front.port());
+    client.set_read_timeout(5, 0);
+    json request = Videos::body({{"model", "video-owner"}});
+    const auto created = client.Post("/v1/videos", request.dump(), "application/json");
+    REQUIRE(created);
+    REQUIRE_EQ(created->status, 200);
+    const std::string path = "/v1/videos/" + str_at(json::parse(created->body), "id");
+    const uint64_t uses = front.activity("video-owner").uses;
+    auto poll = client.Get(path.c_str());
+    REQUIRE(poll);
+    CHECK_EQ(poll->status, 200);
+    CHECK(!front.detach("video-owner", 0));
+    poll = client.Get(path.c_str());
+    REQUIRE(poll);
+    CHECK_EQ(poll->status, 200);
+    CHECK_EQ(front.activity("video-owner").uses, uses);
+    gen.last().ticket->finish(RAD_OK, {});
+    REQUIRE(front.detach("video-owner", 5000));
+    poll = client.Get(path.c_str());
+    REQUIRE(poll);
+    CHECK_EQ(poll->status, 200);
+    const json completed = json::parse(poll->body);
+    if (str_at(completed, "status") == "failed" &&
+        has(str_at(completed["error"], "message"), "no libavcodec"))
+        SKIP("this build has no libavcodec to finish the video");
+    CHECK_EQ(str_at(completed, "status"), "completed");
+    const auto content = client.Get((path + "/content").c_str());
+    REQUIRE(content);
+    CHECK_EQ(content->status, 200);
+    CHECK(!content->body.empty());
+    const auto missing = client.Get("/v1/videos/unknown-job");
+    REQUIRE(missing);
+    CHECK_EQ(missing->status, 404);
+    CHECK_EQ(demands.load(), 0);
+    CHECK(front.activity("cold-text").state == Front::State::Cold);
+}
+
+TEST(a_video_only_model_refuses_soundtrack_options_and_finishes_an_mp4) {
+    Videos v;
+    auto& info = v.gen.inf;
+    info.channels = info.sample_rate = 0;
+    info.max_ref_audios = info.max_enc_samples = 0;
+    info.guidance = true;
+    info.guidance_default[0] = 1.0;
+    CHECK_EQ(v.refused(Videos::body({ { "audio_shift", 3 } })), std::string("audio_shift"));
+    CHECK_EQ(v.refused(Videos::body({ { "audio_guidance_scale", 1 } })),
+             std::string("audio_guidance_scale"));
+
+    if (!mm::decoder_available()) SKIP("video codec unavailable");
+    const HttpResponse r = v.create(Videos::body());
+    REQUIRE_EQ(r.status, 200);
+    const json video = json::parse(r.body, nullptr, false);
+    CHECK(!video.contains("audio_guidance_scale"));
+    CHECK(!video.contains("negative_prompt"));
+    const json done = v.wait(str_at(video, "id"));
+    if (str_at(done, "status") == "failed" && has(str_at(done["error"], "message"), "no libavcodec"))
+        SKIP("video encoder unavailable");
+    CHECK_EQ(str_at(done, "status"), std::string("completed"));
+}
+
+TEST(a_unipc_model_reports_its_sampler_and_refuses_other_samplers) {
+    Videos v;
+    v.gen.inf.channels = v.gen.inf.sample_rate = 0;
+    v.gen.inf.max_ref_audios = v.gen.inf.max_enc_samples = 0;
+    v.gen.inf.unipc_only = true;
+    v.gen.inf.guidance = true;
+    v.gen.inf.guidance_cfg_only = true;
+    CHECK_EQ(v.refused(Videos::body({{"stg_scale", 1}})), std::string("stg_scale"));
+    CHECK_EQ(v.refused(Videos::body({{"modality_scale", 2}})), std::string("modality_scale"));
+    CHECK_EQ(v.refused(Videos::body({{"guidance_rescale", .2}})), std::string("guidance_rescale"));
+    v.gen.inf.step_evals = true;
+    CHECK_EQ(v.refused(Videos::body({ { "sampler", "euler" } })), std::string("sampler"));
+    CHECK_EQ(v.refused(Videos::body({ { "sampler", "res_multistep" } })), std::string("sampler"));
+    for (const auto& body : { Videos::body(), Videos::body({ { "sampler", "unipc" },
+                                                          { "num_inference_steps", 1 } }) }) {
+        if (!mm::decoder_available()) SKIP("video codec unavailable");
+        const HttpResponse r = v.create(body);
+        REQUIRE_EQ(r.status, 200);
+        CHECK_EQ(v.gen.last().sampler, RAD_SAMPLER_UNIPC);
+        const json video = json::parse(r.body, nullptr, false);
+        CHECK_EQ(str_at(video, "sampler"), std::string("unipc"));
+        CHECK(!video.contains("stg_scale"));
+        CHECK(!video.contains("modality_scale"));
+        CHECK(!video.contains("guidance_rescale"));
+        const json done = v.wait(str_at(video, "id"));
+        if (str_at(done, "status") == "failed" && has(str_at(done["error"], "message"), "no libavcodec"))
+            SKIP("video encoder unavailable");
+        CHECK_EQ(str_at(done, "status"), std::string("completed"));
+    }
 }
 
 RAD_TEST_MAIN()

@@ -19,6 +19,8 @@
 #include "avx_vec.h"
 #include "avx_common.h"
 
+#include <vector>
+
 using namespace avx;
 
 /* Widen the gain once per launch, not once per row, into a caller buffer built before the
@@ -290,6 +292,159 @@ AVX_KERNEL(grid_embed) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ grid_embed_pad */
+/* grid_embed with the half-pixel-centre resample (align_corners=False) and grid_sample's
+ * padding_mode="zeros": a tap whose UNCLAMPED index falls outside [0, side) carries weight zero
+ * instead of reading the clamped edge. Matches libref's grid_embed_pad operation: four taps in
+ * f32 in the same order, rounded to x's dtype, then added and rounded again. Scalar, one row per
+ * vision-tower patch, as grid_embed's is. */
+AVX_KERNEL(grid_embed_pad) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *tab = &a->t[1], *crd = &a->t[2];
+    const int64_t n = p_int(a, "n", tab->rank ? tab->shape[tab->rank - 1] : 0);
+    const int64_t side = p_int(a, "side", 0);
+    if (n <= 0 || side <= 0 || numel(tab) < side * side * n) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0 || crd->rank != 2 || crd->shape[0] < 4 || crd->shape[1] < rows)
+        return RAD_E_SHAPE;
+    const int64_t cs = crd->stride[0], ms = crd->stride[1];
+    const int64_t ts = laststride(tab);
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        int64_t g[4];
+        for (int c = 0; c < 4; ++c) g[c] = ldi(crd, c * cs + r * ms);
+        int64_t th[2], tw[2];
+        float wh[2], ww[2];
+        auto axis = [&](int64_t idx, int64_t size, int64_t* t, float* w) {
+            if (size < 1) size = 1;
+            const float src = (float)side / (float)size * ((float)idx + 0.5f) - 0.5f;
+            const float fl = std::floor(src);
+            for (int k = 0; k < 2; ++k) {
+                const int64_t raw = (int64_t)fl + k;
+                t[k] = raw < 0 ? 0 : (raw > side - 1 ? side - 1 : raw);
+                const float d = std::fabs(src - fl - (float)k);
+                const float u = 1.0f - d > 0.0f ? 1.0f - d : 0.0f;
+                w[k] = raw >= 0 && raw <= side - 1 ? u : 0.0f;
+            }
+        };
+        axis(g[0], g[2], th, wh);
+        axis(g[1], g[3], tw, ww);
+        const int64_t xb = rowoff(x, r, n), xs = laststride(x);
+        for (int64_t i = 0; i < n; ++i) {
+            float acc = 0.0f;
+            for (int ki = 0; ki < 2; ++ki)
+                for (int kj = 0; kj < 2; ++kj)
+                    acc += ldt(tab, rowoff(tab, th[ki] * side + tw[kj], n) + i * ts) *
+                           (wh[ki] * ww[kj]);
+            const float pe = round_act(x->dtype, acc);
+            stt(x, xb + i * xs, ldt(x, xb + i * xs) + pe);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ window_order */
+/* The window-attention permutation of one pass from the coordinate planes alone (libref's
+ * window_order operation). One thread does the whole pass: the slot of each patch follows from
+ * its window's base, computed as a prefix over windows, so the work is two linear walks over P --
+ * nothing to vectorise, and off the step path. */
+AVX_KERNEL(window_order) {
+    if (!rad_args_have(a, 6)) return RAD_E_INVAL;
+    const RadTensor *crd = &a->t[0], *cu = &a->t[1];
+    RadTensor *idx = const_cast<RadTensor*>(&a->t[2]), *inv = const_cast<RadTensor*>(&a->t[3]),
+              *pos = const_cast<RadTensor*>(&a->t[4]), *cuw = const_cast<RadTensor*>(&a->t[5]);
+    const int64_t M = p_int(a, "M", 0);
+    const int64_t win = p_int(a, "window", 0);
+    if (M <= 0 || crd->rank != 2 || crd->shape[0] < 4 || crd->shape[1] < M) return RAD_E_SHAPE;
+    if (numel(cu) < 2 || numel(idx) < M || numel(inv) < M || numel(pos) < 2 * M ||
+        numel(cuw) < M + 1)
+        return RAD_E_SHAPE;
+    const int64_t P = crd->shape[1];
+    const int64_t cs = crd->stride[0], ms = crd->stride[1];
+    auto gx = [&](int c, int64_t p) { return ldi(crd, (int64_t)c * cs + p * ms); };
+    auto sti = [](const RadTensor* t, int64_t i, int64_t v) { st_int_dt(t->dtype, t->data, i, v); };
+    if (idx->dtype != RAD_I32 || inv->dtype != RAD_I32 || pos->dtype != RAD_I32 ||
+        cuw->dtype != RAD_I32)
+        return RAD_E_DTYPE;
+
+    auto identity = [&]() {
+        for (int64_t p = 0; p < P; ++p) {
+            sti(idx, p, p);
+            sti(inv, p, p);
+            if (p < M) {
+                sti(pos, p, gx(1, p) + 1);
+                sti(pos, P + p, gx(0, p) + 1);
+            } else {
+                sti(pos, p, 1);
+                sti(pos, P + p, 1);
+            }
+        }
+        int64_t last = 0;
+        const int64_t k = numel(cu) < M + 1 ? numel(cu) : M + 1;
+        for (int64_t i = 0; i < k; ++i) {
+            last = ldi(cu, i);
+            sti(cuw, i, last);
+        }
+        for (int64_t i = k; i < M + 1; ++i) sti(cuw, i, last);
+    };
+    if (win <= 0) {
+        identity();
+        return RAD_OK;
+    }
+
+    std::vector<int64_t> seg((size_t)M), seg_nw, seg_first_win;
+    std::vector<int64_t> wbase((size_t)M);
+    int64_t nwin = 0, slot = 0;
+    const int64_t S = numel(cu) - 1;
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t start = ldi(cu, s);
+        if (start >= M) break;
+        int64_t end = ldi(cu, s + 1);
+        if (end > M) end = M;
+        const int64_t gh = start < end ? gx(2, start) : 1;
+        const int64_t gw = start < end ? gx(3, start) : 1;
+        const int64_t nh = (gh + win - 1) / win, nw = (gw + win - 1) / win;
+        seg_first_win.push_back(nwin);
+        seg_nw.push_back(nw);
+        for (int64_t p = start; p < end; ++p) seg[(size_t)p] = (int64_t)seg_first_win.size() - 1;
+        for (int64_t wr = 0; wr < nh; ++wr)
+            for (int64_t wc = 0; wc < nw; ++wc) {
+                const int64_t rows_in = std::min(win, gh - wr * win);
+                const int64_t cols_in = std::min(win, gw - wc * win);
+                sti(cuw, nwin, slot);
+                wbase[(size_t)nwin] = slot;
+                ++nwin;
+                slot += rows_in * cols_in;
+            }
+    }
+    sti(cuw, nwin, slot);
+    for (int64_t i = nwin + 1; i < M + 1; ++i) sti(cuw, i, slot);
+
+    for (int64_t p = 0; p < P; ++p) {
+        if (p >= M) {
+            sti(idx, p, p);
+            sti(inv, p, p);
+            sti(pos, p, 1);
+            sti(pos, P + p, 1);
+            continue;
+        }
+        const int64_t r = gx(0, p), c = gx(1, p), gw = gx(3, p);
+        int64_t wr = r / win, wc = c / win;
+        if (wr < 0) wr = 0;
+        if (wc < 0) wc = 0;
+        const int64_t cols_in = std::min(win, gw - wc * win);
+        const int64_t wid = seg_first_win[(size_t)seg[(size_t)p]] +
+                            wr * seg_nw[(size_t)seg[(size_t)p]] + wc;
+        const int64_t at = wbase[(size_t)wid] + (r - wr * win) * cols_in + (c - wc * win);
+        sti(idx, at, p);
+        sti(inv, p, at);
+        sti(pos, at, c + 1);
+        sti(pos, P + at, r + 1);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ grid_embed_aa */
 /* Adds the table resampled as torch's F.interpolate(bilinear, align_corners=False,
  * antialias=True) does (SigLIP2's position embedding); matches libref's grid_embed_aa. Per axis: a
@@ -415,6 +570,48 @@ AVX_KERNEL(grid_embed_cpe) {
             const float r1 = ww[0] * at(th[1], tw[0], i) + ww[1] * at(th[1], tw[1], i);
             const float pe = round_act(x->dtype, wh[0] * r0 + wh[1] * r1);
             stt(x, xb + i * xs, ldt(x, xb + i * xs) + pe);
+        }
+    }
+    return RAD_OK;
+}
+
+/* l2_clip: libref's ref_l2_clip. The group norm is taken in double, as libref takes it, before any
+ * element of the group is stored, and each element is read before it is written, so y may alias x. */
+AVX_KERNEL(l2_clip) {
+    if (!a || a->n_t < 4 || !a->t[0].data || !a->t[3].data) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *y = &a->t[3];
+    const RadTensor* w = a->t[1].data ? &a->t[1] : nullptr;
+    const RadTensor* pos = a->t[2].data ? &a->t[2] : nullptr;
+    const int64_t n = p_int(a, "n", 0), g = p_int(a, "group", n);
+    if (n <= 0 || g <= 0 || n % g != 0) return RAD_E_SHAPE;
+    const float thr = p_f32(a, "threshold", 0.0f);
+    const float flr = p_f32(a, "floor", 1.0f), alpha = p_f32(a, "alpha", 0.0f);
+    if (!(thr > 0.0f) || !(flr > 0.0f)) return RAD_E_INVAL;
+    const int64_t rows = rows_of(y, n);
+    if (rows <= 0 || numel(x) < rows * n || numel(y) < rows * n) return RAD_E_SHAPE;
+    if (w && numel(w) < n) return RAD_E_SHAPE;
+    if (pos && numel(pos) < rows) return RAD_E_SHAPE;
+
+    const int64_t xs = laststride(x), ys = laststride(y), ws = w ? laststride(w) : 0;
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float tau = 1.0f;
+        if (pos) {
+            const double p = (double)ldi(pos, offlin(pos, r));
+            tau = 1.0f + alpha * (float)std::log(std::fmax(1.0, (p + 1.0) / (double)flr));
+        }
+        const int64_t xb = rowoff(x, r, n), yb = rowoff(y, r, n);
+        for (int64_t g0 = 0; g0 < n; g0 += g) {
+            double ss = 0.0;
+            for (int64_t i = g0; i < g0 + g; ++i) {
+                const double v = (double)ldt(x, xb + i * xs) * (w ? (double)ldt(w, i * ws) : 1.0);
+                ss += v * v;
+            }
+            const double f = std::fmin(1.0, (double)thr / (std::sqrt(ss) + 1e-6));
+            for (int64_t i = g0; i < g0 + g; ++i) {
+                const float v = ldt(x, xb + i * xs) * (w ? ldt(w, i * ws) : 1.0f);
+                stt(y, yb + i * ys, (float)(v * f) * tau);
+            }
         }
     }
     return RAD_OK;

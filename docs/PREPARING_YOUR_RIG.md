@@ -166,9 +166,9 @@ git clone https://codeberg.org/StillDeadcode/radiance.git
 cp -r radiance/deploy/compose ~/radiance-compose && cd ~/radiance-compose
 
 mkdir -p ~/models/rad
-curl -L -C - -o ~/models/rad/qwen3.8-next-flash-fp8-iq4r-moe.rad \
-  https://huggingface.co/StillDeadcode/qwen3.8-next-flash-fp8-iq4r-moe/resolve/main/qwen3.8-next-flash-fp8-iq4r-moe.rad
-                                               # 114 GiB; -C - resumes after an interruption
+curl -L -C - -o ~/models/rad/qwen3.8-next-flash-iqr-v4.rad \
+  https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4/resolve/main/qwen3.8-next-flash-iqr-v4.rad
+                                               # 113 GiB; -C - resumes after an interruption
 
 cp .env.example .env && chmod 600 .env
 ```
@@ -182,9 +182,13 @@ Set these in `.env`:
 | `RADIANCE_UID`, `RADIANCE_GID` | `id -u`, `id -g` |
 | `RENDER_GID`, `VIDEO_GID` | `getent group render \| cut -d: -f3`, the same for `video` |
 
+`tp2.yaml` serves eleven models from one container, each under its entry's name in the `models:`
+block of `tp2.radiance.yaml` beside it. With only Flash-Next's container downloaded, delete every entry there but
+`flashnext` (the request below names no model, which a file of one model answers with that one).
+
 ```sh
-docker compose -f flashnext.yaml up -d
-docker compose -f flashnext.yaml logs -f       # Ctrl-C once it serves; the container keeps running
+docker compose -f tp2.yaml up -d
+docker compose -f tp2.yaml logs -f       # Ctrl-C once it serves; the container keeps running
 ```
 
 The startup log must say `device: the 2 cards reach each other's memory directly (peer to peer)`. A
@@ -198,6 +202,6 @@ curl -s localhost:8000/v1/chat/completions -H "Authorization: Bearer $KEY" \
   -d '{"messages":[{"role":"user","content":"What is 65 * 3?"}]}'
 ```
 
-The container restarts with the machine. `docker compose -f flashnext.yaml down` stops it.
-[`DOCKER.md`](DOCKER.md) lists the other models' compose files, and [`GUIDE.md`](GUIDE.md) covers
-serving flags and the API.
+The container restarts with the machine. `docker compose -f tp2.yaml down` stops it.
+[`DOCKER.md`](DOCKER.md) covers the compose files and adding other models to them, and
+[`GUIDE.md`](GUIDE.md) covers serving flags and the API.

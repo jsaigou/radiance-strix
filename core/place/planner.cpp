@@ -1146,7 +1146,7 @@ void Planner::pin_hot(const Config& cfg, Plan* p) const {
     const double keep = (double)cfg.expert_pin_top * (double)shares.size();
     const size_t hot = keep <= 0.0 ? 0 : std::min(shares.size(), (size_t)std::ceil(keep));
     const float threshold = hot == 0 ? shares.back() + 1.0f
-                                     : shares[shares.size() - hot] - 1.0f;
+                                     : (hot < shares.size() ? shares[shares.size() - hot - 1] : -1.0f);
     p->pin_threshold = threshold;
     p->profile_units = (int64_t)shares.size();
     int64_t pinned = 0, left = 0;

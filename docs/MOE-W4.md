@@ -2,7 +2,7 @@
 
 Qwen3.8-Flash-Next has 512 experts of 640 over 48 layers: 112.5 GiB of expert weight at E4M3,
 against two 32 GB cards. Split over both ranks, the placement planner still comes up 26 GiB short.
-The file tier (`--weights-disk-tier`) can serve routed weights, but it reads them a layer at a time
+The file tier (`weights-disk-tier: true`) can serve routed weights, but it reads them a layer at a time
 and a step is then paced by the drive; pinned host memory does not close the gap on a 64 GB host.
 At four bits an expert unit is 2.42 MiB instead of 4.69, the per-rank share is ~29 GiB, and that
 fits VRAM plus a few GiB of pinned host.
@@ -25,7 +25,7 @@ bf16 model over the same 83K positions ([TOOLS.md](TOOLS.md#the-kl-mode)):
 
 | | all: mean KL | all: top-1 | text + assistant: mean KL | text + assistant: top-1 |
 |---|---|---|---|---|
-| int4 `-8..7`, round to nearest, E4M3 trunk (`qwen4exp-w4-hc8m.recipe`) | 0.1357 | 90.35% | 0.0440 | 92.46% |
+| int4 `-8..7`, round to nearest, E4M3 trunk | 0.1357 | 90.35% | 0.0440 | 92.46% |
 | `w4nla8h` experts, GPTQ | 0.1098 | 91.36% | 0.0363 | 93.30% |
 | + int8 W8A8 trunk | 0.0841 | 92.46% | 0.0277 | 94.07% |
 | + int8 lm_head | 0.0830 | 92.84% | 0.0265 | 94.54% |
@@ -92,20 +92,23 @@ The encodings are **not interchangeable**:
 | `affine:codes=u4[1x1],scale=fp8_e4m3[1x64],scale.1=f32[*x*],table=f32{1x16}/fwht128` | `w4nl64a8h` | the codebook with an E4M3 scale per row and group of **64**, under one fixed f32 (below); the same bytes |
 | `affine:codes=u4[1x1],scale=fp8_e4m3[1x32],scale.1=f32[*x*],table=f32{1x16}/fwht128` | `w4nl32a8h` | the same at a group of **32**, +0.125 bits per weight |
 | `affine:codes=u5[1x1],scale=fp8_e4m3[1x64],scale.1=f32[*x*],table=f32{1x32}/fwht128` | `w5nl64a8h` | `w4nl64a8h` with **five-bit** codes into the 32-level `w5nl` codebook (below), +1 bit per weight |
+| `affine:codes=u6[1x1],scale=fp8_e4m3[1x64],scale.1=f32[*x*],table=f32{1x64}/fwht128` | `w6nl64a8h` | `w4nl64a8h` with **six-bit** codes into the 64-level `w6nl` codebook ([MOE-W6.md](MOE-W6.md)), +2 bits per weight |
 
 The first two differ only in the transform. The plugin reads the first expert's encoding
 (`rad_weight_encoding`) and declares the matching kernels; a kernel that does not read an encoding
 is not a candidate for it, so a rotated container cannot be served unrotated. The container holds
 nibbles in canonical order, and libr4d reorders each row into its unpack order at load. The
-activation side is `had_quant_act_fp8` / `gated_had_quant_fp8`: the ordinary fp8 quantisers with
-`r4d_fwht_wave<128>` between the load and the absmax, at no cost, since the kernel's mapping (one
-wave per 128-column group, four consecutive columns per lane) is already the transform's.
+activation side is rotated by the same 128-wide transform between the load and the absmax: on an
+int8 trunk `had_quant_act_i8g` and `gated_had_quant_i8g` (the experts read at the `a8i8h` dtypes),
+on an E4M3 one `hc_read`'s rotated copy (`rq`). In libr4d the transform is `r4d_fwht_wave<128>`,
+at no cost, since the kernel's mapping (one wave per 128-column group, four consecutive columns per
+lane) is already the transform's.
 
 **The residual factor is not split.** `H` is symmetric, so `<Hw, Ha> = 128 <w, a>`, and the
 quantiser folds the whole factor of 128 into the **stored weight scale** (`bf16(amax/7) / 128`).
 The int8 rotated ops fold `1/sqrt(group)` into each side; these fold nothing at runtime. This is
-normative in `docs/OPS.md` (*Quantisation and rotation*, the `group` parameter under the `had_*`
-FP8 forms), which also states the cost of splitting it.
+normative in `docs/OPS.md` (*Quantisation and rotation*, the `group` parameter under the rotated
+E4M3 form), which also states the cost of splitting it.
 
 ## The w4nl codebook
 
@@ -207,6 +210,27 @@ under "What is served": 0.0717 / 93.34% against 0.0789 / 92.85%, for -19% prefil
 accumulators and differ only in the GEMM's dtype, so a recipe may put any projection of any layer
 in any of them, and the MoE block reads each layer's two forms from that layer's experts.
 
+## NVFP4 experts: `nvfp4a8i8`
+
+The NVFP4 release (ModelOpt's, and Inkling 2's routed experts) stores each expert as e2m1 codes, an
+E4M3 scale per 16 of K and one f32 level per expert (amax over the release's divisor). Served as
+shipped, its codes are unchanged and its value is `e2m1 * e4m3 * level`. The e2m1 magnitudes double to
+the integers 0, 1, 2, 3, 4, 6, 8, 12, which an int8 activation multiplies exactly, so unlike `w4nl`'s
+codebook (read at the nearest of one int8 set, `kW4nlI8`) this form has no approximation in the
+weight: the only roundings are the activation's int8 codes and the bf16 output. The GEMM applies no
+rotation, since the checkpoints are unrotated.
+
+The planes and the kernel are in [OPS.md](OPS.md) (`moe_gemm_q` at `nvfp4a8i8`). libr4d's kernel is a
+plain one, a column per thread and a block per sorted row, with no WMMA and no run map, so it is
+correct at every band and is the reference the performance work starts from. libref and libavx read
+the codes through the codebook path with the sixteen e2m1 levels as the table.
+
+Tests: `op_moe_gemm_q_nvfp4a8i8_matches_the_oracle` (ref_test, the joined stored form and the plain
+logical one), the `nvfp4a8i8` hand case in `avx_check_hand` and the random cases in `avx_cases`,
+`r4d_emu_nvfp4` (the kernel on the host emulator, stacked and pointer-table scales, token and sorted
+order, a dropped slot), and `r4d_selftest --case moe_gemm_nvfp4a8i8` on a card (three shapes, against
+the same f64 decode of the planes).
+
 ## Rotation without GPTQ
 
 A rotation fixes range, and a group-128 absmax already handles range. On the 27B, Hadamard was 2x
@@ -227,13 +251,13 @@ A second moment is robust to the small perturbation the first container's error 
 activation, which is what makes step 2 valid.
 
 **The production recipe calibrates the checkpoint as it ships instead.** Converted without a
-recipe, Flash-Next is a 335 GiB bf16 container, which `--weights-disk-tier` serves on two cards by
+recipe, Flash-Next is a 335 GiB bf16 container, which `weights-disk-tier` serves on two cards by
 reading each routed layer's non-resident experts from the container per pass (GUIDE.md §4.3). Its
 tap reads the bf16 activation with no upstream layer quantised and writes Hessians in the model's
 own domain, which a rotated recipe's GPTQ rotates into its own; experts are whole per rank. A step
 reads about 100 GiB per rank from the drive and grows slowly with what it carries (50 s at ~32K
-tokens, 59 s at ~55K), so use large prefill steps: `--max-num-batched-tokens 65536
---max-num-seqs 64`, about 96 requests in flight, and a KV pool that holds 64 sequences' recurrent
+tokens, 59 s at ~55K), so use large prefill steps: `max-num-batched-tokens: 65536`,
+`max-num-seqs: 64`, about 96 requests in flight, and a KV pool that holds 64 sequences' recurrent
 state. That records ~930 tokens per second, ten million tokens in three hours.
 
 **The corpus must look like the traffic.** A few thousand tokens of one repeated sentence gives a
@@ -248,21 +272,23 @@ the in-sample/held-out gap drops from up to 3% to under 1% on gate_up, and a 113
 layer 47's down GPTQ at 0.49x RTN where 1.8M tokens say 0.60x.
 
 ```sh
-# 1. the uncalibrated container: the recipe's expert rule is rtn, int4 g128 rotated
-rad-convert <checkpoint> -o model-absmax.rad --recipe data/recipes/qwen4exp-w4.recipe
+# 1. the uncalibrated container: a --quant rule rounds the experts to nearest (int4 g128 rotated)
+#    ahead of the recipe's own expert rule. That rule names calib=$CALIB, and an unset variable is
+#    refused, so CALIB names a directory here too (an empty one)
+CALIB=<empty dir> rad-convert <checkpoint> -o model-absmax.rad \
+    --recipe data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe \
+    --quant 'blk.*.ffn_*_exps.*.weight=rtn:codes=i4,group=128,scale=bf16,transform=fwht128'
 
-# 2. the calibration run. Stops at RADIANCE_CALIB_TOKENS (default 65536) and writes once.
+# 2. the calibration run, with model-absmax.rad as the model in radiance.yaml. Stops at
+#    RADIANCE_CALIB_TOKENS (default 65536) and writes once.
 RADIANCE_CALIB_DIR=<calib dir> RADIANCE_CALIB_TOKENS=65536 \
-  radiance --model model-absmax.rad ...
+  radiance --config radiance.yaml
 # ...then drive prompts at max_tokens=1 until it prints
 #    radiance: calibration wrote layer Hessians after N tokens to <calib dir>
 
-# 3. the calibrated convert: a --quant rule ahead of the recipe's own puts the experts through
-#    GPTQ against calib=$CALIB (a recipe whose expert rule names calib=$CALIB itself, as the
-#    production one does, needs no --quant)
+# 3. the calibrated convert: the recipe's own expert rule runs GPTQ against calib=$CALIB
 CALIB=<calib dir> rad-convert <checkpoint> -o model-gptq.rad \
-    --recipe data/recipes/qwen4exp-w4.recipe --reuse model-absmax.rad \
-    --quant 'blk.*.ffn_*_exps.*.weight=gptq:codes=i4,group=128,scale=bf16,transform=fwht128,calib=$CALIB'
+    --recipe data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe --reuse model-absmax.rad
 ```
 
 `--reuse` in step 3 copies every weight whose encoding, quantiser and options did not change (all
@@ -294,6 +320,16 @@ most (layer 47's expert 399: 0.204 rounded, 0.137 pooled, 0.065 own). Under ~2K 
 overfits and can lose to rounding, hence the threshold; 0.6% of the routed rows fall below it. The
 per-layer sync roughly halves a disk-tier recording's throughput, so the per-expert sets are
 recorded from a million tokens.
+
+**Unsloth's imatrix sees super experts this corpus does not.** `imatrix_unsloth.gguf` (llama.cpp's
+format, 829,440 tokens in raw 18K-token chunks from position 0) records the routed experts per
+expert. Its `gate_up` diagonals agree with the 10M-token Grams at every layer (cosine 0.98-0.99),
+as do the `down` spikes at layers 46 and 47. At layers 2, 4, 9, 14, 16, 25, 30 and 32 its `down`
+spike channels sit at a flat channel's share in radiance's Grams: those super experts never fired
+on the chat-templated corpus. Either raw-text chunks trigger what templated traffic does not, or the
+two implementations compute those experts differently; it is not settled. Unsloth's GGUFs keep
+`down` at Q8_0 in exactly the five layers whose super expert carries the most energy (47, 4, 2, 46,
+30).
 
 About the tap's numbers:
 
@@ -354,23 +390,18 @@ mistyped directory is a message, not a silent quality loss.
   planes, both M bands, through the relayout the loader runs.
 - `r4d_selftest --case moe_gemm_w4a8_mod4`: the four-class op against the two-class one byte for
   byte, and against a host decode with every class at its own geometry and one of classes 1 to 3
-  the only wide one, as ranks 1 to 3 of four hold them; `--case moe_gemm_fp8a8_mod4` is the same
-  host decode at block fp8.
+  the only wide one, as ranks 1 to 3 of four hold them.
 - `quant_test`: **GPTQ against the objective it minimises**, `||X (W - W')^T||^2 = sum over rows of
   e H e^T`, not rel_l2 on the weight (error feedback deliberately makes the weight worse in the
   plain sense). The control is no Hessian at all, under which `gptq` must produce `rtn`'s planes
   byte for byte.
-- `r4d_selftest --case had_quant_act_fp8`: every format against the exact f32 dot product, the only
-  way to see whether the quantiser's `fwht_inplace` and the device's `r4d_fwht_wave` are the same
-  transform, and whether the kernel decodes `w4nl` codes as their table entries. On a source with
-  outlier channels: 0.2015 (`w4a8`), 0.1307 (`w4a8h`), 0.0991 (`w4nla8h`, round to nearest at
-  amax / 22), 0.0761 (`w4nl64a8h`), 0.0625 (`w4nl32a8h`) and 0.0469 (`w5nl64a8h`); the negative
-  control (rotate the activation, not the weight) measures 5.32.
 - `relayout_parity_test`: the `w4nla8h` plane's stored bytes pinned, its inverse giving back the
   codes and the table, and a container quantised against another sixteen-entry table refused at
   relayout; the same for `w4nl64a8h`, `w4nl32a8h` and `w5nl64a8h`, with a second level other than
   2^-13 refused, a 32-entry table other than `w5nl` refused, and each refusing the others'
-  encodings. `r4d_selftest --case moe_gemm_w4a8` also checks `w5nl64a8h`'s arranged row bit for bit
+  encodings; and `w6nl64a8h`'s arranged row read back at every one of its 64 code values, with its
+  inverse, a 64-entry table other than `w6nl` refused and a second level other than 2^-13 refused.
+  `r4d_selftest --case moe_gemm_w4a8` also checks `w5nl64a8h`'s arranged row bit for bit
   against the statement in `r4d_layout.cpp`, and its inverse. `moe_gemm_q_mod4`'s four classes are
   held to `moe_gemm_q`'s stored bytes in every format, and for both ops what the op oracle reads
   through the inverse (codes as their levels, an E4M3 scale times its second level) is held to the

@@ -62,23 +62,23 @@ const char* param_kind_name(int kind) {
 }
 
 const RadOpSchema* Registry::schema(std::string_view op) const {
-    auto it = schemas_.find(std::string(op));
-    return it == schemas_.end() ? nullptr : it->second.schema;
+    auto it = set_->schemas.find(std::string(op));
+    return it == set_->schemas.end() ? nullptr : it->second.schema;
 }
 
 const Plugin* Registry::schema_owner(std::string_view op) const {
-    auto it = schemas_.find(std::string(op));
-    return it == schemas_.end() ? nullptr : plugin(it->second.plugin);
+    auto it = set_->schemas.find(std::string(op));
+    return it == set_->schemas.end() ? nullptr : plugin(it->second.plugin);
 }
 
 std::vector<std::string> Registry::op_names() const {
     std::vector<std::string> out;
-    out.reserve(schemas_.size());
-    for (const auto& kv : schemas_) out.push_back(kv.first);
+    out.reserve(set_->schemas.size());
+    for (const auto& kv : set_->schemas) out.push_back(kv.first);
     /* Include ops that have rows but no schema (check_complete() reports those), so a near-miss
      * search can still name them. */
-    for (const KernelRow& r : rows_)
-        if (schemas_.find(r.info->op) == schemas_.end()) out.emplace_back(r.info->op);
+    for (const KernelRow& r : set_->rows)
+        if (set_->schemas.find(r.info->op) == set_->schemas.end()) out.emplace_back(r.info->op);
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;
@@ -94,8 +94,8 @@ int Registry::validate(std::string_view op, const RadParam* p, int n_p, std::str
     err->clear();
 
     const std::string name(op);
-    auto it = schemas_.find(name);
-    if (it == schemas_.end()) {
+    auto it = set_->schemas.find(name);
+    if (it == set_->schemas.end()) {
         const std::string did = near_miss(op);
         *err = fmt("no loaded kernel plugin declares op '%s'%s", name.c_str(),
                    did.empty() ? "" : fmt("; did you mean '%s'?", did.c_str()).c_str());

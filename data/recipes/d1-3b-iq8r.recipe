@@ -1,0 +1,21 @@
+# d1-3b-iq8r.recipe -- LiquidAI d1-3B (LFM2) with an IQ8R trunk.
+#
+#   rad-convert <LiquidAI/d1-3B> -o d1-3b-iq8r.rad --set decision.type=d1 \
+#       --recipe data/recipes/d1-3b-iq8r.recipe
+#
+# Every linear of the 30 layers (attention q, k, v and output; the convolutions' in and out
+# projections; gate|up and down) becomes int8 codes in -127..127 in the 128-wide Hadamard domain,
+# with a u8 scale per [1 x 256] of K under a bf16 scale per row, read against int8 activations
+# rotated the same way. Round to nearest with a scale search; no calibration data is read. The
+# lm_head (tied to the embedding, so the embedding itself stays bf16) is int8 unrotated with a bf16
+# scale per row per 128 columns, read by logits_gemm_i8. The short convolution and the norms stay
+# bf16.
+blk.*.attn_q.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.attn_k.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.attn_v.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.attn_output.weight     rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.conv_in.weight         rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.conv_out.weight        rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_gate_up.weight     rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_down.weight        rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+output.weight                rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search

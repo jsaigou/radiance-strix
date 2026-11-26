@@ -194,8 +194,8 @@ printf '{"model":"qwen4exp","temperature":0,"seed":%s,"max_tokens":%s,"ignore_eo
 # --max-num-seqs 2 and SPEC 3 that ceiling is 2 x 4 x 513 = 4 104 blocks, under 8 192, so 32 768
 # tokens is not raised.
 FLAGS=(--model "$MODEL_IN" --tp 2 --tp-wire exact --max-num-seqs 2 --max-model-len 204800
-       --placement expert_tiered --host-pool-mib 23652 --gpu-headroom-mib 96
-       --kv-cache-dtype fp8 --prefix-cache-mib 1024 --prefix-cache-ttl 0
+       --placement expert_tiered --host-pool-mib 47304 --gpu-headroom-mib 96
+       --kv-cache-dtype i8 --prefix-cache-mib 1024 --prefix-cache-ttl 0
        --vision-tower-placement ram --num-speculative-tokens "$SPEC" --deterministic
        --host 127.0.0.1 --port "$PORT" --api-key test)
 
@@ -209,7 +209,7 @@ start_arm() {  # $1 arm, $2 tag; sets RUN_NAME and writes $OUT/$2.server.log
         --security-opt seccomp=unconfined --network host \
         -v "$ROOT:/src" -v "$(dirname "$MODEL"):/models" \
         -w /src "$TOOLCHAIN" \
-        bash -lc "RADIANCE_HOME=$BUILD/radiance_home exec $BUILD/bin/radiance ${FLAGS[*]} --kv-resident $RESIDENT" \
+        bash -lc "RADIANCE_HOME=$BUILD/radiance_home exec /src/scripts/radiance-flags $BUILD/bin/radiance ${FLAGS[*]} --kv-resident $RESIDENT" \
         > "$OUT/$tag.server.log" 2>&1 &
       ;;
     stock)

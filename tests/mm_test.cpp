@@ -23,6 +23,7 @@
 #include "mm/processor.h"
 #include "gemma4_golden.h"
 #include "gemma4u_golden.h"
+#include "glimmer_golden.h"
 #include "glm5_golden.h"
 #include "radio_golden.h"
 #include "imaging_golden.h"
@@ -1126,6 +1127,222 @@ TEST(glm5_reads_its_processor_from_the_container) {
     CHECK(why.find("patch_expand_factor") != std::string::npos);
 }
 
+/* ================================================================== Muse Glimmer's processor
+ *
+ * glimmer_golden.h: transformers' own MuseGlimmerImageProcessor and MuseGlimmerVideoProcessor
+ * (mkglimmergolden.py ran them on synthetic splitmix frames), which the processor mirrors: the
+ * token-capped aspect-nearest resize, torchvision's antialiased Lanczos on the uint8 pixels, the
+ * (temporal, channel, y, x) patch rows in radiance's merge-block order, and the sampled frames'
+ * per-group "Time: T s" stamps. */
+namespace {
+
+VisionConfig muse_cfg() {
+    VisionConfig c;
+    c.family = Family::MuseGlimmer;
+    c.patch = kGoldMusePatch;
+    c.temporal = kGoldMuseTemporal;
+    c.merge = kGoldMuseMerge;
+    c.max_image_tokens = 4096;
+    c.max_frame_rows = 144;
+    c.fps = 2.0;
+    c.min_frames = c.temporal;
+    c.max_frames = 96;
+    const int64_t f2 = (int64_t)c.factor() * c.factor();
+    c.image_min_pixels = c.video_min_pixels = f2;
+    c.image_max_pixels = (int64_t)c.max_image_tokens * f2;
+    c.video_max_pixels = (int64_t)c.max_frame_rows * f2;
+    c.tok_image = kGoldMuseTokImage;
+    c.tok_video = kGoldMuseTokVideo;
+    c.tok_start = kGoldMuseTokStart;
+    c.tok_end = kGoldMuseTokEnd;
+    c.tok_video_start = kGoldMuseVidStart;
+    c.tok_video_end = kGoldMuseVidEnd;
+    c.tok_video_sep = kGoldMuseVidSep;
+    c.max_patches = 16384;
+    return c;
+}
+
+}  /* namespace */
+
+TEST(muse_sizes_are_the_references) {
+    for (const GoldMuseResize& g : kGoldMuseResize) {
+        int64_t oh = 0, ow = 0;
+        std::string why;
+        CHECK_OK(muse_size(g.h, g.w, kGoldMusePatch * kGoldMuseMerge, 4096, &oh, &ow, &why));
+        if (oh != g.oh || ow != g.ow)
+            std::fprintf(stderr, "    %lld x %lld: %lld x %lld, reference %lld x %lld\n",
+                         (long long)g.h, (long long)g.w, (long long)oh, (long long)ow,
+                         (long long)g.oh, (long long)g.ow);
+        CHECK_EQ(oh, g.oh);
+        CHECK_EQ(ow, g.ow);
+    }
+}
+
+TEST(muse_pictures_patchify_as_the_reference_does) {
+    Processor p;
+    int rc = p.init(muse_cfg(), [](const std::string&) { return std::vector<int32_t>{ 1 }; });
+    REQUIRE(rc >= 0);
+    for (const GoldMuseImage& g : kGoldMuseImage) {
+        std::shared_ptr<Item> it;
+        std::string why;
+        CHECK_OK(p.image_from(frame(0, (int)g.h, (int)g.w), &it, &why));
+        REQUIRE(it != nullptr);
+        if (it->grid_h != g.gh || it->grid_w != g.gw)
+            std::fprintf(stderr, "    %lld x %lld: grid %d x %d, reference %d x %d\n",
+                         (long long)g.h, (long long)g.w, it->grid_h, it->grid_w, g.gh, g.gw);
+        CHECK_EQ(it->grid_t, 1);
+        CHECK_EQ(it->grid_h, g.gh);
+        CHECK_EQ(it->grid_w, g.gw);
+        REQUIRE_EQ(it->pixels.size(), (size_t)it->n_patch * 1176);
+        for (int i = 0; i < 16; ++i) CHECK_EQ(it->pixels[(size_t)i], g.head[i]);
+        CHECK_EQ(fnv(it->pixels), g.fnv);
+
+        /* <|image_start|>, one <|patch|> per merged row, <|image_end|>: the reference's
+         * replace_image_token. */
+        const int32_t rows = (g.gh / 2) * (g.gw / 2);
+        REQUIRE_EQ(it->expand.size(), (size_t)rows + 2);
+        CHECK_EQ(it->expand.front(), kGoldMuseTokStart);
+        CHECK_EQ(it->expand.back(), kGoldMuseTokEnd);
+        for (int32_t i = 1; i <= rows; ++i) CHECK_EQ(it->expand[(size_t)i], kGoldMuseTokImage);
+        REQUIRE_EQ(it->seg_at.size(), (size_t)1);
+        CHECK_EQ(it->seg_at[0], 1);
+        CHECK_EQ(it->n_rows(), (int64_t)rows);
+    }
+}
+
+TEST(muse_reads_its_processor_from_the_container) {
+    const char* keys[] = { "vision_config.model_type", "vision_config.patch_size",
+                           "vision_config.patch_temporal", "vision_config.merge_size",
+                           "image_token_id", "video_token_id",
+                           "processor.image_processor.max_image_tokens",
+                           "processor.video_processor.max_video_frame_tokens",
+                           "processor.video_processor.num_frames",
+                           "processor.video_processor.fps",
+                           "processor.image_mean", "processor.image_std" };
+    const char* vals[] = { "muse_glimmer_vision", "14", "2", "2", "200092", "200091",
+                           "4096", "144", "96", "2", "", "" };
+    RadModelMeta m{};
+    m.n_kv = (int)(sizeof(keys) / sizeof(keys[0]));
+    m.kv_key = keys;
+    m.kv_val = vals;
+    VisionConfig c;
+    std::string why;
+    CHECK_OK(c.from_meta(m, &why));
+    CHECK(c.family == Family::MuseGlimmer);
+    CHECK_EQ(c.patch, 14);
+    CHECK_EQ(c.temporal, 2);
+    CHECK_EQ(c.merge, 2);
+    CHECK_EQ(c.patch_dim(), (int64_t)1176);
+    CHECK_EQ(c.factor(), 28);
+    CHECK_EQ(c.max_image_tokens, 4096);
+    CHECK_EQ(c.max_frame_rows, 144);
+    CHECK_EQ(c.max_frames, 96);
+    CHECK_EQ(c.fps, 2.0);
+    CHECK_EQ(c.tok_image, 200092);
+    CHECK_EQ(c.tok_video, 200091);
+    /* The markers the container does not number stay unresolved for the vocabulary. */
+    CHECK_EQ(c.tok_start, -1);
+    CHECK_EQ(c.tok_video_sep, -1);
+    /* The shipped mean and deviation, over the reference class's IMAGENET_STANDARD defaults. */
+    for (int i = 0; i < 3; ++i) {
+        CHECK_EQ(c.mean[i], 0.5f);
+        CHECK_EQ(c.stdv[i], 0.5f);
+    }
+    /* Numbered markers and stated mean/std win. */
+    vals[4] = "200090";
+    vals[10] = "0.48 0.46 0.41";
+    vals[11] = "0.27 0.26 0.28";
+    vals[11] = "0.27 0.26 0.28";
+    VisionConfig d;
+    CHECK_OK(d.from_meta(m, &why));
+    CHECK_EQ(d.tok_image, 200090);
+    CHECK_EQ(d.mean[0], 0.48f);
+    CHECK_EQ(d.stdv[2], 0.28f);
+    /* No tower geometry: refused, not defaulted. */
+    vals[1] = "0";
+    VisionConfig e;
+    CHECK_EQ(e.from_meta(m, &why), RAD_E_NOTFOUND);
+    /* A marker the container does not number that the vocabulary cannot spell: refused at init,
+     * not on the first picture. */
+    VisionConfig unnumbered = muse_cfg();
+    unnumbered.tok_start = -1;
+    Processor p;
+    CHECK_EQ(p.init(unnumbered, [](const std::string&) { return std::vector<int32_t>{ 1 }; },
+                    [](const std::string&) { return -1; }),
+             RAD_E_NOTFOUND);
+    /* A frame budget above one pass: refused. */
+    VisionConfig big = muse_cfg();
+    big.max_patches = 100;
+    Processor q;
+    CHECK_EQ(q.init(big, [](const std::string&) { return std::vector<int32_t>{ 1 }; }),
+             RAD_E_INVAL);
+}
+
+TEST(muse_frames_are_sampled_as_the_reference_does) {
+    for (const GoldMuseSample& g : kGoldMuseSample) {
+        VideoInfo info{};
+        info.n_frames = g.total;
+        info.fps = g.fps;
+        const std::vector<int64_t> idx = sample_frames_muse(info, 2.0, kGoldMuseTemporal, 96);
+        if ((int32_t)idx.size() != g.n)
+            std::fprintf(stderr, "    %lld frames at %g fps: %zu indices, reference %d\n",
+                         (long long)g.total, g.fps, idx.size(), g.n);
+        CHECK_EQ((int32_t)idx.size(), g.n);
+        CHECK_EQ(fnv(idx), g.fnv);
+    }
+}
+
+TEST(a_muse_clip_patchifies_and_is_stamped_as_the_reference_does) {
+    std::vector<std::string> stamps;
+    Processor p;
+    REQUIRE(p.init(muse_cfg(), [&](const std::string& s) {
+                stamps.push_back(s);
+                return std::vector<int32_t>((size_t)s.size(), 7);   /* a token per byte */
+            }) >= 0);
+    Video v;
+    v.info.n_frames = kGoldMuseVideoTotal;
+    v.info.fps = kGoldMuseVideoFps;
+    v.info.w = 96;
+    v.info.h = 64;
+    v.index.assign(kGoldMuseVideoIndex,
+                   kGoldMuseVideoIndex + sizeof(kGoldMuseVideoIndex) / sizeof(kGoldMuseVideoIndex[0]));
+    for (int64_t i : v.index) v.frames.push_back(frame((int)i, 64, 96));
+    std::shared_ptr<Item> it;
+    std::string why;
+    CHECK_OK(p.video_from(v, &it, &why));
+    REQUIRE(it != nullptr);
+    CHECK_EQ(it->grid_t, kGoldMuseVideoGrid[0]);
+    CHECK_EQ(it->grid_h, kGoldMuseVideoGrid[1]);
+    CHECK_EQ(it->grid_w, kGoldMuseVideoGrid[2]);
+    REQUIRE_EQ(it->pixels.size(), (size_t)it->n_patch * 1176);
+    for (int i = 0; i < 16; ++i) CHECK_EQ(it->pixels[(size_t)i], kGoldMuseVideoHead[i]);
+    CHECK_EQ(fnv(it->pixels), kGoldMuseVideoFnv);
+
+    /* One stamp per group, the group's first frame's time. */
+    const size_t n_stamps = sizeof(kGoldMuseVideoStamps) / sizeof(kGoldMuseVideoStamps[0]);
+    REQUIRE_EQ(stamps.size(), n_stamps);
+    for (size_t i = 0; i < n_stamps; ++i) CHECK_EQ(stamps[i], std::string(kGoldMuseVideoStamps[i]));
+
+    /* <|vid_start|>, then per group: the stamp's tokens, one <|video|> per merged row, and a
+     * <|vid_frame_separator|> between the groups and <|vid_end|> after the last. */
+    const int32_t rows = (kGoldMuseVideoGrid[1] / 2) * (kGoldMuseVideoGrid[2] / 2);
+    size_t at = 0;
+    REQUIRE_EQ(it->seg_at.size(), (size_t)kGoldMuseVideoGrid[0]);
+    CHECK_EQ(it->expand[at], kGoldMuseVidStart);
+    ++at;
+    for (int32_t g = 0; g < kGoldMuseVideoGrid[0]; ++g) {
+        at += stamps[(size_t)g].size();
+        REQUIRE(at < it->expand.size());
+        CHECK_EQ(it->seg_at[(size_t)g], (int32_t)at);
+        for (int32_t r = 0; r < rows; ++r) CHECK_EQ(it->expand[at + (size_t)r], kGoldMuseTokVideo);
+        at += (size_t)rows;
+        CHECK_EQ(it->expand[at], g + 1 == kGoldMuseVideoGrid[0] ? kGoldMuseVidEnd
+                                                                : kGoldMuseVidSep);
+        ++at;
+    }
+    CHECK_EQ(at, it->expand.size());
+}
+
 /* ================================================================== Pillow's arithmetic
  *
  * imaging_golden.h: Image.resize(LANCZOS) of an RGBA splitmix picture at sizes that shrink, grow,
@@ -1161,6 +1378,30 @@ TEST(the_lanczos_resize_is_pillows_bit_for_bit) {
                          g.h);
         CHECK_EQ(fnv(out.rgba), g.fnv);
     }
+}
+
+TEST(the_threaded_lanczos_resize_is_the_serial_one) {
+    /* imaging.cpp splits a tall resize's rows across threads (its goldens above are 23 rows
+     * tall and take the serial path, bar the 50-row upscale's vertical pass). At an unchanged
+     * height each output row depends only on its own input row, so resizing row bands small
+     * enough to stay serial and stacking them is an oracle for the threaded whole. */
+    const FrameRGBA src = rgba_frame(3, 100, 61);
+    FrameRGBA whole;
+    resize_lanczos_rgba(src, 23, 100, &whole);
+    REQUIRE_EQ(whole.rgba.size(), (size_t)23 * 100 * 4);
+    std::vector<uint8_t> stacked;
+    for (int y0 = 0; y0 < 100; y0 += 25) {
+        FrameRGBA band;
+        band.w = 61;
+        band.h = 25;
+        band.rgba.assign(src.rgba.begin() + (size_t)y0 * 61 * 4,
+                         src.rgba.begin() + (size_t)(y0 + 25) * 61 * 4);
+        FrameRGBA out;
+        resize_lanczos_rgba(band, 23, 25, &out);
+        REQUIRE_EQ(out.rgba.size(), (size_t)23 * 25 * 4);
+        stacked.insert(stacked.end(), out.rgba.begin(), out.rgba.end());
+    }
+    CHECK(stacked == whole.rgba);
 }
 
 TEST(the_white_composite_is_pillows_paste) {
@@ -1292,6 +1533,15 @@ TEST(a_picture_over_the_pixel_limit_is_refused_from_its_header) {
     why.clear();
     CHECK_EQ(decode_image_rgba(png.data(), png.size(), 64 * 48 - 1, &fa, &why), RAD_E_INVAL);
     CHECK(has(why, "3071-pixel limit"));
+    /* A JPEG's size is read from its start of frame the same way. */
+    std::vector<uint8_t> jpg;
+    REQUIRE_EQ(encode_image(px.data(), 64, 48, 3, "jpeg", 90, &jpg, &why), RAD_OK);
+    CHECK_EQ(decode_image(jpg.data(), jpg.size(), 64 * 48, &f, &why), RAD_OK);
+    CHECK_EQ(f.w, 64);
+    CHECK_EQ(f.h, 48);
+    why.clear();
+    CHECK_EQ(decode_image(jpg.data(), jpg.size(), 64 * 48 - 1, &f, &why), RAD_E_INVAL);
+    CHECK(has(why, "64x48, over the server's 3071-pixel limit"));
 
     /* 81 million pixels claimed in 66 bytes: refused on the header, so nothing is allocated for
      * them. A side past what FFmpeg can hold (60000) is refused by its own size check. */
@@ -1531,6 +1781,30 @@ TEST(mono_audio_at_the_rate_passes_through_and_truncates_exactly) {
     REQUIRE_EQ(decode_audio(b.data(), b.size(), 16000, 1000, &cut, &why), RAD_OK);
     CHECK_EQ(cut.size(), (size_t)1000);
     CHECK(std::equal(cut.begin(), cut.end(), m.begin()));
+}
+
+/* With two channels asked, a stereo source keeps its own, channel-major and resampled, and a mono
+ * one is copied to both: the song guide's form. max_samples caps each channel. */
+TEST(stereo_audio_keeps_its_channels_when_asked) {
+    if (!decoder_available()) SKIP("no media decoder in this build");
+    const std::vector<int16_t> left = tone(44100, 1.0, 440.0, 0.5), silent(left.size(), 0);
+    const std::vector<uint8_t> b = wav(interleave(left, silent), 2, 44100);
+    std::vector<float> s;
+    std::string why;
+    REQUIRE_EQ(decode_audio(b.data(), b.size(), 16000, 1 << 20, &s, &why, 2), RAD_OK);
+    REQUIRE(s.size() % 2 == 0);
+    const size_t m = s.size() / 2;
+    CHECK(m >= 15990 && m <= 16010);
+    REQUIRE(m >= 14000);
+    const std::vector<float> l(s.begin(), s.begin() + m), r(s.begin() + m, s.end());
+    CHECK_NEAR(amplitude(l, 2000, 14000), 0.5, 0.005);
+    CHECK_NEAR(amplitude(r, 2000, 14000), 0.0, 0.0005);
+    REQUIRE_EQ(decode_audio(b.data(), b.size(), 16000, 1000, &s, &why, 2), RAD_OK);
+    CHECK_EQ(s.size(), (size_t)2000);
+    const std::vector<uint8_t> mono = wav(left, 1, 44100);
+    REQUIRE_EQ(decode_audio(mono.data(), mono.size(), 16000, 1 << 20, &s, &why, 2), RAD_OK);
+    REQUIRE(s.size() % 2 == 0);
+    CHECK(std::equal(s.begin(), s.begin() + s.size() / 2, s.begin() + s.size() / 2));
 }
 
 /* Qwen3-ASR's front end is the reference's, and its chunks are staged apart. Qwen3ASRFeatureExtractor

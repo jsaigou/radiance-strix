@@ -5,7 +5,7 @@
 #include "rad_plugin.h"
 #include "text/tokenizer.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -23,7 +23,7 @@
 
 namespace rad {
 
-using json = nlohmann::ordered_json;
+using json = Json;
 
 namespace {
 

@@ -26,6 +26,7 @@
 // property to check a fused kernel against, never one to fold.
 #include "r4d.h"
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
 
 #include <cstdint>
@@ -57,13 +58,14 @@ __device__ __forceinline__ float pg_reduce(float v, float* lds) {
     return r;
 }
 
-__global__ __launch_bounds__(kPgThreads) void ple_gate_kernel(
-    const uint16_t* __restrict__ k, const uint16_t* __restrict__ q,
-    const uint16_t* __restrict__ v, const float* __restrict__ wk,
-    const float* __restrict__ wq, const float* __restrict__ wc,
-    uint16_t* __restrict__ gv, uint16_t* __restrict__ gvn,
-    uint32_t n, uint32_t hc, uint32_t k_ld, uint32_t q_ld, uint32_t v_ld,
-    uint32_t g_ld, uint32_t gn_ld, float eps, float wadd, float geps, uint32_t per_thread) {
+#define PLE_GATE_PARAMS                                                                         \
+    const uint16_t* __restrict__ k, const uint16_t* __restrict__ q,                             \
+    const uint16_t* __restrict__ v, const float* __restrict__ wk,                               \
+    const float* __restrict__ wq, const float* __restrict__ wc, uint16_t* __restrict__ gv,      \
+    uint16_t* __restrict__ gvn, uint32_t n, uint32_t hc, uint32_t k_ld, uint32_t q_ld,          \
+    uint32_t v_ld, uint32_t g_ld, uint32_t gn_ld, float eps, float wadd, float geps,            \
+    uint32_t per_thread
+__device__ __forceinline__ void ple_gate_body(PLE_GATE_PARAMS) {
 
     __shared__ float lds[kPgThreads];
     /* At most 16 elements per thread: n <= 16 * kPgThreads = 4096, which the row constrains. */
@@ -126,6 +128,17 @@ __global__ __launch_bounds__(kPgThreads) void ple_gate_kernel(
     }
 }
 
+/* The kernel around the body, whose blocks return where their work ends: CH `r4dchain` is the
+ * chained form (r4d_chain.h), taken at decode heights. */
+template <class CH>
+__global__ __launch_bounds__(kPgThreads)
+void ple_gate_kernel(PLE_GATE_PARAMS) {
+    if (CH::on) r4d_chain_wait_vec();
+    ple_gate_body(k, q, v, wk, wq, wc, gv, gvn, n, hc, k_ld, q_ld, v_ld, g_ld, gn_ld, eps, wadd, geps, per_thread);
+    if (CH::on) r4d_chain_done();
+}
+#undef PLE_GATE_PARAMS
+
 enum { PG_K = 0, PG_Q, PG_V, PG_WK, PG_WQ, PG_WC, PG_GV, PG_GVN };
 
 }  // namespace
@@ -169,13 +182,17 @@ extern "C" int r4d_rad_ple_gate(const RadArgs* a, RadStream s) {
     if (r4d_numel(wk) < hn || r4d_numel(wq) < hn || r4d_numel(wc) < hn)
         return R4D_NO(RAD_E_SHAPE);
 
-    hipLaunchKernelGGL(ple_gate_kernel, dim3((uint32_t)(T * hc)), dim3(kPgThreads), 0,
-                       (hipStream_t)s,
-                       (const uint16_t*)r4d_addr(k), (const uint16_t*)r4d_addr(q),
-                       (const uint16_t*)r4d_addr(v), (const float*)r4d_addr(wk),
-                       (const float*)r4d_addr(wq), (const float*)r4d_addr(wc),
-                       (uint16_t*)r4d_addr(gv), (uint16_t*)r4d_addr(gvn),
-                       (uint32_t)n, (uint32_t)hc, (uint32_t)k_ld, (uint32_t)q_ld, (uint32_t)v_ld,
-                       (uint32_t)g_ld, (uint32_t)gn_ld, eps, wadd, geps, (uint32_t)per_thread);
+#define R4D_PG(CH_)                                                                             \
+    hipLaunchKernelGGL(ple_gate_kernel<CH_>, dim3((uint32_t)(T * hc)), dim3(kPgThreads), 0,      \
+                       (hipStream_t)s,                                                           \
+                       (const uint16_t*)r4d_addr(k), (const uint16_t*)r4d_addr(q),               \
+                       (const uint16_t*)r4d_addr(v), (const float*)r4d_addr(wk),                 \
+                       (const float*)r4d_addr(wq), (const float*)r4d_addr(wc),                   \
+                       (uint16_t*)r4d_addr(gv), (uint16_t*)r4d_addr(gvn),                        \
+                       (uint32_t)n, (uint32_t)hc, (uint32_t)k_ld, (uint32_t)q_ld, (uint32_t)v_ld, \
+                       (uint32_t)g_ld, (uint32_t)gn_ld, eps, wadd, geps, (uint32_t)per_thread)
+    if (r4d_geti_or(a, "chain", 0) != 0 && T <= 64) R4D_PG(r4dchain);
+    else                                          R4D_PG(R4dUnchained);
+#undef R4D_PG
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }

@@ -24,6 +24,37 @@ rotated int8 activations on the `i8a8h` trunk:
 The embedding and the head decode the same forms, unrotated. The arithmetic is the int8 grid's
 for every form: a narrower code changes the bytes read, not the values multiplied.
 
+## IQ8R at one scale a 256 of K
+
+`data/recipes/q38-27b-iq8r.recipe` is the int8 trunk, at block fp8's size. It keeps IQ8R's
+codes and rotation and widens the scale group: a u8 scale per (row, 256 of K) under one bf16 scale
+a row (`codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128`), eight bits and
+1/256 of a byte a weight plus two bytes a row. The rotation stays 128 wide, and the activations
+carry one scale per (token, 256). libr4d reads it with `gemm_iq8r_nt_m16` and `gemm_iq8r_tiled`
+behind the 256-group quantisers, whose decode rows have chained forms; `kv-cache-dtype: i8`
+([GUIDE §4.4](GUIDE.md)) is the cache that goes with it.
+
+The group is 256 for the prefill: at one scale a 128 the tiled GEMM folds a scale twice as often and
+an 8192-token prefill of Qwen3.8-27B runs 11.6% under block fp8's (2407 tok/s against 2724); at 256
+it runs 2.4% under (2649 against 2715). The cost is 0.00004 KL (round to nearest: 0.00045 at 128,
+0.00049 at 256).
+
+Qwen3.8-27B on two R9700s, KL against bf16 over the 464 091 positions the model writes itself:
+
+| container | KL | top-1 |
+|---|---|---|
+| block fp8, the published checkpoint | 0.00363 | 97.38% |
+| the same on the int8 KV cache | 0.00365 | 97.38% |
+| IQ8R by round to nearest from that fp8 checkpoint | 0.00217 | 98.17% |
+| IQ8R by round to nearest from bf16 | 0.00049 | |
+| IQ8R by GPTQ from bf16 (the recipe) | 0.00039 | 99.19% |
+| the same on the int8 KV cache | 0.00043 | 99.18% |
+
+One R9700, ms a decode step: 47.9 at one sequence and 53.6 at eight against block fp8's 48.7 and
+53.9, and with the DFlash2 drafter (the recipe's, on the 16-level codebook) 55.0 / 59.9 / 70.4 at 1
+/ 4 / 8 sequences against 54.6 / 60.8 / 72.3. Over 24 prompts, four at a time, the drafter lands
+12.5 tokens a step against 12.6.
+
 ## The quantiser
 
 `gptq` (libquant) over the rotated weight against the calibration Hessians:
@@ -220,3 +251,43 @@ IQ4R-L-V4 is 24% below the official FP8 checkpoint's KL (8.766 bpw, 0.00389) at 
 IQ2R-L-V4, at 2.8 bpw, is below the AWQ-tuned MXFP4 checkpoint (4.994 bpw, 0.03824). The design, the
 kernels and the measurements are in the IQR-V4 technical report
 (radiance.stilldeadco.de/whitepapers/iqr-v4.pdf).
+
+### Keeping the native MTP head with a split target
+
+For a **dense 64-layer Qwen3.8-27B checkpoint that actually ships the native `mtp.*` weights**,
+the optional `q38-27b-native-mtp-u2.recipe` adds that block at index 64. It drafts with rotated
+int8 linears and a replicated 2-bit projection of the original `lm_head.weight`. Verification
+still uses the target's vocabulary-weighted classes; no BF16 output matrix is added to the
+container. For IQ4R-S-V4, from the repository root:
+
+```sh
+python3 tools/vhead.py --keep-lm-head "$BF16" "$VHEAD" data/vhead/q38-27b-vhead-4.0.cls
+rad-convert "$VHEAD/model.safetensors.index.json" --arch qwen35 \
+    --set quantization_config.quant_method=w8a8 --set quantization_config.fmt=fwht128 \
+    --recipe data/recipes/q38-27b-native-mtp-u2.recipe \
+    --recipe data/recipes/q38-27b-iq4r-s-v4.recipe -o target-with-mtp.rad
+```
+
+Use a fresh `VHEAD` directory on the same filesystem as the BF16 shards and export `CALIB` as
+for the target recipe. To retain an existing calibrated target, pass `--reuse original.rad` with
+the **same source, target recipe and calibration** and write a new file. Check the converter's
+reuse count and that the plan includes `mtp.fc.weight`, `blk.64.*` and `mtp.draft_head.weight`.
+
+To fit the U2 draft head to its actual inputs, run with `--calib-corpus FILE`, `--calib-dir DIR`,
+`--calib-layers 64:65` and `--num-speculative-tokens 0`. Layer 64 is the MTP block beside a
+64-layer trunk; this records `gram.r0.mtp.draft_head.bin` without loading the draft projection or
+generating proposals. Use `--calib-corpus`, not `--kld-record`, and select the virtual layer alone:
+this skips the trunk's separate int8 Hessian capture and allows tensor parallelism. Leave draft
+coupling off. Use `q38-27b-native-mtp-u2-gptq.recipe` in place of the RTN overlay, set
+`MTP_CALIB=DIR` and keep `CALIB` pointed at the target recipe's original Hessians. The base
+IQ4R-S-V4 recipe stays unchanged. The serving plugin is `qwen35_w8a8` (rotated int8 activations),
+not the deprecated block-FP8 plugin.
+
+No external drafter is needed. At serve time `num-speculative-tokens: auto` and
+`draft-window: adaptive` use the native chain; startup should report `'mtp' drafts`, not prompt
+lookup alone. `num-speculative-tokens: 0` leaves the extra block unloaded. An older split-head
+file without these weights does not acquire MTP by changing a flag. A supplied DFlash2 model
+still takes precedence. For optional coupled sampling, load `libr4d,spechub` and set
+`draft-coupling: on`; proposals then come from the U2 head's top eight. Coupled sampling
+preserves the target law, not fixed-seed text. As with other verify paths, different batch
+widths can flip a nearly tied greedy token.

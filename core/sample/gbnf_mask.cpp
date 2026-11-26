@@ -149,12 +149,30 @@ struct TrieEntry {
 static void trie_build(TokenTrie& t, const uint32_t* cps, std::vector<TrieEntry>& ents,
                        int32_t unique_over) {
     const uint32_t n = (uint32_t)ents.size();
-    std::sort(ents.begin(), ents.end(), [cps](const TrieEntry& a, const TrieEntry& b) {
-        const uint32_t* pa = cps + a.off;
-        const uint32_t* pb = cps + b.off;
-        while (*pa != 0 && *pa == *pb) { ++pa; ++pb; }
-        return *pa < *pb;
-    });
+    /* Sort by a packed key of the first three code points (21 bits each; the terminator is 0, as
+     * is the padding past a shorter sequence, which is exactly the comparison's own rule), and
+     * walk the strings only where the keys tie: a vocabulary's 48k entries nearly all differ
+     * inside three code points, so the sort compares integers where it walked both strings. */
+    {
+        struct Keyed { uint64_t key; TrieEntry e; };
+        std::vector<Keyed> keyed;
+        keyed.reserve(n);
+        for (const TrieEntry& e : ents) {
+            const uint32_t* p = cps + e.off;
+            uint64_t k = p[0];
+            k = (k << 21) | (p[0] ? p[1] : 0u);
+            k = (k << 21) | (p[0] && p[1] ? p[2] : 0u);
+            keyed.push_back({ k, e });
+        }
+        std::sort(keyed.begin(), keyed.end(), [cps](const Keyed& a, const Keyed& b) {
+            if (a.key != b.key) return a.key < b.key;
+            const uint32_t* pa = cps + a.e.off;
+            const uint32_t* pb = cps + b.e.off;
+            while (*pa != 0 && *pa == *pb) { ++pa; ++pb; }
+            return *pa < *pb;
+        });
+        for (uint32_t i = 0; i < n; ++i) ents[i] = keyed[i].e;
+    }
 
     t.lex.resize(n);
     for (uint32_t i = 0; i < n; ++i) t.lex[i] = ents[i].id;
@@ -374,11 +392,16 @@ public:
     int32_t intern(GbnfStacks s) {
         if (s.empty()) return -1;
         /* A sort is n log n stack comparisons, each as long as the common prefix; charged as every
-         * element once per sort level, so a set too wide to sort within the bound is refused. */
+         * element once per sort level, so a set too wide to sort within the bound is refused. Sets
+         * built in canonical order only pay the adjacent checks that establish it. */
         size_t elems = 0;
-        for (const GbnfStack& k : s) elems += k.size() + 1;
-        work_->add(elems * (1 + (uint64_t)std::bit_width(s.size())));
-        std::sort(s.begin(), s.end());
+        bool sorted = true;
+        for (size_t i = 0; i < s.size(); ++i) {
+            elems += s[i].size() + 1;
+            if (sorted && i && s[i] < s[i - 1]) sorted = false;
+        }
+        work_->add(elems * (sorted ? 1 : 1 + (uint64_t)std::bit_width(s.size())));
+        if (!sorted) std::sort(s.begin(), s.end());
         s.erase(std::unique(s.begin(), s.end()), s.end());
         return intern_sorted(std::move(s));
     }
@@ -654,7 +677,15 @@ struct Walk {
 };
 
 struct WalkScratch {
-    std::vector<std::pair<uint32_t, int32_t>> cur, nxt;
+    /* A live (node, state) pair, with the state itself: states live in a deque (references
+     * survive interning), and carrying the pointer saves re-indexing it per visit. The id is
+     * still needed to build a successor on a memo miss. */
+    struct Live {
+        uint32_t          n;
+        int32_t           s;
+        const SetDfa::St* S;
+    };
+    std::vector<Live> cur, nxt;
 };
 
 static inline void admit(Walk& w, int32_t id) {
@@ -758,7 +789,7 @@ static void walk(SetDfa& dfa, int32_t start, Walk& w, OpWork& work, WalkScratch&
     cur.clear();
     {
         const VisitState vs = visit_state(dfa, w, start);
-        if (walk_visit(w, work, nd, 0, vs, 0)) cur.push_back({ 0u, start });
+        if (walk_visit(w, work, nd, 0, vs, 0)) cur.push_back({ 0u, start, vs.S });
         if (w.aborted) return;
     }
 
@@ -770,9 +801,14 @@ static void walk(SetDfa& dfa, int32_t start, Walk& w, OpWork& work, WalkScratch&
             return remap ? (uint64_t)(base | (nd[c].cp - 1)) : (uint64_t)nd[c].cp;
         };
         for (size_t e = 0; e < cur.size(); ++e) {
-            const uint32_t n = cur[e].first;
-            const int32_t  s = cur[e].second;
-            const SetDfa::St& S = dfa.parted(s);
+            const uint32_t n = cur[e].n;
+            const int32_t  s = cur[e].s;
+            /* parted() builds the intervals on first use; the walk visits states far oftener
+             * than it parts them, so the built check is inlined (likewise next(), below, whose
+             * memo S.next is read directly). The deque keeps S valid across the interning a
+             * miss does, and S.lo/S.next are assigned once, at parting. */
+            const SetDfa::St& S = *cur[e].S;
+            if (!S.parted) dfa.parted(s);
             const uint32_t* lo = S.lo.data();
             const size_t    m  = S.lo.size();
             uint32_t        c  = nd[n].first + (depth == 1 && w.skip_first ? 1u : 0u);
@@ -792,7 +828,8 @@ static void walk(SetDfa& dfa, int32_t start, Walk& w, OpWork& work, WalkScratch&
                                      [](uint64_t x, uint32_t y) { return x < y; }) - lo) - 1;
                 }
                 const uint64_t hi = i + 1 < m ? (uint64_t)lo[i + 1] : (uint64_t)1 << 33;
-                const int32_t  ns = dfa.next(s, i);
+                int32_t        ns = S.next[i];
+                if (ns == kUnbuilt) ns = dfa.next(s, i);
                 if (ns < 0) {
                     uint32_t a = c, b = c1;
                     while (a < b) {
@@ -806,7 +843,7 @@ static void walk(SetDfa& dfa, int32_t start, Walk& w, OpWork& work, WalkScratch&
                 const VisitState vs = visit_state(dfa, w, ns);
                 const uint32_t   c0 = c;
                 for (; c < c1 && cp_of(c) < hi; ++c)
-                    if (walk_visit(w, work, nd, c, vs, depth)) nxt.push_back({ c, ns });
+                    if (walk_visit(w, work, nd, c, vs, depth)) nxt.push_back({ c, ns, vs.S });
                 work.add(8 + (c - c0));
                 if (w.aborted) return;
             }
@@ -1805,13 +1842,17 @@ bool plan_step(const MaskPlan& P, const std::vector<const GbnfStack*>& stacks, P
         std::vector<const GbnfStack*>& ps = P.step_ptrs;
         ps.clear();
         size_t elems = 0;
+        bool sorted = true;
         for (const GbnfStack* k : stacks) {
+            if (sorted && !ps.empty() && *k < *ps.back()) sorted = false;
             ps.push_back(k);
             elems += k->size() + 1;
         }
-        work.add(elems * (1 + (uint64_t)std::bit_width(ps.size())));
-        std::sort(ps.begin(), ps.end(),
-                  [](const GbnfStack* a, const GbnfStack* b) { return *a < *b; });
+        work.add(elems * (sorted ? 1 : 1 + (uint64_t)std::bit_width(ps.size())));
+        if (!sorted) {
+            std::sort(ps.begin(), ps.end(),
+                      [](const GbnfStack* a, const GbnfStack* b) { return *a < *b; });
+        }
         ps.erase(std::unique(ps.begin(), ps.end(),
                              [](const GbnfStack* a, const GbnfStack* b) { return *a == *b; }),
                  ps.end());

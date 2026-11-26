@@ -85,13 +85,15 @@ int         avx_par_force(int threads);
     X(mla_attn)                                                                                   \
     X(mla_attn_paged)                                                                             \
     X(add)                  X(grid_embed)           X(grid_embed_aa)        X(causal_conv1d)      \
-    X(grid_embed_cpe)                                                                             \
+    X(sconv_res)                                                                                  \
+    X(grid_embed_cpe)       X(grid_embed_pad)       X(window_order)                               \
     X(lili_cand)            X(lili_attn)            X(lili_factor)          X(lili_walk)          \
+    X(attn_res_mix)         X(situ_mul)                                                           \
     X(mul)                  X(silu_mul)             X(gelu_mul)             X(gelu)               \
     X(silu)                 X(sigmoid)              X(logit_softcap)        X(gather_rows)        \
     X(scatter_rows)         X(ngram_ids)            X(ple_conv_bias)                              \
     X(ple_gate)             X(ple_conv)             X(cast)                 X(softmax)            \
-    X(scale_rows)           X(scale)                X(fill)                 X(act_mul)            \
+    X(l2_clip)              X(scale_rows)           X(scale)                X(fill)                 X(act_mul)            \
     X(seg_mean_bf16_sum) \
     X(seg_mean)             X(mul_weight)           X(pool_rows)            X(pool_cols)          \
     X(point_fourier)                                                                              \
@@ -102,15 +104,15 @@ int         avx_par_force(int threads);
     X(embed_attn)           X(ministral_rope)        X(pixtral_rope)         X(pixtral_merge)      \
     /* ---- quantisation and rotation */                                                          \
     X(quant_act_i8)         X(quant_act_i8g)        X(had_quant_act_i8)     X(quant_act_fp8)      \
-    X(had_quant_act_fp8)    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8) \
-    X(dequant)              X(quant_cols_fp8)       X(had_quant_act_i8g)                          \
-    X(rmsnorm_quant_fp8)    X(gated_quant_fp8)      X(givens_rotate)        X(givens_dense_quant) \
+    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8) X(gated_quant_i8) \
+    X(dequant)              X(quant_cols_fp8)       X(had_quant_act_i8g)    X(dequant_w4)         \
+    X(rmsnorm_quant_fp8)    X(gated_quant_fp8)      \
     /* ---- gemm and the vocabulary edges */                                                      \
     X(gemm_nt)              X(gemm_nt_bias)         X(gemm_nt_q)            X(gemm_nt_q_bias)     \
     X(gemm_nt_q_gated)      X(embed_lookup)         X(embed_lookup_q)       X(embed_lookup_iq4xs)  X(logits_gemm)        \
     X(lora_shrink)          X(lora_expand)          X(lora_expand_mm)                             \
     /* ---- attention */                                                                          \
-    X(attn_paged)           X(attn_paged_sink)      X(attn_dense)           X(attn_cross) X(attn_na3d) X(table_add) X(mix_rows) X(chan_stats) X(kv_store) X(kv_store_streamed) X(kv_resolve)             X(rope)               \
+    X(attn_paged)           X(attn_paged_sink)      X(attn_paged_rel)       X(attn_dense)           X(attn_cross) X(attn_na3d) X(table_add) X(mix_rows) X(chan_stats) X(kv_store) X(kv_store_streamed) X(kv_resolve)             X(rope)               \
     X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)        X(attn_local_rel)     \
     X(qsa_score)            X(qsa_select)           X(qsa_tail_store)       X(qsa_work)           \
     X(sam_attn)             \
@@ -125,14 +127,14 @@ int         avx_par_force(int threads);
     /* ---- collectives */                                                                        \
     X(all_reduce)           X(all_gather)                                                         \
     /* ---- image generation */                                                                   \
-    X(ln_mod)               X(gate_add)             X(ln_mod_quant_fp8)     X(timestep_embed)     \
+    X(ln_mod)               X(gate_add)             X(timestep_embed)     \
     X(gather_rows2)         X(lane_gather)          X(lane_store)           X(randn_lanes)        \
     X(flow_euler)           X(chan_affine)          X(conv2d_nhwc)          X(l2norm_chan)        \
     X(d2s_add)              X(s2d_avg_add)          X(to_rgba8)             X(gelu_tanh)          \
     X(scatter_add_rows)     X(attn_prefix_self)     X(kd_input)             X(kd_step)            \
     X(gelu_quick)           X(im2col_nhwc)                                                        \
     /* ---- video generation */                                                                   \
-    X(rms_mod)              X(rms_mod_quant_fp8)    X(flow_x0_step)         X(patch_unfold)       \
+    X(rms_mod)              X(flow_x0_step)         X(patch_unfold)       \
     X(vtile_gather)         X(vtile_stitch)         X(grid_pos3)            X(vsa_select)         \
     X(attn_vsa)             X(conv3d_ndhwc)         X(group_norm)           X(tconv_dw)           \
     X(resize_bilinear)      X(patch_fold)           X(flow_renoise)         X(flow_res_multistep) \
@@ -148,7 +150,7 @@ int         avx_par_force(int threads);
     X(resample_nearest)     X(fourier_embed)        X(win_input)            X(win_prep)           \
     X(win_finish)           X(chan_split)           X(interleave2)          X(iota)               \
     X(cu_repeat)            X(snake_aa)             X(int_affine)           X(sub_i32)            \
-    X(ras_pick)             X(vq_encode)                                                          \
+    X(ras_pick)             X(vq_encode)            X(vq_euclidean)         X(elu)                \
     /* ---- sampling, and the drafter's token walk */                                             \
     X(sample_penalties)     X(sample_dry)           X(sample_temp)          X(sample_topk)        \
     X(sample_topp)          X(sample_minp)          X(sample_typical)       X(sample_xtc)         \

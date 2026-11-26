@@ -1,10 +1,12 @@
 /* imaging.cpp -- PIL's Lanczos resize and alpha paste (imaging.h). The constants and the order of
  * every operation are Pillow's (src/libImaging/Resample.c, Convert.c, Paste.c). */
 #include "mm/imaging.h"
+#include "util/rowpool.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 namespace rad {
@@ -85,6 +87,15 @@ inline unsigned muldiv255(unsigned a, unsigned b) {
     return ((t >> 8) + t) >> 8;
 }
 
+/* Every pass below is row-independent: an output row reads only its own input rows and
+ * writes only itself, each pixel accumulated in Pillow's tap order whichever thread runs
+ * it, so splitting rows across threads is bit-exact (processor.cpp's run_rows states the
+ * same for its resize, and mm_test's Pillow goldens pin this one's bytes). Rows under the
+ * threshold run inline: handing them out costs more than the row. */
+void run_rows(int rows, const std::function<void(int)>& row) {
+    row_pool_run(rows, 8, [&row](int64_t y) { row((int)y); }, 32);
+}
+
 }  /* namespace */
 
 static void resize_rgba(const FrameRGBA& src, int32_t w, int32_t h, bool bilinear, FrameRGBA* out);
@@ -107,11 +118,14 @@ static void resize_rgba(const FrameRGBA& src, int32_t w, int32_t h, bool bilinea
     }
     /* RGBA -> RGBa: the colour premultiplied by the alpha */
     std::vector<uint8_t> pre((size_t)iw * ih * 4);
-    for (size_t i = 0; i < (size_t)iw * ih; ++i) {
-        const unsigned al = src.rgba[i * 4 + 3];
-        for (int c = 0; c < 3; ++c) pre[i * 4 + c] = (uint8_t)muldiv255(src.rgba[i * 4 + c], al);
-        pre[i * 4 + 3] = (uint8_t)al;
-    }
+    run_rows(ih, [&](int y) {
+        for (int x = 0; x < iw; ++x) {
+            const size_t i = (size_t)y * iw + x;
+            const unsigned al = src.rgba[i * 4 + 3];
+            for (int c = 0; c < 3; ++c) pre[i * 4 + c] = (uint8_t)muldiv255(src.rgba[i * 4 + c], al);
+            pre[i * 4 + 3] = (uint8_t)al;
+        }
+    });
     const bool horiz = w != iw, vert = h != ih;
     const Axis ax = coeffs(iw, w, bilinear), ay = coeffs(ih, h, bilinear);
     /* the rows the vertical pass reads */
@@ -124,7 +138,7 @@ static void resize_rgba(const FrameRGBA& src, int32_t w, int32_t h, bool bilinea
         const int th = vert ? y_last - y_first : ih;
         const int off = vert ? y_first : 0;
         tmp.assign((size_t)w * th * 4, 0);
-        for (int yy = 0; yy < th; ++yy)
+        run_rows(th, [&](int yy) {
             for (int xx = 0; xx < w; ++xx) {
                 const int xmin = ax.bounds[(size_t)xx * 2], xn = ax.bounds[(size_t)xx * 2 + 1];
                 const int* k = &ax.kk[(size_t)xx * ax.ksize];
@@ -135,6 +149,7 @@ static void resize_rgba(const FrameRGBA& src, int32_t w, int32_t h, bool bilinea
                     for (int c = 0; c < 4; ++c) s[c] += (int)p[(size_t)x * 4 + c] * k[x];
                 for (int c = 0; c < 4; ++c) tmp[((size_t)yy * w + xx) * 4 + c] = clip8(s[c]);
             }
+        });
         rows = tmp.data();
         rw = w;
         row0 = vert ? y_first : 0;
@@ -142,7 +157,7 @@ static void resize_rgba(const FrameRGBA& src, int32_t w, int32_t h, bool bilinea
     std::vector<uint8_t> res;
     if (vert) {
         res.assign((size_t)rw * h * 4, 0);
-        for (int yy = 0; yy < h; ++yy) {
+        run_rows(h, [&](int yy) {
             const int ymin = ay.bounds[(size_t)yy * 2] - row0, yn = ay.bounds[(size_t)yy * 2 + 1];
             const int* k = &ay.kk[(size_t)yy * ay.ksize];
             for (int xx = 0; xx < rw; ++xx) {
@@ -154,7 +169,7 @@ static void resize_rgba(const FrameRGBA& src, int32_t w, int32_t h, bool bilinea
                 }
                 for (int c = 0; c < 4; ++c) res[((size_t)yy * rw + xx) * 4 + c] = clip8(s[c]);
             }
-        }
+        });
     } else {
         res.assign(rows, rows + (size_t)rw * (horiz ? h : ih) * 4);
     }
@@ -162,15 +177,18 @@ static void resize_rgba(const FrameRGBA& src, int32_t w, int32_t h, bool bilinea
     out->w = w;
     out->h = h;
     out->rgba.resize((size_t)w * h * 4);
-    for (size_t i = 0; i < (size_t)w * h; ++i) {
-        const unsigned al = res[i * 4 + 3];
-        for (int c = 0; c < 3; ++c) {
-            const unsigned v = res[i * 4 + c];
-            out->rgba[i * 4 + c] =
-                (al == 255 || al == 0) ? (uint8_t)v : (uint8_t)std::min(255u, (255u * v) / al);
+    run_rows(h, [&](int y) {
+        for (int x = 0; x < w; ++x) {
+            const size_t i = (size_t)y * w + x;
+            const unsigned al = res[i * 4 + 3];
+            for (int c = 0; c < 3; ++c) {
+                const unsigned v = res[i * 4 + c];
+                out->rgba[i * 4 + c] =
+                    (al == 255 || al == 0) ? (uint8_t)v : (uint8_t)std::min(255u, (255u * v) / al);
+            }
+            out->rgba[i * 4 + 3] = (uint8_t)al;
         }
-        out->rgba[i * 4 + 3] = (uint8_t)al;
-    }
+    });
 }
 
 void resize_lanczos_rgb(const Frame& src, int32_t w, int32_t h, Frame* out) {

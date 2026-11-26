@@ -845,6 +845,64 @@ AVX_KERNEL(vq_encode) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ vq_euclidean */
+/* libref's step a row at a time: the squared distance to every centroid summed in channel order,
+ * the nearest taken (the lower index on a tie), its code written and the centroid subtracted from
+ * the row, rounded once into x. The codebook is read dense in f32 once a launch. */
+AVX_KERNEL(vq_euclidean) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *cb = &a->t[1], *codes = &a->t[2];
+    const int64_t n = p_int(a, "n", 0), bins = p_int(a, "bins", 0);
+    if (n <= 0 || bins <= 0 || numel(cb) != bins * n || codes->dtype != RAD_I32)
+        return RAD_E_SHAPE;
+    const int64_t rows = rows_of(X, n);
+    if (rows < 1 || numel(codes) < rows) return RAD_E_SHAPE;
+    std::vector<float> dense((size_t)(bins * n));
+    for (int64_t i = 0; i < bins * n; ++i) dense[(size_t)i] = ldt(cb, offlin(cb, i));
+    const float* C = dense.data();
+    AVX_PARALLEL_FOR_IF(rows * bins * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t xb = rowoff(X, r, n);
+        const float* xv = in_row(X, xb, n, scratch_f32((size_t)n + 16));
+        float best = INFINITY;
+        int64_t pick = 0;
+        for (int64_t k = 0; k < bins; ++k) {
+            const float* c = C + k * n;
+            float d = 0.0f;
+            for (int64_t j = 0; j < n; ++j) {
+                const float delta = xv[j] - c[j];
+                d += delta * delta;
+            }
+            if (d < best) { best = d; pick = k; }
+        }
+        st_int_dt(codes->dtype, codes->data, offlin(codes, r), pick);
+        float* y = scratch_f32_b((size_t)n + 16);
+        const float* c = C + pick * n;
+        for (int64_t j = 0; j < n; ++j) y[j] = xv[j] - c[j];
+        out_row(X, xb, n, y);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ elu */
+/* y = x >= 0 ? x : expm1(x) (alpha 1), a row at a time, as libref. */
+AVX_KERNEL(elu) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Y = &a->t[1];
+    const int64_t n = p_int(a, "n", numel(Y));
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n);
+    if (rows <= 0 || numel(X) < rows * n) return RAD_E_SHAPE;
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* sy = scratch_f32_b((size_t)n);
+        const float* v = in_row(X, rowoff(X, r, n), n, scratch_f32((size_t)n));
+        for (int64_t i = 0; i < n; ++i) sy[i] = v[i] >= 0.0f ? v[i] : std::expm1(v[i]);
+        out_row(Y, rowoff(Y, r, n), n, sy);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ frame_mix_store */
 /* m = bf16(bf16(sum_l w_l h_l) * bf16(scale)), w = bf16(softmax(bf16(logits))) in libref's double
  * arithmetic, the planes summed in order with each product rounded before its add (`keep`). Entries

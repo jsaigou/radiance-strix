@@ -8,7 +8,7 @@
 #include <cmath>
 #include <fstream>
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 namespace rad {
 namespace {
@@ -107,7 +107,7 @@ int read_package_json(const std::string& gguf_path, PackageJson* out, std::strin
     std::ifstream f(path);
     if (!f) return RAD_OK;
     try {
-        const nlohmann::json j = nlohmann::json::parse(f);
+        const Json j = Json::parse(f);
         if (const auto m = j.find("mode"); m != j.end() && m->is_string() &&
                                           m->get<std::string>() != "project") {
             *why = "control vector " + path + ": mode '" + m->get<std::string>() +

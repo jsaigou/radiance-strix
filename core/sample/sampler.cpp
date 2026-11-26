@@ -4,6 +4,7 @@
 #include "sampler.h"
 #include "gbnf.h"
 #include "../sched/draft.h"   /* RAD_SCHED_MAX_SPEC */
+#include "../util/simd.h"
 
 #include <algorithm>
 #include <chrono>
@@ -85,11 +86,34 @@ void Sampler::shard_mask(uint32_t* dst) const {
         if (n > 0) std::memcpy(dst, mask_full_.data() + w0, (size_t)n * 4);
         return;
     }
-    for (int64_t i = 0; i < cfg_.n_vocab_local; ++i) {
-        const int64_t g = cfg_.vocab_off + i;
-        if (g >= cfg_.n_vocab) break;
-        if (mask_full_[(size_t)(g >> 5)] & (1u << (uint32_t)(g & 31)))
-            dst[i >> 5] |= 1u << (uint32_t)(i & 31);
+    /* The window is the full mask's bitstream shifted right by vocab_off: word i of the shard is
+     * (full[w0+i] >> sh) | (full[w0+i+1] << (32-sh)), which simd::bitstream_shr does a vector at
+     * a time where the per-bit loop did one bit (and one dependent read-modify-write) at a time.
+     * Bits at or past the last global token this shard may name are cleared after, as the loop's
+     * `g >= n_vocab` break cleared them: the shift can pull in bits past n_vocab that
+     * mask_full_'s tail word happens to hold. */
+    const int64_t w0 = cfg_.vocab_off >> 5;
+    const unsigned sh = (unsigned)(cfg_.vocab_off & 31);
+    const int64_t have = full - w0;   /* source words at and after w0 */
+    const int64_t local = std::min<int64_t>(cfg_.n_vocab_local, cfg_.n_vocab - cfg_.vocab_off);
+    if (have <= 0 || local <= 0) return;
+    /* bitstream_shr pairs word i with i+1 and reads one past its count as zero. Given words-1, it
+     * reads source word words-1 as zero for dst[words-2], so that word's high bits are added
+     * after; the last word -- whose high half is a real source word when the shard is narrower
+     * than the source -- is finished by hand. */
+    const int64_t words = std::min<int64_t>(mask_words_, have);
+    if (words > 1) {
+        simd::bitstream_shr(dst, mask_full_.data() + w0, (size_t)(words - 1), sh);
+        dst[words - 2] |= mask_full_[(size_t)(w0 + words - 1)] << (32 - sh);
+    }
+    if (words >= 1) {
+        const int64_t i = words - 1;
+        const uint32_t hi = w0 + i + 1 < full ? mask_full_[(size_t)(w0 + i + 1)] : 0u;
+        dst[i] = (mask_full_[(size_t)(w0 + i)] >> sh) | (hi << (32 - sh));
+    }
+    if (local < words * 32) {
+        if (local & 31) dst[local >> 5] &= (1u << (uint32_t)(local & 31)) - 1u;
+        for (int64_t i = (local + 31) >> 5; i < words; ++i) dst[i] = 0;
     }
 }
 
@@ -140,6 +164,7 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
 
     cfg_ = cfg;
     couple_ = cfg.draft_coupling;
+    trav_ = cfg.draft_coupling && cfg.draft_verify_traversal;
     if (cfg_.n_vocab_local <= 0) cfg_.n_vocab_local = cfg_.n_vocab / cfg_.world_size;
 
     /* The staged mask covers this rank's shard; the grammar's covers the whole vocabulary.
@@ -199,6 +224,10 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
         buf_couple_ = decl("sampler.mtp_couple", RAD_U32, rows, RAD_MTP_COUPLE_STATE_WORDS,
                            RAD_BUF_PERSIST);
         if (!buf_couple_) return RAD_E_NOMEM;
+        if (trav_) {
+            buf_trav_ = decl("sampler.mtp_trav", RAD_I32, rows, 2, RAD_BUF_PERSIST);
+            if (!buf_trav_) return RAD_E_NOMEM;
+        }
     }
     buf_cand_i_ = decl("sampler.cand_idx", RAD_I32, rows, ncand, RAD_BUF_TRANSIENT);
     buf_cand_v_ = decl("sampler.cand_val", RAD_F32, rows, ncand, RAD_BUF_TRANSIENT);
@@ -280,8 +309,13 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
             RadParam{ "n_cand", RAD_P_INT, (long long)ncand, 0, nullptr },
             RadParam{ "n_vocab", RAD_P_INT, (long long)cfg_.n_vocab, 0, nullptr },
         };
-        op_couple_ = rad_decl_op(b, "mtp_couple_verify", pc, 3, nullptr, 0);
-        if (!op_couple_) return RAD_E_NOKERNEL;
+        if (trav_) {
+            op_trav_ = rad_decl_op(b, "mtp_trav_verify", pc, 3, nullptr, 0);
+            if (!op_trav_) return RAD_E_NOKERNEL;
+        } else {
+            op_couple_ = rad_decl_op(b, "mtp_couple_verify", pc, 3, nullptr, 0);
+            if (!op_couple_) return RAD_E_NOKERNEL;
+        }
         /* No rad_op_reads: the other sampler ops declare no lists, and a list on this op alone
          * would narrow the candidate planes' lifetime to it and refuse the first sample_topk. */
     }
@@ -367,6 +401,8 @@ int Sampler::stage_alloc() {
     if (couple_)
         couple_stage_ = (RadMtpCoupleState*)rad_dev_alloc(
             rows * (int64_t)sizeof(RadMtpCoupleState), RAD_MEM_HOST_PINNED);
+    if (trav_)
+        trav_stage_ = (int32_t*)rad_dev_alloc(rows * 2 * (int64_t)sizeof(int32_t), RAD_MEM_HOST_PINNED);
 
     /* Logprobs readback; only rank 0 reads it. */
     if (cfg_.rank == 0) {
@@ -383,7 +419,8 @@ int Sampler::stage_alloc() {
     }
 
     if (!params_stage_ || !greedy_stage_ || !late_stage_ || !hist_stage_ || !brk_stage_ ||
-        !ngram_stage_ || !ngram_wl_stage_ || !mask_stage_ || (couple_ && !couple_stage_)) {
+        !ngram_stage_ || !ngram_wl_stage_ || !mask_stage_ || (couple_ && !couple_stage_) ||
+        (trav_ && !trav_stage_)) {
         RAD_ERR("sampler: could not pin %s of staging",
                 humanb(rows * (3 * (int64_t)sizeof(DeviceSampleParams) + cfg_.max_hist * 5 +
                                mask_words_ * 8 + 8)).c_str());
@@ -404,6 +441,8 @@ void Sampler::stage_free() {
     if (mask_stage_)   rad_dev_free(mask_stage_,   RAD_MEM_HOST_PINNED);
     if (couple_stage_) rad_dev_free(couple_stage_, RAD_MEM_HOST_PINNED);
     couple_stage_ = nullptr;
+    if (trav_stage_) rad_dev_free(trav_stage_, RAD_MEM_HOST_PINNED);
+    trav_stage_ = nullptr;
     if (lp_host_)      rad_dev_free(lp_host_,      RAD_MEM_HOST_PINNED);
     if (lp_ci_host_)   rad_dev_free(lp_ci_host_,   RAD_MEM_HOST_PINNED);
     if (lp_cv_host_)   rad_dev_free(lp_cv_host_,   RAD_MEM_HOST_PINNED);
@@ -695,7 +734,13 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
         const int rep = dry_rep_limit(*brk, h + w0, (int)win);
         if (rep < allowed) return false;
         p.dry_rep_limit = rep < win ? rep : 0;
-        for (int64_t i = 0; i < win; ++i) f[i] = brk->is_single(h[w0 + i]) ? 1 : 0;
+        /* Marked from the indexed bitset when there is one (dry_prepare_breakers built it);
+         * is_single answers the same from the map for a set filled by hand. */
+        if (!brk->singles.empty())
+            simd::bitmap_marks(f, h + w0, (size_t)win, brk->singles.data(),
+                               brk->singles.size());
+        else
+            for (int64_t i = 0; i < win; ++i) f[i] = brk->is_single(h[w0 + i]) ? 1 : 0;
         any_brk_ = true;
         return true;
     };
@@ -760,6 +805,11 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
             think = st->think;
         }
         const ReasoningCount think0 = think;
+        /* --draft-verify block: the chain rows bound from round 1 on, consecutively, are one block
+         * (abi/rad_mtp_block.h); each carries the block's length in `blk` so the verify's round-1
+         * row decides them together. */
+        int64_t blk_row0 = -1;
+        int     blk_len = 0;
 
         for (int k = 0; k < n_pos; ++k) {
             /* Row k's drafts before it: 0..k-1 on a chain, its ancestors (root first) on a tree. */
@@ -792,20 +842,40 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
                 think.push(sp.reasoning, r->draft[k - 1]);
             }
             const int64_t row = n_seq_++;
+            /* The traversal verify's tree: this row's parent row in the step (-1 for the
+             * request's first row) and its own draft token. A chain's row k hangs off row k - 1. */
+            if (trav_) {
+                int32_t pk = -1;
+                if (k > 0) {
+                    pk = k - 1;
+                    if (tpar) { const int32_t pj = tpar[k - 1]; if (pj >= 0 && pj < k) pk = pj; }
+                }
+                trav_stage_[2 * row]     = pk < 0 ? -1 : (int32_t)(row - k + pk);
+                trav_stage_[2 * row + 1] = k > 0 && r->draft ? r->draft[k - 1] : 0;
+            }
             /* Row k verifies draft k against the state its round left. A row with no bound state
              * (the bonus row, a greedy row, an uncoupled step) gets a zeroed one, and the verify
              * leaves the pick's token alone. */
             if (couple_) {
                 couple_stage_[row] = RadMtpCoupleState{};
                 const auto sit = seqs_.find(r->id);
-                if (sit != seqs_.end() && !sp.greedy() && r->draft && k + 1 < n_pos &&
-                    k < sit->second.couple_n) {
+                /* A suffix chain (Request::draft_suffix) was not drawn from the head's law: no row of
+                 * it binds a state, so each is the target's plain draw. */
+                if (sit != seqs_.end() && !sp.greedy() && r->draft && !r->draft_suffix &&
+                    k + 1 < n_pos && k < sit->second.couple_n) {
                     const RadMtpCoupleState& c = sit->second.couple[k];
                     /* Same request and seed, this row's round, position and proposed token
                      * (rad_mtp_couple_binds); anything else is a stale state from another step. */
                     if (rad_mtp_couple_binds(c, r->id, sp.seed, (uint64_t)n_out, k, r->draft[k],
                                              cfg_.n_vocab)) {
                         couple_stage_[row] = c;
+                        if (cfg_.draft_verify_block && !tpar) {
+                            if (k == 0) { blk_row0 = row; blk_len = 0; }
+                            if (blk_row0 >= 0 && k == blk_len) {
+                                ++blk_len;
+                                for (int64_t j = blk_row0; j <= row; ++j) couple_stage_[j].blk = blk_len;
+                            }
+                        }
                         any_couple_ = true;
                         ++couple_build_.rows;
                         auto& q = couple_build_.seqs;
@@ -902,11 +972,24 @@ int Sampler::build_step(const std::vector<Request*>& reqs, int64_t step) {
                 const int64_t len  = n_total + dk;
                 const int64_t take = std::min<int64_t>(len, cfg_.max_hist);
                 int32_t* h = hist_stage_ + row * cfg_.max_hist;
-                for (int64_t i = 0; i < take; ++i) {
-                    const int64_t src = len - take + i;
-                    h[i] = src < n_prompt ? r->prompt[(size_t)src]
-                         : src < n_total  ? r->output[(size_t)(src - n_prompt)]
-                                          : anc[src - n_total];
+                /* The three sources are contiguous runs of one logical sequence, so the tail
+                 * `take` long is at most three memcpys where the element loop branched per token
+                 * (per row per step: at 8k of history the copies are the difference between a
+                 * few microseconds of memcpy and tens of the branchy loop). */
+                {
+                    int64_t i = 0, src = len - take;
+                    auto seg = [&](const int32_t* p, int64_t base, int64_t end) {
+                        if (src >= end || i >= take) return;
+                        const int64_t n = std::min(end - src, take - i);
+                        if (n > 0) {
+                            std::memcpy(h + i, p + (src - base), (size_t)n * sizeof(int32_t));
+                            i += n;
+                            src += n;
+                        }
+                    };
+                    seg(r->prompt.data(), 0, n_prompt);
+                    seg(r->output.data(), n_prompt, n_total);
+                    seg(anc, n_total, len);
                 }
                 p.hist_len = (int32_t)take;
                 if (pen) p.flags |= RAD_SP_PENALTY;
@@ -1176,6 +1259,9 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     if (any_couple_)
         RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_couple_), couple_stage_,
                                  n_seq_ * (int64_t)sizeof(RadMtpCoupleState), s));
+    if (any_couple_ && trav_)
+        RAD_TRY(rad_memcpy_async(rad_buf_ptr(c, buf_trav_), trav_stage_,
+                                 n_seq_ * 2 * (int64_t)sizeof(int32_t), s));
 
     const RadOperand o_logits = opd_rows(logits, n_seq_);
     const RadOperand o_params = opd_rows(buf_params_, n_seq_);
@@ -1189,8 +1275,14 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     const RadOperand o_tok = opd_rows(out_tokens, n_seq_);
 
     auto issue = [&](rad_op op, std::initializer_list<RadOperand> ops) -> int {
-        std::vector<RadOperand> v(ops);
-        return rad_issue(c, op, v.data(), (int)v.size(), n_seq_);
+        /* On the stack, not in a vector: this runs for every sampler stage of every step and a
+         * heap allocation each was pure overhead beside the launch. Sixteen covers every call
+         * below (the widest is five operands); a wider one is refused, never truncated --
+         * operands are positional, so dropping one would be silent numerical garbage. */
+        if (ops.size() > 16) return RAD_E_INVAL;
+        RadOperand v[16];
+        std::memcpy(v, ops.begin(), ops.size() * sizeof(RadOperand));
+        return rad_issue(c, op, v, (int)ops.size(), n_seq_);
     };
 
     /* The logprobs summary reads the raw logits, before any stage writes them in place. Only for
@@ -1268,7 +1360,11 @@ int Sampler::run(RadCtx* c, rad_buf logits, rad_buf out_tokens) {
     /* After the pick, over the same plane: a coupled row replaces the pick's token and an unbound
      * row keeps it. The issued step is recorded for the evidence line. */
     if (any_couple_) {
-        RAD_TRY(issue(op_couple_, { o_ci, o_cv, o_params, opd_rows(buf_couple_, n_seq_), o_tok }));
+        if (trav_)
+            RAD_TRY(issue(op_trav_, { o_ci, o_cv, o_params, opd_rows(buf_couple_, n_seq_), o_tok,
+                                      opd_rows(buf_trav_, n_seq_) }));
+        else
+            RAD_TRY(issue(op_couple_, { o_ci, o_cv, o_params, opd_rows(buf_couple_, n_seq_), o_tok }));
         couple_issued_step_ = couple_build_.step;
     }
 
@@ -1317,8 +1413,8 @@ float Sampler::raw_logit(const LpRow& L, int32_t token, float v) const {
     if (p.flags & RAD_SP_PENALTY) {
         int64_t n = (int64_t)L.hist.size(), o = 0;
         if (p.penalty_last_n > 0 && n > p.penalty_last_n) { o = n - p.penalty_last_n; n = p.penalty_last_n; }
-        int64_t count = 0;
-        for (int64_t i = 0; i < n; ++i) count += L.hist[(size_t)(o + i)] == token;
+        const int64_t count = (int64_t)simd::count_eq_i32(
+            n > 0 ? L.hist.data() + o : L.hist.data(), (size_t)std::max<int64_t>(n, 0), token);
         if (count > 0) {
             y += (double)count * p.freq_penalty + p.pres_penalty;
             y = y > 0.0 ? y * p.rep_penalty : y / p.rep_penalty;

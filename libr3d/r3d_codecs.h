@@ -205,6 +205,19 @@ R3D_HD uint32_t bf16x2_to_f16x2(uint32_t w) {
  * rejected at instruction selection. Both directions are bit maths, about eleven VALU per encode
  * and six per decode. */
 R3D_HD float e4m3_to_f32(uint8_t b) {
+    /* Branch-free (the old form looped over a subnormal's shift, which diverged in every fp8 staging
+     * loop -- the prefill attention tile spent a sixth of its time here on gfx1100). Bit-identical:
+     * a normal re-biases (exponent + 120), a subnormal m is exactly m * 2^-9, S1111111 is the NaN. */
+    const uint32_t s = (uint32_t)(b & 0x80u) << 24;
+    const uint32_t mag = (uint32_t)b & 0x7fu;
+    const uint32_t un = s | ((mag << 20) + (120u << 23));
+    const uint32_t us = s | __builtin_bit_cast(uint32_t, (float)mag * 0x1p-9f);
+    const uint32_t u = mag < 8u ? us : (mag == 0x7fu ? (s | 0x7fc00000u) : un);
+    return float_of(u);
+}
+
+/* The previous (reference) form, kept for the exhaustive equality check. */
+R3D_HD float e4m3_to_f32_ref(uint8_t b) {
     const uint32_t s = (uint32_t)(b >> 7) << 31;
     const uint32_t e = (uint32_t)(b >> 3) & 0xfu;
     uint32_t m = (uint32_t)b & 0x7u;

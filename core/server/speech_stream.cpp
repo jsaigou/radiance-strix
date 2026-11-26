@@ -33,7 +33,7 @@
 #include "gen/audio.h"
 #include "rad_internal.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <chrono>
@@ -48,7 +48,7 @@ namespace server {
 
 namespace {
 
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 
 /* The client messages a session may have queued and not yet taken in. */
 constexpr size_t kMaxQueuedBytes = 16u << 20;

@@ -64,6 +64,9 @@ struct KernelRow {
     bool                 reference = false;
     /* rad_kernel_chain: its launches can wait in the kernel instead of behind the barrier bit. */
     bool                 chain = false;
+    /* rad_kernel_chain said 2: its chained forms' acquire covers their scalar loads too, so their
+     * packets need no acquire from the packet processor. */
+    bool                 chain_fenced = false;
 };
 
 /* A kernel bound to one geometry, one domain and one variant, with init() already run. */
@@ -134,8 +137,6 @@ enum class Tier { VRAM = 0, HostPinned = 1, HostPageable = 2, SSD = 3, Mapped = 
  *          embedding takes Ram or Vram. */
 enum class TablePlacement { Auto = 0, Vram = 1, Ram = 2, Disk = 3 };
 const char* table_placement_name(TablePlacement p);
-/* --attn-prefill-fp8's spelling of RAD_ATTN_FP8_* bits: off, qk, pv or both. */
-const char* attn_prefill_fp8_name(int bits);
 /* --draft-window: how many drafts a step verifies per sequence (core/sched/draft.h).
  *   Fixed     every sequence drafts --num-speculative-tokens.
  *   Adaptive  that is the ceiling; head depth per step and each sequence's stop follow measured
@@ -398,6 +399,14 @@ public:
     /* A generator's slots pack each combination's ranks from j = 0: the ranks pool p takes in
      * slot s at [p * S + s], 0 for a pool the combination does not reach (no adapter op runs). */
     std::vector<int32_t>       lora_rused;
+    struct LoraReplacement {
+        rad_buf slots = 0;
+        int64_t rows = 0;
+        bool row_mixer = false;
+        std::vector<int64_t> source_rows;
+        std::string module;
+    };
+    std::map<rad_weight, LoraReplacement> lora_replacements;
 
     /* The declared draft head (rad_declare_drafter). `kind == RAD_DRAFT_NONE` when none, the
      * normal case: the engine then speculates with the scheduler's prompt-lookup drafter or not at
@@ -416,6 +425,10 @@ public:
      * proposal's parent node, at the proposal's pitch. False and 0 for a chain drafter. */
     bool           drafter_tree = false;
     rad_buf        drafter_parents = 0;
+
+    /* The plugin's buffer for the routing counts (rad_route_table), [layers, n_expert] i32 in the
+     * arena's fixed region; 0 when the core keeps the rows itself. */
+    rad_buf        route_table = 0;
 
     /* The declared media encoder (rad_declare_encoder). `modalities == 0` when none: every
      * text-only program, and every deployment with RadBuildCtx::max_enc_patches 0.
@@ -442,6 +455,7 @@ public:
     struct AudioGenStrings {
         /* "" for an absent template; tmpl_ref and ref_item RadAudioGenDecl's references */
         std::string name, tmpl, tmpl_plain, neg_tmpl, tmpl_ref, ref_item;
+        std::string tmpl_ref_instruct, neg_tmpl_ref;
     } agen_str;
     bool is_audio_generator() const { return audio_gen.max_lanes != 0; }
     /* The declared video generator (rad_declare_video_generator); `max_lanes` 0 when none. */
@@ -737,6 +751,10 @@ struct Request {
     /* A tree drafter's parents for `draft` (StepEntry::draft_parent): draft[j]'s parent node,
      * 0 the bonus token. Null for a chain. The sampler reads each row's ancestors from it. */
     const int32_t*       draft_parent = nullptr;
+    /* The draft is a SuffixDecoding chain (--draft-suffix, sched/suffix.h): copied from the
+     * sequence's own history, not drawn from the head's law. The coupled sampler binds no state to
+     * its rows, whatever stale states the head's own draft for the same positions left. */
+    bool                 draft_suffix = false;
     int32_t              n_accepted = 0;      /* from the previous verify */
 
     /* Whether this request may be speculated on. Written by the engine after every step, read by
@@ -846,6 +864,13 @@ struct Config {
     bool    prefill_interleave_set = false;
     int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks;
                                         * -1 auto (Scheduler::interleave_steps) */
+    /* --mixed-step-target-ms: soft duration target for a mixed prefill/decode step. The scheduler
+     * learns an aggregate prefill-row cap from completed mixed steps; 0 keeps the fixed policy. */
+    int64_t mixed_step_target_ms = 0;
+    /* --prefill-room-gate: a fresh prefill starts only when its whole prompt plus one decode
+     * position fits beside every runner. Off (the default) admits the first chunk alone, which
+     * can fill the pool and be preempted back to zero at the first decode step. */
+    bool prefill_room_gate = false;
     /* --preempt-wait-ms: how long a preempted prefill may wait for the whole-recompute gate
      * before the scheduler evicts cache blocks and preempts a lower-priority running request to
      * make room for it. 0 = fall back on the next step; default 5000 ms. */
@@ -872,18 +897,14 @@ struct Config {
     /* --gpu-memory-mib: claim this much of every card; 0 uses gpu_headroom_mib. Inverse of
      * headroom: N + headroom = the card, in MiB. Not with --gpu-headroom-mib. */
     int64_t gpu_memory_mib = 0;
-    /* --kv-cache-dtype bf16|fp8|fp8_v4|k6_v4. fp8 is an E4M3 cache with per-(sequence, head)
-     * descales; it halves the per-token cost, most of the KV pool at production context. fp8_v4
-     * keeps K as E4M3 and V as int4 in groups of 32, k6_v4 also K as int6 (RadBuildCtx::kv_quant),
-     * served only where the plugin says so. Each changes the model's output slightly, so it is
-     * explicit and bf16 is the default. No "auto": it would always resolve to bf16 and only add
-     * another name. */
+    /* --kv-cache-dtype bf16|i8|fp8. i8 keeps K and V as int8 codes with one f16 scale each per
+     * (token, head) (abi/rad_builder.h); it halves the per-token cost, most of the KV pool at
+     * production context. fp8 is an E4M3 cache, served only where the plugin's probe says so
+     * (RadArchProbe::kv_fp8_ok: GLM-5.3's latent attention). Each changes the model's output
+     * slightly, so it is explicit and bf16 is the default. No "auto": it would always resolve to
+     * bf16 and only add another name. */
     std::string kv_cache_dtype = "bf16";
     std::string state_cache_dtype = "f32";   /* --state-cache-dtype: f32 | f16 */
-    /* --attn-prefill-fp8 off|qk|pv|both: RAD_ATTN_FP8_* bits, the prefill attention's products
-     * accepted in e4m3 (RadBuildCtx::attn_prefill_fp8). Lossy, so off is the default.
-     * attn_prefill_fp8_name() spells it as the flag does. */
-    int attn_prefill_fp8 = 0;
     /* --kv-resident N: tokens of the sparse attention group's context its VRAM ring holds
      * (docs/KV-STREAMING.md). 0 is off; a ring that covers `max_seqs x max_ctx` streams nothing; a
      * ring below kStreamFloorTokens or one decode step's selection is raised to it. */
@@ -891,6 +912,8 @@ struct Config {
     /* Derived: whether a group streams, set by kvstream_cap_probe before the pool is sized (a
      * streamed group's ceiling is its ring and stage, not its cache); the KV MiB rounding reads it. */
     bool kv_streams = false;
+    /* A rank's pinned host pool for weights. --host-pool-mib states all the ranks' together and
+     * config_parse divides it by --tp. */
     int64_t host_pool_mib = 0;
     int64_t host_headroom_mib = 4096; /* --host-headroom-mib: RAM left free for the system at startup */
     /* File tier for weights: what fits in neither the VRAM slab nor the pinned host pool is read
@@ -939,6 +962,12 @@ struct Config {
      * default on. The graph is declared once, so this flag is the deployment's only decision about
      * whether the op exists at all; the value names the startup switch. */
     std::string control_vector = "disabled";
+    /* --control-vector-variant NAME: a second name for this model, listed as MODEL:NAME the way an
+     * adapter is, whose requests run with the vector on whatever the default; the model's own name
+     * keeps the default. Empty -- the default -- lists nothing, so a deployment that does not pick
+     * the vector by name sees no extra entry. A client that can only choose a model sends nothing
+     * else, and a gateway can allow or refuse the name. Needs --control-vector off or on. */
+    std::string control_vector_variant;
     int64_t checkpoint_interval = 2048;   /* linear-state checkpoints (spec §7.3) */
     /* Checkpoint intervals one step may carry of a prefill alone in its step, from an interval
      * boundary past the first (--prefill-span; 1 splits at every interval). The step's rows stay
@@ -948,6 +977,37 @@ struct Config {
      * inside a span are not written; those at its end and at a prompt's tail are, where a span of
      * 1 writes them. */
     int64_t prefill_span = 1;
+    /* --prefill-span-pass piece|step. `step`: where the architecture runs a spanned step serially
+     * (it pipelines none of it), its routed block takes the whole step in one pass instead of one
+     * pass an interval (RadBuildCtx::span_pass_step), so the step sorts its slots once and each
+     * expert's weight is read -- and a trellis expert decoded -- once for all its rows. The expert
+     * planes are then a step tall (on Qwen3.8-Flash-Next at a 4096 budget 165 MiB more arena a
+     * rank), and the output differs from piece passes at tie level, as a spanned step's at one or
+     * two ranks already does. Off (piece): a routed pass a piece. */
+    bool    prefill_span_step = false;
+    /* --prefill-span-min auto|N: the shortest prompt, in tokens, a lone prefill spans for
+     * (Scheduler::set_span_min). -1 is auto, which Engine::serve resolves: eight intervals where
+     * routed experts are staged from host memory (a spanned step runs at the full plan, which lends
+     * the expert slab nothing), 0 elsewhere. 0 spans every lone prefill from its second interval
+     * on. */
+    int64_t prefill_span_min = -1;
+    /* --prefill-tail-snapshot on|off: whether a prompt's last chunk is cut where the linear state
+     * is snapshotted for the next turn under --prefix-resume nearest (Scheduler::plan_chunk): at
+     * the last quantum boundary (Scheduler::tail_checkpoint), or, a spanned last chunk, at the last
+     * interval boundary it crosses. The cut leaves the prompt's last few tokens (up to a quantum,
+     * or a quarter interval) a step of their own, which on a routed model reads most of the
+     * experts once more (some 60 ms a prompt on Flash-Next at two ranks). Off ends the last chunk
+     * at the prompt's end: the next turn resumes from the deepest snapshot a chunk end left (the
+     * last interval or span boundary) and recomputes up to an interval more. On (the default):
+     * the tail snapshot at its own boundary. Output of a cold prompt differs only as another
+     * chunking does. */
+    bool    prefill_tail_snapshot = true;
+    /* --prefill-span-first on|off: whether a span may start at a prompt's first token (off, the
+     * default: from its second interval on, Scheduler::plan_chunk). On, the first interval is no
+     * step of its own: its rows read the indexer's selection where the dense pass served them,
+     * the same keys below QSA's exactness bound summed in another order, and on routed models the
+     * first interval's experts are read once with the span's rows. */
+    bool    prefill_span_first = false;
     /* Cap on linear-state (or sliding-window) snapshots held at once, for the whole server. The
      * slots are pinned host memory, all allocated at startup and never on the card (spec §7.3).
      * A slot is a sizeable fraction of a gigabyte on a linear-attention model, so raising the cap
@@ -955,6 +1015,10 @@ struct Config {
      * store is opened (checkpoint_slots_auto in core/mem/prefix.h). */
     int64_t checkpoint_slots = -1;
     bool    prefix_cache = true;
+    /* Engine-internal, not a flag: plan a checkpoint stage on the card (KVManager::ckpt_stage).
+     * The engine sets it at startup where the plugin can cut a step at a tail snapshot and
+     * --prefix-resume is nearest; a KVManager planned without it (a test, a tool) carves none. */
+    bool    ckpt_stage = false;
     /* --prefix-resume exact|nearest.
      * - exact (the default): a prefix hit resumes only on the grid an idle server's cold prefill
      *   chunks the same prompt on (ChunkGeometry::grid), and a prompt's tail snapshot is taken
@@ -1025,6 +1089,65 @@ struct Config {
      * (RadBuildCtx::draft_coupling, abi/rad_spechub.h).
      * Off by default; on changes which tokens a fixed seed yields, not their law. */
     bool        draft_coupling = false;
+    /* --draft-verify token|block|traversal: how a coupled draft chain is verified. token (default):
+     * each row's maximal coupling (above). block: Block Verification (arXiv 2403.10444,
+     * abi/rad_mtp_block.h), the chain's drafts accepted jointly; the same output law, at least as
+     * many accepted tokens. block switches --draft-coupling on (the drafting half is shared).
+     * traversal: Traversal Verification (arXiv 2505.12398, abi/rad_mtp_traversal.h) walks the
+     * chain from its last draft back to its first; the same output law, never fewer accepted
+     * tokens than token-wise, and it needs --draft-coupling on. */
+    bool        draft_verify_block = false;
+    bool        draft_verify_traversal = false;
+    /* --draft-depth fixed|adaptive (core/sched/draft_depth.h): adaptive stops a coupled serial
+     * chain within the step as soon as the head's own laws make the next draft unlikely, so a step
+     * drafts 1 .. draft_depth_max tokens (0: num-speculative-tokens) and its verify carries that
+     * many rows. The chain goes on while the product of the rounds' statistic (stat 0: the largest
+     * mass of each round's law, 1: the mass of the token it drew) stays >= draft_depth_stop; the
+     * decision trails the chain by draft_depth_lag rounds (0 or 1; 1 hides the host's readback
+     * behind a running round), draft_depth_min rounds always run. Switches --draft-coupling on
+     * and needs a serial head's chain and --draft-window fixed. Lossless: the rule reads draft-side
+     * quantities only. Off by default: the fixed chain. */
+    bool        draft_depth_adaptive = false;
+    int         draft_depth_max = 0;
+    int         draft_depth_min = 1;
+    int         draft_depth_lag = 1;
+    int         draft_depth_stat = 0;
+    double      draft_depth_stop = 0.85;
+    /* --draft-depth-load on|off (core/sched/draft_depth.h): the load-aware depth rule. A step that
+     * drafts for draft_depth_load_from sequences or more runs round j only for the rows whose
+     * expected accepted drafts pay their verify rows, the kernel tile those rows open and the
+     * round, at the throughput the engine has; and, with draft_depth_load_late, chooses each
+     * row's verified prefix again when the next verify is issued, from the laws read by then.
+     * draft_depth_load_min rounds always run. The tables (acceptance by confidence, tokens a
+     * millisecond, a row's, a round's and a tile's milliseconds) start from built-in ones -- or
+     * the comma lists below, by drafting rows 1 .. 8 (jumps: past 16, 32, 48, 64 verify rows) --
+     * and with draft_depth_load_online follow the running server. Needs --draft-depth adaptive
+     * with --draft-depth-stat top. A step with fewer sequences is the stop rule's, bit for bit.
+     * Lossless: the rule reads draft-side laws of the step and tables fixed before it. */
+    bool        draft_depth_load = false;
+    int         draft_depth_load_from = 5;
+    int         draft_depth_load_min = 2;
+    bool        draft_depth_load_late = true;
+    bool        draft_depth_load_online = true;
+    std::string draft_depth_load_tok_ms;
+    std::string draft_depth_load_row_ms;
+    std::string draft_depth_load_round_ms;
+    std::string draft_depth_load_jump_ms;
+    /* --draft-suffix on (core/sched/suffix.h): SuffixDecoding as a step SELECTOR on a serial head's
+     * chain. On a host-built step, when the sequence's own history (prompt ++ output) ends in a
+     * pattern of at least `draft_suffix_min_match` tokens that occurred before, the step verifies
+     * that earlier occurrence's continuation (a chain of at most `draft_suffix_max` rows (7: the
+     * delta-net fold's register window serves 8 query rows, so a Flash-Next verify window past 7
+     * drafts leaves its kernels unsupported), cut where the path score falls under
+     * `draft_suffix_min_score`) in place of the head's draft. Lossless: the proposal's rows are never
+     * coupled. Off by default: every step is the head's. */
+    bool        draft_suffix = false;
+    int         draft_suffix_min_match = 6;
+    int         draft_suffix_max = 7;
+    float       draft_suffix_min_score = 0.3f;
+    /* The head's own rounds when --draft-suffix raised `n_spec` (the verify window) past them; 0 =
+     * `n_spec` (set by the engine, not a flag). */
+    int         n_spec_head = 0;
 
     /* ---------------- KL DIVERGENCE AGAINST A REFERENCE (core/kld.h) ----------------
      *
@@ -1051,6 +1174,22 @@ struct Config {
     bool calib() const { return !calib_corpus.empty(); }
     std::string kld_out;                /* --kld-out FILE: the report as JSON, rows beside it */
     bool kld() const { return !kld_record.empty() || !kld_ref.empty(); }
+
+    /* ---------------- DIAGNOSIS (core/diag/diagnose.h, core/engine_diagnose.cpp) ----------------
+     *
+     * A mode, like the KL mode: the engine starts as it would to serve, then runs a fixed workload
+     * on itself -- decode by prompt category, a concurrency sweep, a prefill sweep with decode at
+     * each depth, a prompt arriving into running streams -- and writes DIR/diagnose.json and
+     * DIR/diagnose.md instead of listening. Every point is run once unmeasured and then
+     * `diagnose_runs` times. */
+    std::string diagnose;               /* --diagnose DIR */
+    int diagnose_tokens = 256;          /* --diagnose-tokens N: tokens a decode stream generates */
+    int diagnose_runs = 3;              /* --diagnose-runs N: measured runs a point */
+    std::vector<int> diagnose_concurrency = { 1, 2, 4, 8 };          /* --diagnose-concurrency */
+    std::vector<int> diagnose_prefill = { 1024, 4096, 16384, 65536 }; /* --diagnose-prefill */
+    std::string diagnose_corpus;        /* --diagnose-corpus FILE; empty is the built-in one */
+    std::string diagnose_baseline;      /* --diagnose-baseline FILE: an earlier diagnose.json to compare outputs with */
+    bool diagnose_mode() const { return !diagnose.empty(); }
 
     /* --mm-max-patches: the most patches one encoder pass carries, which bounds the largest image
      * (one image is one pass) and sizes the encoder's activations. -1 is `auto`: the default below
@@ -1093,6 +1232,20 @@ struct Config {
      * and the metrics carry. Empty takes the container's own name. A request may still name any
      * model: one model is loaded and every request is served by it. */
     std::string served_model_name;
+    /* The cards this engine's ranks run on, rank i on devices[i]: chosen by the fleet
+     * (docs/MULTIMODEL.md §8.4), not by a key. Empty takes the usable cards from the first. */
+    std::vector<int> devices;
+    /* Bytes of each card the fleet granted this engine (docs/MULTIMODEL.md §6.3), set by the
+     * engine from its VramBroker before the split: the split treats the grant as the card, with
+     * nothing already held and no headroom. 0 splits the card as a process of one model does. */
+    int64_t vram_claim = 0;
+    /* Bytes of address space the KV pool reserves when its cache is flex (docs/MULTIMODEL.md §6):
+     * the most it may grow to, of which only vram_kv_mib is backed at start. 0: the pool is
+     * vram_kv_mib, backed whole. Set by the engine from its broker. */
+    int64_t kv_reserve = 0;
+    /* A model the fleet loads again: its startup report printed at its first load, so a load
+     * after an eviction prints only its ready line. Set by the fleet. */
+    bool    report_once = false;
 
     /* Sampler defaults for a request that sends none. Unset, they resolve from the container and
      * the `generation_config.json` beside it (resolve_sampling_defaults in engine.cpp), since a
@@ -1221,4 +1374,15 @@ struct Config {
 namespace rad {
 int  config_parse(int argc, char** argv, Config* c);
 void config_usage(const char* argv0);
+
+/* One entry of the option table: the flag with its dashes, the argument's placeholder (null for a
+ * switch) and the help text. The YAML loader (fleet/config.h) reads the table for its key names,
+ * so a key exists exactly when its flag does. */
+struct ConfigFlag {
+    const char* name;
+    const char* arg;
+    const char* help;
+};
+/* The table in order; *n is its length. */
+const ConfigFlag* config_flags(size_t* n);
 }

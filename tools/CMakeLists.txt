@@ -1,4 +1,4 @@
-# tools/ -- rad-info, rad-convert, rad-kbench, rad-tune, and the smaller checkers below.
+# tools/ -- rad-info, rad-convert, rad-kbench, rad-tune, rad-yaml, and the smaller checkers below.
 #
 # rad_add_tool tools link rad_core: rad-convert, rad-kbench and rad-tune are the engine's startup
 # with a different last step, loading the same plugins in the same hierarchy and running the same
@@ -50,12 +50,18 @@ add_executable(rad-tokcheck rad_tokcheck.cpp ${CMAKE_CURRENT_SOURCE_DIR}/iface.c
 target_link_libraries(rad-tokcheck PRIVATE rad_tokref rad_core)
 set_target_properties(rad-tokcheck PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# rad-yaml writes a command line as the YAML configuration; it parses flags and nothing else.
+add_executable(rad-yaml rad_yaml.cpp)
+target_link_libraries(rad-yaml PRIVATE rad_core)
+set_target_properties(rad-yaml PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # rad-schemas links no core: it dlopens plugins and reads their static schema tables, so it works on
 # a plugin the engine cannot load.
 add_executable(rad-schemas rad_schemas.cpp)
 target_link_libraries(rad-schemas PRIVATE rad_abi ${CMAKE_DL_LIBS})
 set_target_properties(rad-schemas PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 rad_add_tool(rad-convert  rad_convert.cpp)
+target_sources(rad-convert PRIVATE rad_add_vision.cpp)
 # Optional OpenMP across weights and within a large one.
 find_package(OpenMP QUIET)
 if(OpenMP_CXX_FOUND)
@@ -81,7 +87,7 @@ set_target_properties(rad-gbnf-check PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE
 
 # rad-schemas matters most in an installed prefix: it needs only the four exports every kernel
 # plugin has, so it can debug an out-of-tree plugin the engine cannot load.
-install(TARGETS rad-info rad-convert rad-kbench rad-tune rad-schemas rad-tokcheck
+install(TARGETS rad-info rad-convert rad-kbench rad-tune rad-schemas rad-tokcheck rad-yaml
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # rad-chatparse: the reply parser's acceptance run against a checkpoint's real tokenizer and chat

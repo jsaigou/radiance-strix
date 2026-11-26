@@ -320,7 +320,9 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
 }
 
 /* ADV_COMPACT for one (batch row, pool, layer, head): the moves the row's accepted path asks
- * for, `c0` and every `cstep`-th 16-byte chunk of each K|V row. Node path[t] stored at
+ * for, `c0` and every `cstep`-th 16-byte chunk of each K|V row. A row is whole 32-bit words; the
+ * words past its last whole chunk (an int8 cache's two f16 scales) go with the caller whose chunk
+ * set the next chunk would be in. Node path[t] stored at
  * base + path[t] and belongs at base + t + 1. path[] increases (a parent's index is below its
  * child's) and path[t] >= t + 1, so in t order no move overwrites a node a later move still reads:
  * a destination base + t + 1 is either the node's own place or a place a node already moved out
@@ -340,7 +342,8 @@ RAD_ADV_FN void adv_compact(const AdvanceArgs& a, int i, int p, int l, int h, in
     const int32_t base = S.head - S.acc;
     const int32_t bs = e.block_size;
     char* lay = P.base + (int64_t)l * P.layer_stride;
-    const int32_t chunks = P.row_bytes / 16;
+    const int32_t chunks = P.row_bytes / 16, tail = P.row_bytes % 16 / 4;
+    const bool tails = tail > 0 && chunks % cstep == c0;
     for (int32_t t = 0; t < np; ++t) {
         const int32_t src = base + S.path[t], dst = base + t + 1;
         if (src == dst) continue;
@@ -355,6 +358,8 @@ RAD_ADV_FN void adv_compact(const AdvanceArgs& a, int i, int p, int l, int h, in
                            v3 = from[4 * c + 3];
             to[4 * c] = v0; to[4 * c + 1] = v1; to[4 * c + 2] = v2; to[4 * c + 3] = v3;
         }
+        if (tails)
+            for (int32_t j = 0; j < tail; ++j) to[4 * chunks + j] = from[4 * chunks + j];
     }
 }
 

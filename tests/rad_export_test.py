@@ -204,9 +204,9 @@ if "minicpm5-2b-bf16-dspark" in by:
     check("recipe: minicpm5 dspark names its drafter", bool(r["draft"]), r)
     pick, _ = rx.pick_recipe(types.SimpleNamespace(recipe="auto"), {}, recipes, ["openbmb/MiniCPM5-2B", "MiniCPM5-2B"])
     check("auto: MiniCPM5-2B -> minicpm5-2b-bf16-dspark", pick["name"] == "minicpm5-2b-bf16-dspark", pick["name"])
-if "q38-27b-fp8block-df2" in by:
+if "gemma4-31b-dense-bf16-w4a8" in by:
     check("recipe: a usage line's --set keys are read",
-          "quantization_config.weight_block_size=128 128" in by["q38-27b-fp8block-df2"]["set"])
+          "quantization_config.quant_method=compressed-tensors" in by["gemma4-31b-dense-bf16-w4a8"]["set"])
 check("auto: an unknown model asks for --recipe",
       refused(lambda: rx.pick_recipe(types.SimpleNamespace(recipe="auto"), {}, recipes, ["org/NoSuchModel-9B", "NoSuchModel-9B"])))
 pin, _ = rx.pick_recipe(types.SimpleNamespace(recipe="auto"), {"recipes": {"NoSuchModel": recipes[0]["name"]}}, recipes, ["org/NoSuchModel-9B"])

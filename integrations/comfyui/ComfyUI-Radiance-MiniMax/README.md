@@ -10,24 +10,34 @@ description (the **?** in its header) documents every input.
 
 ## The server
 
-    radiance --model minimax-h3-fp8.rad --radiance-home ... --tp 2 \
-        --host 0.0.0.0 --port 8133 --lora-dir /path/to/loras
+    # radiance.yaml
+    server:
+      host: 0.0.0.0
+      port: 8133
+      radiance-home: ...
+    models:
+      minimax-h3:
+        model: minimax-h3-i8.rad
+        tp: 2
+        lora-dir: /path/to/loras
 
-`--host 0.0.0.0` makes the server reachable from other machines. The node sends no API key, so
-it drives a server without `--api-key`, which takes any request: keep that server on a trusted
+    radiance --config radiance.yaml
+
+`host: 0.0.0.0` makes the server reachable from other machines. The node sends no API key, so
+it drives a server without `api-key`, which takes any request: keep that server on a trusted
 network. The node fetches the adapter lists from the browser, which needs the server's CORS
-headers (on unless `--no-cors`).
+headers (on unless `no-cors: true`).
 
-`--lora-dir` lets a request name any `NAME.safetensors` under the directory; the node's two
+`lora-dir` lets a request name any `NAME.safetensors` under the directory; the node's two
 adapter lists show them (`GET /v1/loras`). Pointing it at ComfyUI's `models/loras` serves the
 same files ComfyUI shows. ComfyUI's Load LoRA node does not apply to this node, since the server
 applies adapters to the weights it serves.
 
 The server reserves every adapter slot in VRAM at startup and logs what a slot costs. With
-`--lora-dir` alone it reserves two (`--max-loras`). On two 32 GB cards serving MiniMax-H3 a
+`lora-dir` alone it reserves two (`max-loras`). On two 32 GB cards serving MiniMax-H3 a
 rank-16 slot costs about 265 MiB a card, and the second one fits only when nothing else holds
 VRAM on those cards. When it does not, startup stops with `vram_kv resolved to 0 MiB`: serve
-with `--max-loras 1` and leave the node's second adapter at `none`, or run ComfyUI on other
+with `max-loras: 1` and leave the node's second adapter at `none`, or run ComfyUI on other
 cards.
 
 ## Media
@@ -44,6 +54,12 @@ A task ignores media it does not use, with a warning on the console. For `ref2va
 `video_audio_N` is the soundtrack of `video_N`, and `audio_N` is standalone reference audio such
 as a voice. Each kind is filled in order, since the input's number is the reference's number in
 the request. Pictures are sent as PNG, audio as WAV and clips as MP4.
+
+Every task also takes a song guide, as ComfyUI's Add Guide for MiniMax H3 does: `guide_audio`
+is a song pinned as the clip's soundtrack from frame `guide_frame` on (0 the first, a negative
+frame counted from the end), so the mouths follow its words. The server reads at most 15.6 s of
+it and cuts it where the clip ends. It goes with reference media and with keyframes, and needs a
+container with the audio VAE's encoder (`video_guide_audio` in `GET /v1/models`).
 
 ## Sizes
 

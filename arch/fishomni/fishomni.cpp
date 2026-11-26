@@ -322,7 +322,7 @@ struct Model {
  * row's label). */
 constexpr int64_t kPcW = kMaxPrompt + 1;
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* ================================================================== declare helpers */
 static rad_op norm_op(RadBuilder* b, int64_t rows, int64_t n, double eps, double wadd,
@@ -1701,8 +1701,9 @@ static int declare_encoder(RadBuilder* b, Model& m) {
 /* ================================================================== declare */
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
-    Model& m = g_model[ctx->rank];
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(check_format(meta));
@@ -2184,7 +2185,7 @@ static void step_vocode(RadCtx* c, const RadBatch* batch, const Model& m) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
+    const Model& m = g_model[rad_slot(c)];
     if (!batch->gen || !batch->agen_b) {
         rad_step_fail(c, "fishomni is an audio generator and runs generator passes only");
         return;
@@ -2352,6 +2353,8 @@ RAD_ARCH_PROBE(fishomni)
 extern "C" int64_t rad_arch_text_prepare(int field, const char* in, char* out, int64_t cap) {
     return fishomni::text_prepare(field, in, out, cap);
 }
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(fishomni, "fishomni", "bsgemm-moe", "0.1.0",
                 "Fish Audio drama-3: the Qwen3.5-35B-A3B backbone (block-scaled fp8 experts), a "
                 "13-layer codebook tower over its full-attention cache, and Fish S2's modified "

@@ -11,22 +11,6 @@ namespace rad {
 
 namespace {
 
-/* Step-cost prior, a shape rather than a measurement: each draft adds 6% to a step (one serial
- * head round plus one verify row on a weight-bound step). Once anything is measured only its
- * ratios are used: an unmeasured depth is the nearest measured one scaled by prior(d) / prior(d'). */
-constexpr double kCostSlope = 0.06;
-double cost_prior(int d) { return 1.0 + kCostSlope * (double)d; }
-
-/* A step-time mean is a running mean for the first steps, then a moving average with a half-life
- * of 32 steps: long enough to average out one-off costs (a tier copy, a recording, a prefix-cache
- * trim), short enough to follow a context growing by a few thousand tokens over a reply. */
-constexpr double kCostHalfLife = 32.0;
-/* Once a key has 4 samples, one step counts for at most 4x its mean. A step that waited on
- * something else (a first recording, an allocation, a host stall) says nothing about its depth's
- * cost. Below 4 samples the mean is not a trustworthy reference to clip against. */
-constexpr double kCostOutlier = 4.0;
-constexpr int64_t kCostClipAfter = 4;
-
 /* The prior weighs as much as this many verifies. The (n+1)-th verify moves an estimate by
  * 1 / (n + k + 1), a running mean over prior and evidence, until that falls below the half-life's
  * step and the moving average takes over. Without it a sequence would spend its first ~16
@@ -59,10 +43,8 @@ int DraftController::configure(const Params& p) {
     step_held_ = 0;
     prior_n_ = 0;
     for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) prior_[j] = 0.0f;
-    for (int d = 0; d <= RAD_SCHED_MAX_SPEC; ++d) {
-        by_depth_[d] = 0;
-        for (int c = 0; c < kCostClasses; ++c) { cost_ms_[d][c] = 0.0; cost_n_[d][c] = 0; }
-    }
+    for (int d = 0; d <= RAD_SCHED_MAX_SPEC; ++d) by_depth_[d] = 0;
+    cost_.reset(kRowCost);
     if (adapt_)
         RAD_INFO("draft depth: adaptive, %d..%d; a sequence stops at the first draft emitted less "
                  "than %.0f%% of the time, and the depth moves at +%.0f%% at most every %d steps",
@@ -91,51 +73,16 @@ void DraftController::observe(int drafted, int accepted) {
 }
 
 /* ------------------------------------------------------------------ the step's cost */
-int DraftController::cost_class(int n_rows) {
-    int c = 0;
-    while (c + 1 < kCostClasses && n_rows >= (2 << c)) ++c;
-    return c;
+void DraftController::step_time(int q_rows, double ms) {
+    if (!adapt_) return;
+    cost_.sample(q_rows, ms);
 }
 
-void DraftController::step_time(int depth, int n_rows, double ms) {
-    if (!adapt_ || depth < 1 || depth > p_.max_depth || n_rows < 1 || !(ms > 0.0) ||
-        !std::isfinite(ms))
-        return;
-    const int c = cost_class(n_rows);
-    double&  m = cost_ms_[depth][c];
-    int64_t& n = cost_n_[depth][c];
-    if (n >= kCostClipAfter && ms > kCostOutlier * m) ms = kCostOutlier * m;
-    const double w = settle_weight(kCostHalfLife, n);
-    m = n ? m + w * (ms - m) : ms;
-    ++n;
+int64_t DraftController::cost_samples(int q_rows) const {
+    return q_rows >= 1 ? cost_.samples(q_rows) : 0;
 }
 
-int64_t DraftController::cost_samples(int depth, int n_rows) const {
-    if (depth < 1 || depth > RAD_SCHED_MAX_SPEC || n_rows < 1) return 0;
-    return cost_n_[depth][cost_class(n_rows)];
-}
-
-double DraftController::step_cost(int depth, int n_rows) const {
-    if (depth < 1 || depth > RAD_SCHED_MAX_SPEC) return 0.0;
-    const int c = n_rows >= 1 ? cost_class(n_rows) : 0;
-    if (cost_n_[depth][c] > 0) return cost_ms_[depth][c];
-    /* Nearest measured key: this class first (nearest depth, shallower on a tie), then the
-     * nearest class. Only its ratio to the prior is borrowed, so D's comparison across depths in
-     * one class follows the prior's shape until those depths are measured. */
-    for (int dc = 0; dc < kCostClasses; ++dc) {
-        for (int sgn = 0; sgn < 2; ++sgn) {
-            const int k = sgn ? c + dc : c - dc;
-            if (k < 0 || k >= kCostClasses || (dc == 0 && sgn)) continue;
-            int best = -1;
-            for (int d = 1; d <= p_.max_depth; ++d) {
-                if (cost_n_[d][k] <= 0) continue;
-                if (best < 0 || std::abs(d - depth) < std::abs(best - depth)) best = d;
-            }
-            if (best > 0) return cost_ms_[best][k] * cost_prior(depth) / cost_prior(best);
-        }
-    }
-    return cost_prior(depth);
-}
+double DraftController::step_cost(int q_rows) const { return cost_.cost(q_rows); }
 
 /* ------------------------------------------------------------------ one sequence */
 int DraftController::stop_of(const float* a) const {
@@ -181,14 +128,14 @@ double DraftController::yield(const DraftAdapt& s, int d) const {
 }
 
 int DraftController::window_of(const DraftAdapt& s) const {
-    if (!adapt_) return p_.max_depth;
+    if (!adapt_) return next_depth();
     if (s.depth <= 0) return 0;
     const int D = step_d_ > 0 ? step_d_ : p_.max_depth;
     return s.depth < D ? s.depth : D;
 }
 
 int DraftController::window_for(DraftAdapt& s) const {
-    if (!adapt_) return p_.max_depth;
+    if (!adapt_) return next_depth();
     if (s.depth <= 0) start(s);
     return window_of(s);
 }
@@ -236,9 +183,11 @@ int DraftController::plan_step(DraftAdapt* const* seq, int n_seq, int n_rows) {
     if (n_rows < n_seq) n_rows = n_seq;
     const int M = p_.max_depth;
 
-    /* Expected tokens at each head depth: sum_i E_i(min(D, stop_i)), plus one per non-drafting
-     * row. Candidates end at the deepest stop, since a deeper D changes nothing. */
+    /* Expected tokens at each head depth, sum_i E_i(min(D, stop_i)) plus one per non-drafting
+     * row, and the drafts the step would then verify, sum_i min(D, stop_i). Candidates end at the
+     * deepest stop, since a deeper D changes nothing. */
     double tok[RAD_SCHED_MAX_SPEC + 1] = {};
+    int    drafts[RAD_SCHED_MAX_SPEC + 1] = {};
     int top = kMinDepth;
     for (int i = 0; i < n_seq; ++i) {
         DraftAdapt& s = *seq[i];
@@ -248,15 +197,18 @@ int DraftController::plan_step(DraftAdapt* const* seq, int n_seq, int n_rows) {
         for (int d = 1; d <= M; ++d) {
             if (d <= s.depth) { run *= (double)s.a[d - 1]; e += run; }
             tok[d] += e;
+            drafts[d] += d <= s.depth ? d : s.depth;
         }
     }
     const double plain = (double)(n_rows - n_seq);
     if (top > M) top = M;
 
+    /* A step's query rows at depth d: a row a decode sequence and its drafts. */
+    auto gain = [&](int d) { return (tok[d] + plain) / step_cost(n_rows + drafts[d]); };
     int best = kMinDepth;
     double best_g = -1.0;
     for (int d = kMinDepth; d <= top; ++d) {
-        const double g = (tok[d] + plain) / step_cost(d, n_rows);
+        const double g = gain(d);
         if (g > best_g) { best_g = g; best = d; }
     }
 
@@ -268,7 +220,7 @@ int DraftController::plan_step(DraftAdapt* const* seq, int n_seq, int n_rows) {
     } else {
         if (step_held_ < INT32_MAX) ++step_held_;
         const int cur = step_d_ < top ? step_d_ : top;
-        const double cur_g = (tok[cur] + plain) / step_cost(cur, n_rows);
+        const double cur_g = gain(cur);
         if (best != cur && step_held_ >= kHold && best_g > cur_g * (1.0 + kHyst)) {
             RAD_DEBUG("draft window: head depth %d -> %d over %d drafting of %d rows (%.3f -> "
                       "%.3f tokens per unit of step cost)", step_d_, best, n_seq, n_rows, cur_g,

@@ -1,0 +1,30 @@
+# q38-27b-iq8r-rtn.recipe -- q38-27b-iq8r.recipe by round to nearest: a Qwen3.8-27B checkpoint (the
+# release or a finetune of it) from bf16 in IQ8R with the DFlash2 drafter, no calibration data read.
+#
+#   rad-convert <Qwen3.8-27B bf16 checkpoint> --draft-model <z-lab/Qwen3.8-27B-DFlash2> \
+#       --recipe data/recipes/q38-27b-iq8r-rtn.recipe \
+#       --set quantization_config.quant_method=w8a8 --set quantization_config.fmt=fwht128 \
+#       -o q38-27b-iq8r.rad
+#
+# The formats are q38-27b-iq8r.recipe's, which describes them; only the fit differs. On the release,
+# two cards, the KL divergence from the bf16 model over the 464,091 generated positions of the
+# quantisation challenge's public split is 0.000491 rounded this way against 0.000393
+# fitted by GPTQ, and 0.003633 for Qwen's FP8 checkpoint.
+
+blk.*.attn_qg.weight                 rtn   codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.attn_k.weight                  rtn   codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.attn_v.weight                  rtn   codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.attn_output.weight             rtn   codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ssm_inz.weight                 rtn   codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ssm_out.weight                 rtn   codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_gate_up.weight             rtn   codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_down.weight                rtn   codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+output.weight                        rtn   codes=i8 group=128 scale=bf16 clamp=sym rule=search
+dflash.draft_head.weight             rtn   codes=u2 zero=u8 group=128 scale=f16 rule=search
+dflash.fc.weight                     rtn   table=-127;-97;-75;-58;-43;-30;-18;-6;6;18;30;43;58;75;97;127 group=128 scale=bf16 transform=fwht128 rule=search
+dflash.blk.*.attn_q.weight           rtn   table=-127;-97;-75;-58;-43;-30;-18;-6;6;18;30;43;58;75;97;127 group=128 scale=bf16 transform=fwht128 rule=search
+dflash.blk.*.attn_k.weight           rtn   table=-127;-97;-75;-58;-43;-30;-18;-6;6;18;30;43;58;75;97;127 group=128 scale=bf16 transform=fwht128 rule=search
+dflash.blk.*.attn_v.weight           rtn   table=-127;-97;-75;-58;-43;-30;-18;-6;6;18;30;43;58;75;97;127 group=128 scale=bf16 transform=fwht128 rule=search
+dflash.blk.*.attn_output.weight      rtn   table=-127;-97;-75;-58;-43;-30;-18;-6;6;18;30;43;58;75;97;127 group=128 scale=bf16 transform=fwht128 rule=search
+dflash.blk.*.ffn_gate_up.weight      rtn   table=-127;-97;-75;-58;-43;-30;-18;-6;6;18;30;43;58;75;97;127 group=128 scale=bf16 transform=fwht128 rule=search
+dflash.blk.*.ffn_down.weight         rtn   table=-127;-97;-75;-58;-43;-30;-18;-6;6;18;30;43;58;75;97;127 group=128 scale=bf16 transform=fwht128 rule=search

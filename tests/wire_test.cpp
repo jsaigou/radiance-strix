@@ -13,7 +13,7 @@
  */
 #include "rad_test.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include "server/http.h"
 #include "server/json_partial.h"
@@ -413,7 +413,7 @@ TEST(a_histogram_scraped_during_observations_stays_cumulative) {
         obs.emplace_back([&m, &stop, t] {
             const double v = 0.0001 * (t + 1);   /* below every bucket's bound */
             while (!stop.load(std::memory_order_relaxed))
-                m.observe_request(1, 2, v, v, v, v, 1, 8, SuccessReason::Stop);
+                m.observe_request(1, 2, v, v, v, v, v, 1, 8, SuccessReason::Stop);
         });
     int bad = 0;
     for (int i = 0; i < 500 && bad == 0; ++i) bad += histogram_violations(m.render());
@@ -421,6 +421,34 @@ TEST(a_histogram_scraped_during_observations_stays_cumulative) {
     for (auto& t : obs) t.join();
     CHECK_EQ(bad, 0);
     CHECK_EQ(histogram_violations(m.render()), 0);
+}
+
+/* The queue time, the prefix cache as counters and the cache settings, under vLLM's names. A
+ * request that was never admitted leaves the queue histogram alone, and the hits are the tokens
+ * requests did not compute again. */
+TEST(queue_time_and_prefix_cache_counters_render_under_vllm_names) {
+    Metrics m("m", 1024);
+    m.set_cache_config("fp8", 16, true, 4096);
+    m.observe_request(10, 2, 0.5, 0.01, 1.0, 0.5, 0.25, 1, 8, SuccessReason::Stop);
+    m.observe_request(10, 0, -1.0, -1.0, 0.1, -1.0, -1.0, 1, 8, SuccessReason::Abort);
+    SchedMetrics sm;
+    sm.prefix_queries = 100;
+    sm.linear_cached_tokens = 60;
+    m.sample(sm);
+    const std::string out = m.render();
+    const std::string L = "{model_name=\"m\",engine=\"0\"} ";
+    CHECK(out.find("vllm:prefix_cache_queries_total" + L + "100\n") != std::string::npos);
+    CHECK(out.find("vllm:prefix_cache_hits_total" + L + "60\n") != std::string::npos);
+    CHECK(out.find("vllm:request_queue_time_seconds_count" + L + "1\n") != std::string::npos);
+    CHECK(out.find("vllm:request_queue_time_seconds_sum" + L + "0.25\n") != std::string::npos);
+    CHECK(out.find("vllm:cache_config_info{model_name=\"m\",engine=\"0\",cache_dtype=\"fp8\","
+                   "block_size=\"16\",enable_prefix_caching=\"True\",prefix_cache_mib=\"4096\"} 1\n")
+          != std::string::npos);
+    CHECK_EQ(histogram_violations(out), 0);
+
+    /* Not set: no info line. */
+    Metrics bare("m", 1024);
+    CHECK(bare.render().find("vllm:cache_config_info") == std::string::npos);
 }
 
 /* ================================================================== the response bodies
@@ -559,13 +587,16 @@ TEST(a_chat_body_with_a_tool_call_sends_a_null_content) {
     const json p = parsed(chat_completion_body(a_request("chatcmpl-3", "m"), { both }, UsageOut{}));
     CHECK_EQ(p["choices"][0]["message"].value("content", std::string()), std::string("checking"));
 
-    /* Reasoning goes under vLLM's key, and only when non-empty. */
+    /* Reasoning goes under both spellings, and under neither when empty. */
     CHECK(!p["choices"][0]["message"].contains("reasoning_content"));
+    CHECK(!p["choices"][0]["message"].contains("reasoning"));
     ChoiceOut think;
     think.msg.reasoning = "the user wants weather";
     think.msg.content = "it is cold";
     const json q = parsed(chat_completion_body(a_request("chatcmpl-4", "m"), { think }, UsageOut{}));
     CHECK_EQ(q["choices"][0]["message"].value("reasoning_content", std::string()),
+             std::string("the user wants weather"));
+    CHECK_EQ(q["choices"][0]["message"].value("reasoning", std::string()),
              std::string("the user wants weather"));
 }
 
@@ -641,6 +672,20 @@ TEST(the_completion_usage_chunk_is_an_event_with_an_empty_choices_array) {
     CHECK_EQ(o.value("id", std::string()), std::string("cmpl-9"));
 }
 
+/* An embedding value is spelled with the shortest digits that read back as the float: the
+ * engine's float32, not the extra digits widening it to a double would add. */
+TEST(an_embeddings_value_is_spelled_as_its_float) {
+    const std::vector<std::vector<float>> vecs = { { 0.1f, 1.0f, -2.5e-7f, 3.4028235e38f, -0.0f,
+                                                     0.0123f } };
+    UsageOut u;
+    const std::string body = embeddings_body(a_request("emb-3", "m"), vecs, u);
+    CHECK(body.find("\"embedding\":[0.1,1.0,-2.5e-07,3.4028235e+38,-0.0,0.0123]") !=
+          std::string::npos);
+    const json o = parsed(body);
+    for (size_t j = 0; j < vecs[0].size(); ++j)
+        CHECK_EQ(o["data"][0]["embedding"][j].get<float>(), vecs[0][j]);
+}
+
 /* Base64 encoding is per request and is the raw float buffer, which every client that asks for it
  * unpacks. Sending the JSON array under that flag, or base64 of a formatted array, would
  * deserialise to nonsense instead of failing. */
@@ -678,6 +723,125 @@ TEST(an_embeddings_body_honours_the_encoding_the_request_asked_for) {
     const json z = parsed(embeddings_body(plain, {}, UsageOut{}));
     CHECK(z["data"].is_array());
     CHECK_EQ(z["data"].size(), 0u);
+}
+
+/* ================================================================== the body reader
+ *
+ * parse_json_bounded is the DOM's bounded read (util/json.cpp). Its verdicts and typing are
+ * the recorded contract the request parser has always been written against: a non-negative
+ * integer reads as unsigned, an integer past uint64 as a double, and the value-budget and
+ * depth boundaries refuse the same bodies. These cases are what a yyjson refresh is re-run
+ * against (vendor/UPSTREAM). */
+
+TEST(the_bounded_body_reader_agrees_with_the_reference_reader) {
+    const char* cases[] = {
+        "{\"a\":1e-999}", "{\"a\":1e-400}", "{\"a\":0e999}", "{\"a\":1e309}", "{\"a\":-1e309}",
+        "{\"a\":1.7976931348623157e308}", "{\"a\":1.7976931348623159e308}",
+        "{\"a\":2.2250738585072011e-308}", "{\"a\":5e-324}", "{\"a\":4e-324}",
+        "{\"a\":0.1}", "{\"a\":123456789012345678901234567890}",
+        "{\"a\":9223372036854775807}", "{\"a\":9223372036854775808}",
+        "{\"a\":-9223372036854775808}", "{\"a\":-9223372036854775809}",
+        "{\"a\":18446744073709551615}", "{\"a\":18446744073709551616}",
+        "{\"a\":-0}", "{\"a\":-0.0}", "{\"a\":0.0}", "{\"a\":1E7}", "{\"a\":1e+7}",
+        "{\"a\":0x10}", "{\"a\":.5}", "{\"a\":1.}", "{\"a\":1e}", "{\"a\":01}", "{\"a\":+1}",
+        "{\"a\":NaN}", "{\"a\":Infinity}",
+        "{\"a\":\"\\u0000\"}", "{\"a\":\"\\ud83d\\ude00\"}", "{\"a\":\"\\ude00\"}",
+        "{\"a\":\"\\ud800\"}", "{\"a\":\"\\/\"}", "{\"a\":\"\\x\"}", "{\"a\":\"\\u12g4\"}",
+        "{\"a\":\"caf\\u00e9\"}", "{\"a\":\"\x7f\"}", "{\"a\":\"\"}",
+        "{\"a\":1,\"b\":0,\"a\":2,\"b\":3}", "{\"\\u0061\":1}",
+        "[]", "{}", "null", "true", "42", "-17", "\"hi\"", "  {\"a\":1}  ",
+        "[1,2,]", "{,}", "{\"a\"}", "{\"a\":}", "[}", "nul", "{\"a\":\"unterminated}",
+        "", "   ", "{\"a\":1} x", "{\"a\":1} {\"b\":2}",
+    };
+    for (const char* c : cases) {
+        const std::string s = c;
+        bool over = false, deep = false;
+        const json got = parse_json_bounded(s, 1 << 20, &over, &deep);
+        const json want = json::parse(s, nullptr, false);
+        CHECK_EQ(got.is_discarded(), want.is_discarded());
+        CHECK(!over && !deep);
+        if (!want.is_discarded()) {
+            CHECK_EQ(got.dump(), want.dump());
+            CHECK_EQ(got.type(), want.type());
+        }
+    }
+    /* A BOM is skipped, as the reference reader skips it; invalid UTF-8 and a CESU-8
+     * surrogate are refused. */
+    {
+        bool over = false, deep = false;
+        const json j = parse_json_bounded(std::string("\xef\xbb\xbf") + "{\"a\":1}", 0, &over, &deep);
+        CHECK(!j.is_discarded());
+        CHECK_EQ(j["a"].get<uint64_t>(), 1u);
+        CHECK(parse_json_bounded("{\"a\":\"\xff\"}", 0, &over, &deep).is_discarded());
+        CHECK(parse_json_bounded("{\"a\":\"\xc3\x28\"}", 0, &over, &deep).is_discarded());
+        CHECK(parse_json_bounded("{\"a\":\"\xed\xa0\x80\"}", 0, &over, &deep).is_discarded());
+        CHECK(!parse_json_bounded("{\"a\":\"\xc3\xa9\"}", 0, &over, &deep).is_discarded());
+    }
+    /* Number typing is pinned, because the request parser's checks read it. */
+    {
+        bool over = false, deep = false;
+        const json j = parse_json_bounded(
+            "{\"u\":5,\"n\":-5,\"big\":9223372036854775808,\"huge\":18446744073709551616}",
+            0, &over, &deep);
+        CHECK(j["u"].is_number_unsigned());
+        CHECK(!j["n"].is_number_unsigned() && j["n"].is_number_integer());
+        CHECK(j["big"].is_number_unsigned());
+        CHECK(j["huge"].is_number_float());
+        /* Duplicate keys: the last value at the first key's position. */
+        const json d = parse_json_bounded("{\"a\":1,\"b\":0,\"a\":2}", 0, &over, &deep);
+        CHECK_EQ(d.dump(), std::string("{\"a\":2,\"b\":0}"));
+    }
+}
+
+TEST(the_bounded_body_reader_keeps_the_value_and_depth_boundaries) {
+    auto ask = [](const std::string& s, bool* over, bool* deep, int64_t ctx = 0) {
+        *over = *deep = false;
+        return parse_json_bounded(s, ctx, over, deep);
+    };
+    auto nested = [](int n, bool scalar) {
+        std::string s((size_t)n, '[');
+        if (scalar) s += '1';
+        return s + std::string((size_t)n, ']');
+    };
+    bool over, deep;
+    /* A value nested kJsonMaxDepth below the root is the deepest accepted. The innermost
+     * empty container sits one level above its would-be elements, hence the off-by-one
+     * between the scalar and empty shapes: both are the reference reader's boundaries. */
+    ask(nested(kJsonMaxDepth, true), &over, &deep);
+    CHECK(!deep && !over);
+    ask(nested(kJsonMaxDepth + 1, true), &over, &deep);
+    CHECK(deep && !over);
+    ask(nested(kJsonMaxDepth + 1, false), &over, &deep);
+    CHECK(!deep && !over);
+    ask(nested(kJsonMaxDepth + 2, false), &over, &deep);
+    CHECK(deep && !over);
+
+    /* Every value counts once -- containers included, keys excluded. The budget at ctx 0 is
+     * the floor. One repeated key in the object shape: a million distinct keys would pay
+     * the ordered map's quadratic insert for no extra information. */
+    const int64_t budget = json_value_budget(0);
+    auto flat = [](int64_t n, bool object) {
+        std::string s = object ? "{" : "[";
+        for (int64_t i = 0; i < n; ++i) {
+            if (i) s += ',';
+            s += object ? "\"k\":1" : "1";
+        }
+        return s + (object ? '}' : ']');
+    };
+    ask(flat(budget - 1, false), &over, &deep);   /* root + elements == budget */
+    CHECK(!over && !deep);
+    ask(flat(budget, false), &over, &deep);
+    CHECK(over && !deep);
+    ask(flat(budget - 1, true), &over, &deep);
+    CHECK(!over && !deep);
+    ask(flat(budget, true), &over, &deep);
+    CHECK(over && !deep);
+
+    /* An over-deep or over-budget body still returns a usable (null) value rather than a
+     * discarded one, matching the reference reader: a caller tests discarded for "not JSON"
+     * before it tests the flags. */
+    CHECK(!ask(nested(kJsonMaxDepth + 5, true), &over, &deep).is_discarded());
+    CHECK(deep);
 }
 
 RAD_TEST_MAIN()

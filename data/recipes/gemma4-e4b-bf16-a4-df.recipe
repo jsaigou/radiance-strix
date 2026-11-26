@@ -1,7 +1,7 @@
 # gemma4-e4b-bf16-a4-df.recipe -- Gemma 4 E4B (text, vision, NVIDIA's DFlash drafter) from a bf16 checkpoint,
 # 4-bit: the feed-forward as asymmetric int4 (u4 codes, a u8 zero point and an f16 scale per [1 x 128]),
 # attention and layers 19-23 as int8 with a bf16 scale per [1 x 128] (i8a8). An int8 lm_head, the drafter on
-# block FP8, the vision tower bf16.
+# int8 (w8a8), the vision tower bf16.
 #
 #   rad-convert <checkpoint> --recipe data/recipes/gemma4-e4b-bf16-a4-df.recipe --draft-model <dflash-bf16> \
 #       --set quantization_config.quant_method=compressed-tensors -o gemma4-e4b-a4-df.rad
@@ -39,11 +39,11 @@ blk.*.ffn_gate_up.weight   rtn  codes=u4 zero=u8 group=128 scale=f16 rule=search
 
 output.weight              rtn  codes=i8 group=128 scale=bf16 clamp=sym
 
-dflash.fc.weight                 rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.attn_q.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.attn_k.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.attn_v.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.attn_output.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.ffn_gate_up.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.ffn_down.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.draft_head.weight         rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.fc.weight                 rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.attn_q.weight       rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.attn_k.weight       rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.attn_v.weight       rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.attn_output.weight  rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.ffn_gate_up.weight  rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.ffn_down.weight     rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.draft_head.weight         rtn codes=i8 group=128 scale=f16 clamp=sym

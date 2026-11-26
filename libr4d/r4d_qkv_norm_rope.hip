@@ -25,12 +25,12 @@
 //
 // `qkv_norm_rope_kv_store` is the same launch followed by `kv_store`: the block of a k head (and of
 // a v head) ends holding its token's finished head, so it also writes it into the paged cache at
-// the token's slot, converted as kv_store converts it (E4M3: times the inverse descale, clamped to
-// +-448, v_cvt_pk_fp8_f32 four columns a lane; bf16: the values as they are). The head is staged in
-// LDS for that, since the fp8 store packs four neighbouring columns a lane. Byte-identical to the
-// pair at either cache width; the k, v and q rows are still written, as the pair leaves them.
+// the token's slot, converted as kv_store converts it (the int8 cache: the head's codes against its
+// absmax / 127 as an f16, kv_store_i8's bytes; bf16: the values as they are). The head is staged in
+// LDS for that, since the int8 store takes the head's absmax first. Byte-identical to the pair at
+// either cache; the k, v and q rows are still written, as the pair leaves them.
 //
-// Returns a negative code instead of throwing, for the reason given in r4d_gemm_fp8a8.hip.
+// Returns a negative code instead of throwing: a kernel entry point has no caller to catch.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_emit.h"
@@ -88,27 +88,29 @@ __device__ __forceinline__ void rotate(const uint16_t* __restrict__ nb, uint16_t
     }
 }
 
-// One head into the paged cache at element offset `off` (r4d_model_bf16.hip's kv_store kernels):
-// KV 1 an E4M3 cache, four columns a lane as kv_store_fp8_kernel converts them; KV 2 a bf16 cache,
-// the values as they are. `src` is the head in LDS, complete before the call.
+// One head into the paged cache (r4d_model_bf16.hip's kv_store kernels). `src` is the head in LDS,
+// complete before the call. KV 2, a bf16 cache: the values as they are, at element offset `off`.
+// KV 1, the int8 cache: the head's int8 codes at byte offset `off` and its f16 scale (absmax / 127,
+// the codes taken against the rounded scale) at byte offset `soff`, as kv_store_i8 writes them;
+// `red` is a wave's slot each for the block's absmax, and the call holds a barrier, so the whole
+// block makes it.
 template <uint32_t HD, int KV>
-__device__ __forceinline__ void kv_put(void* __restrict__ kv, size_t off,
-                                       const uint16_t* __restrict__ src, float inv) {
+__device__ __forceinline__ void kv_put(void* __restrict__ kv, size_t off, size_t soff,
+                                       const uint16_t* __restrict__ src, float* red) {
     const uint32_t t = threadIdx.x;
     if (KV == 1) {
-        if (t < HD / 4) {
-            const uint32_t d = t * 4u;
-            float f[4];
+        const float f = bf2f(src[t]);
+        float am = r4d_wave_max(fabsf(f));
+        if ((t & 31u) == 0u) red[t >> 5] = am;
+        __syncthreads();
+        am = 0.0f;
 #pragma unroll
-            for (int e = 0; e < 4; ++e) f[e] = bf2f(src[d + (uint32_t)e]) * inv;
-            // clamped because v_cvt_pk_fp8_f32 returns NaN out of range instead of saturating
-            int pk = 0;
-            pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(f[0], -448.0f), 448.0f),
-                                                 fminf(fmaxf(f[1], -448.0f), 448.0f), pk, false);
-            pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(f[2], -448.0f), 448.0f),
-                                                 fminf(fmaxf(f[3], -448.0f), 448.0f), pk, true);
-            *(uint32_t*)((uint8_t*)kv + off + d) = (uint32_t)pk;
-        }
+        for (uint32_t w = 0; w < HD / kWave; ++w) am = fmaxf(am, red[w]);
+        const __fp16 s16 = (__fp16)fminf(am / 127.0f, 515.0f);
+        const float sc = (float)s16;
+        const float r = sc > 0.0f ? rintf(f / sc) : 0.0f;
+        ((uint8_t*)kv)[off + t] = (uint8_t)(int8_t)(int)fminf(fmaxf(r, -127.0f), 127.0f);
+        if (t == 0u) *(uint16_t*)((uint8_t*)kv + soff) = __builtin_bit_cast(uint16_t, s16);
     } else if (KV == 2) {
         for (uint32_t i = t; i < HD; i += HD) ((uint16_t*)kv)[off + i] = src[i];
     }
@@ -117,9 +119,10 @@ __device__ __forceinline__ void kv_put(void* __restrict__ kv, size_t off,
 // blockIdx.y: [0, nq) a query head, [nq, nq+nkv) a key head (and with VK its value, from the raw
 // key), [nq+nkv, nq+2nkv) a value head normalised in place (without VK).
 //
-// KV 1 or 2 also stores each k and v head into the paged cache [n_blocks, nkv, block_size, 2*HD]
-// at slot[m] (k at column 0, v at HD), for rows m < n_slot whose slot is in range; KV 0 stores
-// nothing and ignores the cache arguments.
+// KV 1 or 2 also stores each k and v head into the paged cache [n_blocks, nkv, block_size, row] at
+// slot[m] (k at column 0, v at HD; row 2*HD, or 2*HD + 4 at the int8 cache, whose two scales
+// follow the codes), for rows m < n_slot whose slot is in range; KV 0 stores nothing and ignores
+// the cache arguments.
 // The body: its blocks return early (rows past the cliff, value heads), so the chained form
 // (r4d_chain.h) wraps it below rather than bracketing it in place.
 template <uint32_t HD, bool WF32, bool VK, int KV>
@@ -130,7 +133,7 @@ __device__ __forceinline__ void qkv_norm_rope_body(
     uint32_t q_ld, uint32_t k_ld, uint32_t v_ld, float eps, float wadd,
     uint32_t rot, uint32_t nfreq, int den, float theta, float rscale, uint32_t n_pos,
     uint32_t m_rows, const int32_t* __restrict__ slot, void* __restrict__ kvc, uint32_t n_slot,
-    uint32_t block_size, uint32_t n_blocks, float k_inv, float v_inv, uint32_t vnorm) {
+    uint32_t block_size, uint32_t n_blocks, uint32_t vnorm) {
     __shared__ float l1[HD / kWave], l2[HD / kWave];
     __shared__ uint16_t nb[HD];
     __shared__ uint16_t sb[KV ? HD : 1];           // the head this block stores
@@ -141,7 +144,8 @@ __device__ __forceinline__ void qkv_norm_rope_body(
     // rope rotates only the rows its positions cover; a row past them is normed and not rotated
     const float p0 = m < n_pos ? (float)pos[m] / div : 0.0f;
     // The row's cache slot, as kv_store reads it: a negative or out-of-range slot stores nothing.
-    // Uniform over the block, so the barriers below are too.
+    // Uniform over the block, so the barriers below are too. ROW is a token's row in a head.
+    constexpr size_t ROW = KV == 1 ? 2 * HD + 4 : 2 * HD;
     size_t base = 0;
     bool put = false;
     if (KV && m < n_slot) {
@@ -149,10 +153,10 @@ __device__ __forceinline__ void qkv_norm_rope_body(
         if (sl >= 0 && (uint32_t)sl / block_size < n_blocks) {
             put = true;
             base = ((size_t)((uint32_t)sl / block_size) * nkv * block_size +
-                    (size_t)((uint32_t)sl % block_size)) * 2 * HD;
+                    (size_t)((uint32_t)sl % block_size)) * ROW;
         }
     }
-    const size_t head_step = (size_t)block_size * 2 * HD;
+    const size_t head_step = (size_t)block_size * ROW;
 
     if (hh >= nq + nkv) {   // a value head, in place: rmsnorm_p (or, without v_norm, only stored)
         const uint32_t h = hh - nq - nkv;
@@ -170,7 +174,8 @@ __device__ __forceinline__ void qkv_norm_rope_body(
         }
         if (KV && put) {
             __syncthreads();
-            kv_put<HD, KV>(kvc, base + (size_t)h * head_step + HD, sb, v_inv);
+            const size_t r0 = base + (size_t)h * head_step;
+            kv_put<HD, KV>(kvc, r0 + HD, r0 + 2 * HD + 2, sb, l1);
         }
         return;
     }
@@ -200,8 +205,9 @@ __device__ __forceinline__ void qkv_norm_rope_body(
     else for (uint32_t i = t; i < HD; i += HD) { x[i] = nb[i]; if (st) st[i] = nb[i]; }
     if (KV && !isq && put) {
         __syncthreads();   // the stored head (and VK's value) complete in LDS
-        kv_put<HD, KV>(kvc, base + (size_t)h * head_step, sb, k_inv);
-        if (VK) kv_put<HD, KV>(kvc, base + (size_t)h * head_step + HD, vb, v_inv);
+        const size_t r0 = base + (size_t)h * head_step;
+        kv_put<HD, KV>(kvc, r0, r0 + 2 * HD, sb, l1);
+        if (VK) kv_put<HD, KV>(kvc, r0 + HD, r0 + 2 * HD + 2, vb, l2);
     }
 }
 
@@ -211,9 +217,9 @@ __device__ __forceinline__ void qkv_norm_rope_body(
     uint32_t q_ld, uint32_t k_ld, uint32_t v_ld, float eps, float wadd,                              \
     uint32_t rot, uint32_t nfreq, int den, float theta, float rscale, uint32_t n_pos,                \
     uint32_t m_rows, const int32_t* __restrict__ slot, void* __restrict__ kvc, uint32_t n_slot,      \
-    uint32_t block_size, uint32_t n_blocks, float k_inv, float v_inv, uint32_t vnorm
+    uint32_t block_size, uint32_t n_blocks, uint32_t vnorm
 #define R4D_QNR_ARGS q, k, v, pos, qw, kw, nq, nkv, pq, pk, pv, q_ld, k_ld, v_ld, eps, wadd, rot, nfreq, \
-    den, theta, rscale, n_pos, m_rows, slot, kvc, n_slot, block_size, n_blocks, k_inv, v_inv, vnorm
+    den, theta, rscale, n_pos, m_rows, slot, kvc, n_slot, block_size, n_blocks, vnorm
 // The plain kernel, and the chained one (r4dchain*, r4d_chain.h) wrapping the same body.
 template <uint32_t HD, bool WF32, bool VK, int KV>
 __global__ __launch_bounds__(HD) void qkv_norm_rope_kernel(R4D_QNR_PARAMS) {
@@ -257,7 +263,9 @@ static int qkv_norm_rope_launch(const RadArgs* a, RadStream stream, bool store) 
     const long long vn  = r4d_geti_or(a, "v_norm", 1);
     if (hd != 128 && hd != 256 && hd != 512) return R4D_NO(RAD_E_SHAPE);
     if (vk && !vn) return R4D_NO(RAD_E_INVAL);   // v from k is v's norm
-    if (nq < 0 || nkv <= 0 || rot <= 0 || rot > hd || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
+    /* rot 0 is the NoPE layer: the norm still runs, and `rotate` with half = 0 only copies the
+     * unrotated tail, which is the whole head. */
+    if (nq < 0 || nkv <= 0 || rot < 0 || rot > hd || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(qw) != hd || r4d_numel(kw) != hd) return R4D_NO(RAD_E_SHAPE);
     const char* mode = r4d_gets(a, "mode");
     if (mode && std::strcmp(mode, "neox")) return R4D_NO(RAD_E_UNSUPPORTED);
@@ -299,34 +307,25 @@ static int qkv_norm_rope_launch(const RadArgs* a, RadStream stream, bool store) 
     const bool chain = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;   /* RadKernelChainFn, decode */
 
     // The store's geometry, checked as kv_store_geom checks it (r4d_model_bf16.hip).
-    int kvw = 0;   // 0 none, 1 E4M3, 2 bf16
+    int kvw = 0;   // 0 none, 1 the int8 cache, 2 bf16
     const RadTensor* sm = nullptr;
     const RadTensor* kv = nullptr;
     long long bs = 0, nblk = 0, nslot = 0;
-    float kinv = 1.0f, vinv = 1.0f;
     if (store) {
         sm = r4d_opt(a, QN_SLOT);
         kv = r4d_opt(a, QN_CACHE);
         if (!sm || !kv) return R4D_NO(RAD_E_INVAL);
         if (sm->dtype != RAD_I32 || !r4d_contig(sm) || !r4d_contig(kv)) return R4D_NO(RAD_E_STRIDE);
+        if (kv->dtype == RAD_I8)        kvw = 1;
+        else if (kv->dtype == RAD_BF16) kvw = 2;
+        else return R4D_NO(RAD_E_DTYPE);
         bs = r4d_geti_or(a, "block_size", 0);
         if (bs <= 0 || kv->rank != 4 || kv->shape[1] != nkv || kv->shape[2] != bs ||
-            kv->shape[3] != 2 * hd)
+            kv->shape[3] != (kvw == 1 ? 2 * hd + 4 : 2 * hd))
             return R4D_NO(RAD_E_SHAPE);
         nblk  = kv->shape[0];
         nslot = r4d_numel(sm);
         if (nslot <= 0 || nslot > M) return R4D_NO(RAD_E_SHAPE);
-        if (kv->dtype == RAD_F8E4M3) {
-            const double ks = r4d_getf(a, "k_scale", 1.0), vs = r4d_getf(a, "v_scale", 1.0);
-            if (!(ks > 0.0) || !(vs > 0.0)) return R4D_NO(RAD_E_INVAL);
-            kinv = 1.0f / (float)ks;
-            vinv = 1.0f / (float)vs;
-            kvw = 1;
-        } else if (kv->dtype == RAD_BF16) {
-            kvw = 2;
-        } else {
-            return R4D_NO(RAD_E_DTYPE);
-        }
     }
 
 #define R4D_QNR_T(HD, WF, VK, KV) emit_rc = chain ? R4D_QNR_C(HD, WF, VK, KV, true) : R4D_QNR_C(HD, WF, VK, KV, false)
@@ -335,7 +334,7 @@ static int qkv_norm_rope_launch(const RadArgs* a, RadStream stream, bool store) 
     r4d_p(qw), r4d_p(kw), (uint32_t)nq, (uint32_t)nkv, pq, pk, pv, (uint32_t)q_ld, (uint32_t)k_ld,          \
     (uint32_t)v_ld, eps, wadd, (uint32_t)rot_l, (uint32_t)nfreq, (int)den, theta, rsc, (uint32_t)Mp,        \
     (uint32_t)M, (const int32_t*)(sm ? r4d_p(sm) : nullptr), (void*)(kv ? r4d_wp(kv) : nullptr),           \
-    (uint32_t)nslot, (uint32_t)bs, (uint32_t)nblk, kinv, vinv, (uint32_t)(vn ? 1 : 0))
+    (uint32_t)nslot, (uint32_t)bs, (uint32_t)nblk, (uint32_t)(vn ? 1 : 0))
 #define R4D_QNR_KV(HD, WF, VK)                                                                          \
     do { if (kvw == 1) R4D_QNR_T(HD, WF, VK, 1); else if (kvw == 2) R4D_QNR_T(HD, WF, VK, 2);           \
          else R4D_QNR_T(HD, WF, VK, 0); } while (0)

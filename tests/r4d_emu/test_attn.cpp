@@ -30,7 +30,7 @@ static RadTensor tens(void* p, uint32_t dt, std::vector<int64_t> shape) {
 struct Case {
     std::string name;
     int hd, gqa, kvh;
-    bool fp8, causal, ragged, descale;
+    bool i8, causal, ragged, descale;    /* i8: the int8 cache, codes and two f16 scales a slot */
     int window;
     std::vector<int> qlen, ctx;          /* per sequence */
     int missing_block = -1;              /* sequence 0's block index to mark -1, or -1 */
@@ -43,24 +43,24 @@ struct Case {
 };
 
 using Fn = int (*)(const RadArgs*, RadStream);
-static Fn pick(int hd, int gqa, bool fp8, bool ahead) {
+static Fn pick(int hd, int gqa, bool i8, bool ahead) {
     if (ahead) {
-#define A(G) if (hd == 256 && gqa == G) return fp8 ? r4d_rad_attn_window_ahead_h256_gqa##G##_fp8 : r4d_rad_attn_window_ahead_h256_gqa##G##_bf16;
+#define A(G) if (hd == 256 && gqa == G) return i8 ? r4d_rad_attn_window_ahead_h256_gqa##G##_i8 : r4d_rad_attn_window_ahead_h256_gqa##G##_bf16;
         A(1) A(2) A(4) A(8)
 #undef A
         return nullptr;
     }
-#define P(H, G) if (hd == H && gqa == G) return fp8 ? r4d_rad_attn_window_h##H##_gqa##G##_fp8 : r4d_rad_attn_window_h##H##_gqa##G##_bf16;
-    P(128, 1) P(256, 1) P(256, 2) P(256, 4) P(256, 8) P(512, 1) P(512, 2) P(512, 4) P(512, 8)
+#define P(H, G) if (hd == H && gqa == G) return i8 ? r4d_rad_attn_window_h##H##_gqa##G##_i8 : r4d_rad_attn_window_h##H##_gqa##G##_bf16;
+    P(128, 1) P(128, 4) P(256, 1) P(256, 2) P(256, 4) P(256, 8) P(512, 1) P(512, 2) P(512, 4) P(512, 8)
     P(512, 16)
 #undef P
     return nullptr;
 }
-static Fn pick_sink(int hd, int gqa, bool fp8) {
+static Fn pick_sink(int hd, int gqa, bool i8) {
     if (hd == 128 && gqa == 8)
-        return fp8 ? r4d_rad_attn_window_sink_h128_gqa8_fp8 : r4d_rad_attn_window_sink_h128_gqa8_bf16;
+        return i8 ? r4d_rad_attn_window_sink_h128_gqa8_i8 : r4d_rad_attn_window_sink_h128_gqa8_bf16;
     if (hd == 128 && gqa == 16)
-        return fp8 ? r4d_rad_attn_window_sink_h128_gqa16_fp8 : r4d_rad_attn_window_sink_h128_gqa16_bf16;
+        return i8 ? r4d_rad_attn_window_sink_h128_gqa16_i8 : r4d_rad_attn_window_sink_h128_gqa16_bf16;
     return nullptr;
 }
 
@@ -81,17 +81,45 @@ static int run(const Case& c) {
      * kernel that reads a masked key's V without guarding is caught */
     const int64_t slot = 2 * HD, nel = (int64_t)nblocks * kvh * 16 * slot;
     std::vector<float> kvf(nel);
-    std::vector<uint16_t> kvb(nel); std::vector<uint8_t> kv8(nel);
-    for (int64_t i = 0; i < nel; ++i) {
-        float v = nrm();
-        if (c.fp8) { kv8[i] = rad_f32_to_fp8e4m3(v * 4.f); kvf[i] = rad_fp8e4m3_to_f32(kv8[i]); }
-        else { kvb[i] = rad_f32_to_bf16(v); kvf[i] = rad_bf16_to_f32(kvb[i]); }
-    }
+    std::vector<uint16_t> kvb(nel);
+    for (int64_t i = 0; i < nel; ++i) { kvb[i] = rad_f32_to_bf16(nrm()); kvf[i] = rad_bf16_to_f32(kvb[i]); }
+    /* The int8 cache's bytes, as kv_store_i8 lays a slot out: K codes, V codes, K's f16 scale, V's.
+     * Each slot's two rows get their own magnitude, so a kernel that used one scale for another
+     * key's codes is caught; kvf holds code times scale, what the reference reads. */
+    const int64_t slot8 = 2 * HD + 4;
+    std::vector<uint8_t> kvi(c.i8 ? (size_t)((int64_t)nblocks * kvh * 16 * slot8) : 0);
+    if (c.i8)
+        for (int64_t r = 0; r < (int64_t)nblocks * kvh * 16; ++r)
+            for (int half = 0; half < 2; ++half) {
+                const float mag = 0.25f + (float)(rng() % 64) / 8.0f;
+                std::vector<float> v((size_t)HD);
+                float am = 0.0f;
+                for (int d = 0; d < HD; ++d) { v[(size_t)d] = nrm() * mag; am = std::max(am, std::fabs(v[(size_t)d])); }
+                const _Float16 s16 = (_Float16)(am / 127.0f);
+                const float sc = (float)s16;
+                for (int d = 0; d < HD; ++d) {
+                    const float q = sc > 0.0f ? std::rint(v[(size_t)d] / sc) : 0.0f;
+                    const int8_t code = (int8_t)std::fmin(std::fmax(q, -127.0f), 127.0f);
+                    kvi[(size_t)(r * slot8 + half * HD + d)] = (uint8_t)code;
+                    kvf[(size_t)(r * slot + half * HD + d)] = (float)code * sc;
+                }
+                std::memcpy(&kvi[(size_t)(r * slot8 + 2 * HD + 2 * half)], &s16, 2);
+            }
     /* poison: every slot at or past a sequence's context in its last block, and every block no
      * table names */
     std::vector<char> named(nblocks, 0);
     for (int s = 0; s < n_seq; ++s) for (int b = 0; b < maxb; ++b) if (bt[s * maxb + b] >= 0) named[bt[s * maxb + b]] = 1;
-    auto poison = [&](int64_t i) { if (c.fp8) { kv8[i] = 0x7f; } else { kvb[i] = 0x7fc0; } kvf[i] = NAN; };
+    /* An int8 slot is poisoned through its scales (an f16 NaN each), which every element of it is
+     * multiplied by. */
+    auto poison = [&](int64_t i) {
+        if (c.i8) {
+            const int64_t r = i / slot;
+            const uint16_t nan16 = 0x7e00;
+            std::memcpy(&kvi[(size_t)(r * slot8 + 2 * HD)], &nan16, 2);
+            std::memcpy(&kvi[(size_t)(r * slot8 + 2 * HD + 2)], &nan16, 2);
+        } else { kvb[i] = 0x7fc0; }
+        kvf[i] = NAN;
+    };
     for (int blk = 0; blk < nblocks; ++blk) if (!named[blk]) for (int64_t i = 0; i < kvh * 16 * slot; ++i) poison((int64_t)blk * kvh * 16 * slot + i);
     for (int s = 0; s < n_seq; ++s) {
         const int last = (c.ctx[s] - 1) / 16, blk = bt[s * maxb + last];
@@ -116,7 +144,8 @@ static int run(const Case& c) {
     for (int h = 0; h < qh; ++h) sinks[h] = h % 5 == 3 ? 6.f + nrm() : h % 7 == 6 ? -40.f : 1.5f * nrm();
     RadTensor t[9];
     t[0] = tens(qb.data(), RAD_BF16, {rows, qh * HD}); t[0].stride[0] = qcols;
-    t[1] = tens(c.fp8 ? (void*)kv8.data() : (void*)kvb.data(), c.fp8 ? RAD_F8E4M3 : RAD_BF16, {nblocks, kvh, 16, slot});
+    t[1] = c.i8 ? tens(kvi.data(), RAD_I8, {nblocks, kvh, 16, slot8})
+                : tens(kvb.data(), RAD_BF16, {nblocks, kvh, 16, slot});
     t[2] = tens(bt.data(), RAD_I32, {n_seq, maxb});
     t[3] = tens(su.data(), RAD_I32, {n_seq});
     t[4] = c.descale ? tens(kd.data(), RAD_F32, {n_seq, kvh}) : RadTensor{};
@@ -131,13 +160,13 @@ static int run(const Case& c) {
     auto pf = [&](const char* k, double v) { RadParam x{}; x.key = k; x.kind = RAD_P_F64; x.dval = v; p.push_back(x); };
     pi("q_len", qmax + 3);  /* the band bound, above the step's max */
     pi("head_dim", HD); pi("gqa", c.gqa); pi("block_size", 16); pi("causal", c.causal && !c.ahead); pi("window", c.window);
-    ps("q_dtype", "bf16"); ps("kv_dtype", c.fp8 ? "fp8_e4m3" : "bf16");
+    ps("q_dtype", "bf16"); ps("kv_dtype", c.i8 ? "i8" : "bf16");
     const double scale = 1.0 / std::sqrt((double)HD) * 1.3;   /* not the default: the param must be read */
     pf("scale", scale); pi("n_head", qh); pi("max_seqs", n_seq);
     if (c.max_ctx) pi("max_ctx", c.max_ctx);
     RadArgs a{}; a.t = t; a.n_t = c.sink ? 9 : 8; a.p = p.data(); a.n_p = (int)p.size();
     a.scratch = c.scratch ? sp : nullptr; a.scratch_bytes = c.scratch;
-    Fn fn = c.sink ? pick_sink(HD, c.gqa, c.fp8) : pick(HD, c.gqa, c.fp8, c.ahead);
+    Fn fn = c.sink ? pick_sink(HD, c.gqa, c.i8) : pick(HD, c.gqa, c.i8, c.ahead);
     if (!fn) { std::printf("%-44s no entry point for this geometry\n", c.name.c_str()); return 1; }
     const int g0 = emu_grids;
     const int rc = fn(&a, nullptr);
@@ -208,16 +237,31 @@ int main(int argc, char** argv) {
          0, 0, 512, 1},
         {"wmma h128 gqa1 swa w1024 ragged", 128, 1, 1, false, true, true, false, 1024, {150, 70},
          {300, 70}, -1, 0, 0, 0, 1},
+        /* LFM3: h128, 16 query heads over 4 KV heads; full layers and a 256-token sliding window.
+         * Prefill and chunked prefill past the decode leg's band, ragged steps with decode rows, a
+         * query whose window starts inside the context, int8 cache */
+        {"h128 gqa4 kvh4 full verify17 split", 128, 4, 4, false, true, false, false, 0, {17}, {300}, -1, 262144, s128},
+        {"h128 gqa4 kvh4 swa w256 ragged", 128, 4, 4, false, true, true, false, 256, {1, 5, 40}, {600, 77, 300}},
+        {"h128 gqa4 kvh2 swa w256 i8+descale split", 128, 4, 2, true, true, false, true, 256, {20}, {700}, -1, 4096, s128},
+        {"h128 gqa4 kvh4 noncausal missing-block", 128, 4, 4, false, false, true, false, 0, {4, 2}, {37, 20}, 1},
+        {"wmma h128 gqa4 kvh4 full prefill 200 of 900", 128, 4, 4, false, true, false, false, 0, {200}, {900},
+         -1, 0, 0, 0, 1},
+        {"wmma h128 gqa4 kvh4 swa w256 prefill 300 of 900", 128, 4, 4, false, true, false, false, 256, {300},
+         {900}, -1, 0, 0, 0, 1},
+        {"wmma h128 gqa4 kvh4 swa w256 ragged + decode rows", 128, 4, 4, false, true, true, false, 256,
+         {150, 1, 70}, {500, 50, 70}, -1, 0, 0, 0, 1},
+        {"wmma h128 gqa4 kvh2 swa w256 i8+descale", 128, 4, 2, true, true, true, true, 256, {100, 90},
+         {400, 90}, -1, 0, 0, 0, 1},
         /* Gemma 4 sliding: h256 gqa2, causal, windowed; a ragged mixed step */
         {"h256 gqa2 swa w64 ragged bf16", 256, 2, 2, false, true, true, false, 64, {1, 5, 40}, {200, 77, 140}},
-        {"h256 gqa2 swa w64 ragged fp8+descale", 256, 2, 2, true, true, true, true, 64, {1, 5, 40}, {200, 77, 140}},
+        {"h256 gqa2 swa w64 ragged i8+descale", 256, 2, 2, true, true, true, true, 64, {1, 5, 40}, {200, 77, 140}},
         /* the real window, a context past it, a verify-sized query */
         {"h256 gqa2 swa w1024 verify16", 256, 2, 1, false, true, false, false, 1024, {16}, {1100}},
         /* split-KV decode: one row a sequence, long context, scratch present */
         {"h256 gqa2 swa w1024 decode split", 256, 2, 2, false, true, true, false, 1024, {1, 1}, {1300, 40}, -1, 0, s256},
         /* Gemma 4 full: h512, causal, no window, at the three TP ratios */
         {"h512 gqa8 full ragged bf16", 512, 8, 1, false, true, true, false, 0, {2, 7}, {90, 33}},
-        {"h512 gqa8 full decode split fp8", 512, 8, 1, true, true, false, true, 0, {1}, {700}, -1, 4096, s512},
+        {"h512 gqa8 full decode split i8", 512, 8, 1, true, true, false, true, 0, {1}, {700}, -1, 4096, s512},
         {"h512 gqa4 full verify16 split", 512, 4, 1, false, true, false, false, 0, {16}, {300}, -1, 1024, s512},
         /* the serving case: max_ctx 262144 gives a decode step 64 splits, most of them empty */
         {"h512 gqa4 full decode, 64 splits, short ctx", 512, 4, 1, false, true, false, false, 0, {4}, {37}, -1, 262144, s512},
@@ -226,7 +270,7 @@ int main(int argc, char** argv) {
         /* Gemma 4 12B full at TP1: 16 q heads over its one kv head, one position a tile; the
          * assistant's full layer is the same geometry at one row a sequence */
         {"h512 gqa16 full ragged bf16", 512, 16, 1, false, true, true, false, 0, {3, 1, 9}, {50, 64, 9}},
-        {"h512 gqa16 full decode split fp8", 512, 16, 1, true, true, false, true, 0, {1}, {700}, -1, 4096, s512},
+        {"h512 gqa16 full decode split i8", 512, 16, 1, true, true, false, true, 0, {1}, {700}, -1, 4096, s512},
         {"h512 gqa16 full verify16 split", 512, 16, 1, false, true, false, false, 0, {16}, {300}, -1, 1024, s512},
         {"h512 gqa16 full decode, 3 seqs, 64 splits", 512, 16, 1, false, true, true, false, 0, {1, 1, 1}, {40, 90, 300}, -1, 262144, s512},
         {"h512 gqa16 kvh2 noncausal missing-block", 512, 16, 2, false, false, true, false, 0, {4, 2}, {37, 20}, 1},
@@ -238,41 +282,55 @@ int main(int argc, char** argv) {
         {"h256 gqa2 decode, split wanted, no scratch", 256, 2, 1, false, true, false, false, 0, {1}, {500}},
         /* Prefill-shaped: the WMMA kernel (a 64-row query, or longer) */
         {"wmma h512 gqa4 prefill 200 of 900", 512, 4, 1, false, true, false, false, 0, {200}, {900}, -1, 262144, s512, 0, 1},
-        {"wmma h512 gqa8 prefill fp8+descale", 512, 8, 1, true, true, false, true, 0, {130}, {130}, -1, 0, 0, 0, 1},
+        {"wmma h512 gqa8 prefill i8+descale", 512, 8, 1, true, true, false, true, 0, {130}, {130}, -1, 0, 0, 0, 1},
         {"wmma h512 gqa2 kvh2 ragged + decode rows", 512, 2, 2, false, true, true, false, 0, {150, 1, 70}, {300, 50, 70}, -1, 0, 0, 0, 1},
         {"wmma h512 gqa1 noncausal", 512, 1, 1, false, false, false, false, 0, {64}, {100}, -1, 0, 0, 0, 1},
         {"wmma h512 gqa16 prefill 200 of 900", 512, 16, 1, false, true, false, false, 0, {200}, {900}, -1, 262144, s512, 0, 1},
-        {"wmma h512 gqa16 ragged + decode rows fp8+descale", 512, 16, 1, true, true, true, true, 0, {150, 1, 70}, {300, 50, 70}, -1, 0, 0, 0, 1},
+        {"wmma h512 gqa16 ragged + decode rows i8+descale", 512, 16, 1, true, true, true, true, 0, {150, 1, 70}, {300, 50, 70}, -1, 0, 0, 0, 1},
         {"wmma h256 gqa2 swa w1024 prefill 300 of 1500", 256, 2, 2, false, true, false, false, 1024, {300}, {1500}, -1, 0, 0, 0, 1},
-        {"wmma h256 gqa2 swa w64 ragged fp8+descale", 256, 2, 2, true, true, true, true, 64, {100, 90}, {250, 90}, -1, 0, 0, 0, 1},
+        {"wmma h256 gqa2 swa w64 ragged i8+descale", 256, 2, 2, true, true, true, true, 64, {100, 90}, {250, 90}, -1, 0, 0, 0, 1},
         {"wmma h256 gqa4 noncausal w20 missing-block", 256, 4, 1, false, false, true, false, 20, {80, 70}, {200, 70}, 3, 0, 0, 0, 1},
         {"wmma h256 gqa8 causal q-pitch slice", 256, 8, 1, false, true, false, false, 0, {64}, {64}, -1, 0, 0, 512, 1},
-        {"wmma h256 gqa1 causal w5 fp8", 256, 1, 1, true, true, false, false, 5, {96}, {150}, -1, 0, 0, 0, 1},
+        {"wmma h256 gqa1 causal w5 i8", 256, 1, 1, true, true, false, false, 5, {96}, {150}, -1, 0, 0, 0, 1},
         /* Gemma 4's picture runs, read again non-causally up to the run's end: 280 rows after a short
          * prefix, after one the window cuts, q at the fused plane's pitch, a run's tail after a prefix hit */
         {"wmma h256 gqa2 picture 280 of 300", 256, 2, 2, false, false, false, false, 1024, {280}, {300}, -1, 0, 0, 0, 1},
-        {"wmma h256 gqa2 picture 280 of 1500 fp8", 256, 2, 2, true, false, false, true, 1024, {280}, {1500}, -1, 0, 0, 0, 1},
+        {"wmma h256 gqa2 picture 280 of 1500 i8", 256, 2, 2, true, false, false, true, 1024, {280}, {1500}, -1, 0, 0, 0, 1},
         {"wmma h256 gqa2 picture q-pitch slice", 256, 2, 2, false, false, false, false, 1024, {96}, {120}, -1, 0, 0, 512, 1},
         {"h256 gqa2 picture tail split", 256, 2, 2, false, false, false, false, 1024, {10}, {1300}, -1, 0, s256, 0, 0},
         /* a picture longer than the window, whose rows read every later key (attn_paged_ahead): the
          * window is 20 here, the rows 70 to 100, and the scalar, split and WMMA kernels all take it */
         {"h256 gqa2 ahead w20 verify-like", 256, 2, 2, false, false, false, false, 20, {6}, {70}, -1, 0, 0, 0, 0, true},
-        {"h256 gqa2 ahead w20 ragged fp8", 256, 2, 2, true, false, true, true, 20, {3, 1, 9}, {50, 64, 40}, -1, 0, 0, 0, 0, true},
+        {"h256 gqa2 ahead w20 ragged i8", 256, 2, 2, true, false, true, true, 20, {3, 1, 9}, {50, 64, 40}, -1, 0, 0, 0, 0, true},
         {"h256 gqa1 ahead w5 missing-block", 256, 1, 1, false, false, true, false, 5, {4, 2}, {37, 20}, 1, 0, 0, 0, 0, true},
         {"h256 gqa4 ahead w20 split", 256, 4, 1, false, false, false, false, 20, {5}, {300}, -1, 4096, s256, 0, 0, true},
         {"wmma h256 gqa2 ahead w20 picture 100 of 100", 256, 2, 2, false, false, false, false, 20, {100}, {100}, -1, 0, 0, 0, 1, true},
-        {"wmma h256 gqa2 ahead w20 picture 90 of 300 fp8", 256, 2, 2, true, false, false, true, 20, {90}, {300}, -1, 0, 0, 0, 1, true},
+        {"wmma h256 gqa2 ahead w20 picture 90 of 300 i8", 256, 2, 2, true, false, false, true, 20, {90}, {300}, -1, 0, 0, 0, 1, true},
+        /* the int8 cache (kv_store_i8's slots) at Gemma 4 26B-A4B's two geometries: decode with the
+         * split, a ragged verify, prefill on the WMMA kernel with a missing block, the sliding
+         * window, a picture's non-causal rows and the open-ended window */
+        {"h512 gqa8 i8 decode split", 512, 8, 1, true, true, false, false, 0, {1}, {700}, -1, 4096, s512, 0, -1, false},
+        {"h512 gqa8 i8 verify ragged", 512, 8, 1, true, true, true, false, 0, {16, 3}, {300, 70}, -1, 0, 0, 0, 0, false},
+        {"wmma h512 gqa8 i8 prefill 130", 512, 8, 1, true, true, false, false, 0, {130}, {130}, -1, 0, 0, 0, 1, false},
+        {"wmma h512 gqa8 i8 ragged missing-block", 512, 8, 1, true, true, true, false, 0, {200, 70}, {900, 70}, 3, 0, 0, 0, 1, false},
+        {"h256 gqa2 i8 swa w64 ragged", 256, 2, 2, true, true, true, false, 64, {1, 5, 40}, {200, 77, 140}, -1, 0, 0, 0, -1, false},
+        {"h256 gqa2 i8 decode split", 256, 2, 2, true, true, false, false, 1024, {1}, {1300}, -1, 4096, s256, 0, -1, false},
+        {"wmma h256 gqa2 i8 swa w1024 prefill 300 of 1500", 256, 2, 2, true, true, false, false, 1024, {300}, {1500}, -1, 0, 0, 0, 1, false},
+        {"wmma h256 gqa2 i8 picture 280 of 1500", 256, 2, 2, true, false, false, false, 1024, {280}, {1500}, -1, 0, 0, 0, 1, false},
+        {"h256 gqa2 i8 ahead w20 ragged", 256, 2, 2, true, false, true, false, 20, {3, 1, 9}, {50, 64, 40}, -1, 0, 0, 0, 0, true},
+        {"wmma h256 gqa2 i8 ahead w20 picture 90 of 300", 256, 2, 2, true, false, false, false, 20, {90}, {300}, -1, 0, 0, 0, 1, true},
         /* LiLiCorr's drafter (attn_paged_sink): 32 query heads over 2 KV heads at h128 (16 over 1 at
          * TP 2), a block of 8 non-causal rows past the context, a 1024-token window; one sequence
-         * and a batch, unsplit and split, a bf16 and an fp8 cache */
+         * and a batch, unsplit and split, a bf16 and an int8 cache, and a prefill-shaped launch
+         * that takes the WMMA kernel (with and without int8 descales) */
         {"sink h128 gqa16 kvh2 block8 w1024", 128, 16, 2, false, false, false, false, 1024, {8}, {1500},
          -1, 0, 0, 0, -1, false, true},
         {"sink h128 gqa16 kvh1 block8 x3 split", 128, 16, 1, false, false, true, false, 1024, {8, 8, 8},
          {900, 40, 2100}, -1, 262144, s128, 0, -1, false, true},
-        {"sink h128 gqa16 kvh2 fp8+descale split", 128, 16, 2, true, false, false, true, 1024, {8}, {1300},
+        {"sink h128 gqa16 kvh2 i8+descale split", 128, 16, 2, true, false, false, true, 1024, {8}, {1300},
          -1, 262144, s128, 0, -1, false, true},
-        {"sink h128 gqa16 prefill-shaped stays scalar", 128, 16, 1, false, false, false, false, 1024, {96},
-         {400}, -1, 0, 0, 0, 0, false, true},
+        {"sink h128 gqa16 prefill-shaped takes WMMA", 128, 16, 1, false, false, false, false, 1024, {96},
+         {400}, -1, 0, 0, 0, 1, false, true},
         {"sink h128 gqa16 missing-block", 128, 16, 1, false, false, false, false, 1024, {8}, {70}, 1,
          0, 0, 0, -1, false, true},
         /* and at TP 4, 8 query heads over the rank's replicated KV head */
@@ -280,10 +338,32 @@ int main(int argc, char** argv) {
          -1, 0, 0, 0, -1, false, true},
         {"sink h128 gqa8 kvh1 block8 x3 split", 128, 8, 1, false, false, true, false, 1024, {8, 8, 8},
          {900, 40, 2100}, -1, 262144, s128, 0, -1, false, true},
-        {"sink h128 gqa8 kvh1 fp8+descale split", 128, 8, 1, true, false, false, true, 1024, {8}, {1300},
+        {"sink h128 gqa8 kvh1 i8+descale split", 128, 8, 1, true, false, false, true, 1024, {8}, {1300},
          -1, 262144, s128, 0, -1, false, true},
-        {"sink h128 gqa8 prefill-shaped stays scalar", 128, 8, 1, false, false, false, false, 1024, {96},
-         {400}, -1, 0, 0, 0, 0, false, true},
+        {"sink h128 gqa8 prefill-shaped takes WMMA", 128, 8, 1, false, false, false, false, 1024, {96},
+         {400}, -1, 0, 0, 0, 1, false, true},
+        {"sink h128 gqa8 prefill-shaped WMMA i8+descale", 128, 8, 1, true, false, false, true, 1024,
+         {96}, {400}, -1, 0, 0, 0, 1, false, true},
+        {"sink h128 gqa16 prefill-shaped WMMA i8+descale", 128, 16, 1, true, false, false, true, 1024,
+         {96}, {400}, -1, 0, 0, 0, 1, false, true},
+        /* Recursive Flint (arch/flint): 32 query heads over 4 KV heads at h128 (gqa 8 at TP 1 and
+         * 2), causal, a sink on every layer; the sliding layers' 513-token window and the full
+         * layers' none. Prefill on the WMMA kernel, ragged with decode rows beside it and with a
+         * missing block, and decode on the scalar kernel's split, at both caches. */
+        {"sink h128 gqa8 kvh4 causal w513 prefill 300 of 1200", 128, 8, 4, false, true, false, false,
+         513, {300}, {1200}, -1, 0, 0, 0, 1, false, true},
+        {"sink h128 gqa8 kvh4 causal w513 prefill 300 of 1200 i8", 128, 8, 4, true, true, false, false,
+         513, {300}, {1200}, -1, 0, 0, 0, 1, false, true},
+        {"sink h128 gqa8 kvh2 causal full prefill 200 of 900 i8", 128, 8, 2, true, true, false, false,
+         0, {200}, {900}, -1, 0, 0, 0, 1, false, true},
+        {"sink h128 gqa8 kvh2 causal full ragged + decode rows", 128, 8, 2, false, true, true, false,
+         0, {150, 1, 70}, {300, 50, 70}, -1, 0, 0, 0, 1, false, true},
+        {"sink h128 gqa8 kvh2 causal w513 ragged missing-block i8", 128, 8, 2, true, true, true, false,
+         513, {130, 70}, {700, 70}, 3, 0, 0, 0, 1, false, true},
+        {"sink h128 gqa8 kvh4 causal w513 decode split i8", 128, 8, 4, true, true, true, false, 513,
+         {1, 1}, {1300, 40}, -1, 262144, s128, 0, -1, false, true},
+        {"sink h128 gqa8 kvh4 causal full decode split", 128, 8, 4, false, true, true, false, 0,
+         {1, 1}, {1300, 40}, -1, 262144, s128, 0, -1, false, true},
         /* and what must stay scalar: a verify batch, many sequences, a few rows each */
         {"scalar: 8 x verify16, ragged", 512, 4, 1, false, true, true, false, 0, {16, 16, 16, 16, 16, 16, 16, 16},
          {40, 50, 60, 70, 80, 90, 100, 110}, -1, 262144, s512, 0, 0},
@@ -295,7 +375,7 @@ int main(int argc, char** argv) {
         for (int it = 0; it < n; ++it) {
             Case c;
             c.hd = hds[rng() % 2]; c.gqa = gqas[rng() % 4]; c.kvh = 1 + rng() % 3;
-            c.fp8 = rng() % 2; c.causal = rng() % 4 != 0; c.ragged = rng() % 2; c.descale = rng() % 2;
+            c.i8 = rng() % 2; c.causal = rng() % 4 != 0; c.ragged = rng() % 2; c.descale = rng() % 2;
             c.window = rng() % 3 == 0 ? 0 : 1 + rng() % 200;
             const int ns = 1 + rng() % 4;
             const bool pre = rng() % 3 == 0;         /* prefill-shaped: the WMMA kernel */
@@ -311,7 +391,7 @@ int main(int argc, char** argv) {
             if (rng() % 2) c.max_ctx = 512;
             if (rng() % 5 == 0) c.missing_block = (int)(rng() % ((c.ctx[0] + 15) / 16));
             c.name = "sweep " + std::to_string(it) + " h" + std::to_string(c.hd) + " g" + std::to_string(c.gqa) +
-                     " kvh" + std::to_string(c.kvh) + (c.fp8 ? " fp8" : " bf16") + (c.causal ? " c" : " nc") +
+                     " kvh" + std::to_string(c.kvh) + (c.i8 ? " i8" : " bf16") + (c.causal ? " c" : " nc") +
                      " w" + std::to_string(c.window) + (c.ragged ? " rag" : "");
             const int g0 = emu_grids;
             fails += run(c);

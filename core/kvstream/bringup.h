@@ -50,9 +50,10 @@ bool kvstream_op_gated(const RadBuildCtx& ctx, const char* op);
  *
  *   - The group is kv_stream_group's. A ring that covers its context streams nothing.
  *   - An architecture with no streamed path for the group (kvstream_ops: no kv_resolve, or no
- *     streamed store, as for a packed fp8_v4 / k6_v4 cache) ignores the flag with one warning
- *     naming the missing op or the layout; `out` is then exactly the no-flag configuration.
- *   - A core dtype other than E4M3 or bf16 is refused: the streamed store has rows for those only.
+ *     streamed store) ignores the flag with one warning naming the missing op; `out` is then
+ *     exactly the no-flag configuration.
+ *   - A core dtype other than int8, bf16 or E4M3 is refused: the streamed store has rows for
+ *     those only.
  *   - A ring below the decode-step bound or kStreamFloorTokens is raised, with one warning.
  *     --kv-resident itself is left as given; `out` holds both numbers for the report. */
 int kvstream_configure(const Config& cfg, int64_t ctx, const std::vector<KVGroupInfo>& groups,

@@ -277,6 +277,27 @@ int r3d_shape_kv_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
 
 /* x[r] = wte[ids[r] - vocab_offset]. Ids are global, so the draw's bound is `vocab_offset + n_vocab`:
  * under a shard the draw crosses the slice boundary and exercises the zero-row path. */
+/* The KDA recurrence (r3d_kda_update.hip). The state cache's slot axis is the step's candidate
+ * count plus one, and `state_idx` draws inside it, uniquely per sequence. */
+int r3d_shape_kda_update(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const char* form = gs(p, n_p, "state_form");
+    if (form && !std::strcmp(form, "anchor")) return RAD_E_UNSUPPORTED;
+    const int64_t M = gi(p, n_p, "M", 0), H = gi(p, n_p, "heads", 0);
+    const int64_t K = gi(p, n_p, "head_k", 0), V = gi(p, n_p, "head_v", 0);
+    const uint32_t D = act_dt(p, n_p);
+    const char* mode = gs(p, n_p, "mode");
+    const int64_t history = (mode && !std::strcmp(mode, "verify")) ? M : 1;
+    const RadOpdDesc l[] = {
+        opd(D, M, H, K), opd(D, M, H, K), opd(D, M, H, V), opd(D, M, H, K), opd(D, M, H),
+        opd((uint32_t)RAD_F32, H), opd((uint32_t)RAD_F32, H * K),
+        opd((uint32_t)RAD_F32, history + 1, H, V, K),
+        opd_idx(1, history + 1, -1, RAD_OPD_F_IDX_UNIQUE, history),
+        opd_idx(2, M, -1, RAD_OPD_F_IDX_CU),
+        opd_idx(1, 0, 1), opd_idx(1, 0, 1), opd(D, M, H, V),
+    };
+    R3D_PICK(l);
+}
+
 int r3d_shape_embed_lookup(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M  = gi(p, n_p, "M", 0);
     const int64_t ne = gi(p, n_p, "n_embd", 0);
@@ -504,6 +525,15 @@ int r3d_shape_gemm_nt(const RadParam* p, int n_p, int operand, RadOpdDesc* out) 
     const RadOpdDesc list[] = { opd(D, M, K), opd(D, N, K), opd(D, M, N) };   /* a, b, y */
     R3D_PICK(list);
 }
+/* y[M,N] = a[M,K] @ b[N,K]^T with an F32 weight and output: the router's logits and the index
+ * gates, the row's own dtype. */
+int r3d_shape_gemm_nt_f32(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0), K = gi(p, n_p, "K", 0);
+    const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, K), opd((uint32_t)RAD_F32, N, K),
+                                opd((uint32_t)RAD_F32, M, N) };   /* a, b, y */
+    R3D_PICK(list);
+}
+
 
 /* The vocabulary projection, transcribed from ref_logits_gemm_shape: x [M, n_embd] and the head
  * [n_vocab, n_embd] in the activation's dtype, logits in f32 because every sampler stage reads
@@ -545,6 +575,27 @@ int r3d_shape_gemm_nt_q(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     list[1] = a8 ? in_unit(opd((uint32_t)RAD_F32, M, kb)) : opd_none();   /* a_scale */
     list[2] = opd(i8a8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3, N, K);  /* b */
     list[3] = in_unit(opd((uint32_t)RAD_F32, i8a8 ? N : nb, kb));         /* b_scale */
+    list[4] = opd((uint32_t)RAD_BF16, M, N);                             /* y */
+    list[5] = opd_none();                                                /* a_sum */
+    list[6] = opd_none();                                                /* b_ref */
+    return pick(out, operand, list, R3D_GEMM_Q_NOPERAND);
+}
+
+/* The int8 trunk grid (i8a8, i8a8h), as libref describes it: quant_act_i8g's (or its rotated
+ * twin's) row-major codes with an f32 scale per (row, `group` of K), against int8 codes [N, K]
+ * with a bf16 scale per (row, `group` of K). No zero point, so both sums are absent. */
+int r3d_shape_gemm_nt_q_i8a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0), K = gi(p, n_p, "K", 0);
+    if (M <= 0 || N <= 0 || K <= 0) return RAD_E_UNSUPPORTED;
+    int64_t group = gi(p, n_p, "group", 0);
+    if (group <= 0) group = R3D_W8_GROUP;
+    if (K % group) return RAD_E_UNSUPPORTED;
+    const int64_t kb = K / group;
+    RadOpdDesc list[R3D_GEMM_Q_NOPERAND];
+    list[0] = opd((uint32_t)RAD_I8, M, K);                               /* a */
+    list[1] = in_unit(opd((uint32_t)RAD_F32, M, kb));                    /* a_scale */
+    list[2] = opd((uint32_t)RAD_I8, N, K);                               /* b */
+    list[3] = in_unit(opd((uint32_t)RAD_BF16, N, kb));                   /* b_scale */
     list[4] = opd((uint32_t)RAD_BF16, M, N);                             /* y */
     list[5] = opd_none();                                                /* a_sum */
     list[6] = opd_none();                                                /* b_ref */
@@ -708,6 +759,42 @@ int r3d_shape_attn_paged(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     };
     R3D_PICK(list);
 }
+/* The absorbed MLA projection (r3d_mla_project.hip): a[M, heads, head_dim|latent] against the
+ * shared [heads, 2*head_dim, latent] weight, absorb or expand. */
+int r3d_shape_mla_project(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), h = gi(p, n_p, "heads", 0), d = gi(p, n_p, "head_dim", 0),
+                  l = gi(p, n_p, "latent_dim", 0);
+    const char* mode = gs(p, n_p, "mode");
+    const bool absorb = mode && !std::strcmp(mode, "absorb"),
+               expand = mode && !std::strcmp(mode, "expand");
+    if (!absorb && !expand) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, h, absorb ? d : l),
+                                opd((uint32_t)RAD_BF16, h * 2 * d, l),
+                                opd((uint32_t)RAD_BF16, M, h, absorb ? l : d) };
+    R3D_PICK(list);
+}
+
+/* The paged latent attention (r3d_mla_attn_paged.hip): the cache row is the latent then the
+ * rotated key part; `block_table` draws its page indices, `seqused` the context so far, and
+ * `cu_seqlens` the [0, M+1] cumulative form. */
+int r3d_shape_mla_attn_paged(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), h = gi(p, n_p, "heads", 0), L = gi(p, n_p, "latent_dim", 0),
+                  R = gi(p, n_p, "rope_dim", 0), bs = gi(p, n_p, "block_size", 0);
+    if (M <= 0 || h <= 0 || L <= 0 || R <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
+    int64_t ctx = gi(p, n_p, "ctx", 0);
+    if (ctx < M) ctx = M;
+    const int64_t blocks = (ctx + bs - 1) / bs;
+    const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, h, L),
+                                opd((uint32_t)RAD_BF16, M, h, R),
+                                opd((uint32_t)RAD_BF16, blocks, 1, bs, L + R),
+                                opd_idx(1, blocks, -1, 0, blocks),
+                                opd_idx(1, 0, ctx),
+                                opd_idx(2, M + 1, -1, (uint32_t)RAD_OPD_F_IDX_CU),
+                                opd_none(),
+                                opd((uint32_t)RAD_BF16, M, h, L) };
+    R3D_PICK(list);
+}
+
 
 /* Exact per-row top-R. `pairs` packs an int32 id's bits in the first slot beside its value, in an
  * f32 plane. */
@@ -721,6 +808,22 @@ int r3d_shape_row_topk(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     };                                                          /* x, idx, val, pairs */
     R3D_PICK(list);
 }
+/* Group-limited sigmoid routing: the group form of router_sigmoid_topk. The geometry's bounds are
+ * the shim's: `n_expert` 1..512, `n_group` 1..32 dividing the experts by at least two,
+ * `topk_group` a group count, `top_k` inside the kept groups' experts. f32 operands, as the row's
+ * constraints; `ids` is drawn over `n_expert`. (libr4d's r4d_shape_router_sigmoid_group_topk.) */
+int r3d_shape_router_sigmoid_group_topk(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), ne = gi(p, n_p, "n_expert", 0), k = gi(p, n_p, "top_k", 0);
+    const int64_t ng = gi(p, n_p, "n_group", 0), kg = gi(p, n_p, "topk_group", 0);
+    if (ne <= 0 || ne > 512 || k <= 0 || ng <= 0 || ng > 32 || ne % ng || ne / ng < 2 || kg <= 0 ||
+        kg > ng || k > kg * (ne / ng))
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    const RadOpdDesc list[] = { opd(D, M, ne), opd((uint32_t)RAD_F32, ne),
+                                opd_idx(M, ne, -1, 0, k), opd(D, M, k) };
+    R3D_PICK(list);
+}
+
 
 int r3d_shape_sample_argmax(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     int64_t M = 0, nv = 0;

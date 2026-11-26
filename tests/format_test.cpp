@@ -473,7 +473,14 @@ TEST(a_table_file_on_another_disk_is_filled_once_and_mapped_in_place_of_the_cont
     const RadFilePlane& pl = f.plane(*f.find("ngram.weight"), 0);
     const uint8_t* src = f.data(pl);
     const int64_t n = (int64_t)pl.bytes;
-    const std::string tab = radtest::tmp_path("tfile-table");
+    /* /proc/self/maps names a mapping by its resolved path, so compare against the resolved
+     * directory: $RAD_TEST_TMPDIR may go through a symlink (the build directory is one). */
+    const std::string tab_raw = radtest::tmp_path("tfile-table");
+    std::string tab = tab_raw;
+    if (char* r = ::realpath(tab_raw.substr(0, tab_raw.rfind('/')).c_str(), nullptr)) {
+        tab = std::string(r) + tab_raw.substr(tab_raw.rfind('/'));
+        std::free(r);
+    }
     ::unlink(tab.c_str());
 
     TableCopy a;
@@ -1020,6 +1027,146 @@ TEST(a_container_extended_in_place_keeps_every_old_weight_where_it_was) {
     CHECK_EQ(::ftruncate(fd, (off_t)len), 0);
     ::close(fd);
     CHECK(slurp(b.path) == before);
+}
+
+/* A layer the container holds no expert of takes its whole table past the end, at a fixed stride
+ * like a layer written with the file; the layers it had keep theirs. */
+TEST(an_in_place_extension_takes_a_whole_new_layer_of_experts) {
+    Built b = write_model("append_layer");
+    RadFile old;
+    REQUIRE((old.open(b.path.c_str())) >= 0);
+    const int64_t n_old = old.entry_count(), size_old = old.size();
+    RadWriter w;
+    REQUIRE((w.begin_append(b.path.c_str(), old)) >= 0);
+    carry_over(w, old);
+    std::vector<RadWriter::Weight> made;
+    for (int32_t e = 0; e < 5; ++e) {
+        const std::string x = "." + std::to_string(e);
+        RadWriter::Weight g = mkw(("blk.2.ffn_gate" + x).c_str(), int4_g32(), EXP_ROWS, EXP_COLS,
+                                  2, e, 0);
+        const Planes gp = planes_of(g, (uint8_t)(40 + e));
+        CHECK(w.add_weight(g, gp.ptr.data()) >= 0);
+        RadWriter::Weight d = mkw(("blk.2.ffn_down" + x).c_str(), plain_bf16(), 64, 32, 2, e, 1);
+        const Planes dp = planes_of(d, (uint8_t)(60 + e));
+        CHECK(w.add_weight(d, dp.ptr.data()) >= 0);
+        made.push_back(g);
+        made.push_back(d);
+    }
+    /* The new layer's table is closed like any other: an expert out of order is refused. */
+    const RadWriter::Weight late = mkw("blk.2.ffn_gate.6", int4_g32(), EXP_ROWS, EXP_COLS, 2, 6, 0);
+    CHECK(w.add_weight(late) < 0);
+    REQUIRE((w.finish()) >= 0);
+    old.close();
+
+    RadFile f;
+    REQUIRE((f.open(b.path.c_str())) >= 0);
+    CHECK_EQ(f.entry_count(), n_old + 10);
+    CHECK_EQ(f.group_count(), (int64_t)3);
+    for (int32_t layer = 0; layer < 2; ++layer) {
+        const RadFile::ExpertGroup* g = f.group_for_layer(layer);
+        REQUIRE(g != nullptr);
+        CHECK_EQ((int)g->n_expert, 4);
+        CHECK_EQ((int)g->n_slot, 3);
+    }
+    const RadFile::ExpertGroup* g = f.group_for_layer(2);
+    REQUIRE(g != nullptr);
+    CHECK_EQ((int)g->n_expert, 5);
+    CHECK_EQ((int)g->n_slot, 2);
+    CHECK((int64_t)g->base >= size_old);
+    CHECK_EQ((int64_t)(g->stride % RAD_ALIGN_UNIT), (int64_t)0);
+    for (int32_t e = 0; e < 5; ++e)
+        for (int32_t sl = 0; sl < 2; ++sl) {
+            const RadFileEntry& row = f.expert_entry(*g, e, sl);
+            CHECK_EQ((int)row.expert, (int)e);
+            CHECK_EQ((int64_t)(row.offset - g->base - (uint64_t)e * g->stride),
+                     (int64_t)g->slot_off[sl]);
+            CHECK(planes_match(f, row, made[(size_t)(2 * e + sl)],
+                               (uint8_t)((sl ? 60 : 40) + e)));
+        }
+    f.close();
+}
+
+/* A layer whose old experts are not kept takes a whole new table past the end, of its own
+ * geometry, and the old table is left behind; a layer is kept whole or written whole, in either
+ * order of the two calls. */
+TEST(an_in_place_extension_writes_a_layers_experts_again_all_together) {
+    Built b = write_model("append_replace");
+    RadFile old;
+    REQUIRE((old.open(b.path.c_str())) >= 0);
+    const int64_t size_old = old.size();
+    int64_t n_kept = 0;
+    {
+        RadWriter w;
+        REQUIRE((w.begin_append(b.path.c_str(), old)) >= 0);
+        const RadWriter::Weight g0 = mkw("blk.1.ffn_gate.0", int4_g32(), EXP_ROWS, EXP_COLS, 1, 0, 0);
+        CHECK(w.add_weight(g0) >= 0);
+        const RadFileEntry* kept = old.find("blk.1.ffn_gate.1");
+        REQUIRE(kept != nullptr);
+        CHECK(w.add_existing(weight_of(old, *kept), old, *kept) < 0);
+        w.abort();
+    }
+    {
+        RadWriter w;
+        REQUIRE((w.begin_append(b.path.c_str(), old)) >= 0);
+        const RadFileEntry* kept = old.find("blk.1.ffn_gate.1");
+        REQUIRE(kept != nullptr);
+        CHECK(w.add_existing(weight_of(old, *kept), old, *kept) >= 0);
+        const RadWriter::Weight g0 = mkw("blk.1.ffn_gate.0", int4_g32(), EXP_ROWS, EXP_COLS, 1, 0, 0);
+        CHECK(w.add_weight(g0) < 0);
+        w.abort();
+    }
+    RadWriter w;
+    REQUIRE((w.begin_append(b.path.c_str(), old)) >= 0);
+    w.set_arch("radtest");
+    w.set_model_name("format-test");
+    w.set_quant("fp8_block");
+    w.set_recipe(kRecipe);
+    w.set_created_by("format_test, a layer written again");
+    w.meta_i("n_layers", 2);
+    for (int64_t i = 0; i < old.entry_count(); ++i) {
+        const RadFileEntry& e = old.entry(i);
+        if (e.expert >= 0 && e.layer == 1) continue;
+        CHECK(w.add_existing(weight_of(old, e), old, e) >= 0);
+        ++n_kept;
+    }
+    std::vector<RadWriter::Weight> made;
+    for (int32_t e = 0; e < 5; ++e) {
+        const std::string x = "." + std::to_string(e);
+        RadWriter::Weight g = mkw(("blk.1.ffn_gate" + x).c_str(), plain_bf16(), 64, 32, 1, e, 0);
+        const Planes gp = planes_of(g, (uint8_t)(90 + e));
+        CHECK(w.add_weight(g, gp.ptr.data()) >= 0);
+        RadWriter::Weight d = mkw(("blk.1.ffn_down" + x).c_str(), int4_g32(), EXP_ROWS, EXP_COLS,
+                                  1, e, 1);
+        const Planes dp = planes_of(d, (uint8_t)(110 + e));
+        CHECK(w.add_weight(d, dp.ptr.data()) >= 0);
+        made.push_back(g);
+        made.push_back(d);
+    }
+    REQUIRE((w.finish()) >= 0);
+    old.close();
+
+    RadFile f;
+    REQUIRE((f.open(b.path.c_str())) >= 0);
+    CHECK_EQ(f.entry_count(), n_kept + 10);
+    CHECK_EQ(f.group_count(), (int64_t)2);
+    const RadFile::ExpertGroup* g0 = f.group_for_layer(0);
+    REQUIRE(g0 != nullptr);
+    CHECK_EQ((int)g0->n_expert, 4);
+    CHECK((int64_t)g0->base < size_old);
+    const RadFile::ExpertGroup* g = f.group_for_layer(1);
+    REQUIRE(g != nullptr);
+    CHECK_EQ((int)g->n_expert, 5);
+    CHECK_EQ((int)g->n_slot, 2);
+    CHECK((int64_t)g->base >= size_old);
+    for (int32_t e = 0; e < 5; ++e)
+        for (int32_t sl = 0; sl < 2; ++sl) {
+            const RadFileEntry& row = f.expert_entry(*g, e, sl);
+            CHECK_EQ((int)row.expert, (int)e);
+            CHECK(planes_match(f, row, made[(size_t)(2 * e + sl)],
+                               (uint8_t)((sl ? 110 : 90) + e)));
+        }
+    CHECK(f.find("blk.1.ffn_up.0") == nullptr);
+    f.close();
 }
 
 TEST(an_in_place_extension_that_fails_leaves_the_container_as_it_was) {

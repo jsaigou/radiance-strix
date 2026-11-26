@@ -43,7 +43,7 @@
 #include "llama/common/chat.h"
 #include "llama/common/jinja/runtime.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <cstdio>
 #include <cstring>
@@ -54,7 +54,7 @@
 #include <vector>
 
 using namespace rad;
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 
 namespace {
 

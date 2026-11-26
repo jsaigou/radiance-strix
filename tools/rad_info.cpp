@@ -9,12 +9,15 @@
  */
 #include "iface.h"
 #include "format/encoding.h"
+#include "format/recipe.h"
 
 #include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <utility>
+#include <vector>
 
 using namespace rad;
 
@@ -32,6 +35,12 @@ void usage() {
         "      --vocab        print the vocab summary and its normaliser chain, and stop\n"
         "      --profile N    print the top N entries of the expert profile (default 20, 0 = all)\n"
         "      --recipe       print the recipe the container was converted with, and stop\n"
+        "      --unreferenced [N]  print the byte ranges of at least N bytes (default 1048576)\n"
+        "                     that no table and no plane names, one `offset bytes` a line, and\n"
+        "                     stop: what `rad-convert --in-place --replace` left behind. Nothing\n"
+        "                     reads them, so `fallocate --punch-hole` gives their disk back.\n"
+        "      --planes GLOB  print the planes of every weight whose name the glob matches, one\n"
+        "                     `offset bytes name` a line, and stop\n"
         "      --plugins      print every plugin the $RADIANCE_HOME search path offers, as the\n"
         "                     engine loads it, and stop\n"
         "      --home DIRS    the search path for --plugins (default $RADIANCE_HOME)\n"
@@ -397,6 +406,74 @@ int print_plugins(const std::string& home) {
     return 0;
 }
 
+/* ------------------------------------------------------------------ unreferenced bytes */
+
+/* Every range of at least `min_bytes` that neither the header, a table it places, nor a plane of
+ * the directory covers, as `offset bytes` lines; a summary on stderr. A container written in one
+ * pass has only alignment padding between its planes; one extended in place also keeps the tables
+ * it had before and the planes of every weight it replaced. */
+int print_unreferenced(const RadFile& f, int64_t min_bytes) {
+    const RadFileHeader& h = f.header();
+    std::vector<std::pair<uint64_t, uint64_t>> live;   /* [first, last) */
+    auto add = [&](uint64_t off, uint64_t bytes) { if (bytes) live.emplace_back(off, off + bytes); };
+    add(0, sizeof(RadFileHeader));
+    add(h.str_off,   h.str_bytes);
+    add(h.meta_off,  h.meta_count * sizeof(RadFileKV));
+    add(h.dir_off,   h.dir_count * sizeof(RadFileEntry));
+    add(h.plane_off, h.plane_count * sizeof(RadFilePlane));
+    add(h.enc_off,   h.enc_count * sizeof(RadEncoding));
+    add(h.vocab_off, h.vocab_bytes);
+    add(h.prof_off,  h.prof_count * sizeof(RadFileProfile));
+    add(h.reserved[RAD_HDR_AUX_VOCAB_OFF], h.reserved[RAD_HDR_AUX_VOCAB_BYTES]);
+    for (int64_t i = 0; i < f.entry_count(); ++i) {
+        const RadFileEntry& e = f.entry(i);
+        for (uint32_t k = 0; k < e.n_planes; ++k) {
+            const RadFilePlane& p = f.plane(e, (int)k);
+            add(p.offset, p.bytes);
+        }
+    }
+    std::sort(live.begin(), live.end());
+    const uint64_t end = (uint64_t)f.size();
+    uint64_t at = 0, total = 0, listed = 0;
+    int64_t n = 0;
+    auto gap = [&](uint64_t a, uint64_t b) {
+        if (b <= a) return;
+        total += b - a;
+        if ((int64_t)(b - a) < min_bytes) return;
+        std::printf("%llu %llu\n", (unsigned long long)a, (unsigned long long)(b - a));
+        listed += b - a;
+        ++n;
+    };
+    for (const auto& r : live) {
+        gap(at, r.first < end ? r.first : end);
+        if (r.second > at) at = r.second;
+    }
+    gap(at, end);
+    std::fprintf(stderr, "rad-info: %s of %s is in no table and no plane; %lld range(s) of at "
+                 "least %s hold %s\n", humanb((int64_t)total).c_str(),
+                 humanb((int64_t)end).c_str(), (long long)n, humanb(min_bytes).c_str(),
+                 humanb((int64_t)listed).c_str());
+    return 0;
+}
+
+/* ------------------------------------------------------------------ a weight's planes */
+
+/* Where the planes of the weights `glob` names sit in the file: before an in-place run replaces
+ * or moves them, the list of bytes that run will leave behind. */
+int print_planes(const RadFile& f, const std::string& glob) {
+    for (int64_t i = 0; i < f.entry_count(); ++i) {
+        const RadFileEntry& e = f.entry(i);
+        const char* name = f.str(e.name);
+        if (!rad::recipe_glob(glob.c_str(), name)) continue;
+        for (uint32_t k = 0; k < e.n_planes; ++k) {
+            const RadFilePlane& p = f.plane(e, (int)k);
+            std::printf("%llu %llu %s\n", (unsigned long long)p.offset,
+                        (unsigned long long)p.bytes, name);
+        }
+    }
+    return 0;
+}
+
 }  /* namespace */
 
 int main(int argc, char** argv) {
@@ -404,6 +481,8 @@ int main(int argc, char** argv) {
     bool verbose = false, only_meta = false, only_vocab = false, only_recipe = false, plugins = false;
     std::string home = rad_home();
     int  top = 20;
+    int64_t unref_min = -1;
+    std::string planes_glob;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -419,6 +498,12 @@ int main(int argc, char** argv) {
         else if (a == "--profile") top = (int)rad_flag_int("rad-info", "--profile", next("--profile"),
                                                            0, INT32_MAX);
         else if (a == "--recipe") only_recipe = true;
+        else if (a == "--unreferenced") {
+            unref_min = 1 << 20;
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+                unref_min = rad_flag_int("rad-info", "--unreferenced", argv[++i], 1, INT64_MAX);
+        }
+        else if (a == "--planes") planes_glob = next("--planes");
         else if (a == "--plugins") plugins = true;
         else if (a == "--home") home = next("--home");
         else if (!a.empty() && a[0] == '-') {
@@ -439,6 +524,8 @@ int main(int argc, char** argv) {
         std::fputs(r[0] ? r : "# no recipe: every weight is the checkpoint's own\n", stdout);
         return 0;
     }
+    if (unref_min >= 0) return print_unreferenced(f, unref_min);
+    if (!planes_glob.empty()) return print_planes(f, planes_glob);
     if (only_meta)  { print_meta(f);  return 0; }
     if (only_vocab) { print_vocab(f); return 0; }
 

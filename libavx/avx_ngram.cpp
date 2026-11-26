@@ -82,6 +82,7 @@ struct Gather {
     std::vector<uint8_t>   kind;     /* per row: a RowCache::Found, or PAD / DONE below */
     std::vector<SpanRead>  reads;    /* the rows this thread reads */
     std::vector<long long> waits;    /* rows another thread is reading */
+    std::vector<long long> later;    /* the other ranks' share of a decode gather, unclaimed so far */
     std::vector<long long> again;    /* rows whose slot changed under the decode */
     /* One decode batch: each row's source and destination and, for cached rows, its call index
      * and the slot word it was read under. */
@@ -430,6 +431,18 @@ inline uint64_t owner_tag() {
     return me.v;
 }
 
+/* ring_errno: 0 when this process can make an io_uring ring, else the errno (defined below). */
+int ring_errno();
+
+/* True when this process reads the n-gram table with synchronous pread instead of a ring: the
+ * kernel, the sandbox, or a resource limit refused io_uring. pread() needs no ring: a positional
+ * read on a read-only file is safe from every thread. Every read is its own round trip, so the
+ * table reads slower; startup and serving work. avx_init_ngram says it once. */
+inline bool ring_sync_mode() {
+    static const bool sync = ring_errno() != 0;
+    return sync;
+}
+
 struct ReadRing {
     static constexpr unsigned kEntries = 4096;
     int            fd       = -1;
@@ -449,7 +462,7 @@ struct ReadRing {
         std::memset(&p, 0, sizeof p);
         p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
         const long r = syscall(__NR_io_uring_setup, kEntries, &p);
-        if (r < 0) { err = errno; return false; }
+        if (r < 0) { err = errno; entries = 1; return false; }  /* Sync-read mode keeps one span at a time. */
         fd      = (int)r;
         entries = p.sq_entries;
         sq_sz   = p.sq_off.array + (size_t)p.sq_entries * sizeof(unsigned);
@@ -494,6 +507,19 @@ struct ReadRing {
     int read_spans(const TableFile& tf, const SpanRead* r, unsigned count, long long n,
                    long long stride, uint8_t* bounce) {
         const long long A = tf.align;
+        if (ring_sync_mode()) {
+            for (unsigned i = 0; i < count; ++i) {
+                const long long a   = (long long)r[i].key & ~(A - 1);
+                const long long len = (((long long)r[i].key + n + A - 1) & ~(A - 1)) - a;
+                uint8_t* dst = bounce + (size_t)i * stride;
+                for (long long off = 0; off < len;) {
+                    const ssize_t got = ::pread(tf.fd, dst + off, (size_t)(len - off), (off_t)(a + off));
+                    if (got <= 0) return RAD_E_IO;
+                    off += got;
+                }
+            }
+            return RAD_OK;
+        }
         unsigned tail = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
         for (unsigned i = 0; i < count; ++i) {
             const long long a = (long long)r[i].key & ~(A - 1);
@@ -541,7 +567,10 @@ inline ReadRing* read_ring(int* why) {
         tried = true;
         std::unique_ptr<ReadRing> p(new ReadRing());
         if (p->init()) r = std::move(p);
-        else           err = p->err ? p->err : EIO;
+        else {
+            err = p->err ? p->err : EIO;
+            if (ring_sync_mode()) r = std::move(p);  /* The reader thread runs; its reads go through pread. */
+        }
     }
     if (!r && why) *why = err;
     return r.get();
@@ -636,12 +665,13 @@ int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
     return RAD_OK;
 }
 
-/* The decode regime: a step wants a hundred-odd rows now, and never waits on another thread's read.
- * Rows READY in the cache decode from it; a missing row whose slot is free to take is claimed and
- * read into the cache, so the ranks' gathers and the later steps that meet the same trigram find it
- * READY instead of reading the file again (Flash-Next decode at c4 lost 2.5% when these reads were
- * never cached); a row another thread is reading, or one with no slot, is read straight into its
- * output row. */
+/* The decode regime: a step wants a hundred-odd rows now, and never waits on the reader thread's
+ * read. Rows READY in the cache decode from it; a missing row whose slot is free to take is claimed
+ * and read into the cache, so the ranks' gathers and the later steps that meet the same trigram
+ * find it READY instead of reading the file again (Flash-Next decode at c4 lost 2.5% when these
+ * reads were never cached); a row the reader thread holds, or one with no slot, is read straight
+ * into its output row, and one another rank's gather is reading is waited for. The ranks split a
+ * step's missing rows between them (gather_ondemand). */
 constexpr long long kOnDemandMaxRows = 4096;
 
 /* Decode-sized gathers reading now. The reader thread starts no batch while any is (see the reader
@@ -686,33 +716,68 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
     g.reads.clear();
     g.again.clear();
     g.waits.clear();
+    g.later.clear();
     const uint64_t reader = g_reader_tag.load(std::memory_order_acquire);
-    for (long long m = 0; m < M; ++m) {
-        uint16_t* dst = q.out + m * x_ld;
-        if (pad(row_of(m))) { std::memset(dst, 0, (size_t)ne * sizeof(uint16_t)); continue; }
+    auto hit = [&](long long m, int64_t s, uint64_t key) {
+        g.src.push_back(rc.data + (size_t)s * (size_t)n);
+        g.scsrc.push_back(sc_of(m));
+        g.scsrc1.push_back(sc1_of(m));
+        g.dst.push_back(q.out + m * x_ld);
+        g.dm.push_back(m);
+        g.dw.push_back(RowCache::ready(key));
+    };
+    auto theirs_waits = [&](int64_t s) {
+        return s >= 0 && ((rc.word[s].load(std::memory_order_acquire) >> 2) & 255) != reader;
+    };
+    /* Finds or claims row m: READY decodes from the cache, a row another rank thread is reading is
+     * waited for below instead of read a second time (both ranks gather the same rows, so reading
+     * it again doubled decode's reads), and the reader's THEIRS, MINE (a row twice in one call)
+     * and NONE are read directly. */
+    auto claim = [&](long long m) {
         const uint64_t key = key_of(m);
         int64_t s = -1;
         const RowCache::Found f = rc.find_or_claim(key, me, &s);
         g.slot[m] = s;
+        if (f == RowCache::HIT) hit(m, s, key);
+        else if (f == RowCache::THEIRS && theirs_waits(s)) g.waits.push_back(m);
+        else g.reads.push_back({m, key, f == RowCache::CLAIMED ? s : -1, sc_of(m), sc1_of(m)});
+    };
+    /* A direct read costs its thread a few microseconds to submit and to complete, and the ranks'
+     * threads gather the same rows at the same moment: whichever scanned first used to claim every
+     * missing row and read them all alone while the other waited (47 rows, 380 us, on Flash-Next
+     * at one sequence under the draft head, longer than the first layer runs: the card idled). So
+     * a rank first claims only its share, the rows m with m % world_size == rank, and leaves the
+     * rest, which it takes up after its own reads: by then the other ranks have claimed theirs and
+     * it waits for those, and whatever nobody claimed (a rank that is not there) it reads itself. */
+    const long long share = q.world_size > 1 ? q.world_size : 1;
+    for (long long m = 0; m < M; ++m) {
+        if (pad(row_of(m))) {
+            std::memset(q.out + m * x_ld, 0, (size_t)ne * sizeof(uint16_t));
+            continue;
+        }
+        if (m % share == q.rank % share) { claim(m); continue; }
+        const uint64_t key = key_of(m);
+        int64_t s = -1;
+        const RowCache::Found f = rc.lookup(key, &s);
+        g.slot[m] = s;
         if (f == RowCache::HIT) {
-            g.src.push_back(rc.data + (size_t)s * (size_t)n);
-            g.scsrc.push_back(sc_of(m));
-            g.scsrc1.push_back(sc1_of(m));
-            g.dst.push_back(dst);
-            g.dm.push_back(m);
-            g.dw.push_back(RowCache::ready(key));
-        } else if (f == RowCache::THEIRS && s >= 0 &&
-                   ((rc.word[s].load(std::memory_order_acquire) >> 2) & 255) != reader) {
-            /* Another rank thread is reading it: wait below instead of reading it a second time
-             * (both ranks gather the same rows, so reading it again doubled decode's reads). */
+            rc.ref[s].store(1, std::memory_order_relaxed);
+            hit(m, s, key);
+        } else if (f == RowCache::THEIRS && theirs_waits(s)) {
             g.waits.push_back(m);
         } else {
-            /* The reader's THEIRS, MINE (a row twice in one call) and NONE are read directly. */
-            g.reads.push_back({m, key, f == RowCache::CLAIMED ? s : -1, sc_of(m), sc1_of(m)});
+            g.later.push_back(m);
         }
     }
     const UrgentReads urgent;
-    if (!g.reads.empty()) {
+    /* This rank's share, then what is left of the others' (see above): each batch is read and
+     * published before the next is claimed. */
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 1) {
+            g.reads.clear();
+            for (long long m : g.later) claim(m);
+        }
+        if (g.reads.empty()) continue;
         const int rs = read_and_publish(tf, rc, rr, g, g.reads.data(), g.reads.size(), n, ne,
                                         decode, lut, q.out, x_ld);
         if (rs != RAD_OK) return rs;
@@ -727,9 +792,9 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
             g.dw.push_back(RowCache::ready(r.key));
         }
     }
-    /* Wait for the other rank's reads, as gather_rows does. This thread's own reads are done, so no cycle: the other rank reads its claims before it
-     * waits. A row that turns READY decodes from the cache; one released or taken over is read
-     * directly below. */
+    /* Wait for the other ranks' reads, as gather_rows does. This thread's own reads are done, so
+     * no cycle: every rank reads its claims before it waits. A row that turns READY decodes from
+     * the cache; one released or taken over is read directly below. */
     while (!g.waits.empty()) {
         const uint32_t e = rc.published.load(std::memory_order_acquire);
         size_t keep = 0;
@@ -933,6 +998,37 @@ int stream_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
     uint8_t* bounce = g.bounce_for(depth * (size_t)stride, (size_t)A);
     int status = bounce ? RAD_OK : RAD_E_NOMEM;
     freebuf.clear();
+    if (status == RAD_OK && ring_sync_mode()) {
+        for (size_t i = 0; i < total; ++i) {
+            for (int u; (u = g_urgent_reads.load(std::memory_order_acquire)) > 0;)
+                g_urgent_reads.wait(u, std::memory_order_acquire);
+            const SpanRead& r = reads[i];
+            const long long a   = (long long)r.key & ~(A - 1);
+            const long long len = (((long long)r.key + n + A - 1) & ~(A - 1)) - a;
+            bool ok = true;
+            for (long long off = 0; off < len;) {
+                const ssize_t got = ::pread(tf.fd, bounce + off, (size_t)(len - off), (off_t)(a + off));
+                if (got <= 0) { ok = false; break; }
+                off += got;
+            }
+            if (!ok) { status = RAD_E_IO; break; }
+            const uint8_t* row = bounce + (r.key & (uint64_t)(A - 1));
+            std::memcpy(rc.data + (size_t)r.slot * (size_t)n, row, (size_t)n);
+            rc.ref[r.slot].store(1, std::memory_order_relaxed);
+            rc.word[r.slot].store(RowCache::ready(r.key), std::memory_order_release);
+            landed[i] = 1;
+            g_rows_read.fetch_add(1, std::memory_order_relaxed);
+            rc.published.fetch_add(1, std::memory_order_release);
+            rc.published.notify_all();
+        }
+        if (status != RAD_OK) {
+            for (size_t i = 0; i < total; ++i)
+                if (!landed[i]) rc.word[reads[i].slot].store(RowCache::EMPTY, std::memory_order_release);
+            rc.published.fetch_add(1, std::memory_order_release);
+            rc.published.notify_all();
+        }
+        return status;
+    }
     for (size_t d = 0; d < depth; ++d) freebuf.push_back((uint32_t)(depth - 1 - d));
     size_t next = 0, inflight = 0;
     unsigned pending = 0;                       /* queued in the SQ, not yet submitted */
@@ -1376,8 +1472,7 @@ extern "C" int avx_init_ngram(const RadParam* p, int n_p, int rank, int world_si
     if (!dt || std::strcmp(dt, "bf16") != 0) return RAD_OK;
     if (const int e = ring_errno()) {
         static std::once_flag said;
-        std::call_once(said, [e] { std::fprintf(stderr, "%s\n", ring_refusal(e).c_str()); });
-        return RAD_E_UNSUPPORTED;
+        std::call_once(said, [e] { std::fprintf(stderr, "%s The table reads fall back to synchronous pread: the model starts and serves, the n-gram reads are slower.\n", ring_refusal(e).c_str()); });
     }
 #else
     (void)p;

@@ -1,12 +1,12 @@
 #pragma once
 
-#include <nlohmann/json_fwd.hpp>
+#include "util/json.h"
 
 #include <functional>
 #include <memory>
 #include <string>
 
-std::string json_schema_to_grammar(const nlohmann::ordered_json & schema,
+std::string json_schema_to_grammar(const rad::Json & schema,
                                    bool force_gbnf = false);
 
 class common_schema_converter;
@@ -24,17 +24,17 @@ class common_schema_info {
     common_schema_info(common_schema_info &&) noexcept;
     common_schema_info & operator=(common_schema_info &&) noexcept;
 
-    void resolve_refs(nlohmann::ordered_json & schema);
-    bool resolves_to_string(const nlohmann::ordered_json & schema);
+    void resolve_refs(rad::Json & schema);
+    bool resolves_to_string(const rad::Json & schema);
     // RADIANCE: whether no value satisfies the schema -- `false`, or a `not` of a schema every
     // value satisfies (`{}`, or types naming all six JSON types).
-    bool unsatisfiable(const nlohmann::ordered_json & schema) const;
+    bool unsatisfiable(const rad::Json & schema) const;
 };
 
 struct common_grammar_builder {
     std::function<std::string(const std::string &, const std::string &)> add_rule;
-    std::function<std::string(const std::string &, const nlohmann::ordered_json &)> add_schema;
-    std::function<void(nlohmann::ordered_json &)> resolve_refs;
+    std::function<std::string(const std::string &, const rad::Json &)> add_schema;
+    std::function<void(rad::Json &)> resolve_refs;
 };
 
 struct common_grammar_options {

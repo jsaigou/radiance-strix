@@ -185,13 +185,30 @@ static inline int ref_layout_mtp(const RadParam*, int, int operand, const RadEnc
 /* gemm_nt_q: `b_scale` (operand 3) as the scale and zero of the zero-point grid `dtype` names,
  * one each per (row, `group` of K), over codes of that grid's width. The codes (operand 2) are one
  * plane and stored as they are. A "givens" transform is the activation's (givens_rotate,
- * givens_dense_quant), so the planes are read the same way under it. */
+ * givens_dense_quant), so the planes are read the same way under it.
+ *
+ * A symmetric int8 grid's scale in two levels is joined the same way: an unsigned integer "scale"
+ * per (row, `group` of K) under a float "scale.1" a row (IQ8R), whose product is the scale. */
 static inline int ref_layout_gemm_q(const RadParam* p, int n_p, int operand,
                                     const RadEncoding* enc, const int* sel,
                                     const RadTensor* planes, int n, RadLayout* out) {
     if (n < 2 || operand != 3) return RAD_E_UNSUPPORTED;
     const ZpGrid* zg = zp_grid(rad_param_gets(p, n_p, "dtype", nullptr));
     const long long group = rad_param_geti(p, n_p, "group", 0);
+    if (!zg && sel_roles(enc, sel, n, "scale", "scale.1")) {
+        if (group <= 0 || !rad_enc_is(enc, "affine") || enc->n_planes != 3) return RAD_E_DTYPE;
+        const RadEncPlane& c = enc->plane[0];
+        const RadEncPlane& s = enc->plane[sel[0]];
+        const RadEncPlane& s2 = enc->plane[sel[1]];
+        if (std::strncmp(c.role, "codes", RAD_ENC_STR) != 0 || c.dtype != RAD_I8 ||
+            c.block[0] != 1 || c.block[1] != 1)
+            return RAD_E_DTYPE;
+        if (s.kind != RAD_PLANE_TILED || s.dtype != RAD_U8 || s.block[0] != 1 ||
+            s.block[1] != group || s2.kind != RAD_PLANE_TILED || !float_scale_dt(s2.dtype) ||
+            s2.block[0] != 1 || s2.block[1] != 0)
+            return RAD_E_DTYPE;
+        return rad_planes_layout(enc, sel, planes, n, out);
+    }
     if (!zg || group <= 0 || !rad_enc_is(enc, "affine")) return RAD_E_DTYPE;
     if (enc->transform[0] && std::strncmp(enc->transform, "givens", RAD_ENC_STR) != 0)
         return RAD_E_DTYPE;

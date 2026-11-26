@@ -1,6 +1,6 @@
-/* gemma4 -- Gemma 4 text decoders (26B-A4B MoE, and the dense members of the family): a bf16
- * trunk, routed experts bf16 or block fp8 (see FP8 EXPERTS), and the DFlash block-diffusion
- * drafter.
+/* gemma4 -- Gemma 4 decoders (26B-A4B MoE, and the dense members of the family): a bf16
+ * trunk, routed experts bf16, block fp8 or rotated int8 (see FP8 EXPERTS), and the DFlash
+ * block-diffusion drafter, with the shared Gemma 4 vision tower.
  *
  * ============================== THE SHAPE (gemma-4-26B-A4B-it) ==============================
  *
@@ -77,17 +77,25 @@
  *            blocks, which 704 is not. It stays bf16 -- unless the checkpoint is padded to 768
  *            first, outside the engine: zero rows of gate and up give gelu(0) * 0 = 0 in the
  *            padded columns, which meet zero columns of down, so the function is unchanged, and
- *            then both projections are fp8 (data/recipes/gemma4-26b-a4b-df-pad768.recipe).
+ *            then both projections are fp8.
+ *
+ * Rotated int8 experts (`rtn codes=i8 group=128 scale=bf16 transform=fwht128`) take the same
+ * tables and the same widths through `moe_gemm_q` at i8a8h, over int8 codes of the experts' input
+ * that the attention join's fused route writes (`norm_add_norm_route_i8g`), or the rotating norm
+ * (`rmsnorm_had_quant_i8g`) where that is not served. A model's quantised experts are all one or
+ * all the other.
+ *
+ * The cache is bf16 or int8 with an f16 scale of K and of V per token and head
+ * (--kv-cache-dtype i8, libr4d's windowed kernels' int8 rows and kv_store_i8), the drafter's
+ * with it.
  *
  * ============================== NOT DECLARED ==============================
  *
- *   the vision tower (arch/embgemma2 declares Gemma 4's for an encoder): this plugin serves text;
- *   a container carrying a tower is served with --mm-max-patches 0 and media parts are refused by
- *   name;
  *   an fp8 attention or dense arm: under a tenth of the weight bytes, and the dense arm's 2112 is
  *   not whole 128-blocks.
  */
 #include <arch/rad_arch.h>
+#include <arch/rad_block_gemma4_vision.h>
 #include <arch/rad_fp8.h>
 #include <arch/rad_gemma4_chat.h>
 #include <arch/rad_gemma4_dflash.h>
@@ -148,6 +156,7 @@ struct Layer {
     rad_op op_anorm = 0, op_qkv = 0, op_qknr = 0, op_lift = 0;
     rad_op op_q = 0, op_k = 0, op_vnorm = 0, op_qn = 0, op_kn = 0, op_qrope = 0, op_krope = 0;
     rad_op op_store = 0, op_attn = 0, op_o = 0, op_ar_o = 0, op_apost = 0, op_add_a = 0;
+    rad_op op_bidi = 0, op_ahead = 0;
     /* dense arm */
     rad_weight w_fnorm = 0, w_gu = 0, w_dn = 0, w_fpost1 = 0;
     rad_op op_fnorm = 0, op_gu = 0, op_act = 0, op_dn = 0;
@@ -157,7 +166,9 @@ struct Layer {
      * w_egus/w_edns, so each parity is one run (see declare). */
     rad_weight w_rscale = 0, w_router = 0, w_escale = 0, w_enorm = 0, w_fpost2 = 0;
     std::vector<rad_weight> w_egu, w_edn, w_egus, w_edns;
-    bool gu_fp8 = false, dn_fp8 = false;
+    /* A projection's experts are quantised (block fp8 or rotated int8: the table GEMM over a code
+     * pair), else plain bf16. */
+    bool gu_q = false, dn_q = false;
     rad_op op_rnorm = 0, op_router = 0, op_topk = 0, op_escale = 0, op_emul = 0, op_enorm = 0;
     rad_op op_scatter = 0, op_egu = 0, op_eact = 0, op_eq = 0, op_edn = 0, op_gather = 0;
     /* libr4d's fused forms of the router, its top-k and the sort, where they resolve: the pair
@@ -177,8 +188,9 @@ struct Layer {
      * then declared and issued instead. */
     rad_op op_join_a = 0, op_join_f = 0;
     /* op_join_r: op_join_a writing the routed arm's two inputs as well -- the router's norm into
-     * b_rn and the experts' fp8 codes into b_hq / b_hqs (norm_add_norm_route) -- where the
-     * layer's gate_up is block fp8. op_rnorm and op_enorm are then declared and not issued. */
+     * b_rn and the experts' codes into b_hq / b_hqs (norm_add_norm_route's E4M3, or
+     * norm_add_norm_route_i8g's rotated int8) -- where the layer's gate_up is quantised. op_rnorm
+     * and op_enorm are then declared and not issued. */
     rad_op op_join_r = 0;
     /* op_join_f also writes the next norm (the following layer's input norm, or the final norm
      * after the last layer) into `h`, with that norm's gain `w_next`; the replaced norm is then
@@ -220,11 +232,16 @@ struct Model {
     /* the experts' E4M3 inputs, declared only where some layer's projection is fp8: gate_up's
      * (the normed block input, a row a token) and down's (the gated product, a row a slot) */
     rad_buf b_hq = 0, b_hqs = 0, b_eq = 0, b_eqs = 0;
-    int     n_gu_fp8 = 0, n_dn_fp8 = 0;   /* layers whose projection is fp8 */
+    int     n_gu_q = 0, n_dn_q = 0;   /* layers whose projection is quantised */
+    /* The quantised experts are rotated int8 against int8 activations (EXP_I8), every layer's:
+     * the code pairs are one buffer each for the whole model. */
+    bool    exp_i8 = false, exp_seen = false;
     rad_buf b_hout = 0, b_logits = 0;
 
     rad_weight w_tok = 0, w_onorm = 0;
     rad_op op_embed = 0, op_embed_ar = 0, op_onorm = 0, op_gather = 0, op_logits = 0, op_cap = 0;
+    rad_op op_mm = 0;
+    Gemma4Vision vis{};
 
     enum { MAX_TAPS = Dflash1::MAX_TAPS };
     int     n_taps = 0;
@@ -245,7 +262,7 @@ struct Model {
     std::vector<Layer> layers;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* ============================================================== geometry */
 
@@ -331,7 +348,7 @@ static int declare_dflash(RadBuilder* b, const RadModelMeta* meta, const RadBuil
  * plan, rad_weight_encoding), which picks the GEMM: plain bf16 is `moe_gemm`, block fp8 (fp8_e4m3
  * codes, a bf16 scale per 128x128 block) is `moe_gemm_q` at fp8a8. Anything else is refused by
  * name. A builder with no model behind it answers nothing, and the declared dtype bf16 is read. */
-enum { EXP_BF16 = 0, EXP_FP8 = 1 };
+enum { EXP_BF16 = 0, EXP_FP8 = 1, EXP_I8 = 2 };
 static int expert_format(RadBuilder* b, const char* wn, int* fmt) {
     RadEncoding e{};
     *fmt = EXP_BF16;
@@ -341,11 +358,22 @@ static int expert_format(RadBuilder* b, const char* wn, int* fmt) {
         *fmt = EXP_FP8;
         return RAD_OK;
     }
+    /* Rotated int8: codes with a bf16 scale per (row, 128 of K), each 128 of K rotated by the
+     * Hadamard (libquant's `codes=i8 group=128 scale=bf16 transform=fwht128`). */
+    const RadEncPlane* sc = rad_enc_plane(&e, "scale");
+    if (rad_enc_is(&e, "affine") && e.n_planes == 2 && e.plane[0].dtype == RAD_I8 && sc &&
+        sc->dtype == RAD_BF16 && sc->block[0] == 1 && sc->block[1] == RAD_FP8_BLOCK &&
+        std::strcmp(e.transform, "fwht128") == 0) {
+        *fmt = EXP_I8;
+        return RAD_OK;
+    }
     char en[256];
     rad_enc_format(&e, en, sizeof en);
-    fprintf(stderr, "radiance: gemma4: '%s' is %s; the routed experts are served plain bf16 or "
-                    "block fp8 (fp8_e4m3*bf16[128x128]). Convert with no rule for them, or with "
-                    "`rtn codes=fp8_e4m3 block=128x128 scale=bf16`.\n", wn, en);
+    fprintf(stderr, "radiance: gemma4: '%s' is %s; the routed experts are served plain bf16, "
+                    "block fp8 (fp8_e4m3*bf16[128x128]) or rotated int8 "
+                    "(i8*bf16[1x128]/fwht128). Convert with no rule for them, or with `rtn "
+                    "codes=fp8_e4m3 block=128x128 scale=bf16` or `rtn codes=i8 group=128 "
+                    "scale=bf16 transform=fwht128 clamp=sym rule=search`.\n", wn, en);
     return RAD_E_DTYPE;
 }
 
@@ -360,11 +388,11 @@ static int layer_expert_format(RadBuilder* b, Names& nm, int64_t l, int64_t base
         RAD_ARCH_TRY(expert_format(b, wn, &f));
         if (e == 0) { *fmt = f; continue; }
         if (f != *fmt) {
+            static const char* const kName[3] = { "bf16", "block fp8", "rotated int8" };
             fprintf(stderr, "radiance: gemma4: '%s' is %s and expert %lld of the same layer is %s; "
                             "one layer's %s experts take one encoding (a recipe rule for them "
-                            "matches all of a layer's or none)\n", wn,
-                    f == EXP_FP8 ? "block fp8" : "bf16", (long long)base,
-                    *fmt == EXP_FP8 ? "block fp8" : "bf16", what);
+                            "matches all of a layer's or none)\n", wn, kName[f], (long long)base,
+                    kName[*fmt], what);
             return RAD_E_DTYPE;
         }
     }
@@ -375,7 +403,8 @@ static int layer_expert_format(RadBuilder* b, Names& nm, int64_t l, int64_t base
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
     if (ctx->is_draft) {
         fprintf(stderr, "radiance: gemma4: this plugin has no draft scope\n");
         return RAD_E_UNSUPPORTED;
@@ -388,7 +417,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_UNSUPPORTED;
     }
 
-    Model& m = g_model[ctx->rank];
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     Names& nm = m.nm;
@@ -541,24 +570,39 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* ---- the KV groups, one per geometry: the sliding layers' (256-wide heads) and the full
      * layers' (512).
      *
-     * The sliding layers' group is RAD_KV_FULL, not RAD_KV_WINDOW; the window lives on the
-     * attention op (`window` 1024), which reads only keys inside it. A window group is not
-     * prefix-cached (core/mem/prefix.cpp), so a prefix hit on a model with one reuses nothing and
-     * re-prefills (core/sched). As FULL the group is cached with the others and the drafter's KV
-     * has no hole. The only loss is recycling below the window, which gains nothing here: the
-     * planner gives every paged group the same block count, so the full group bounds the tokens a
-     * card holds anyway. */
+     * The sliding layers' group is RAD_KV_WINDOW, sized to the attention window, which is what
+     * the kernel reads: attn_paged takes `window` 1024 on those layers and never looks at a key
+     * older than it. As a window group the pool is capped at the window plus one block per
+     * sequence (core/mem/kv.cpp), so the sliding layers cost about 1k tokens of cache each
+     * instead of the whole context. The full layers' group stays RAD_KV_FULL: it is the only one
+     * whose keys outlive a window.
+     *
+     * A windowed group is not prefix-cached (core/mem/prefix.cpp): its rows below the window are
+     * recycled, and adopt() would overfill a table capped at window_blocks. On a prefix hit the
+     * full layers' rows come back from the store, and the window resumes from the deepest
+     * retained checkpoint at or below the matched end: that checkpoint's slot carries the window
+     * behind it, and only the gap between it and the match end is recomputed. Where no retained
+     * checkpoint sits at or below the match, the windowed layers start their cache where the hit
+     * ended and the prompt is prefilled again. Gemma 3 declares its sliding group the same way.
+     *
+     * The drafter does not read the trunk's cache. DFlash keeps its own windowed draft KV,
+     * rebuilt each context pass from the trunk's residual taps, so a windowed trunk group costs
+     * the drafter nothing. */
     {
+        const uint32_t kvdt = rad_kv_cache_dtype(ctx, RAD_BF16);
         RadKVGroupDecl d{};
-        d.kind = RAD_KV_FULL;
-        d.dtype = rad_kv_cache_dtype(ctx, RAD_BF16);
+        d.kind = RAD_KV_WINDOW;
+        d.window = m.ks.window;   /* the same 1024 the attention op reads */
+        d.dtype = kvdt;
         d.n_head_kv = m.ks.nkv;
         d.head_dim = m.ks.hd;
         m.ks.kv = rad_decl_kv_group(b, nm.f("kv_swa"), &d);
+        d.kind = RAD_KV_FULL;
+        d.window = 0;
         d.n_head_kv = m.kf.nkv;
         d.head_dim = m.kf.hd;
         m.kf.kv = rad_decl_kv_group(b, nm.f("kv_full"), &d);
-        g.kv_dtype = rad_dtype_name(d.dtype);
+        g.kv_dtype = rad_dtype_name(kvdt);
     }
 
     /* Gemma4ForConditionalGeneration keeps the text model under model.language_model;
@@ -587,26 +631,40 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             int fgu = EXP_BF16, fdn = EXP_BF16;
             RAD_ARCH_TRY(layer_expert_format(b, nm, l, m.expert_base, NL, "gate_up", &fgu));
             RAD_ARCH_TRY(layer_expert_format(b, nm, l, m.expert_base, NL, "down", &fdn));
-            y.gu_fp8 = fgu == EXP_FP8;
-            y.dn_fp8 = fdn == EXP_FP8;
+            y.gu_q = fgu != EXP_BF16;
+            y.dn_q = fdn != EXP_BF16;
+            /* One quantised format for the model: the experts' code pairs are shared buffers. */
+            for (const int f : { fgu, fdn }) {
+                if (f == EXP_BF16) continue;
+                const bool i8 = f == EXP_I8;
+                if (m.exp_seen && i8 != m.exp_i8) {
+                    fprintf(stderr, "radiance: gemma4: layer %lld's experts are %s and an earlier "
+                                    "projection's %s; a model's quantised experts are all block "
+                                    "fp8 or all rotated int8\n", ll,
+                            i8 ? "rotated int8" : "block fp8", i8 ? "block fp8" : "rotated int8");
+                    return RAD_E_DTYPE;
+                }
+                m.exp_seen = true;
+                m.exp_i8 = i8;
+            }
             /* moe_gemm_q's geometry, refused here by name rather than as a kernel miss. It takes
              * experts as two tables by parity, so a rank must hold an even count. */
-            if ((y.gu_fp8 || y.dn_fp8) && NL % 2) {
-                fprintf(stderr, "radiance: gemma4: block fp8 experts come in pairs on a rank (the "
-                                "fp8 grouped GEMM takes them as two tables by parity); this rank "
+            if ((y.gu_q || y.dn_q) && NL % 2) {
+                fprintf(stderr, "radiance: gemma4: quantised experts come in pairs on a rank (the "
+                                "grouped GEMM takes them as two tables by parity); this rank "
                                 "holds %lld\n", (long long)NL);
                 return RAD_E_INVAL;
             }
-            if (y.gu_fp8 && ((2 * m.n_ffe) % 64 || E % RAD_FP8_BLOCK)) {
-                fprintf(stderr, "radiance: gemma4: layer %lld's gate_up experts are block fp8 at "
-                                "%lld x %lld; the fp8 grouped GEMM takes N in 64s and K in whole "
+            if (y.gu_q && ((2 * m.n_ffe) % 64 || E % RAD_FP8_BLOCK)) {
+                fprintf(stderr, "radiance: gemma4: layer %lld's gate_up experts are quantised at "
+                                "%lld x %lld; the grouped GEMM takes N in 64s and K in whole "
                                 "%d-column blocks\n", ll, (long long)(2 * m.n_ffe), (long long)E,
                         RAD_FP8_BLOCK);
                 return RAD_E_INVAL;
             }
-            if (y.dn_fp8 && (E % 64 || m.n_ffe % RAD_FP8_BLOCK)) {
-                fprintf(stderr, "radiance: gemma4: layer %lld's down experts are block fp8, and "
-                                "the experts are %lld wide: the fp8 grouped GEMM reads K in whole "
+            if (y.dn_q && (E % 64 || m.n_ffe % RAD_FP8_BLOCK)) {
+                fprintf(stderr, "radiance: gemma4: layer %lld's down experts are quantised, and "
+                                "the experts are %lld wide: the grouped GEMM reads K in whole "
                                 "%d-column scale blocks. Keep `ffn_down_exps` bf16 (no recipe "
                                 "rule for it), or pad the experts to a multiple of %d (zero rows "
                                 "of gate and up, zero columns of down) and convert the padded "
@@ -614,8 +672,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         (long long)m.n_ffe, RAD_FP8_BLOCK, RAD_FP8_BLOCK);
                 return RAD_E_INVAL;
             }
-            m.n_gu_fp8 += y.gu_fp8;
-            m.n_dn_fp8 += y.dn_fp8;
+            m.n_gu_q += y.gu_q;
+            m.n_dn_q += y.dn_q;
         }
     }
 
@@ -640,10 +698,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.b_ids    = decl_b(b, nm.f("moe_ids"),    RAD_I32,  {T, K});
         m.b_ew     = decl_b(b, nm.f("moe_w"),      RAD_BF16, {T, K});
         m.b_es     = decl_b(b, nm.f("moe_es"),     RAD_BF16, {T, K});
-        if (m.n_gu_fp8 < m.n_layer)
+        if (m.n_gu_q < m.n_layer)
             m.b_hx = decl_b(b, nm.f("moe_h"),      RAD_BF16, {T, E});
-        if (m.n_gu_fp8 > 0) {
-            m.b_hq  = decl_b(b, nm.f("moe_hq"),    RAD_F8E4M3, {T, E});
+        if (m.n_gu_q > 0) {
+            m.b_hq  = decl_b(b, nm.f("moe_hq"),    m.exp_i8 ? RAD_I8 : RAD_F8E4M3, {T, E});
             m.b_hqs = decl_b(b, nm.f("moe_hqs"),   RAD_F32,    {T, fp8_blocks(E)});
         }
         m.b_sorted = decl_b(b, nm.f("moe_sorted"), RAD_I32,  {P * K});
@@ -651,8 +709,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.b_ecnt   = decl_b(b, nm.f("moe_ecnt"),   RAD_I32,  {m.n_local});
         m.b_egu    = decl_b(b, nm.f("moe_egu"),    RAD_BF16, {P * K, 2 * m.n_ffe});
         m.b_eact   = decl_b(b, nm.f("moe_eact"),   RAD_BF16, {P * K, m.n_ffe});
-        if (m.n_dn_fp8 > 0) {
-            m.b_eq  = decl_b(b, nm.f("moe_eq"),    RAD_F8E4M3, {P * K, m.n_ffe});
+        if (m.n_dn_q > 0) {
+            m.b_eq  = decl_b(b, nm.f("moe_eq"),    m.exp_i8 ? RAD_I8 : RAD_F8E4M3, {P * K, m.n_ffe});
             m.b_eqs = decl_b(b, nm.f("moe_eqs"),   RAD_F32,    {P * K, fp8_blocks(m.n_ffe)});
         }
         m.b_edn    = decl_b(b, nm.f("moe_edn"),    RAD_BF16, {P * K, E});
@@ -689,6 +747,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    RAD_INT("vocab_offset", g.vocab_off), RAD_F64("mult", m.escale)),
                         RAD_WEIGHTS(m.w_tok)),
                     {}, {m.b_x});
+    const bool vision = ctx->max_enc_patches > 0 && Gemma4Vision::present(meta);
+    const char* bidi = meta_text_gets(meta, "use_bidirectional_attention", "");
+    m.vis.bidirectional = vision && bidi && !std::strcmp(bidi, "vision");
+    if (vision)
+        m.op_mm = rw(b, RAD_OP(b, "scatter_rows",
+                         RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E), RAD_STR("dtype", "bf16")),
+                         RAD_NOWEIGHTS),
+                     {m.b_x}, {m.b_x});
     if (W > 1)
         m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
                                RAD_PARAMS(RAD_INT("world_size", W), RAD_RANGE("numel", E, T * E),
@@ -739,10 +805,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          RAD_NOWEIGHTS),
                   {buf}, {buf});
     };
-    auto attn = [&](const Kind& k, rad_buf q, rad_buf out, const char* op = "attn_paged") {
+    auto attn = [&](const Kind& k, rad_buf q, rad_buf out, const char* op = "attn_paged",
+                    int causal = 1) {
         return rw(b, RAD_OP(b, op,
                          RAD_PARAMS(RAD_RANGE("q_len", 1, T), RAD_INT("head_dim", k.hd),
-                                    RAD_INT("gqa", k.nh / k.nkv), RAD_INT("causal", 1),
+                                    RAD_INT("gqa", k.nh / k.nkv), RAD_INT("causal", causal),
                                     RAD_INT("window", k.window), RAD_INT("n_head", k.nh),
                                     RAD_INT("block_size", RAD_KV_BLOCK),
                                     RAD_INT("max_seqs", g.max_seqs), RAD_INT("max_ctx", g.max_ctx),
@@ -769,7 +836,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * (libr4d/r4d_norm_join_bf16.hip); on a card they differ from libr4d's chain only in reduction
      * order. libref deliberately has no row for them, so the chain path stays tested. */
     const bool has_join_a = rad_op_declared(b, "norm_add_norm") != 0;
-    const bool has_join_r = rad_op_declared(b, "norm_add_norm_route") != 0;
+    const char* const join_r = m.exp_i8 ? "norm_add_norm_route_i8g" : "norm_add_norm_route";
+    const bool has_join_r = rad_op_declared(b, join_r) != 0;
     const bool has_join_f = rad_op_declared(b, "join_add_scale") != 0;
     const bool has_escale = rad_op_declared(b, "expert_scale") != 0;
     const bool has_qrow   = rad_op_declared(b, "attn_paged_qrow") != 0;
@@ -876,6 +944,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                 {m.b_qkv}, {m.b_qs});
                 y.op_attn = attn(k, m.b_qs, m.b_atts);
             }
+            if (m.vis.bidirectional) {
+                const bool dense_q = y.op_lift != 0;
+                const rad_buf q = dense_q ? m.b_qs : m.b_qkv;
+                y.op_bidi = attn(k, q, m.b_atts, dense_q ? "attn_paged" : "attn_paged_qrow", 0);
+                if (!y.op_bidi) {
+                    fprintf(stderr, "radiance: gemma4: no sliding attention kernel for "
+                                    "bidirectional image spans\n");
+                    return RAD_E_UNSUPPORTED;
+                }
+                const char* ahead = dense_q ? "attn_paged_ahead" : "attn_paged_qrow_ahead";
+                if (T > k.window && rad_op_declared(b, ahead))
+                    y.op_ahead = attn(k, q, m.b_atts, ahead, 0);
+            }
             y.op_store = kv_store(k, m.b_qkv, m.b_qkv);
             y.op_o     = gemm(T, E, k.q(), y.w_o, m.b_atts, m.b_o);
         } else {
@@ -924,12 +1005,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             y.w_rscale = decl_w(b, nm.f("blk.%lld.ffn_gate_inp.scale", ll), RAD_F32, {E}, A, N, gl);
         }
 
-        /* The attention join. On a layer whose gate_up is block fp8 it also writes the routed
+        /* The attention join. On a layer whose gate_up is quantised it also writes the routed
          * arm's two inputs: the router's norm (rmsnorm with mult hidden^-0.5) and the experts'
-         * E4M3 codes (as rmsnorm_quant_fp8), saving two launches and two reads of x per layer.
-         * Otherwise norm_add_norm, else the chain. */
-        if (has_join_r && m.moe && y.gu_fp8)
-            y.op_join_r = rw(b, RAD_OP(b, "norm_add_norm_route",
+         * codes (as rmsnorm_quant_fp8, or for rotated int8 experts rmsnorm_had_quant_i8g),
+         * saving two launches and two reads of x per layer. Otherwise norm_add_norm, else the
+         * chain. */
+        if (has_join_r && m.moe && y.gu_q)
+            y.op_join_r = rw(b, RAD_OP(b, join_r,
                                     RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", E),
                                                RAD_F64("eps", eps), RAD_STR("dtype", "bf16"),
                                                RAD_F64("mult", 1.0 / std::sqrt((double)E)),
@@ -972,10 +1054,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             /* The experts: this rank's run of whole experts (name maps and encodings were settled
              * before the buffers). Each projection's handles are declared in its GEMM's table
              * order, since a table is a run of consecutively declared handles: bf16 is one run in
-             * expert order; block fp8 is the even local experts' codes, then the odd ones', then
-             * the scale views in the same two runs (`moe_gemm_q` takes two tables by parity). Codes
+             * expert order; block fp8 or int8 is the even local experts' codes, then the odd ones',
+             * then the scale views in the same two runs (`moe_gemm_q` takes two tables by parity;
+             * an int8 expert's scale is per row, block fp8's per 128 rows). Codes
              * and scale plane are two views of one stored weight and one movement unit (slot 0
              * gate_up, 1 down). */
+            const uint32_t cdt = m.exp_i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
             auto experts = [&](bool fp8, const char* what, int slot, int64_t rows, int64_t cols,
                                std::vector<rad_weight>& wc, std::vector<rad_weight>& ws) {
                 wc.assign((size_t)NL, 0);
@@ -1001,18 +1085,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             rad_weight& h = (pass ? ws : wc)[(size_t)(par * half + i)];
                             h = pass ? decl_view(b, nm.f("blk.%lld.ffn_%s_exps.%lld.scale", ll, what, ge),
                                                  wn, "scale", RAD_BF16,
-                                                 {fp8_blocks(rows), fp8_blocks(cols)},
+                                                 {m.exp_i8 ? rows : fp8_blocks(rows),
+                                                  fp8_blocks(cols)},
                                                  RAD_ACCESS_CONDITIONAL, N,
                                                  grp_expert_slot(li, (int)e, slot))
-                                     : decl_view(b, wn, nullptr, "codes", RAD_F8E4M3, {rows, cols},
+                                     : decl_view(b, wn, nullptr, "codes", cdt, {rows, cols},
                                                  RAD_ACCESS_CONDITIONAL, N,
                                                  grp_expert_slot(li, (int)e, slot));
                             if (!h) return RAD_E_INVAL;
                         }
                 return RAD_OK;
             };
-            RAD_ARCH_TRY(experts(y.gu_fp8, "gate_up", 0, 2 * m.n_ffe, E, y.w_egu, y.w_egus));
-            RAD_ARCH_TRY(experts(y.dn_fp8, "down", 1, E, m.n_ffe, y.w_edn, y.w_edns));
+            RAD_ARCH_TRY(experts(y.gu_q, "gate_up", 0, 2 * m.n_ffe, E, y.w_egu, y.w_egus));
+            RAD_ARCH_TRY(experts(y.dn_q, "down", 1, E, m.n_ffe, y.w_edn, y.w_edns));
             /* An fp8 projection's op takes its weights in its table operands' order: even codes,
              * even scales, odd codes, odd scales. */
             auto tables = [&](const std::vector<rad_weight>& wc, const std::vector<rad_weight>& ws) {
@@ -1051,11 +1136,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                   {m.b_ids}, {m.b_es});
                 y.op_emul   = binop("mul", P, K, m.b_ew, m.b_es, m.b_ew);
             }
-            /* The experts' input, pre_feedforward_layernorm_2 of the stream. For an fp8 gate_up it
-             * is normed and quantised in one pass (`rmsnorm_quant_fp8`) with no bf16 copy, since
-             * the fp8 GEMM reads only codes and scales. */
-            if (y.gu_fp8) {
-                y.op_enorm = RAD_OP(b, "rmsnorm_quant_fp8",
+            /* The experts' input, pre_feedforward_layernorm_2 of the stream. For a quantised
+             * gate_up it is normed and quantised in one pass (`rmsnorm_quant_fp8`, or for int8
+             * experts the rotating `rmsnorm_had_quant_i8g`) with no bf16 copy, since the table
+             * GEMM reads only codes and scales. */
+            if (y.gu_q) {
+                y.op_enorm = RAD_OP(b, m.exp_i8 ? "rmsnorm_had_quant_i8g" : "rmsnorm_quant_fp8",
                                     RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("n", E),
                                                RAD_F64("eps", eps), RAD_INT("group", RAD_FP8_BLOCK),
                                                RAD_STR("dtype", "bf16"), RAD_F64("wadd", 0.0)),
@@ -1108,13 +1194,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             /* The two grouped GEMMs use different a_order: gate_up reads the block input, one row
              * per token, gathered through sorted_tok; down reads gate_up's product, already one row
              * per (token, slot) in scatter order (rad_block_moe_fp8.h). */
-            if (y.gu_fp8) {
+            if (y.gu_q) {
                 const std::vector<rad_weight> tab = tables(y.w_egu, y.w_egus);
-                y.op_egu = rw(b, rad_decl_op(b, "moe_gemm_q",
-                                     RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("N", 2 * m.n_ffe),
-                                                RAD_INT("K", E), RAD_INT("n_expert", NL),
-                                                RAD_INT("top_k", K), RAD_INT("group", RAD_FP8_BLOCK),
-                                                RAD_STR("a_order", "token"), RAD_STR("dtype", "fp8a8")),
+                /* `a_group` is stated to the int8 rows alone, last and cut off otherwise. */
+                const RadParam ps[] = { RAD_RANGE("M", 1, P), RAD_INT("N", 2 * m.n_ffe),
+                                        RAD_INT("K", E), RAD_INT("n_expert", NL),
+                                        RAD_INT("top_k", K), RAD_INT("group", RAD_FP8_BLOCK),
+                                        RAD_STR("a_order", "token"),
+                                        RAD_STR("dtype", m.exp_i8 ? "i8a8h" : "fp8a8"),
+                                        RAD_INT("a_group", RAD_FP8_BLOCK) };
+                y.op_egu = rw(b, rad_decl_op(b, "moe_gemm_q", ps,
+                                     (int)(sizeof ps / sizeof *ps) - (m.exp_i8 ? 0 : 1),
                                      tab.data(), (int)tab.size()),
                               {m.b_hq, m.b_hqs, m.b_sorted, m.b_eoff}, {m.b_egu});
             } else {
@@ -1129,19 +1219,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             /* gelu_tanh(gate) * up over the two column halves. An fp8 down then quantises the
              * product on its own launch: libr4d's fused gated quantiser is compiled for silu. */
             y.op_eact = act_mul(P * K, m.n_ffe, m.b_egu, m.b_eact);
-            if (y.dn_fp8) {
-                y.op_eq = rw(b, RAD_OP(b, "quant_act_fp8",
+            if (y.dn_q) {
+                y.op_eq = rw(b, RAD_OP(b, m.exp_i8 ? "had_quant_act_i8g" : "quant_act_fp8",
                                     RAD_PARAMS(RAD_RANGE("M", 1, P * K), RAD_INT("n", m.n_ffe),
                                                RAD_INT("group", RAD_FP8_BLOCK),
                                                RAD_STR("dtype", "bf16")),
                                     RAD_NOWEIGHTS),
                              {m.b_eact}, {m.b_eq, m.b_eqs});
                 const std::vector<rad_weight> tab = tables(y.w_edn, y.w_edns);
-                y.op_edn = rw(b, rad_decl_op(b, "moe_gemm_q",
-                                     RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("N", E),
-                                                RAD_INT("K", m.n_ffe), RAD_INT("n_expert", NL),
-                                                RAD_INT("top_k", K), RAD_INT("group", RAD_FP8_BLOCK),
-                                                RAD_STR("a_order", "sorted"), RAD_STR("dtype", "fp8a8")),
+                const RadParam ps[] = { RAD_RANGE("M", 1, P), RAD_INT("N", E),
+                                        RAD_INT("K", m.n_ffe), RAD_INT("n_expert", NL),
+                                        RAD_INT("top_k", K), RAD_INT("group", RAD_FP8_BLOCK),
+                                        RAD_STR("a_order", "sorted"),
+                                        RAD_STR("dtype", m.exp_i8 ? "i8a8h" : "fp8a8"),
+                                        RAD_INT("a_group", RAD_FP8_BLOCK) };
+                y.op_edn = rw(b, rad_decl_op(b, "moe_gemm_q", ps,
+                                     (int)(sizeof ps / sizeof *ps) - (m.exp_i8 ? 0 : 1),
                                      tab.data(), (int)tab.size()),
                               {m.b_eq, m.b_eqs, m.b_sorted, m.b_eoff}, {m.b_edn});
             } else {
@@ -1165,7 +1258,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 rad_op_reads(b, y.op_gather, rd, 3);
                 rad_op_writes(b, y.op_gather, wr, 1);
             }
-            if (!y.op_enorm || !y.op_egu || !y.op_edn || (y.dn_fp8 && !y.op_eq)) return RAD_E_INVAL;
+            if (!y.op_enorm || !y.op_egu || !y.op_edn || (y.dn_q && !y.op_eq)) return RAD_E_INVAL;
             if (W > 1) y.op_ar_f = allreduce(2 * T * E, m.b_ff2);
             if (has_join_f)
             {
@@ -1291,9 +1384,29 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         "output draws from a sharper distribution", m.softcap, m.softcap);
     }
 
-    /* The drafter last: declaration order is the buffer planner's liveness. */
+    /* The drafter follows the trunk: declaration order is the buffer planner's liveness. */
     if (m.n_taps > 0)
         RAD_ARCH_TRY(declare_dflash(b, meta, ctx, m, (int)m.n_layer));
+    if (vision) {
+        /* Reserve the draft groups even when speculation is disabled. */
+        const int64_t draft_layers = dflash_kind(meta) == 1
+            ? rad_meta_geti(meta, "draft.num_hidden_layers", 0) : 0;
+        RAD_ARCH_TRY(m.vis.declare(b, meta, ctx, nm, E, (int)(m.n_layer + draft_layers),
+                                  "model.", "gemma4"));
+        /* A declaration without a weight source is valid for graph tools and tests. When
+         * the trunk is backed by weights, check the tower's entry and exit before loading. */
+        RadEncoding enc{};
+        if (rad_weight_encoding(b, nm.f("token_embd.weight"), &enc, nullptr, nullptr) == RAD_OK) {
+            for (const char* name : { "v.patch.weight", "v.embed.weight" }) {
+                if (rad_weight_encoding(b, nm.f("%s", name), &enc, nullptr, nullptr) != RAD_E_NOTFOUND)
+                    continue;
+                fprintf(stderr, "radiance: gemma4: vision is enabled but the model is missing "
+                                "vision weight '%s'; use --mm-max-patches 0 for text-only serving\n",
+                        name);
+                return RAD_E_NOTFOUND;
+            }
+        }
+    }
 
     int nfull = 0;
     for (int f : full) nfull += f;
@@ -1309,24 +1422,27 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     rad_note(b, "sandwich joins: %d of %lld fused (norm_add_norm / join_add_scale)%s",
              n_joins, (long long)(m.moe ? 2 * m.n_layer : m.n_layer),
              n_joins == 0 ? " -- not served, the rmsnorm / add / mul_weight chain" : "");
-    if (m.moe && m.n_gu_fp8 > 0)
-        rad_note(b, "routed inputs: %d of %d fp8 layers take the router's norm and the experts' "
-                    "codes from the attention join (norm_add_norm_route)%s",
-                 n_route, m.n_gu_fp8,
-                 n_route ? "" : " -- the rmsnorm and rmsnorm_quant_fp8 launches instead");
+    if (m.moe && m.n_gu_q > 0)
+        rad_note(b, "routed inputs: %d of %d quantised layers take the router's norm and the "
+                    "experts' codes from the attention join (%s)%s",
+                 n_route, m.n_gu_q, join_r,
+                 n_route ? "" : m.exp_i8 ? " -- the rmsnorm and rmsnorm_had_quant_i8g launches instead"
+                                         : " -- the rmsnorm and rmsnorm_quant_fp8 launches instead");
     if (m.ks.nh > 0)
         rad_note(b, "sliding attention: q %s", m.qrow == 1
                     ? "read in the fused qkv row (attn_paged_qrow)"
                     : "lifted into a dense block for attn_paged (attn_paged_qrow not served)");
     if (m.moe) {
         auto how = [&](int n_fp8) {
-            return n_fp8 == m.n_layer ? "block fp8" : n_fp8 == 0 ? "bf16" : "mixed";
+            return n_fp8 == 0 ? "bf16" : n_fp8 < m.n_layer ? "mixed"
+                 : m.exp_i8 ? "rotated int8" : "block fp8";
         };
         rad_note(b, "routed arm: %lld local experts from %lld of %lld, top %lld, %lld wide; "
-                    "gate_up %s (%d of %lld layers fp8), down %s (%d fp8); passes of %lld tokens",
+                    "gate_up %s (%d of %lld layers quantised), down %s (%d quantised); passes of "
+                    "%lld tokens",
                  (long long)m.n_local, (long long)m.expert_base, (long long)m.n_expert,
-                 (long long)m.top_k, (long long)m.n_ffe, how(m.n_gu_fp8), m.n_gu_fp8,
-                 (long long)m.n_layer, how(m.n_dn_fp8), m.n_dn_fp8, (long long)m.moe_rows);
+                 (long long)m.top_k, (long long)m.n_ffe, how(m.n_gu_q), m.n_gu_q,
+                 (long long)m.n_layer, how(m.n_dn_q), m.n_dn_q, (long long)m.moe_rows);
         if (W > 1)
             rad_note(b, "prefill overlap: %s", m.overlap
                         ? "a chunk of two routed passes or more runs as two slices, each slice's "
@@ -1394,11 +1510,11 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t
         }
         /* rmsnorm_quant_fp8's operands: x, residual (absent), w, q, scale, out_bf16 (absent);
          * issued only where the attention join did not already write the codes. */
-        if (y.gu_fp8 && !y.op_join_r)
+        if (y.gu_q && !y.op_join_r)
             RAD_ISSUE_N(c, y.op_enorm, n, brow_slice(m.b_x, r0, n, E), RAD_NONE, RAD_W(y.w_enorm),
                         brow_slice(m.b_hq, r0, n, E), brow_slice(m.b_hqs, r0, n, E / RAD_FP8_BLOCK),
                         RAD_NONE);
-        else if (!y.gu_fp8)
+        else if (!y.gu_q)
             RAD_ISSUE_N(c, y.op_enorm, n, brow_slice(m.b_x, r0, n, E), RAD_W(y.w_enorm),
                         brow_slice(m.b_hx, r0, n, E));
         if (!rfused && !pair)
@@ -1407,7 +1523,7 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t
         /* An fp8 projection's tables: the first handle of each parity's run and its length --
          * even codes, even scales, odd codes, odd scales (declare). */
         const int64_t H = NL / 2;
-        if (y.gu_fp8)
+        if (y.gu_q)
             RAD_ISSUE_N(c, y.op_egu, n, brow_slice(m.b_hq, r0, n, E),
                         brow_slice(m.b_hqs, r0, n, E / RAD_FP8_BLOCK),
                         RAD_WTAB(y.w_egu[0], H), RAD_WTAB(y.w_egus[0], H),
@@ -1419,7 +1535,7 @@ static void routed(RadCtx* c, const Model& m, const Layer& y, int64_t T, int64_t
                         brows(m.b_sorted, n * K), brows(m.b_eoff, NL + 1), brows(m.b_egu, n * K));
         RAD_ISSUE_N(c, y.op_eact, n * K, bcol(m.b_egu, 0, m.n_ffe, n * K),
                     bcol(m.b_egu, m.n_ffe, m.n_ffe, n * K), brows(m.b_eact, n * K));
-        if (y.dn_fp8) {
+        if (y.dn_q) {
             RAD_ISSUE_N(c, y.op_eq, n * K, brows(m.b_eact, n * K), brows(m.b_eq, n * K),
                         brows(m.b_eqs, n * K));
             RAD_ISSUE_N(c, y.op_edn, n, brows(m.b_eq, n * K), brows(m.b_eqs, n * K),
@@ -1460,7 +1576,8 @@ static void attend(RadCtx* c, const Model& m, const Layer& y, size_t li, const R
     const int32_t* slot  = kvb ? kvb->slot_mapping : nullptr;
     const int32_t* table = kvb ? kvb->block_table  : nullptr;
     const int32_t* used  = kvb ? kvb->seqused      : nullptr;
-    const RadOperand bt  = praw2(table, RAD_I32, batch->n_seq, kvb ? kvb->block_table_pitch : 0);
+    const int64_t pitch = kvb ? kvb->block_table_pitch : 0;
+    const RadOperand bt  = praw2(table, RAD_I32, batch->n_seq, pitch);
     const RadOperand su  = praw(used, RAD_I32, batch->n_seq);
 
     if (!y.full) {
@@ -1472,6 +1589,24 @@ static void attend(RadCtx* c, const Model& m, const Layer& y, size_t li, const R
         RAD_ISSUE_N(c, y.op_attn, batch->max_q_len,
                     y.op_lift ? brows(m.b_qs, T) : bcol(m.b_qkv, 0, qd, T),
                     kv_cache(k.kv, (int)li), bt, su, RAD_NONE, RAD_NONE, cu, brows(m.b_atts, T));
+        /* Recompute only the image rows, with the cache ending at the span's last row.
+         * The window still limits lookback; for a long span it must not limit lookahead. */
+        for (int64_t i = 0; y.op_bidi && i < batch->n_bidi; ++i) {
+            const int64_t first = batch->bidi_row[i], n = batch->bidi_n[i], s = batch->bidi_seq[i];
+            const rad_op op = n > k.window ? y.op_ahead : y.op_bidi;
+            if (!op) {
+                rad_step_fail(c, "gemma4: an image span exceeds the sliding window and needs "
+                                 "a paged attention kernel with unrestricted lookahead");
+                return;
+            }
+            RAD_ISSUE_N(c, op, n,
+                        y.op_lift ? brow_slice(m.b_qs, first, n, qd)
+                                  : bcol_at(m.b_qkv, first, qd + 2 * kvd, 0, qd, n),
+                        kv_cache(k.kv, (int)li),
+                        praw2(table ? table + s * pitch : nullptr, RAD_I32, 1, pitch),
+                        praw(batch->bidi_used + i, RAD_I32, 1),
+                        RAD_NONE, RAD_NONE, RAD_NONE, brow_slice(m.b_atts, first, n, qd));
+        }
     } else {
         RAD_ISSUE_N(c, y.op_vnorm, T * k.nkv, brows(m.b_kf, T), RAD_NONE, brows(m.b_vf, T));
         RAD_ISSUE_N(c, y.op_qn, T * k.nh, brows(m.b_qf, T), RAD_W(y.w_qn), brows(m.b_qf, T));
@@ -1737,7 +1872,7 @@ static void calib_count(RadCtx* c, Model& m, int64_t T) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
+    const Model& m = g_model[rad_slot(c)];
     if (batch->draft_pass != 0) {
         if (!m.have_df) {
             rad_step_fail(c, "the batch asks for a drafter pass and no drafter is declared: the "
@@ -1750,20 +1885,31 @@ static void step(RadCtx* c, const RadBatch* batch) {
         return;
     }
     if (batch->enc) {
-        rad_step_fail(c, "gemma4 declares no encoder; serve this container with --mm-max-patches 0");
+        if (batch->enc & ~(RAD_MM_IMAGE | RAD_MM_VIDEO))
+            rad_step_fail(c, "gemma4: unsupported encoder modality");
+        else if (!m.vis.on)
+            rad_step_fail(c, "gemma4: no vision tower was declared; image and video encoding "
+                             "require vision weights and --mm-max-patches greater than 0");
+        else
+            m.vis.step(c, batch);
         return;
     }
     const int64_t T = batch->n_tok, E = m.E;
     if (T <= 0) return;
 
     RAD_ISSUE(c, m.op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.b_x, T));
+    /* The batch supplies image rows on rank 0 and zeros on the other ranks. */
+    if (m.op_mm && batch->n_mm_rows > 0)
+        RAD_ISSUE_N(c, m.op_mm, batch->n_mm_rows,
+                    praw2(batch->mm_embd, RAD_BF16, batch->n_mm_rows, E),
+                    praw(batch->mm_rows, RAD_I32, batch->n_mm_rows), brows(m.b_x, T));
     if (m.op_embed_ar)
         RAD_ISSUE_N(c, m.op_embed_ar, T * E, brows(m.b_x, T), RAD_NONE);
 
     const int64_t cut = split_at(m, T);
     if (cut > 0) trunk_overlap(c, m, batch, cut);
     else         trunk(c, m, batch);
-    if (m.calib && m.tap_live) calib_count(c, g_model[rad_rank(c)], T);
+    if (m.calib && m.tap_live) calib_count(c, g_model[rad_slot(c)], T);
 
     if (m.op_onorm) RAD_ISSUE(c, m.op_onorm, brows(m.b_x, T), RAD_W(m.w_onorm), brows(m.b_h, T));
     if (batch->n_out > 0) {
@@ -1784,6 +1930,10 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     out->draft_depth = 0;
     (void)dflash_probe(meta, out);
+    if (Gemma4Vision::present(meta)) {
+        const int64_t k = rad_meta_geti(meta, "vision_config.pooling_kernel_size", 0);
+        if (k > 0) out->enc_merge = k * k;
+    }
     return RAD_OK;
 }
 
@@ -1796,8 +1946,10 @@ static const RadChatFormat* chat_format(const RadModelMeta*) { return gemma4_cha
 }  /* namespace gemma4 */
 
 #ifndef RAD_ARCH_NO_EXPORTS
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(gemma4, "gemma4", "", "0.1.0",
-                "Gemma 4 text decoders (26B-A4B MoE, dense 31B), bf16: sliding and full attention "
+                "Gemma 4 decoders (26B-A4B MoE, dense 31B) with vision, bf16: sliding and full attention "
                 "with proportional rope and K = V, a dense and a routed feed-forward side by side, "
                 "and z-lab's DFlash block-diffusion drafter")
 RAD_ARCH_PROBE(gemma4)

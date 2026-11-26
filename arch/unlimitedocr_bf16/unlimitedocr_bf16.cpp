@@ -100,7 +100,7 @@ struct Model {
     std::vector<Layer> layers;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* The per-MoE-layer norm and shared arm. The MoE block declares no norm in external-input mode,
  * and the shared expert must read the same normed row the routed experts do; the block's gather
@@ -178,9 +178,10 @@ static int declare_moe_norm_and_shared(RadBuilder* b, Model& m, int l) {
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
 
-    Model& m = g_model[ctx->rank];
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
@@ -488,7 +489,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    Model& m = g_model[rad_rank(c)];
+    Model& m = g_model[rad_slot(c)];
 
     if (batch->enc) {
         m.enc.step(c, batch);
@@ -543,9 +544,22 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 }
 
+/* Chained launches pay on the plain-bf16 trunk: every kernel of its decode step but the cache's
+ * two-dimensional copy and the vocabulary GEMM has a chained form (libr4d's rad_kernel_chain).
+ * Unlimited-OCR on one R9700, ms a decode step unchained / chained: 2.79 / 2.49 at one sequence
+ * and 4.51 / 4.19 at four. */
+static int probe(const RadModelMeta* meta, RadArchProbe* out) {
+    if (!meta || !out) return RAD_E_INVAL;
+    out->chain_pays = RAD_CHAIN_ALWAYS;
+    return RAD_OK;
+}
+
 }  /* namespace unlimitedocr_bf16 */
 
 #ifndef RAD_ARCH_NO_EXPORTS
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
+RAD_ARCH_PROBE(unlimitedocr_bf16)
 RAD_ARCH_PLUGIN(unlimitedocr_bf16, "unlimitedocr", "", "0.1.0",
                 "baidu/Unlimited-OCR decoder: 12-layer Llama-MoE (64 experts top-6 + 2 shared), "
                 "bf16 weights and activations, full rotary MHA, with the DeepEncoder "

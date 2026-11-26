@@ -39,7 +39,7 @@
 #include "mm/media.h"
 #include "rad_internal.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cmath>
@@ -254,9 +254,16 @@ int Server::speech_request(const json& body, const std::string& text,
         }
         if (refs.empty()) r->ref_cu.clear();
     }
-    if (!refs.empty() && !inst.empty())
+    const bool ref_direction = !refs.empty() && !inst.empty();
+    if (ref_direction && info.tmpl_ref_instruct.empty())
         return fail(err_unsupported("instructions", "a request with references takes no "
                                                     "instructions; the clips set the voice"));
+    /* A model whose negative template omits the reference has not declared reference CFG.
+     * In particular Breeze's ref_clone_tata is an unguided continuation, not voice design. */
+    if (!refs.empty() && info.branches != 1 && r->cfg > 1.0f &&
+        (!ref_direction || info.neg_tmpl_ref.empty()))
+        return fail(err_unsupported("guidance_scale", "voice cloning requires guidance_scale 1; "
+                                                     "this model has no guided reference template"));
 
     /* ---- the prompt */
     std::string i2, t2, why;
@@ -277,26 +284,28 @@ int Server::speech_request(const json& body, const std::string& text,
     /* One reference (ref_item): its header, the transcript in it, tokenised as one segment with
      * its special tokens (the speaker tags prepare() allows), a row a frame of its clip, and what
      * follows the clip as another segment. */
-    int64_t frame0 = 0;
-    auto render_ref = [&](size_t i, std::vector<int32_t>* ids_out) {
+    auto render_ref = [&](size_t i, std::vector<int32_t>* ids_out,
+                          std::vector<int32_t>* frame_map, int64_t& frame0) {
         static const std::string kAudio = "{audio}";
         const std::string idx = std::to_string(i + 1);
         const size_t a = info.ref_item.find(kAudio);
         encode(subst(subst(info.ref_item.substr(0, a), "{index}", idx), "{text}", refs[i].text),
                true, ids_out);
-        r->ref_frame.resize(ids_out->size(), -1);
+        frame_map->resize(ids_out->size(), -1);
         for (int64_t f = 0; f < refs[i].frames; ++f) {
             ids_out->push_back(0);
-            r->ref_frame.push_back((int32_t)(frame0 + f));
+            frame_map->push_back((int32_t)(frame0 + f));
         }
         frame0 += refs[i].frames;
         encode(subst(info.ref_item.substr(a + kAudio.size()), "{index}", idx), true, ids_out);
     };
     /* A template a segment at a time: its own text with special tokens, each slot without. */
-    auto render = [&](const std::string& t, std::vector<int32_t>* ids_out) {
+    auto render = [&](const std::string& t, std::vector<int32_t>* ids_out,
+                      std::vector<int32_t>* frame_map) {
         static const std::string kInst = "{instructions}", kInput = "{input}",
                                  kRefs = "{references}";
         size_t at = 0;
+        int64_t frame0 = 0;
         while (at <= t.size()) {
             const size_t a = t.find(kInst, at), b = t.find(kInput, at), c = t.find(kRefs, at);
             const size_t p = std::min(a, std::min(b, c));
@@ -304,7 +313,7 @@ int Server::speech_request(const json& body, const std::string& text,
                    ids_out);
             if (p == std::string::npos) break;
             if (p == c) {
-                for (size_t i = 0; i < refs.size(); ++i) render_ref(i, ids_out);
+                for (size_t i = 0; i < refs.size(); ++i) render_ref(i, ids_out, frame_map, frame0);
                 at = p + kRefs.size();
                 continue;
             }
@@ -314,11 +323,14 @@ int Server::speech_request(const json& body, const std::string& text,
             encode(is_inst ? i2 : t2, !is_inst && info.input_special, ids_out);
             at = p + (is_inst ? kInst : kInput).size();
         }
+        if (frame_map) frame_map->resize(ids_out->size(), -1);
     };
-    render(!refs.empty() ? info.tmpl_ref : inst.empty() ? info.tmpl_plain : info.tmpl,
-           &r->tokens);
-    if (!refs.empty()) r->ref_frame.resize(r->tokens.size(), -1);
-    if (!info.neg_tmpl.empty()) render(info.neg_tmpl, &r->neg_tokens);
+    render(ref_direction ? info.tmpl_ref_instruct : !refs.empty() ? info.tmpl_ref :
+           inst.empty() ? info.tmpl_plain : info.tmpl, &r->tokens,
+           refs.empty() ? nullptr : &r->ref_frame);
+    if (ref_direction)
+        render(info.neg_tmpl_ref, &r->neg_tokens, &r->neg_ref_frame);
+    else if (!info.neg_tmpl.empty()) render(info.neg_tmpl, &r->neg_tokens, nullptr);
     const size_t n_prompt = std::max(r->tokens.size(), r->neg_tokens.size());
     if ((int64_t)n_prompt > info.max_prompt)
         return fail(err_bad("input", "the prompt is " + std::to_string(n_prompt) +

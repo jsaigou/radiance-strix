@@ -1088,6 +1088,11 @@ TEST(the_checked_in_fixtures_use_no_dtype_the_harness_cannot_draw_or_read) {
         }
         for (const auto& [what, w] : weights) {
             KfOperand t = *w.first;
+            /* A scale of two planes (IQ8R's u8 scale per 256 of K under a bf16 scale a row) is one
+             * operand at the weight's extents that the kernel's layout combines; it has no
+             * logical decode of its own, and the codes operand beside it is the one drawn here. */
+            if (t.sel.size() > 1 && std::find(t.sel.begin(), t.sel.end(), 0) == t.sel.end())
+                continue;
             t.sel_rows.clear();
             t.sel_cols.clear();
             for (int i : t.sel) {

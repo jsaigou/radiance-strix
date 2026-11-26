@@ -19,8 +19,8 @@
 
 #include "r4d.h"
 #include "r4d_args.h"
-#include "r4d_emit.h"
 #include "r4d_chain.h"
+#include "r4d_emit.h"
 #include "r4d_launch.h"   // R4D_DYN_LDS
 #include "r4d_common.h"   // the DPP wave scans
 
@@ -129,13 +129,14 @@ __device__ __forceinline__ void counts_before(const uint32_t* wsum, int lane, in
  * block table and complete-block count. The per-query bound is (pos + 1) / ratio: block b is
  * entirely in the query's past when b * ratio + ratio - 1 <= pos. At decode this equals the
  * sequence's complete count. */
+#define QSA_SELECT_PARAMS                                                                       \
+    const float* __restrict__ score, const int32_t* __restrict__ bt,                            \
+    const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,                            \
+    const int32_t* __restrict__ cu, int32_t* __restrict__ sel, int32_t* __restrict__ nsel,      \
+    int32_t* __restrict__ seqused, int nb, int topk, int ratio, int nseq, int s_ld,             \
+    int t_ld, int o_ld, int cap
 template <bool Signed>
-__device__ __forceinline__ void qsa_select_kernel_body(
-    const float* __restrict__ score, const int32_t* __restrict__ bt,
-    const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
-    const int32_t* __restrict__ cu,
-    int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
-    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld, int cap) {
+__device__ __forceinline__ void qsa_select_body(QSA_SELECT_PARAMS) {
 
     __shared__ uint32_t hist[kBins];
     __shared__ uint32_t suf[kBins];
@@ -295,27 +296,17 @@ __device__ __forceinline__ void qsa_select_kernel_body(
     }
 }
 
-/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
-template <bool Signed>
-__global__ __launch_bounds__(kThreads) void qsa_select_kernel(
-    const float* __restrict__ score, const int32_t* __restrict__ bt,
-    const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
-    const int32_t* __restrict__ cu,
-    int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
-    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld, int cap) {
-    qsa_select_kernel_body<Signed>(score, bt, nc, pos, cu, sel, nsel, seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap);
+/* The kernel around the body, whose blocks and threads return where their work ends: CH `r4dchain`
+ * is the chained form (r4d_chain.h). */
+template <bool Signed, class CH>
+__global__ __launch_bounds__(kThreads)
+void qsa_select_kernel(QSA_SELECT_PARAMS) {
+    if (CH::on) r4d_chain_wait();
+    qsa_select_body<Signed>(score, bt, nc, pos, cu, sel, nsel, seqused, nb, topk, ratio, nseq, s_ld,
+                            t_ld, o_ld, cap);
+    if (CH::on) r4d_chain_done();
 }
-template <bool Signed>
-__global__ __launch_bounds__(kThreads) void r4dchain_qsa_select(
-    const float* __restrict__ score, const int32_t* __restrict__ bt,
-    const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
-    const int32_t* __restrict__ cu,
-    int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
-    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld, int cap) {
-    r4d_chain_wait();
-    qsa_select_kernel_body<Signed>(score, bt, nc, pos, cu, sel, nsel, seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap);
-    r4d_chain_done();
-}
+#undef QSA_SELECT_PARAMS
 
 /* ===================================================== the wide-launch path, for a prefill chunk
  *
@@ -814,8 +805,16 @@ constexpr int32_t kParOver = 1 << 30;
  * hide LDS and global latency (24 VGPRs, so occupancy is not the limit). The bin scan stays at
  * 256 threads. */
 constexpr int kMergeThreads = 1024;
-/* The local pass has many more workgroups (48 at the decode shape), so a narrower block. */
-constexpr int kLocalThreads = 512;
+/* The local pass has many more workgroups (a query's chunks times the query rows), so a narrower
+ * block -- except where the grid is small enough to sit on the card at once: up to
+ * kLocalWideGrid workgroups (four verify rows over as many as kParWMax chunks) the wide block
+ * hides the same latencies as the merge's. At 95K tokens of context, one sequence under the draft
+ * head, the twelve local launches of a verify pass take 105 us wide against 126 (and 209 at 256
+ * threads). */
+constexpr int kLocalThreads = 512, kLocalWideThreads = 1024;
+constexpr int kLocalWideGrid = 64;
+static_assert(kParCap / kLocalThreads <= 32 && kLdsCap / kMergeThreads <= 32,
+              "a thread's run of keys is a 32-bit mask (run_take)");
 
 /* Chunks for a block list of nb (at most kParWMax). Both kernels index the scratch at the fixed
  * kParWMax stride, so they agree regardless of this value. */
@@ -874,76 +873,77 @@ __device__ __forceinline__ void radix_thresh(const uint32_t* __restrict__ key, i
     }
 }
 
-/* The qualifying set by prefix count, in two layouts.
+/* The qualifying set by prefix count.
  *
  * The merge must reproduce the single-workgroup kernel's table exactly (entries above the
  * threshold first, ties last): the attention sums pages in table order and float addition is not
  * associative. The local pass instead writes in block order, since the merge's tie rule reads it
- * that way. Slots come from workgroup prefix counts, never from scheduling. */
-struct ParEmit {
-    uint32_t* wsum;                    /* [kWaves] scratch for the wave prefix */
-    uint32_t* sh_hi;                   /* running count of entries above the threshold */
-    uint32_t* sh_ord;                  /* running count of entries taken, in block order */
-    uint32_t  taken_eq;                /* ties taken so far; per thread, and uniform by induction */
-    uint32_t  T, need;
-    bool      all;                     /* below the top-k: everything live is in */
-};
-struct ParTake {
-    bool     hi, take;
-    uint32_t slot_hi, slot_ord, rank_eq;
+ * that way. Slots come from workgroup prefix counts, never from scheduling.
+ *
+ * A thread owns `run` consecutive keys of the list in LDS (threads in order, so block order holds)
+ * and classes them into bit masks; three workgroup prefixes over the per-thread counts then place
+ * every key, two barriers each whatever the list's length (a prefix per NT keys of the list costs
+ * five barriers a round, eight rounds for a chunk). `run` is at most 32. */
+struct RunTake {
+    uint32_t hi, eq, take;             /* bit j: this thread's key j is above the threshold, a tie
+                                        * at it, taken */
+    uint32_t rank_eq;                  /* ties ahead of this thread's first key */
+    uint32_t slot_hi, slot_take;       /* above-threshold and taken keys ahead of it */
+    uint32_t n_hi, n_take;             /* the workgroup's totals */
 };
 
-/* One ballot, one wave prefix, one workgroup prefix. `*run` is the running total, advanced by
- * thread 0. */
+/* The exclusive workgroup prefix of a per-thread count, and the total. */
 template <int NT>
-__device__ __forceinline__ uint32_t par_scan(ParEmit& e, bool p, int lane, int wave,
-                                             uint32_t* run, uint32_t base0, uint32_t* total) {
+__device__ __forceinline__ uint32_t run_prefix(uint32_t mine, uint32_t* wsum, int lane, int wave,
+                                               uint32_t* total) {
     constexpr int NW = NT / kWave;
-    const unsigned long long mk = __ballot(p);
-    const uint32_t rk = (uint32_t)__popcll(mk & ((1ull << lane) - 1ull));
-    if (lane == 0) e.wsum[wave] = (uint32_t)__popcll(mk);
+    const uint32_t inc = r4d_wave_prefix_u32(mine, lane);
+    if (lane == kWave - 1) wsum[wave] = inc;
     __syncthreads();
     uint32_t before, tot;
-    counts_before<NW>(e.wsum, lane, wave, &before, &tot);
-    const uint32_t base = base0 + before;
+    counts_before<NW>(wsum, lane, wave, &before, &tot);
     __syncthreads();
-    if (total) *total = tot;
-    if (run && threadIdx.x == 0) *run += tot;
-    return base + rk;
+    *total = tot;
+    return before + inc - mine;
 }
 
-/* WantHi / WantOrd select which slots are computed: each par_scan costs a ballot and two
- * barriers, the merge reads only slot_hi and rank_eq, and the local pass only slot_ord. The
- * branches are compile-time, so every thread takes the same path and the barriers inside are
- * legal. `take` depends on rank_eq, which is always computed first. */
-template <bool WantHi, bool WantOrd, int NT>
-__device__ __forceinline__ ParTake par_take(ParEmit& e, uint32_t k, int lane, int wave) {
-    ParTake r{};
-    r.hi        = k != 0u && (e.all || k > e.T);
-    const bool eq = k != 0u && !e.all && k == e.T;
-
-    uint32_t tot_e = 0;
-    r.rank_eq = par_scan<NT>(e, eq, lane, wave, nullptr, e.taken_eq, &tot_e);
-    r.take    = r.hi || (eq && r.rank_eq < e.need);
-    if (WantHi)  r.slot_hi  = par_scan<NT>(e, r.hi,   lane, wave, e.sh_hi,  *e.sh_hi,  nullptr);
-    if (WantOrd) r.slot_ord = par_scan<NT>(e, r.take, lane, wave, e.sh_ord, *e.sh_ord, nullptr);
-    e.taken_eq += tot_e;
-    __syncthreads();
+/* `all`: below the top-k, everything live is in. Else keys above `T` are in and the first `need`
+ * ties at `T` in list order. */
+template <int NT>
+__device__ __forceinline__ RunTake run_take(const uint32_t* __restrict__ key, int n, int run,
+                                            uint32_t T, uint32_t need, bool all, uint32_t* wsum,
+                                            int lane, int wave) {
+    RunTake r{};
+    const int i0 = (int)threadIdx.x * run;
+    for (int j = 0; j < run; ++j) {
+        const uint32_t k = i0 + j < n ? key[i0 + j] : 0u;
+        if (k != 0u && (all || k > T)) r.hi |= 1u << j;
+        if (k != 0u && !all && k == T) r.eq |= 1u << j;
+    }
+    uint32_t n_eq = 0;
+    r.rank_eq = run_prefix<NT>((uint32_t)__builtin_popcount(r.eq), wsum, lane, wave, &n_eq);
+    /* The ties this thread may take: the first `need - rank_eq` of its own. */
+    uint32_t left = r.rank_eq < need ? need - r.rank_eq : 0u, eq_take = 0u;
+    for (int j = 0; j < run && left > 0u; ++j)
+        if ((r.eq >> j) & 1u) { eq_take |= 1u << j; --left; }
+    r.take = r.hi | eq_take;
+    r.slot_hi   = run_prefix<NT>((uint32_t)__builtin_popcount(r.hi),   wsum, lane, wave, &r.n_hi);
+    r.slot_take = run_prefix<NT>((uint32_t)__builtin_popcount(r.take), wsum, lane, wave, &r.n_take);
     return r;
 }
 
 /* ---- pass one: every chunk's own top-k, as (key, block index) in block order. */
-template <bool Signed>
-__global__ __launch_bounds__(kLocalThreads) void qsa_local_kernel(
-    const float* __restrict__ score, const int32_t* __restrict__ bt,
-    const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
-    const int32_t* __restrict__ cu,
-    uint32_t* __restrict__ ck, int32_t* __restrict__ ci, int32_t* __restrict__ cc,
-    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int chunk) {
+#define QSA_LOCAL_PARAMS                                                                        \
+    const float* __restrict__ score, const int32_t* __restrict__ bt,                            \
+    const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,                            \
+    const int32_t* __restrict__ cu,                                                             \
+    uint32_t* __restrict__ ck, int32_t* __restrict__ ci, int32_t* __restrict__ cc,              \
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int chunk
+template <bool Signed, int LT>
+__device__ __forceinline__ void qsa_local_body(QSA_LOCAL_PARAMS) {
 
-    constexpr int LT = kLocalThreads;
     __shared__ uint32_t hist[kBins], suf[kBins], wsum[LT / kWave];
-    __shared__ uint32_t sh_T, sh_need, sh_hi, sh_ord;
+    __shared__ uint32_t sh_T, sh_need;
     __shared__ int      sh_seq;
     R4D_DYN_LDS(uint32_t, sh_key);
 
@@ -968,41 +968,68 @@ __global__ __launch_bounds__(kLocalThreads) void qsa_local_kernel(
 
     const float*   sc = score + (size_t)m * s_ld;
     const int32_t* tb = bt    + (size_t)seq * t_ld;
-    for (int i = t; i < cn; i += LT) sh_key[i] = keyof<Signed>(sc[lo + i], tb[lo + i]);
+    /* A thread's scores and pages (every LT-th of the chunk) are all loaded before the first key
+     * is staged: one round trip instead of one a key. */
+    {
+        constexpr int kPre = kParCap / LT;
+        float   sv[kPre];
+        int32_t pv[kPre];
+#pragma unroll
+        for (int u = 0; u < kPre; ++u) {
+            const int i = t + u * LT;
+            sv[u] = 0.0f; pv[u] = -1;
+            if (i < cn) { sv[u] = sc[lo + i]; pv[u] = tb[lo + i]; }
+        }
+#pragma unroll
+        for (int u = 0; u < kPre; ++u) {
+            const int i = t + u * LT;
+            if (i < cn) sh_key[i] = keyof<Signed>(sv[u], pv[u]);
+        }
+    }
     __syncthreads();
 
-    ParEmit e{ wsum, &sh_hi, &sh_ord, 0u, 0u, 0u, cn <= topk };
-    if (!e.all) {
+    const bool all = cn <= topk;
+    uint32_t T = 0u, need = 0u;
+    if (!all) {
         radix_thresh<LT>(sh_key, cn, (uint32_t)topk, true, hist, suf, wsum, &sh_T, &sh_need);
-        e.T = sh_T; e.need = sh_need;
+        T = sh_T; need = sh_need;
     }
     /* A threshold means more than topk live keys here, so more than topk in the whole list. */
-    const bool over = !e.all && e.T != 0u;
-    if (t == 0) { sh_hi = 0; sh_ord = 0; }
-    __syncthreads();
+    const bool over = !all && T != 0u;
 
     /* In block order: the merge breaks ties by block index. */
     uint32_t* dk = ck + (size_t)(m * kParWMax + c) * topk;
     int32_t*  di = ci + (size_t)(m * kParWMax + c) * topk;
-    for (int i0 = 0; i0 < cn; i0 += LT) {
-        const int i = i0 + t;
-        const uint32_t k = i < cn ? sh_key[i] : 0u;
-        const ParTake r = par_take<false, true, LT>(e, k, lane, wave);
-        if (r.take && r.slot_ord < (uint32_t)topk) {
-            dk[r.slot_ord] = k;
-            /* Store the page, not the block index: resolving it here spreads the dependent load
-             * over many workgroups instead of the merge's few. The merge breaks ties by list
-             * position (block-ordered), never by index. A taken candidate has k != 0, so its
-             * page is live. */
-            di[r.slot_ord] = tb[lo + i];
-        }
+    const int run = (cn + LT - 1) / LT;
+    const RunTake r = run_take<LT>(sh_key, cn, run, T, need, all, wsum, lane, wave);
+    for (int j = 0; j < run; ++j) {
+        if (!((r.take >> j) & 1u)) continue;
+        const uint32_t slot = r.slot_take + (uint32_t)__builtin_popcount(r.take & ((1u << j) - 1u));
+        if (slot >= (uint32_t)topk) continue;
+        const int i = t * run + j;
+        dk[slot] = sh_key[i];
+        /* Store the page, not the block index: resolving it here spreads the dependent load
+         * over many workgroups instead of the merge's few. The merge breaks ties by list
+         * position (block-ordered), never by index. A taken candidate has k != 0, so its
+         * page is live. */
+        di[slot] = tb[lo + i];
     }
     if (t == 0) cc[(size_t)m * kParWMax + c] =
-        (int32_t)(sh_ord < (uint32_t)topk ? sh_ord : (uint32_t)topk) | (over ? kParOver : 0);
+        (int32_t)(r.n_take < (uint32_t)topk ? r.n_take : (uint32_t)topk) | (over ? kParOver : 0);
 }
+/* The kernel around the body, whose blocks return where their chunk is empty: CH `r4dchain` is the
+ * chained form (r4d_chain.h). */
+template <bool Signed, int LT, class CH>
+__global__ __launch_bounds__(LT) void qsa_local_kernel(QSA_LOCAL_PARAMS) {
+    if (CH::on) r4d_chain_wait();
+    qsa_local_body<Signed, LT>(score, bt, nc, pos, cu, ck, ci, cc, nb, topk, ratio, nseq, s_ld,
+                               t_ld, chunk);
+    if (CH::on) r4d_chain_done();
+}
+#undef QSA_LOCAL_PARAMS
 
 /* ---- pass two: merge the chunk lists and emit the page-id table. */
-template <bool Signed>
+template <bool Signed, class CH>
 __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
     const uint32_t* __restrict__ ck, const int32_t* __restrict__ ci,
     const int32_t* __restrict__ cc, const int32_t* __restrict__ bt,
@@ -1010,10 +1037,12 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
     const int32_t* __restrict__ cu,
     int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
     int nb, int topk, int ratio, int nseq, int t_ld, int o_ld, int nchunk) {
+    /* CH `r4dchain` is the chained form (r4d_chain.h): no block or thread returns before the end. */
+    if (CH::on) r4d_chain_wait();
 
     constexpr int NT = kMergeThreads;
     __shared__ uint32_t hist[kBins], suf[kBins], wsum[NT / kWave];
-    __shared__ uint32_t sh_T, sh_need, sh_hi, sh_ord, sh_tot, sh_over;
+    __shared__ uint32_t sh_T, sh_need, sh_tot, sh_over;
     __shared__ int      sh_seq, sh_off[kParWMax + 1];
     R4D_DYN_LDS(uint32_t, sh_key);
 
@@ -1031,27 +1060,41 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
     int n = nc[seq] < nb ? nc[seq] : nb;
     if (own < n) n = own;
 
-    /* Chunk offsets, serially on one thread (nchunk <= 16). */
-    if (t == 0) {
-        int s = 0;
-        uint32_t over = 0;
-        for (int c = 0; c < nchunk; ++c) {
-            const int32_t v = cc[(size_t)m * kParWMax + c];
-            over |= (v & kParOver) ? 1u : 0u;
-            sh_off[c] = s;
-            s += v & ~kParOver;
-        }
-        sh_off[nchunk] = s;
-        sh_tot = (uint32_t)s;
-        sh_over = over;
+    /* Chunk offsets: the first wave loads a chunk's count a lane and takes their prefix, one
+     * round trip for all of them (nchunk <= kParWMax lanes). */
+    {
+        const int32_t  v   = t < nchunk ? cc[(size_t)m * kParWMax + t] : 0;
+        const uint32_t cnt = (uint32_t)(v & ~kParOver);
+        const uint32_t inc = r4d_wave_prefix_u32(cnt, lane);
+        const unsigned long long ov = __ballot(t < nchunk && (v & kParOver) != 0);
+        if (t < nchunk) sh_off[t] = (int)(inc - cnt);
+        if (t == nchunk - 1) { sh_off[nchunk] = (int)inc; sh_tot = inc; }
+        if (t == 0) sh_over = ov != 0ull ? 1u : 0u;
     }
     __syncthreads();
     const int tot = (int)sh_tot;
 
-    for (int c = 0; c < nchunk; ++c) {
-        const int base = sh_off[c], cnt = sh_off[c + 1] - base;
-        const uint32_t* src = ck + (size_t)(m * kParWMax + c) * topk;
-        for (int i = t; i < cnt; i += NT) sh_key[base + i] = src[i];
+    /* The candidates into LDS in list order. A thread's keys (every NT-th of the list) are all
+     * loaded before the first is stored: one round trip, where a pass per chunk made one for each
+     * of the nchunk lists. */
+    {
+        constexpr int kPre = kLdsCap / NT;
+        uint32_t kv[kPre];
+#pragma unroll
+        for (int u = 0; u < kPre; ++u) {
+            const int i = t + u * NT;
+            kv[u] = 0u;
+            if (i < tot) {
+                int c = nchunk - 1;
+                while (c > 0 && sh_off[c] > i) --c;
+                kv[u] = ck[(size_t)(m * kParWMax + c) * topk + (i - sh_off[c])];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kPre; ++u) {
+            const int i = t + u * NT;
+            if (i < tot) sh_key[i] = kv[u];
+        }
     }
     __syncthreads();
 
@@ -1059,32 +1102,36 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
      * most topk blocks, or topk or fewer live. With no chunk over topk the candidates are every
      * live key, so their count is the live count; a chunk over topk means more than topk live,
      * and then exactly topk candidates are the top-k, whose ties go last. */
-    ParEmit e{ wsum, &sh_hi, &sh_ord, 0u, 0u, 0u, n <= topk || (!sh_over && tot <= topk) };
-    if (!e.all) {
+    const bool all = n <= topk || (!sh_over && tot <= topk);
+    uint32_t T = 0u, need = 0u;
+    if (!all) {
         radix_thresh<NT>(sh_key, tot, (uint32_t)topk, false, hist, suf, wsum, &sh_T, &sh_need);
-        e.T = sh_T; e.need = sh_need;
+        T = sh_T; need = sh_need;
     }
-    if (t == 0) { sh_hi = 0; sh_ord = 0; }
-    __syncthreads();
 
     const int32_t* tb = bt  + (size_t)seq * t_ld;
     int32_t*       ou = sel + (size_t)m * o_ld;
-    for (int i0 = 0; i0 < tot; i0 += NT) {
-        const int i = i0 + t;
-        const uint32_t k = i < tot ? sh_key[i] : 0u;
-        const ParTake r = par_take<true, false, NT>(e, k, lane, wave);
-        if (r.take) {
-            /* The candidate's chunk, from the offsets. */
-            int c = nchunk - 1;
-            while (c > 0 && sh_off[c] > i) --c;
-            /* Already a page (resolved by the local pass); tb is still needed for the partial
-             * page. */
-            const int32_t page = ci[(size_t)(m * kParWMax + c) * topk + (i - sh_off[c])];
-            /* The single-workgroup kernel's layout: above the threshold first, ties last. */
-            if (r.hi) { if (r.slot_hi < (uint32_t)topk) ou[r.slot_hi] = page; }
-            else       { ou[(uint32_t)topk - e.need + r.rank_eq] = page; }
+    const int run = (tot + NT - 1) / NT;
+    const RunTake r = run_take<NT>(sh_key, tot, run, T, need, all, wsum, lane, wave);
+    for (int j = 0; j < run; ++j) {
+        if (!((r.take >> j) & 1u)) continue;
+        const int i = t * run + j;
+        /* The candidate's chunk, from the offsets. */
+        int c = nchunk - 1;
+        while (c > 0 && sh_off[c] > i) --c;
+        /* Already a page (resolved by the local pass); tb is still needed for the partial
+         * page. */
+        const int32_t page = ci[(size_t)(m * kParWMax + c) * topk + (i - sh_off[c])];
+        /* The single-workgroup kernel's layout: above the threshold first, ties last. */
+        const uint32_t below = (1u << j) - 1u;
+        if ((r.hi >> j) & 1u) {
+            const uint32_t slot = r.slot_hi + (uint32_t)__builtin_popcount(r.hi & below);
+            if (slot < (uint32_t)topk) ou[slot] = page;
+        } else {
+            ou[(uint32_t)topk - need + r.rank_eq + (uint32_t)__builtin_popcount(r.eq & below)] = page;
         }
     }
+    const uint32_t n_hi = r.n_hi;
 
     /* The partial page, appended last, as in the single-workgroup kernel. */
     if (t == 0) {
@@ -1092,7 +1139,7 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
          * table is full (ties fill it), and the merged count can fall short, which would let the
          * padding loop overwrite ties with -1. The exception is the same as there: topk or
          * fewer live blocks, all of them emitted. */
-        uint32_t out = e.all ? sh_hi : (uint32_t)topk;
+        uint32_t out = all ? n_hi : (uint32_t)topk;
         const int32_t part = (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
         if (part >= 0) ou[out++] = part;
         for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) ou[i] = -1;
@@ -1101,6 +1148,7 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
                                    : (out - 1) * (uint32_t)ratio + (uint32_t)(p % ratio) + 1u);
         seqused[m] = su;
     }
+    if (CH::on) r4d_chain_done();
 }
 }  // namespace
 
@@ -1124,7 +1172,8 @@ template <bool Signed>
 static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long cu, long sel,
                                    long nsel, long seqused, int M, int nb, int topk, int ratio,
                                    int nseq, int s_ld, int t_ld, int o_ld,
-                                   void* scratch, long long scratch_bytes, RadStream stream) {
+                                   void* scratch, long long scratch_bytes, RadStream stream,
+                                   bool chain) {
     if (!score || !bt || !nc || !cu || !sel || !nsel || !seqused) return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || nb <= 0 || topk <= 0 || ratio <= 0 || nseq <= 0) return R4D_NO(RAD_E_SHAPE);
     if (!s_ld) s_ld = nb;
@@ -1143,19 +1192,30 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
         uint32_t* ck = (uint32_t*)scratch;
         int32_t*  ci = (int32_t*)(ck + (size_t)kParM * kParWMax * topk);
         int32_t*  cc = ci + (size_t)kParM * kParWMax * topk;
-        const int rc = R4D_EMIT(stream, qsa_local_kernel<Signed>,
-                                dim3((unsigned)nchunk, (unsigned)M), dim3(kLocalThreads),
-                                (size_t)chunk * sizeof(uint32_t),
-                                (const float*)score, (const int32_t*)bt, (const int32_t*)nc,
-                                (const int32_t*)pos, (const int32_t*)cu, ck, ci, cc, nb, topk,
-                                ratio, nseq, s_ld, t_ld, chunk);
+        /* Each form named at its own launch, as below. */
+#define R4D_QLOC(LT_, CH_)                                                                      \
+        R4D_EMIT(stream, (qsa_local_kernel<Signed, LT_, CH_>),                                  \
+                 dim3((unsigned)nchunk, (unsigned)M), dim3(LT_),                                \
+                 (size_t)chunk * sizeof(uint32_t),                                              \
+                 (const float*)score, (const int32_t*)bt, (const int32_t*)nc,                   \
+                 (const int32_t*)pos, (const int32_t*)cu, ck, ci, cc, nb, topk,                 \
+                 ratio, nseq, s_ld, t_ld, chunk)
+#define R4D_QMRG(CH_)                                                                           \
+        R4D_EMIT(stream, (qsa_merge_kernel<Signed, CH_>), dim3((unsigned)M),                    \
+                 dim3(kMergeThreads), (size_t)nchunk * topk * sizeof(uint32_t),                 \
+                 (const uint32_t*)ck, (const int32_t*)ci, (const int32_t*)cc,                   \
+                 (const int32_t*)bt, (const int32_t*)nc, (const int32_t*)pos,                   \
+                 (const int32_t*)cu, (int32_t*)sel, (int32_t*)nsel, (int32_t*)seqused,          \
+                 nb, topk, ratio, nseq, t_ld, o_ld, nchunk)
+        const bool wide = (long)M * nchunk <= kLocalWideGrid;
+        const int  rc = wide ? (chain ? R4D_QLOC(kLocalWideThreads, r4dchain)
+                                      : R4D_QLOC(kLocalWideThreads, R4dUnchained))
+                             : (chain ? R4D_QLOC(kLocalThreads, r4dchain)
+                                      : R4D_QLOC(kLocalThreads, R4dUnchained));
         if (rc != RAD_OK) return rc;
-        return R4D_EMIT(stream, qsa_merge_kernel<Signed>, dim3((unsigned)M), dim3(kMergeThreads),
-                        (size_t)nchunk * topk * sizeof(uint32_t), (const uint32_t*)ck,
-                        (const int32_t*)ci, (const int32_t*)cc, (const int32_t*)bt,
-                        (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
-                        (int32_t*)sel, (int32_t*)nsel, (int32_t*)seqused,
-                        nb, topk, ratio, nseq, t_ld, o_ld, nchunk);
+        return chain ? R4D_QMRG(r4dchain) : R4D_QMRG(R4dUnchained);
+#undef R4D_QLOC
+#undef R4D_QMRG
     }
 
     /* A wide launch (prefill chunk, key cache off) takes the wide kernel. */
@@ -1171,19 +1231,15 @@ static int r4d_qsa_select_bf16_emit(long score, long bt, long nc, long pos, long
     /* Never more than the table width. */
     int cap = (M <= kCacheMaxM) ? lds_cap_of() : 0;
     if (cap > nb) cap = nb;
-    /* Two launch sites rather than a choice of kernel inside one: each names its kernel alone, and
-     * the emulator test reads the plain one's name (tests/r4d_emu/test_qsa.cpp). */
-    if (g_r4d_chain_arg)
-        return R4D_EMIT(stream, r4dchain_qsa_select<Signed>, dim3((unsigned)M), dim3(kThreads),
-                        (size_t)cap * sizeof(uint32_t), (const float*)score, (const int32_t*)bt,
-                        (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
-                        (int32_t*)sel, (int32_t*)nsel,
-                        (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap);
-    return R4D_EMIT(stream, qsa_select_kernel<Signed>, dim3((unsigned)M), dim3(kThreads),
-                    (size_t)cap * sizeof(uint32_t), (const float*)score, (const int32_t*)bt,
-                    (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu,
-                    (int32_t*)sel, (int32_t*)nsel,
-                    (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap);
+    /* Each form named at its own launch: a test reads the kernel a launch site names. */
+#define R4D_QSEL(CH_)                                                                           \
+    R4D_EMIT(stream, (qsa_select_kernel<Signed, CH_>), dim3((unsigned)M), dim3(kThreads),       \
+             (size_t)cap * sizeof(uint32_t), (const float*)score, (const int32_t*)bt,           \
+             (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu, (int32_t*)sel,        \
+             (int32_t*)nsel, (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap)
+    const int rc = chain ? R4D_QSEL(r4dchain) : R4D_QSEL(R4dUnchained);
+#undef R4D_QSEL
+    return rc;
 }
 
 extern "C" void r4d_qsa_select_pin_form(int form) { g_qsa_select_form = form; }
@@ -1199,7 +1255,6 @@ enum { QL_SCORE = 0, QL_BT = 1, QL_NC = 2, QL_POS = 3, QL_CU = 4, QL_SEL = 5, QL
        QL_SEQ = 7 };
 
 extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
-    const R4dChainArg chain_arg(r4d_geti_or(a, "chain", 0) != 0);
     const RadTensor* sc = r4d_opt(a, QL_SCORE);
     const RadTensor* bt = r4d_opt(a, QL_BT);
     const RadTensor* nc = r4d_opt(a, QL_NC);
@@ -1235,6 +1290,6 @@ extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
                 r4d_addr(cu), r4d_addr(se), r4d_addr(ns), r4d_addr(su),
                 (int)M, (int)nb, (int)topk, (int)ratio, (int)nseq,
                 (int)sp, (int)tp, (int)op, a->scratch, a->scratch_bytes,
-                stream);
+                stream, r4d_geti_or(a, "chain", 0) != 0);
 }
 

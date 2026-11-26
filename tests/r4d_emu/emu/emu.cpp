@@ -1,6 +1,8 @@
 #include "hip/hip_runtime.h"
 #include "rad_plugin.h"
+#include <algorithm>
 #include <cstdio>
+#include <emmintrin.h>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -59,9 +61,29 @@ struct Sched {
     int slot[64][2][32] = {};
     int tag[64][2][32] = {};   /* which op, and its uniform operand, each lane posted */
     unsigned xparity[1024] = {};
+    /* each wave's live lanes and returned-lane mask, kept as lanes return: a barrier arrival
+     * reads them rather than walking the wave */
+    int walive[64] = {};
+    unsigned wdone[64] = {};
+    /* the wave generation whose exchange slots have been checked and poisoned, by parity */
+    unsigned xchecked[64][2] = {};
+    /* bumped by every barrier arrival and every lane's return: a round that leaves it unchanged
+     * made no progress */
+    uint64_t progress = 0;
 } S;
 
-void yield() { Fiber& me = S.f[S.cur]; emu_switch(&me.sp, S.main_sp); }
+/* Hands the core to the next live fiber of the round, in thread order, or back to the scheduler
+ * after the last: the order fibers run in is the scheduler's own, at one switch a hand-off. */
+void yield() {
+    Fiber& me = S.f[S.cur];
+    for (int t = S.cur + 1; t < S.nthreads; ++t)
+        if (!S.f[t].done) {
+            S.cur = t;
+            emu_switch(&me.sp, S.f[t].sp);
+            return;
+        }
+    emu_switch(&me.sp, S.main_sp);
+}
 
 /* Lanes of wave `w` that have not returned. A cross-lane op on the card runs over the active lanes:
  * a lane that has returned takes no part, and the op completes without it (a read of its value is
@@ -73,21 +95,16 @@ int g_wmma_pending[64];   /* the wave exchange now forming is a WMMA's, which ev
  * arrive, so a lane reads this before it can be overwritten. */
 unsigned g_absent[64];
 unsigned wave_done_mask(int w);
-unsigned wave_done_mask(int w) {
-    unsigned m = 0;
-    for (int i = 0; i < 32 && w * 32 + i < S.nthreads; ++i) m |= (unsigned)S.f[w * 32 + i].done << i;
-    return m;
-}
-int wave_alive(int w) {
-    int n = 0;
-    for (int i = w * 32; i < w * 32 + 32 && i < S.nthreads; ++i) n += !S.f[i].done;
-    return n;
-}
+unsigned wave_done_mask(int w) { return S.wdone[w]; }
+int wave_alive(int w) { return S.walive[w]; }
 extern "C" void emu_trampoline() {
     S.body(S.ctx);
     S.f[S.cur].done = true;
     /* The lanes still running may be waiting at a wave exchange only this lane had yet to reach. */
     const int w = (int)S.f[S.cur].tid.x >> 5;
+    --S.walive[w];
+    S.wdone[w] |= 1u << ((int)S.f[S.cur].tid.x & 31);
+    ++S.progress;
     if (S.warrive[w] > 0 && S.warrive[w] == wave_alive(w)) {
         if (g_wmma_pending[w]) {
             std::fprintf(stderr, "emu: block (%u,%u,%u), wave %d: lane %d returned while the others wait at a "
@@ -125,6 +142,7 @@ void __syncthreads() {
     /* Clearing the next generation's slot here, as the barrier completes, keeps it ahead of every
      * write to it (threads arrive at g + 1 only after g completes) and behind every read of the
      * slot it shares a residue with (g - 2's, read before arriving at g - 1). */
+    ++S.progress;
     if (++S.arrive == S.nthreads) { S.arrive = 0; S.or_acc[(g + 1) % 3] = 0; ++S.gen; return; }
     me.waiting = 1;
     while (S.gen == g) yield();
@@ -140,6 +158,7 @@ int __syncthreads_or(int p) {
 static void wave_barrier(int w) {
     Fiber& me = S.f[S.cur];
     const unsigned g = S.wgen[w];
+    ++S.progress;
     if (++S.warrive[w] == wave_alive(w)) {
         g_absent[w] = wave_done_mask(w);
         S.warrive[w] = 0; ++S.wgen[w]; g_wmma_pending[w] = 0;
@@ -163,6 +182,10 @@ static const int* exchange(int v, int* lane, int tag) {
     S.slot[w][par][*lane] = v;
     S.tag[w][par][*lane] = tag;
     wave_barrier(w);
+    /* The exchange's slots are checked and poisoned once, by the first lane to read them: the
+     * wave's generation names the exchange until every live lane has read it. */
+    if (S.xchecked[w][par] == S.wgen[w]) return S.slot[w][par];
+    S.xchecked[w][par] = S.wgen[w];
     for (int i = 0; i < 32; ++i) {
         if ((g_absent[w] >> i) & 1u) {       /* a lane that had returned: no value; a read of it shows */
             S.slot[w][par][i] = 0x7fbadbad;
@@ -203,7 +226,12 @@ static void wmma_whole_wave(int w) {
     }
 }
 /* One 16x16x16 WMMA: each lane posts its A and B elements, then reads the whole tile back. `ga`
- * and `gb` are the exchange slots of one element type, [wave][parity][lane][element]. */
+ * and `gb` are the exchange slots of one element type, [wave][parity][lane][element].
+ *
+ * A lane's eight outputs are rows M = 8h + e of column N. Its operands are converted once, A
+ * transposed to [k][e], and the eight sums run in two SSE2 registers: each step multiplies and
+ * then adds (the file builds with -ffp-contract=off), every output in k order from c, as the
+ * hardware's own order is restated in the tests' host references. */
 template <class T, class V, class Cvt>
 static emu_v8f emu_wmma(T (&ga)[64][2][32][8], T (&gb)[64][2][32][8], V a, V b, emu_v8f c,
                         Cvt cvt) {
@@ -213,15 +241,40 @@ static emu_v8f emu_wmma(T (&ga)[64][2][32][8], T (&gb)[64][2][32][8], V a, V b, 
     wmma_whole_wave(w);
     wave_barrier(w);
     const int N = l & 15, h = l >> 4;
-    emu_v8f d;
-    for (int e = 0; e < 8; ++e) {
-        const int M = 8 * h + e;
-        float acc = c[e];
-        for (int k = 0; k < 16; ++k)
-            acc += cvt(ga[w][par][M + 16 * (k >> 3)][k & 7]) * cvt(gb[w][par][N + 16 * (k >> 3)][k & 7]);
-        d[e] = acc;
+    alignas(16) float at[16][8];
+    float bt[16];
+    for (int k = 0; k < 16; ++k) {
+        const int slot = 16 * (k >> 3), el = k & 7;
+        bt[k] = cvt(gb[w][par][N + slot][el]);
+        for (int e = 0; e < 8; ++e) at[k][e] = cvt(ga[w][par][8 * h + e + slot][el]);
     }
+    __m128 lo = _mm_setr_ps(c[0], c[1], c[2], c[3]), hi = _mm_setr_ps(c[4], c[5], c[6], c[7]);
+    for (int k = 0; k < 16; ++k) {
+        const __m128 bk = _mm_set1_ps(bt[k]);
+        lo = _mm_add_ps(lo, _mm_mul_ps(_mm_load_ps(at[k]), bk));
+        hi = _mm_add_ps(hi, _mm_mul_ps(_mm_load_ps(at[k] + 4), bk));
+    }
+    alignas(16) float out[8];
+    _mm_store_ps(out, lo);
+    _mm_store_ps(out + 4, hi);
+    emu_v8f d;
+    for (int e = 0; e < 8; ++e) d[e] = out[e];
     return d;
+}
+namespace {
+/* Every binary16 pattern's value: the baseline ISA has no F16C, so a conversion is a libgcc call. */
+struct HalfTable {
+    std::unique_ptr<float[]> v{ new float[65536] };
+    HalfTable() {
+        for (uint32_t i = 0; i < 65536; ++i) {
+            const uint16_t u = (uint16_t)i;
+            _Float16 h;
+            std::memcpy(&h, &u, 2);
+            v[i] = (float)h;
+        }
+    }
+};
+const HalfTable g_half;
 }
 static short g_wa[64][2][32][8], g_wb[64][2][32][8];
 emu_v8f emu_wmma_bf16(emu_v8s a, emu_v8s b, emu_v8f c) {
@@ -229,20 +282,30 @@ emu_v8f emu_wmma_bf16(emu_v8s a, emu_v8s b, emu_v8f c) {
 }
 static _Float16 g_ha[64][2][32][8], g_hb[64][2][32][8];
 emu_v8f emu_wmma_f16(emu_v8h a, emu_v8h b, emu_v8f c) {
-    return emu_wmma(g_ha, g_hb, a, b, c, [](_Float16 v) { return (float)v; });
+    return emu_wmma(g_ha, g_hb, a, b, c, [](_Float16 v) {
+        uint16_t u;
+        std::memcpy(&u, &v, 2);
+        return g_half.v[u];
+    });
 }
 namespace {
 struct Bytes8 {
     uint8_t v[8];
     uint8_t operator[](int e) const { return v[e]; }
 };
+/* Every E4M3 code's value, from the ABI's own converter. */
+struct Fp8Table {
+    float v[256];
+    Fp8Table() { for (int i = 0; i < 256; ++i) v[i] = rad_fp8e4m3_to_f32((uint8_t)i); }
+};
+const Fp8Table g_fp8;
 }
 static uint8_t g_qa[64][2][32][8], g_qb[64][2][32][8];
 emu_v8f emu_wmma_fp8(emu_v2i a, emu_v2i b, emu_v8f c) {
     Bytes8 pa, pb;
     std::memcpy(pa.v, &a, 8);
     std::memcpy(pb.v, &b, 8);
-    return emu_wmma(g_qa, g_qb, pa, pb, c, [](uint8_t v) { return rad_fp8e4m3_to_f32(v); });
+    return emu_wmma(g_qa, g_qb, pa, pb, c, [](uint8_t v) { return g_fp8.v[v]; });
 }
 emu_v8i emu_wmma_iu8(bool, emu_v2i, bool, emu_v2i, emu_v8i, bool) {
     std::fprintf(stderr, "emu: v_wmma_i32_16x16x16_iu8 is not emulated\n");
@@ -330,7 +393,12 @@ void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t 
         std::memset(g_lds, 0xA5, dyn_lds);
         S.arrive = 0; S.gen = 0;
         for (int& a : S.or_acc) a = 0;
-        for (int w = 0; w < 64; ++w) { S.warrive[w] = 0; S.wgen[w] = 0; g_wmma_pending[w] = 0; g_absent[w] = 0; }
+        for (int w = 0; w < 64; ++w) {
+            S.warrive[w] = 0; S.wgen[w] = 0; g_wmma_pending[w] = 0; g_absent[w] = 0;
+            S.walive[w] = std::max(0, std::min(32, n - 32 * w));
+            S.wdone[w] = 0;
+            S.xchecked[w][0] = S.xchecked[w][1] = ~0u;
+        }
         for (int t = 0; t < n; ++t) {
             Fiber& f = S.f[t];
             f.done = false; f.waiting = 0; f.tid = EmuIdx{(unsigned)t, 0, 0};
@@ -344,18 +412,17 @@ void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t 
         int live = n;
         while (live > 0) {
             const int live_before = live;
-            const unsigned g0 = S.gen; unsigned wg0[64]; for (int w = 0; w < 64; ++w) wg0[w] = S.wgen[w];
-            int arr0 = S.arrive; int warr0[64]; for (int w = 0; w < 64; ++w) warr0[w] = S.warrive[w];
+            const uint64_t p0 = S.progress;
+            /* One round: the first live fiber runs, each hands on to the next (yield), and the
+             * last hands back here. */
+            int first = 0;
+            while (S.f[first].done) ++first;
+            S.cur = first;
+            emu_switch(&S.main_sp, S.f[first].sp);
+            S.cur = -1;
             live = 0;
-            for (int t = 0; t < n; ++t) {
-                if (S.f[t].done) continue;
-                S.cur = t;
-                emu_switch(&S.main_sp, S.f[t].sp);
-                S.cur = -1;
-                if (!S.f[t].done) ++live;
-            }
-            bool progressed = S.gen != g0 || S.arrive != arr0 || live != live_before;
-            for (int w = 0; w < 64; ++w) progressed |= (S.wgen[w] != wg0[w]) || (S.warrive[w] != warr0[w]);
+            for (int t = 0; t < n; ++t) live += !S.f[t].done;
+            const bool progressed = S.progress != p0 || live != live_before;
             if (live > 0 && !progressed) {
                 int done = 0, wb = 0, bb = 0;
                 for (auto& f : S.f) { done += f.done; wb += f.waiting == 2; bb += f.waiting == 1; }
@@ -374,6 +441,8 @@ void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t 
  * that replicates its operands across the halves (the documented form) sees no difference; one that
  * leaves the lanes the part never reads holding something else is emulated as the part runs it. */
 static uint16_t g11_a[64][2][32][16], g11_b[64][2][32][16];
+/* As emu_wmma: the lane's operands converted once (A transposed to [k][e]), then the eight sums
+ * in two SSE2 registers, each in k order from c, multiply then add. */
 template <class Cvt>
 static emu_v8f emu_wmma11(const uint16_t (&a)[16], const uint16_t (&b)[16], emu_v8f c, Cvt cvt) {
     const int t = (int)S.f[S.cur].tid.x, w = t >> 5, l = t & 31;
@@ -382,14 +451,23 @@ static emu_v8f emu_wmma11(const uint16_t (&a)[16], const uint16_t (&b)[16], emu_
     wmma_whole_wave(w);
     wave_barrier(w);
     const int N = l & 15, h = l >> 4;
-    emu_v8f d;
-    for (int e = 0; e < 8; ++e) {
-        const int M = 2 * e + h;
-        float acc = c[e];
-        for (int k = 0; k < 16; ++k)
-            acc += cvt(g11_a[w][par][M + 16 * h][k]) * cvt(g11_b[w][par][N + 16 * h][k]);
-        d[e] = acc;
+    alignas(16) float at[16][8];
+    float bt[16];
+    for (int k = 0; k < 16; ++k) {
+        bt[k] = cvt(g11_b[w][par][N + 16 * h][k]);
+        for (int e = 0; e < 8; ++e) at[k][e] = cvt(g11_a[w][par][2 * e + h + 16 * h][k]);
     }
+    __m128 lo = _mm_setr_ps(c[0], c[1], c[2], c[3]), hi = _mm_setr_ps(c[4], c[5], c[6], c[7]);
+    for (int k = 0; k < 16; ++k) {
+        const __m128 bk = _mm_set1_ps(bt[k]);
+        lo = _mm_add_ps(lo, _mm_mul_ps(_mm_load_ps(at[k]), bk));
+        hi = _mm_add_ps(hi, _mm_mul_ps(_mm_load_ps(at[k] + 4), bk));
+    }
+    alignas(16) float out[8];
+    _mm_store_ps(out, lo);
+    _mm_store_ps(out + 4, hi);
+    emu_v8f d;
+    for (int e = 0; e < 8; ++e) d[e] = out[e];
     return d;
 }
 emu_v8f emu_wmma11_bf16(emu_v16bf a, emu_v16bf b, emu_v8f c) {
@@ -402,7 +480,7 @@ emu_v8f emu_wmma11_f16(emu_v16h a, emu_v16h b, emu_v8f c) {
     uint16_t ua[16], ub[16];
     std::memcpy(ua, &a, 32);
     std::memcpy(ub, &b, 32);
-    return emu_wmma11(ua, ub, c, [](uint16_t v) { _Float16 h; std::memcpy(&h, &v, 2); return (float)h; });
+    return emu_wmma11(ua, ub, c, [](uint16_t v) { return g_half.v[v]; });
 }
 emu_v2hf emu_cvt_pkrtz(float a, float b) {
     auto rtz = [](float f) {

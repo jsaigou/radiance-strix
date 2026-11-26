@@ -1,0 +1,10 @@
+# museglimmer-30b-bf16.recipe -- Meta Muse Glimmer 30B (text + images + video) at bf16.
+# Every weight stays as the release holds it: the trunk's linears are bf16 GEMMs served by the
+# museglimmer plugin, the tower and its projector keep the checkpoint's bf16, and the vision
+# position table is resampled at run time (grid_embed_pad), so nothing is recomputed here.
+#
+#   rad-convert <Muse-Glimmer-30B> --recipe data/recipes/museglimmer-30b-bf16.recipe \
+#       -o muse-glimmer-30b-bf16.rad
+#
+# The lm_head is declared at whatever the container holds; a block-fp8 recipe aimed at it selects
+# the fp8 logits kernel without a second plugin.

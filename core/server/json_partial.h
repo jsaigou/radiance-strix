@@ -7,7 +7,7 @@
  *   json_stable_prefix  How much may be streamed now? A fragment is JSON-encoded into the SSE
  *                       payload, so it must end on a UTF-8 boundary; a split code point corrupts
  *                       this delta and the next.
- *   json_quote_append   Writes a string literal exactly as nlohmann does, for delta chunks.
+ *   json_quote_append   Writes a string literal exactly as Json::dump does, for delta chunks.
  *
  * A scanner, not a parser: it allocates nothing and builds no DOM.
  */
@@ -33,11 +33,11 @@ size_t utf8_trunc(std::string_view s);
  * escape. */
 size_t json_stable_prefix(std::string_view s);
 
-/* Append `s` to `out` as a JSON string literal, quotes included, byte for byte as nlohmann's
+/* Append `s` to `out` as a JSON string literal, quotes included, byte for byte as Json::dump's
  * dump() writes one: `\b \t \n \f \r \" \\` as two characters, other control characters as
  * `\u00xx` in lowercase hex, everything else (DEL and non-ASCII included) as itself. Returns
  * false with `out` unchanged when `s` is not well-formed UTF-8 (including overlong forms,
- * surrogates and code points past U+10FFFF), which nlohmann refuses.
+ * surrogates and code points past U+10FFFF), which Json::dump refuses.
  *
  * Streamed chunks use this around a fixed frame: building and dumping a DOM per token cost more
  * than the rest of the token's host work. */

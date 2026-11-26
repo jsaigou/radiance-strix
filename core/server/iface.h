@@ -10,8 +10,7 @@
  */
 #pragma once
 #include "rad_core.h"
-
-#include <nlohmann/json_fwd.hpp>
+#include "util/json.h"
 
 #include <map>
 #include <memory>
@@ -27,9 +26,10 @@ namespace gen { struct Request; struct AudioRequest; class AudioTicket; struct V
 namespace mm { struct Frame; struct Item; }
 namespace server {
 
-/* ordered_json, not json: a tool's parameter schema is rendered into the prompt in the caller's
- * order, and property order in a schema changes what the model emits. */
-using json = nlohmann::ordered_json;
+/* The ordered DOM (util/json.h), not a sorted one: a tool's parameter schema is rendered into
+ * the prompt in the caller's order, and property order in a schema changes what the model
+ * emits. */
+using json = Json;
 
 /* ================================================================== the scheduler
  *
@@ -93,6 +93,9 @@ struct SchedMetrics {
     double  linear_hit_rate = 0.0;
     int64_t attn_cached_tokens = 0;
     int64_t linear_cached_tokens = 0;
+    /* Prompt tokens of every admitted request: what the two cached counts above are out of, counted
+     * at the admission as they are. */
+    int64_t prefix_queries = 0;
     int64_t checkpoints_written = 0;
     double  prefill_tps = 0.0;
     double  decode_tps = 0.0;
@@ -113,6 +116,12 @@ struct SchedMetrics {
     int64_t lookup_held = 0;
     int64_t lookup_held_drafts = 0;
     int64_t lookup_held_hits = 0;
+    /* --draft-suffix: verifies that carried a suffix chain, their rows and accepted drafts, and the
+     * decode steps kept from being issued ahead by a recurring pattern. */
+    int64_t suffix_steps = 0;
+    int64_t suffix_rows = 0;
+    int64_t suffix_accepted = 0;
+    int64_t suffix_held_ahead = 0;
     /* Per-position draft acceptance. The pooled `draft_acceptance` cannot tell a drafter that
      * decays with depth from one whose later rounds are broken. Per position j: verifies that
      * reached j (every earlier position accepted) and how many of those took j. */
@@ -139,7 +148,19 @@ struct SchedMetrics {
     int64_t steps_ahead = 0;          /* issued behind the step before, ahead of its commit */
     int64_t prefill_chunks_capped = 0; /* held back for other work in the step (--busy-prefill-chunk) */
     int64_t steps_held = 0;           /* decode-only steps --prefill-interleave inserted */
+    int64_t mixed_step_target_steps = 0; /* mixed steps observed by --mixed-step-target-ms */
+    int64_t mixed_step_target_misses = 0;      /* those whose completed wall time exceeded the target */
+    int64_t mixed_step_target_prefill_cap = 0; /* current learned mixed-prefill row cap */
     int64_t decode_rows_unspeculated = 0;
+    /* Runtime LoRA, by slot index (rad::SchedMetrics::loras): what completed under each slot
+     * and what runs there now. The dashboard's adapter rows read these; the names come from
+     * IScheduler::lora_names(), which indexes the same slots. */
+    static const int MAX_LORA_SLOTS = 16;
+    struct LoraCount {
+        int64_t requests = 0, prompt_tokens = 0, output_tokens = 0, running = 0;
+    };
+    int        n_loras = 0;
+    LoraCount  loras[MAX_LORA_SLOTS] = {};
     /* Cumulative nanoseconds inside steps, all shapes and decode-only. Wall clock over a step
      * count is not a step time: the engine idles between turns, and a prefill chunk costs an
      * order of magnitude more than a decode step. `step_ns_decode / steps_decode` is the cost of
@@ -149,6 +170,12 @@ struct SchedMetrics {
     /* The single-sequence decode floor and most recent window (rad::SchedMetrics). */
     int64_t step_ns_decode_best = 0;
     int64_t step_ns_decode_recent = 0;
+    /* The encoder: cumulative items, patches and nanoseconds, and the items waiting or being
+     * encoded now (rad::SchedMetrics::encode_items). */
+    int64_t encode_items = 0;
+    int64_t encode_patches = 0;
+    int64_t encode_ns = 0;
+    int64_t encode_pending = 0;
 };
 
 
@@ -175,6 +202,9 @@ struct SessionStat {
     /* The prefix a return skips: the deepest snapshot's position (IdleTiers::SessionInfo). */
     int64_t     resume_tokens = 0;
     bool        moving = false;   /* a transfer is outstanding */
+    /* The runtime LoRA the conversation's last turn ran under; "" for the base. A session's
+     * turns may name different adapters -- this is the newest one, not a constraint. */
+    std::string lora;
 };
 
 /* What stored conversations occupy off the card, blocks and snapshots each counted once (the
@@ -211,6 +241,8 @@ struct RequestStat {
     int64_t     kv_tokens = 0;
     int32_t     n_draft = 0;
     int32_t     slot = -1;
+    /* The runtime LoRA this row runs under; "" for the base. */
+    std::string lora;
     double      age_s = 0;
     double      ttft_s = -1;       /* negative until the first token */
     double      prefill_s = -1;    /* first token minus admission; negative until both */
@@ -264,6 +296,10 @@ public:
 
     /* The live request table, oldest first; returns the count. Default: none kept. */
     virtual int requests(std::vector<RequestStat>* /*out*/) const { return 0; }
+
+    /* The runtime LoRA names by slot index (the scheduler's ReqStat::lora_slot and the metrics'
+     * loras array index the same slots). Default: none. */
+    virtual std::vector<std::string> lora_names() const { return {}; }
 
     /* The stored conversations and where they are held. Default: no idle tiers, so an empty
      * table (everything the cache holds is in VRAM). */
@@ -431,6 +467,8 @@ public:
 
     virtual bool supports_tools() const = 0;
     virtual bool supports_reasoning() const = 0;
+    /* What the template's tool capability probe threw (ChatCaps::probe_error), or "". */
+    virtual std::string tools_probe_error() const { return std::string(); }
 
     /* Why this model's tool calls cannot be read, or "" when they can. A template may support
      * tools in a format the reply parser does not know; the model still chats, and a request that
@@ -619,9 +657,9 @@ public:
         return RAD_E_UNSUPPORTED;
     }
 
-    virtual int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
-                              std::vector<float>* out, std::string* why) {
-        (void)bytes; (void)n; (void)rate; (void)max_samples; (void)out;
+    virtual int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int32_t channels,
+                              int64_t max_samples, std::vector<float>* out, std::string* why) {
+        (void)bytes; (void)n; (void)rate; (void)channels; (void)max_samples; (void)out;
         if (why) *why = "this server prepares no reference media for an audio encoder";
         return RAD_E_UNSUPPORTED;
     }
@@ -748,6 +786,7 @@ struct AudioGenInfo {
     /* RadAudioGenDecl's references: the prompt with them and one reference ("" when the model
      * takes none), the clips' rate and frame, and the most of them and their samples. */
     std::string tmpl_ref, ref_item;
+    std::string tmpl_ref_instruct, neg_tmpl_ref;
     int64_t ref_rate = 0, ref_hop = 0, ref_max_samples = 0;
     int32_t ref_max = 0;
 };
@@ -792,9 +831,11 @@ struct VideoGenInfo {
     int64_t max_enc_frames = 0, max_enc_side = 0, max_enc_samples = 0, enc_ratio = 0;
     /* `steps` counts model evaluations rather than sigma grid points (RadVideoGenDecl form 1). */
     bool    step_evals = false;
+    bool    unipc_only = false;
     /* Guidance (RadVideoGenDecl::guidance): the terms a request may name, their defaults and the
      * negative prompt a guided request gets when it names none. */
     bool    guidance = false;
+    bool    guidance_cfg_only = false;
     double  guidance_default[8] = {};
     std::string default_negative;
     /* Image to video: a first frame is taken, after an H.264 round trip at image_crf when > 0. */

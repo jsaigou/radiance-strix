@@ -53,10 +53,23 @@ struct Model {
     /* Routed experts whole on their rank (288/world of them) instead of split by width across
      * every rank. Whole experts can be read from the drive, which two cards need; at four and
      * eight the width split is the shape the MXFP4 kernels are tuned for (prefill runs about three
-     * times faster), so all-MXFP4 experts take it unless --weights-disk-tier asks for the drive.
+     * times faster), so all-MXFP4 or all-IQR experts take it unless --weights-disk-tier asks for
+     * the drive.
      * Anything else stays whole: a plain bf16 expert cannot be sliced at all. */
     bool whole_experts = false;
     std::vector<Layer> layers;
+    /* Each routed layer's source and config, probed before any buffer is sized: the expert
+     * format decides the routed arm's code pair. Indexed by layer; 0..2 are dense and unused. */
+    std::vector<MoeFP8::Src> moe_src;
+    /* An IQ8R trunk (rotated int8 linears, one scale a `trunk_g8` of K), read from layer 0's dense
+     * gate_up before any buffer is sized: every activation a trunk linear reads then carries
+     * rotated int8 codes, and the routed experts read rotated int8 too (IQR). KDA, the indexer,
+     * the router and the MLA's kv_b stay as they are declared. `norm_fed`: the norms write those
+     * codes themselves (rmsnorm_had_quant_i8g); where they cannot, each linear quantises the bf16
+     * plane. */
+    bool trunk_rot = false;
+    int64_t trunk_g8 = RAD_FP8_BLOCK;
+    bool norm_fed = false;
     rad_kvgroup latent = 0, index = 0, tail = 0, state = 0, conv = 0;
     /* The streams and the step's stream-wide buffers. */
     rad_buf h0 = 0, h1 = 0, x = 0, y = 0, post = 0, comb = 0, final_hidden = 0, logit_input = 0,
@@ -79,7 +92,7 @@ struct Model {
     GlmVision vit{};
     MediaRows mrows{};
 };
-static std::unique_ptr<Model> models[MAX_RANKS];
+static std::unique_ptr<Model> models[MAX_SLOTS];
 static thread_local std::unique_ptr<Model> probe_model;
 
 /* Whether every routed expert is MXFP4, asked before any buffer is sized and of the same experts on
@@ -87,14 +100,18 @@ static thread_local std::unique_ptr<Model> probe_model;
  * name map, so it leaves the graph as it was. One expert in another format settles it: a protected
  * bf16 expert is served only whole. No answer means no container entry, and what is not known to
  * be MXFP4 stays whole. */
-static bool experts_are_mxfp4(RadBuilder* b, Names& nm) {
+/* Whether every routed expert can be split by width over the ranks: MXFP4 (format 8) or the IQR
+ * computed trellis (format 11), each a scale a row and K in whole 128-wide units, so a rank's 512
+ * columns of an expert's down projection are four whole units and its gate/up rows whole rows. */
+static bool experts_split_by_width(RadBuilder* b, Names& nm) {
     for (int l = 3; l < 45; ++l)
         for (int ge = 0; ge < 288; ++ge)
             for (const char* fmt : { "blk.%d.ffn_gate_up_exps.%d.weight",
                                      "blk.%d.ffn_down_exps.%d.weight" }) {
                 RadEncoding e{};
-                if (!weight_enc(b, nm.f(fmt, l, ge), &e) || MoeFP8::format_of(e) != 8)
-                    return false;
+                if (!weight_enc(b, nm.f(fmt, l, ge), &e)) return false;
+                const int f = MoeFP8::format_of(e);
+                if (f != 8 && f != 11) return false;
             }
     return true;
 }
@@ -122,6 +139,31 @@ static rad_op norm(RadBuilder* b, const Geom& g, rad_weight w, rad_buf x, rad_bu
 }
 
 /* ------------------------------------------------------------------ the shared activations */
+/* A norm's code pair: E4M3 for a block-fp8 or bf16 trunk; for an IQ8R one rotated int8 codes at the
+ * trunk's group, written by the norm where `norm_fed`, else an E4M3 pair no linear reads beside
+ * int8 codes each linear writes from the bf16 plane (ActFP8::declare_pair). */
+static int norm_pair(RadBuilder* b, Model& m, ActFP8& a, const char* name, int64_t n) {
+    if (!m.trunk_rot) return a.declare_qs(b, m.nm, m.g, name, n);
+    RAD_ARCH_TRY(a.declare_qs(b, m.nm, m.g, name, n, 0, true, !m.norm_fed, m.trunk_g8));
+    a.q8_fed = a.q8_rot = m.norm_fed;
+    return RAD_OK;
+}
+/* A quantiser's code pair (the MLA's expanded output, the clamped products): for an IQ8R trunk the
+ * rotated int8 codes the block's own had_quant_act_i8g writes at `group`, and no E4M3 pair. */
+static int quant_pair(RadBuilder* b, Model& m, ActFP8& a, const char* name, int64_t n,
+                      int64_t rows = 0, int64_t group = 0) {
+    if (!m.trunk_rot) return a.declare_qs(b, m.nm, m.g, name, n, rows);
+    const int64_t g8 = group > 0 ? group : m.trunk_g8;
+    if (n % g8) {
+        fprintf(stderr, "radiance: glm5next: the IQ8R trunk keeps one scale a %lld of K, which "
+                        "does not divide this rank's %lld-wide '%s'\n",
+                (long long)g8, (long long)n, name);
+        return RAD_E_UNSUPPORTED;
+    }
+    RAD_ARCH_TRY(a.declare_qs(b, m.nm, m.g, name, n, rows, true, false, g8));
+    a.q8_fed = a.q8_rot = true;
+    return RAD_OK;
+}
 static int stream_buffers(RadBuilder* b, Model& m) {
     auto& g = m.g;
     auto& nm = m.nm;
@@ -137,7 +179,7 @@ static int stream_buffers(RadBuilder* b, Model& m) {
     m.post = decl_b(b, nm.f("post"), RAD_F32, { T, 4 });
     m.comb = decl_b(b, nm.f("mix"), RAD_F32, { T, 16 });
     m.act.x = decl_b(b, nm.f("normalized"), RAD_BF16, { T, 4096 });
-    RAD_ARCH_TRY(m.act.declare_qs(b, nm, g, "normalized", 4096));
+    RAD_ARCH_TRY(norm_pair(b, m, m.act, "normalized", 4096));
     m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, 4096 }, RAD_BUF_PERSIST);
     m.logit_input = decl_b(b, nm.f("logit_input"), RAD_BF16, { g.max_logit_rows, 4096 });
     m.logits = decl_b(b, nm.f("logits"), RAD_F32, { g.max_logit_rows, g.n_vocab });
@@ -178,14 +220,14 @@ static int mla_buffers(RadBuilder* b, Model& m) {
     aw.q_raw = bf("q_raw", 1536);
     aw.kv_raw = bf("kv_raw", 512);
     aw.q_low.x = bf("q_low", 1536);
-    RAD_ARCH_TRY(aw.q_low.declare_qs(b, nm, g, "q_low", 1536));
+    RAD_ARCH_TRY(norm_pair(b, m, aw.q_low, "q_low", 1536));
     aw.latent = bf("latent", 512);
     aw.out = m.y;
     aw.core.q = bf("query", Q);
     aw.core.q_latent = decl_b(b, nm.f("q_latent"), RAD_BF16, { T, H, 512 });
     aw.core.attn_latent = decl_b(b, nm.f("attn_latent"), RAD_BF16, { T, H, 512 });
     aw.attn.x = bf("expanded", Q);
-    RAD_ARCH_TRY(aw.attn.declare_qs(b, nm, g, "expanded", Q));
+    RAD_ARCH_TRY(quant_pair(b, m, aw.attn, "expanded", Q));
     aw.core.out = aw.attn.x;
     const int64_t part = g.world > 1 ? DsaCache::part_rows(T, g.world) : 0;
     const int64_t TQ = g.world > 1 ? std::max(T, g.world * part) : T;
@@ -259,7 +301,7 @@ static int ffn_buffers(RadBuilder* b, Model& m) {
     dw.h = m.act;
     dw.gate_up = bf("dense_gate_up", 2 * g.n_ff);
     dw.ffn.x = bf("dense_ff", g.n_ff);
-    RAD_ARCH_TRY(dw.ffn.declare_qs(b, nm, g, "dense_ff", g.n_ff));
+    RAD_ARCH_TRY(quant_pair(b, m, dw.ffn, "dense_ff", g.n_ff));
     auto& mw = m.mw;
     mw.x = m.x;
     mw.h = m.act;
@@ -281,11 +323,20 @@ static int ffn_buffers(RadBuilder* b, Model& m) {
     const int64_t FE = m.whole_experts ? 2048 : F;
     mw.egu = decl_b(b, nm.f("expert_gate_up"), RAD_BF16, { T * 8, 2 * FE });
     mw.eff.x = decl_b(b, nm.f("expert_ff"), RAD_BF16, { T * 8, FE });
-    RAD_ARCH_TRY(mw.eff.declare_qs(b, nm, g, "expert_ff", FE, T * 8));
+    /* An IQ8R trunk's routed arm is rotated int8 throughout: the gated product's codes at one
+     * scale a 128 of K, which the IQR grouped GEMM reads (MoeFP8::a8). Its gate_up reads the
+     * norm's own codes where the norm writes them, else a rotated copy of the block input that
+     * MoeFP8 writes once a layer (Wire::hr). */
+    RAD_ARCH_TRY(quant_pair(b, m, mw.eff, "expert_ff", FE, T * 8, RAD_FP8_BLOCK));
+    if (m.trunk_rot && !m.norm_fed) {
+        RAD_ARCH_TRY(mw.hr.declare_qs(b, nm, g, "normalized_rot", 4096, 0, true, false,
+                                      RAD_FP8_BLOCK));
+        mw.hr.q8_fed = mw.hr.q8_rot = true;
+    }
     mw.edn = decl_b(b, nm.f("expert_down"), RAD_BF16, { T * 8, 4096 });
     mw.sgu = bf("shared_gate_up", 2 * F);
     mw.sff.x = bf("shared_ff", F);
-    RAD_ARCH_TRY(mw.sff.declare_qs(b, nm, g, "shared_ff", F));
+    RAD_ARCH_TRY(quant_pair(b, m, mw.sff, "shared_ff", F));
     mw.sout = bf("shared_out", 4096);
     mw.sgate = bf("shared_one", 1);
     return RAD_OK;
@@ -295,7 +346,8 @@ static int kv_groups(RadBuilder* b, Model& m) {
     auto& nm = m.nm;
     RadKVGroupDecl d{};
     d.kind = RAD_KV_FULL;
-    // bf16, or E4M3 under --kv-cache-dtype fp8 (geometry); the other groups keep their own.
+    // bf16, E4M3 under --kv-cache-dtype fp8, or the int8 row under i8 (geometry); the other groups
+    // keep their own.
     d.dtype = rad_dtype_parse(g.kv_dtype);
     d.n_head_kv = 1;
     d.head_dim = 256;
@@ -325,8 +377,63 @@ static int kv_groups(RadBuilder* b, Model& m) {
 }
 
 /* ------------------------------------------------------------------ one layer */
+/* A routed layer's source and config, before its probe. */
+static MoeFP8::Src moe_source(const Model& m, Names& nm, int l) {
+    const auto& g = m.g;
+    const char* pre = nm.ckpt("model.language_model.layers.%d", l);
+    MoeFP8::Src s;
+    s.norm = nm.ckpt("%s.post_attention_layernorm.weight", pre);
+    s.router = nm.ckpt("%s.mlp.gate.weight", pre);
+    s.router_bias = nm.ckpt("%s.mlp.gate.e_score_correction_bias", pre);
+    s.experts = nm.ckpt("%s.mlp.experts", pre);
+    s.shared = nm.ckpt("%s.mlp.shared_experts", pre);
+    // EXPERT PARALLELISM AT TP: each rank owns 288/world WHOLE experts (the contiguous
+    // window [expert_base, expert_base+n_expert) of the checkpoint's numbering), which the
+    // helper declares RAD_SHARD_NONE -- unsharded, so an expert unit is file-direct and can
+    // live in the container's mapping or the file tier
+    // instead of needing VRAM+pinned-pool residency for all 151 GiB of them. The router
+    // stays replicated over n_expert_all; moe_scatter/router_topk_scatter drop slots
+    // outside the window (moe_scatter schema: "which is how EXPERT PARALLELISM is
+    // expressed"); the shared expert stays width-sharded on its own declaration path; the
+    // block's all-reduce sums the partials exactly as width TP did. At world 1 this
+    // degenerates to the old whole-model declaration (n_expert == n_expert_all, no spans).
+    s.cfg.n_expert_all = 288;
+    s.cfg.top_k = 8;
+    s.cfg.n_ff_shared = GlmTp::expert_width(g.world);
+    if (m.whole_experts) {
+        s.cfg.n_expert = 288 / g.world;
+        // A shape probe may pass rank >= world (arch_test's parallel declares reuse i % 4);
+        // old code tolerated that because expert_base stayed 0, so clamp to rank 0's window.
+        const int ep_rank = g.rank < g.world ? g.rank : 0;
+        s.cfg.expert_base = ep_rank * (288 / g.world);
+        s.cfg.probed_expert = s.cfg.expert_base;  // probe this rank's first owned expert
+        s.cfg.n_ff_exp = 2048;                    // whole: whole experts' intermediate
+    } else {
+        s.cfg.n_expert = 288;
+        s.cfg.n_ff_exp = GlmTp::expert_width(g.world);
+    }
+    s.cfg.rows = g.max_tok;
+    s.cfg.sigmoid_router = 1;
+    s.cfg.route_scale = 2.5;
+    s.cfg.swiglu_limit = 10;
+    s.cfg.shared_ungated = 1;
+    s.cfg.router_fuse = 1;
+    s.cfg.swiglu_quant = 1;
+    // At world 1 the width-slice declaration IS the whole model: keep the spans so the
+    // graph stays the pinned one. Whole experts need no width spans (split && ep is refused
+    // by the helper).
+    if (!m.whole_experts) {
+        for (int q = 0; q < 2; ++q) {
+            s.cfg.ff_lo[q] = g.rank * GlmTp::expert_width(g.world);
+            s.cfg.ff_hi[q] = (g.rank + 1) * GlmTp::expert_width(g.world);
+        }
+    }
+    return s;
+}
+
 static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool draft) {
     const auto& g = m.g;
+    if (!draft && l >= 3 && (size_t)l >= m.moe_src.size()) return RAD_E_INVAL;
     lay.draft = draft;
     lay.full = draft || l % 4 == 3;
     const char* pre = nm.ckpt("model.language_model.layers.%d", l);
@@ -385,55 +492,20 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
     } else {
         auto w = m.mw;
         w.x = input;
+        /* The trunk's routed layers were probed before the buffers (declare); the draft layer is
+         * probed here, through its own names. */
         MoeFP8::Src s;
-        s.norm = nm.ckpt("%s.post_attention_layernorm.weight", pre);
-        s.router = nm.ckpt("%s.mlp.gate.weight", pre);
-        s.router_bias = nm.ckpt("%s.mlp.gate.e_score_correction_bias", pre);
-        s.experts = nm.ckpt("%s.mlp.experts", pre);
-        s.shared = nm.ckpt("%s.mlp.shared_experts", pre);
-        // EXPERT PARALLELISM AT TP: each rank owns 288/world WHOLE experts (the contiguous
-        // window [expert_base, expert_base+n_expert) of the checkpoint's numbering), which the
-        // helper declares RAD_SHARD_NONE -- unsharded, so an expert unit is file-direct and can
-        // live in the container's mapping or the file tier
-        // instead of needing VRAM+pinned-pool residency for all 151 GiB of them. The router
-        // stays replicated over n_expert_all; moe_scatter/router_topk_scatter drop slots
-        // outside the window (moe_scatter schema: "which is how EXPERT PARALLELISM is
-        // expressed"); the shared expert stays width-sharded on its own declaration path; the
-        // block's all-reduce sums the partials exactly as width TP did. At world 1 this
-        // degenerates to the old whole-model declaration (n_expert == n_expert_all, no spans).
-        s.cfg.n_expert_all = 288;
-        s.cfg.top_k = 8;
-        s.cfg.n_ff_shared = GlmTp::expert_width(g.world);
-        if (m.whole_experts) {
-            s.cfg.n_expert = 288 / g.world;
-            // A shape probe may pass rank >= world (arch_test's parallel declares reuse i % 4);
-            // old code tolerated that because expert_base stayed 0, so clamp to rank 0's window.
-            const int ep_rank = g.rank < g.world ? g.rank : 0;
-            s.cfg.expert_base = ep_rank * (288 / g.world);
-            s.cfg.probed_expert = s.cfg.expert_base;  // probe this rank's first owned expert
-            s.cfg.n_ff_exp = 2048;                    // whole: whole experts' intermediate
+        if (draft) {
+            s = moe_source(m, nm, l);
+            RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
         } else {
-            s.cfg.n_expert = 288;
-            s.cfg.n_ff_exp = GlmTp::expert_width(g.world);
+            s = m.moe_src[(size_t)l];
         }
-        s.cfg.rows = g.max_tok;
-        s.cfg.sigmoid_router = 1;
-        s.cfg.route_scale = 2.5;
-        s.cfg.swiglu_limit = 10;
-        s.cfg.shared_ungated = 1;
-        s.cfg.router_fuse = 1;
-        s.cfg.swiglu_quant = 1;
-        // At world 1 the width-slice declaration IS the whole model: keep the spans so the
-        // graph stays the pinned one. Whole experts need no width spans (split && ep is refused
-        // by the helper).
-        if (!m.whole_experts) {
-            for (int q = 0; q < 2; ++q) {
-                s.cfg.ff_lo[q] = g.rank * GlmTp::expert_width(g.world);
-                s.cfg.ff_hi[q] = (g.rank + 1) * GlmTp::expert_width(g.world);
-            }
-        }
-        RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
-        RAD_ARCH_TRY(lay.moe.declare(b, nm, g, l, w, s, false, draft));
+        /* The MoE helper takes a protected bf16 expert's whole width from `n_ff_all`, which the
+         * model sets to the dense layers' 12288; an expert is 2048 wide. */
+        Geom mg = g;
+        mg.n_ff_all = GlmTp::expert_width(1);
+        RAD_ARCH_TRY(lay.moe.declare(b, nm, mg, l, w, s, false, draft));
     }
     if (!draft) RAD_ARCH_TRY(lay.ffn_hc.declare_post(b));
     return RAD_OK;
@@ -466,14 +538,15 @@ static int geometry(Geom& g, const RadModelMeta* meta, const RadBuildCtx* ctx, i
     if (ctx->max_out_rows > g.max_logit_rows) g.max_logit_rows = ctx->max_out_rows;
     g.eps = meta->rms_eps;
     /* --kv-cache-dtype names the latent cache's dtype only (kv_groups); declare refuses all but
-     * bf16 and fp8. */
+     * bf16, fp8 and i8. */
     g.kv_dtype = rad_dtype_name(rad_kv_cache_dtype(ctx, RAD_BF16));
     g.wire_exact = !ctx->tp_wire_lossy;
     g.wire_min_bytes = ctx->tp_wire_min_bytes;
     return g.max_tok < 1 || g.max_ctx < 1 || g.max_seqs < 1 || g.eps <= 0 ? RAD_E_INVAL : RAD_OK;
 }
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
-    if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
+    if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS ||
+        rad_build_slot(ctx) >= MAX_SLOTS)
         return RAD_E_INVAL;
     const int world = ctx->world_size ? ctx->world_size : 1;
     if (!GlmTp::world_ok(world)) {
@@ -506,15 +579,18 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 ctx->max_spec);
         return RAD_E_UNSUPPORTED;
     }
-    /* fp8 narrows the latent attention cache to E4M3 at a descale of 1 (kv_groups); the index
-     * tail, the DSA index and the KDA caches keep their dtypes. */
-    if (ctx->kv_dtype && ctx->kv_dtype != RAD_BF16 && ctx->kv_dtype != RAD_F8E4M3) {
+    /* fp8 narrows the latent attention cache to E4M3 at a descale of 1, i8 to the ordinary int8
+     * cache row at head_dim 256 (each 256-wide half of the latent its own f16 scale; its device
+     * reader is the GLM kernel plugin's, plugin/glm) (kv_groups); the index tail, the DSA index and
+     * the KDA caches keep their dtypes. */
+    if (ctx->kv_dtype && ctx->kv_dtype != RAD_BF16 && ctx->kv_dtype != RAD_F8E4M3 &&
+        ctx->kv_dtype != RAD_I8) {
         fprintf(stderr, "radiance: glm5next: --kv-cache-dtype %s; this plugin serves its latent "
-                        "attention cache in bf16 or fp8 only\n",
+                        "attention cache in bf16, fp8 or i8 only\n",
                 rad_dtype_name(ctx->kv_dtype));
         return RAD_E_UNSUPPORTED;
     }
-    auto& slot = ctx->shape_probe ? probe_model : models[ctx->rank];
+    auto& slot = ctx->shape_probe ? probe_model : models[rad_build_slot(ctx)];
     slot = std::make_unique<Model>();
     auto& m = *slot;
     auto& g = m.g;
@@ -523,7 +599,59 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.form = ctx->tp_attn_rows ? GlmMla::Form::rows : GlmMla::Form::heads;
     RAD_ARCH_TRY(geometry(g, meta, ctx, world));
     m.whole_experts = world == 2 || (world > 2 && (ctx->expert_file_tier ||
-                                                   !experts_are_mxfp4(b, nm)));
+                                                   !experts_split_by_width(b, nm)));
+    /* ---- each routed layer's expert format, read before any buffer is declared: the format
+     * decides the routed arm's code pair (ffn_buffers). The probe declares the layer's first
+     * experts' name maps, which the layer's declare skips. */
+    m.moe_src.assign(45, MoeFP8::Src{});
+    for (int l = 3; l < 45; ++l) {
+        m.moe_src[(size_t)l] = moe_source(m, nm, l);
+        RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, m.moe_src[(size_t)l], &m.moe_src[(size_t)l].cfg));
+    }
+    /* ---- the trunk's stored form, read from layer 0's dense gate_up through that layer's own
+     * LinearFP8 (MlpFP8 then does not map it again). */
+    m.layers.resize(45);
+    {
+        const char* pre = nm.ckpt("model.language_model.layers.%d", 0);
+        RAD_ARCH_TRY(m.layers[0].dense.gate_up.probe(
+            b, nm, g, nm.f("blk.0.ffn_gate_up"),
+            { nm.ckpt("%s.mlp.gate_proj.weight", pre), nm.ckpt("%s.mlp.up_proj.weight", pre) }));
+        RadEncoding enc{};
+        m.trunk_rot = weight_enc(b, nm.f("blk.0.ffn_gate_up.weight"), &enc) &&
+                      linear_is_w8h(enc) && !linear_is_wnh(enc);
+        m.trunk_g8 = m.trunk_rot ? linear_w8h_group(enc) : (int64_t)RAD_FP8_BLOCK;
+    }
+    for (int l = 3; l < 45; ++l) {
+        const MoeFP8::Config& c = m.moe_src[(size_t)l].cfg;
+        const bool int8_experts = c.expert_iqr || c.expert_i8;
+        if (m.trunk_rot && (c.expert_bf16 || !int8_experts)) {
+            fprintf(stderr, "radiance: glm5next: the trunk is IQ8R and layer %d's routed experts are "
+                            "%s; an IQ8R trunk's experts read its rotated int8 codes, so they are "
+                            "IQR or rotated int8\n",
+                    l, c.expert_bf16 ? "plain bf16" : "in another format");
+            return RAD_E_UNSUPPORTED;
+        }
+        if (!m.trunk_rot && int8_experts) {
+            fprintf(stderr, "radiance: glm5next: layer %d's routed experts are rotated int8 and the "
+                            "trunk is not IQ8R; they read the trunk's rotated int8 codes\n", l);
+            return RAD_E_UNSUPPORTED;
+        }
+    }
+    /* The draft layer's IQ8R and IQR wiring is not yet covered (its names are under the draft
+     * scope and it reads the trunk's pairs from its own join), so an IQ8R container is served
+     * without it until it is. */
+    if (m.trunk_rot && ctx->max_spec > 0) {
+        fprintf(stderr, "radiance: glm5next: the MTP draft layer of an IQ8R trunk is not served yet; "
+                        "`num-speculative-tokens: 0` serves the model without it (and rad-convert "
+                        "--max-spec 0 converts it without it)\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    if (m.trunk_rot && m.form == GlmMla::Form::rows) {
+        fprintf(stderr, "radiance: glm5next: the MLA row form (tp-attn-rows) views its head-form "
+                        "weights, which an IQ8R trunk's int8 linears cannot; serve the head form\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    m.norm_fed = m.trunk_rot && rad_op_declared(b, "rmsnorm_had_quant_i8g") != 0;
     RAD_ARCH_TRY(stream_buffers(b, m));
     RAD_ARCH_TRY(kda_buffers(b, m));
     RAD_ARCH_TRY(mla_buffers(b, m));
@@ -590,9 +718,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     // with every buffer above. Its weight groups follow the 45 layers and the MTP layer's.
     if (m.media) RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, 4096, 46));
     rad_note(b,
-             "GLM-5.3: TP%d, 45 mHC layers, 34 KDA + 11 sparse MLA, mixed MXFP4/FP8, native MTP "
+             "GLM-5.3: TP%d, 45 mHC layers, 34 KDA + 11 sparse MLA, %s trunk, native MTP "
              "%s, vision %s",
-             world, m.have_mtp ? "enabled" : "disabled", m.media ? "enabled" : "disabled");
+             world, m.trunk_rot ? "IQ8R" : "bf16", m.have_mtp ? "enabled" : "disabled",
+             m.media ? "enabled" : "disabled");
     return RAD_OK;
 }
 
@@ -625,7 +754,7 @@ static void draft_pass(RadCtx* c, Model& m, const RadBatch* batch) {
     m.mtp.step_head(c, batch);
 }
 static void step(RadCtx* c, const RadBatch* batch) {
-    auto& m = *models[rad_rank(c)];
+    auto& m = *models[rad_slot(c)];
     const int64_t T = batch->n_tok;
     // An encoder pass runs only the vision tower (RadBatch::enc).
     if (batch->enc) {
@@ -675,11 +804,19 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     }
     out->shape_probe_ok = 1;
     out->tp_attn_rows_ok = 1;
+    /* --kv-cache-dtype fp8: the latent attention cache as E4M3 (declare, kv_groups). */
+    out->kv_fp8_ok = 1;
+    /* Nearly every launch of a decode pass depends on the one before it. Chained, at TP4 on four
+     * R9700 with a 64k context, the step went from 23.82 to 23.37 ms over four sequences and from
+     * 16.15 to 15.90 ms at one, with the same tokens out. */
+    out->chain_pays = RAD_CHAIN_ALWAYS;
     return RAD_OK;
 }
 } // namespace glm5next
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PROBE(glm5next)
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(glm5next, "glm5next", "", "0.1.0",
                 "GLM-5.3-Flash mixed MXFP4/FP8, mHC/KDA/MLA and native serial MTP")
 #endif

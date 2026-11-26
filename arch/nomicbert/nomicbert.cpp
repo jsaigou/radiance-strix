@@ -71,7 +71,7 @@ struct Model {
     std::vector<Layer> layers;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* The layer schedule, read from moe_every_n_layers rather than derived: a wrong interval would
  * declare a MoE layer whose tensors the checkpoint does not hold. Layer l is routed when
@@ -93,7 +93,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
     /* A 475M-parameter encoder fits one card; tensor parallelism would only add an all-reduce per
      * layer. */
     if (ctx->world_size > 1) {
@@ -102,7 +103,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_UNSUPPORTED;
     }
 
-    Model& m = g_model[ctx->rank];
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
@@ -441,7 +442,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
+    const Model& m = g_model[rad_slot(c)];
     const Geom& g = m.g;
     const int64_t T = batch->n_tok, S = batch->n_seq, E = g.n_embd;
     if (T <= 0 || S <= 0) return;
@@ -500,6 +501,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
 }  /* namespace nomicbert */
 
 #ifndef RAD_ARCH_NO_EXPORTS
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(nomicbert, "nomicbert", "", "0.1.0",
                 "Nomic BERT (nomic-embed-text-v2-moe): a bidirectional post-norm encoder with "
                 "NeoX rotary attention, dense and routed GELU feed-forwards, mean-pooled to one "

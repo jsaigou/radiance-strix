@@ -35,6 +35,9 @@ struct LoadedPlugins {
     std::string                 arch_id;
     /* The quantisation half of the selection key, "" for an unquantised container. */
     std::string                 arch_quant;
+    /* The registry declare selects through: an engine's own share of the process set
+     * (Registry::share), or null for the process registry itself, as the tools use. */
+    Registry*                   registry = nullptr;
 
     /* `name@version`, space separated, in hierarchy order; what a benchmark records as the
      * libraries measured. */
@@ -177,5 +180,13 @@ int rad_reference_ops(const Program& p, std::vector<std::string>* out);
 int rad_gate_reference_kernels(const Program& p, bool allow, const char* what);
 
 Registry& rad_tools_registry();
+
+/* Engines in one process (docs/MULTIMODEL.md §3.3). Each holds, while it lives, a contiguous block
+ * of `n_ranks` instance slots, whose first is its RadBuildCtx::slot_base, and a claim on its
+ * architecture plugin. A plugin that does not export rad_arch_multi_instance backs one engine at a
+ * time: a second claim on it is refused by name. RAD_OK with *slot_base set, or a negative status
+ * after a RAD_ERR line saying why. Release returns the slots and the claim. */
+int  rad_engine_claim(const std::string& arch_plugin, int n_ranks, int* slot_base);
+void rad_engine_release(const std::string& arch_plugin, int slot_base, int n_ranks);
 
 }  /* namespace rad */

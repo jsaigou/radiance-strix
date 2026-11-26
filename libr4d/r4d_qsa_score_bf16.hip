@@ -19,8 +19,8 @@
 
 #include "r4d.h"
 #include "r4d_args.h"
-#include "r4d_emit.h"
 #include "r4d_chain.h"
+#include "r4d_emit.h"
 #include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
 
@@ -242,12 +242,13 @@ constexpr long long kMxWavesTarget = 4096;
  * heads) would otherwise dominate. */
 constexpr long long kMxMinTiles    = 4;
 
+#define QSA_SCORE_MX_PARAMS                                                                     \
+    const unsigned short* __restrict__ q, const unsigned short* __restrict__ bk,                \
+    const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,                             \
+    const int32_t* __restrict__ nc, float* __restrict__ out, int M, int nb, int nseq,           \
+    int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec
 template <int HEADS>
-__device__ __forceinline__ void qsa_score_mx_kernel_body(
-    const unsigned short* __restrict__ q, const unsigned short* __restrict__ bk,
-    const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
-    const int32_t* __restrict__ nc, float* __restrict__ out,
-    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec) {
+__device__ __forceinline__ void qsa_score_mx_body(QSA_SCORE_MX_PARAMS) {
 
     const int lane = threadIdx.x & (kWave - 1), wave = threadIdx.x >> 5;
     const int half = lane >> 4, col = lane & 15;
@@ -335,25 +336,17 @@ __device__ __forceinline__ void qsa_score_mx_kernel_body(
     }
 }
 
-/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
-template <int HEADS>
-__global__ __launch_bounds__(kMxWaves * kWave) void qsa_score_mx_kernel(
-    const unsigned short* __restrict__ q, const unsigned short* __restrict__ bk,
-    const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
-    const int32_t* __restrict__ nc, float* __restrict__ out,
-    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec) {
-    qsa_score_mx_kernel_body<HEADS>(q, bk, bt, cu, nc, out, M, nb, nseq, tpw, q_ld, bk_ld, bt_ld, out_ld, vec);
+/* The kernel around the body, whose blocks and threads return where their work ends: CH `r4dchain`
+ * is the chained form (r4d_chain.h). */
+template <int HEADS, class CH>
+__global__ __launch_bounds__(kMxWaves * kWave)
+void qsa_score_mx_kernel(QSA_SCORE_MX_PARAMS) {
+    if (CH::on) r4d_chain_wait();
+    qsa_score_mx_body<HEADS>(q, bk, bt, cu, nc, out, M, nb, nseq, tpw, q_ld, bk_ld, bt_ld, out_ld,
+                             vec);
+    if (CH::on) r4d_chain_done();
 }
-template <int HEADS>
-__global__ __launch_bounds__(kMxWaves * kWave) void r4dchain_qsa_score_mx(
-    const unsigned short* __restrict__ q, const unsigned short* __restrict__ bk,
-    const int32_t* __restrict__ bt, const int32_t* __restrict__ cu,
-    const int32_t* __restrict__ nc, float* __restrict__ out,
-    int M, int nb, int nseq, int tpw, int q_ld, int bk_ld, int bt_ld, int out_ld, int vec) {
-    r4d_chain_wait();
-    qsa_score_mx_kernel_body<HEADS>(q, bk, bt, cu, nc, out, M, nb, nseq, tpw, q_ld, bk_ld, bt_ld, out_ld, vec);
-    r4d_chain_done();
-}
+#undef QSA_SCORE_MX_PARAMS
 
 /* Form override for tests (r4d_selftest compares the two): 0 = automatic, 1 = scalar,
  * 2 = matrix. Like r4d_gemm_fp8a8_pin_mw. */
@@ -371,7 +364,8 @@ extern "C" void r4d_qsa_score_pin_form(int form) { g_qsa_form = form; }
 //   out  [M][nb]         f32, `out_ld` elements a row (0 = nb)
 static int r4d_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, long out,
                                   int M, int n, int heads, int nb, int nseq,
-                                  int q_ld, int bk_ld, int bt_ld, int out_ld, RadStream stream) {
+                                  int q_ld, int bk_ld, int bt_ld, int out_ld, RadStream stream,
+                                  bool chain) {
     int emit_rc = RAD_OK;
     if (!q || !bk || !bt || !cu || !nc || !out) return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || n <= 0 || heads <= 0 || nb <= 0 || nseq <= 0) return R4D_NO(RAD_E_SHAPE);
@@ -394,12 +388,14 @@ static int r4d_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, l
         if (tpw < kMxMinTiles) tpw = kMxMinTiles;
         const unsigned gx = (unsigned)((tiles + tpw * kMxWaves - 1) / (tpw * kMxWaves));
         const int vec = (out_ld % 4 == 0) && ((out & 15) == 0);
-#define RAD_QSA_MX(H)                                                                             \
-        emit_rc = R4D_EMIT(stream, (g_r4d_chain_arg ? &r4dchain_qsa_score_mx<H> : &qsa_score_mx_kernel<H>), dim3(gx, (unsigned)qt),          \
+#define RAD_QSA_MX_E(H, CH_)                                                                      \
+        emit_rc = R4D_EMIT(stream, (qsa_score_mx_kernel<H, CH_>), dim3(gx, (unsigned)qt),         \
                            dim3(kMxWaves * kWave), 0, (const unsigned short*)q,                   \
                            (const unsigned short*)bk,                                             \
                            (const int32_t*)bt, (const int32_t*)cu, (const int32_t*)nc,            \
                            (float*)out, M, nb, nseq, (int)tpw, q_ld, bk_ld, bt_ld, out_ld, vec)
+#define RAD_QSA_MX(H)                                                                             \
+        do { if (chain) RAD_QSA_MX_E(H, r4dchain); else RAD_QSA_MX_E(H, R4dUnchained); } while (0)
         switch (heads) {
             case 1: RAD_QSA_MX(1); break;
             case 2: RAD_QSA_MX(2); break;
@@ -408,6 +404,7 @@ static int r4d_qsa_score_bf16_emit(long q, long bk, long bt, long cu, long nc, l
             default: return R4D_NO(RAD_E_SHAPE);
         }
 #undef RAD_QSA_MX
+#undef RAD_QSA_MX_E
         return emit_rc;
     }
     const unsigned nbg = (unsigned)((nb + kWaves * kBPW - 1) / (kWaves * kBPW));
@@ -482,10 +479,10 @@ extern "C" int r4d_rad_qsa_score(const RadArgs* a, RadStream stream) {
     const long long qp = r4d_row_pitch(q), kp = r4d_row_pitch(bk);
     const long long tp = r4d_row_pitch(bt), op = r4d_row_pitch(o);
     if (qp < 0 || kp < 0 || tp < 0 || op < 0) return R4D_NO(RAD_E_STRIDE);
-    const R4dChainArg chain_arg(r4d_geti_or(a, "chain", 0) != 0);
     return r4d_qsa_score_bf16_emit(r4d_addr(q), r4d_addr(bk), r4d_addr(bt), r4d_addr(cu),
                                    r4d_addr(nc), r4d_addr(o),
                                    (int)M, (int)n, (int)heads, (int)nb, (int)nseq,
-                                   (int)qp, (int)kp, (int)tp, (int)op, stream);
+                                   (int)qp, (int)kp, (int)tp, (int)op, stream,
+                                   r4d_geti_or(a, "chain", 0) != 0);
 }
 

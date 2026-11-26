@@ -3,7 +3,7 @@
 
 #include "rad_internal.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -93,9 +93,16 @@ std::vector<GenFieldSource> gen_sampling_sources(const GenSampling& stated, cons
 }
 
 bool gen_sampling_parse(const std::string& json_text, const char* src, GenSampling* out) {
-    nlohmann::json j;
-    try { j = nlohmann::json::parse(json_text); }
-    catch (const std::exception& e) { RAD_WARN("%s: %s; ignoring it", src, e.what()); return false; }
+    /* A model-repo file, and container metadata reaches here too. Read it with the container's
+     * bounds: a file that is refused never becomes a tree -- an unbounded read of a hostile one
+     * could overflow this process's stack on the way to the dump or destructor below. */
+    bool over = false, deep = false;
+    Json j = Json::parse_container(json_text, &over, &deep);
+    if (over || deep) {
+        RAD_WARN("%s: %s; ignoring it", src, Json::bound_why(over, deep));
+        return false;
+    }
+    if (j.is_discarded()) { RAD_WARN("%s: not valid JSON; ignoring it", src); return false; }
     if (!j.is_object()) { RAD_WARN("%s: not a JSON object; ignoring it", src); return false; }
 
     /* `do_sample: false` means greedy, and transformers then ignores every other sampler field,
@@ -178,19 +185,23 @@ bool gen_sampling_parse(const std::string& json_text, const char* src, GenSampli
 }
 
 bool gen_sampling_from_file(const std::string& path, bool required, GenSampling* out) {
-    std::ifstream f(path);
-    if (!f) {
+    std::string text;
+    const int rst = read_text_file(path, text, kMaxContainerFile);
+    if (rst == RAD_E_IO) {
         if (required) RAD_ERR("%s: cannot be read", path.c_str());
         return false;
     }
-    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (rst != RAD_OK) {
+        RAD_ERR("%s: larger than the 256 MiB a container file may be", path.c_str());
+        return false;
+    }
     return gen_sampling_parse(text, path.c_str(), out);
 }
 
 bool gen_sampling_from_kv(const std::function<const char*(const char*)>& get, GenSampling* out) {
     /* Rebuilt as JSON and passed to gen_sampling_parse, so container metadata and the original
      * file share one set of range checks and one reading of `do_sample`. */
-    nlohmann::json j = nlohmann::json::object();
+    Json j = Json::object();
     static const char* const kFields[] = { "do_sample", "temperature", "top_p", "min_p", "top_k",
                                            "no_repeat_ngram_size", "no_repeat_ngram_window_size",
                                            "no_repeat_ngram_whitelist", "suppress_tokens" };
@@ -204,18 +215,22 @@ bool gen_sampling_from_kv(const std::function<const char*(const char*)>& get, Ge
         }
         if (std::strcmp(k, "no_repeat_ngram_whitelist") == 0) {
             /* Not a number: the container's metadata is string-valued, and the whitelist is a
-             * JSON array spelled as JSON text. */
-            try {
-                j[k] = nlohmann::json::parse(v);
-            } catch (const std::exception& e) {
+             * JSON array spelled as JSON text. Bounded like every other container input. */
+            bool over = false, deep = false;
+            Json w = Json::parse_container(v, &over, &deep);
+            if (over || deep)
                 RAD_WARN("the container states generation.%s as \"%s\", which is not a JSON "
-                         "array of ids (%s); ignoring it", k, v, e.what());
-            }
+                         "array of ids (%s); ignoring it",
+                         k, log_sanitize(v).c_str(), Json::bound_why(over, deep));
+            else if (!w.is_discarded()) j[k] = std::move(w);
+            else
+                RAD_WARN("the container states generation.%s as \"%s\", which is not a JSON "
+                         "array of ids; ignoring it", k, log_sanitize(v).c_str());
             continue;
         }
         if (std::strcmp(k, "suppress_tokens") == 0) {
             /* An array of scalars is flattened to a space-separated string (flatten_json). */
-            nlohmann::json ids = nlohmann::json::array();
+            Json ids = Json::array();
             char* p = const_cast<char*>(v);
             for (char* e = nullptr;; p = e) {
                 const long long id = std::strtoll(p, &e, 10);

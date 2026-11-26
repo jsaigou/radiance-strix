@@ -1,15 +1,20 @@
 /* tests/dashboard_test.cpp -- what the dashboard and its JSON routes show.
  *
- * The page at `/` polls /stats and /sessions and reads dozens of their fields by name; a field
- * renamed on either side blanks a panel with no error anywhere. So the routes are checked for the
- * values a populated engine gives them, and the page's own script is read for every field it
- * takes from them, each of which a route must emit. The KV figures behind both come from
+ * The page at `/` and the process's sampler read dozens of the fields of /stats and /sessions by
+ * name; a field renamed on either side blanks a panel with no error anywhere. So the routes are
+ * checked for the values a populated engine gives them, for every field the page reads of them
+ * and for every figure the sampler derives from them. The KV figures behind both come from
  * SchedulerBridge's aggregation over the scheduler's groups, checked here on a hybrid model's
  * groups, where summing or picking the wrong group goes wrong silently.
  */
 #include "server_fakes.h"
 #include "rad_internal.h"   /* rad_mono_ns: a synthetic bringup start */
+#include "server/dashboard_page.h"
+#include "server/history.h"
 
+#include <cmath>
+#include <functional>
+#include <map>
 #include <set>
 
 namespace {
@@ -146,6 +151,10 @@ struct Dash {
         sched.m.draft_depth_seen = 2;
         sched.m.draft_pos_reached[0] = 10; sched.m.draft_pos_accepted[0] = 8;
         sched.m.draft_pos_reached[1] = 8;  sched.m.draft_pos_accepted[1] = 2;
+        sched.m.encode_items = 3;
+        sched.m.encode_patches = 12000;
+        sched.m.encode_ns = 1500000000;
+        sched.m.encode_pending = 1;
         srv.reset(new Server(d, o));
     }
     json get(const char* path) {
@@ -154,41 +163,6 @@ struct Dash {
         return json::parse(r.body, nullptr, false);
     }
 };
-
-/* The identifiers `var.<name>` that `text` reads, and the string arguments of `calls("<name>")`. */
-std::set<std::string> fields(const std::string& text, const std::string& var) {
-    std::set<std::string> out;
-    const std::string pat = var + ".";
-    for (size_t at = text.find(pat); at != std::string::npos; at = text.find(pat, at + 1)) {
-        if (at > 0) {
-            const char b = text[at - 1];
-            if (std::isalnum((unsigned char)b) || b == '_' || b == '.' || b == '$') continue;
-        }
-        size_t e = at + pat.size();
-        while (e < text.size() && (std::isalnum((unsigned char)text[e]) || text[e] == '_')) ++e;
-        if (e > at + pat.size()) out.insert(text.substr(at + pat.size(), e - at - pat.size()));
-    }
-    return out;
-}
-
-std::set<std::string> called(const std::string& text, const std::string& fn) {
-    std::set<std::string> out;
-    const std::string pat = fn + "(\"";
-    for (size_t at = text.find(pat); at != std::string::npos; at = text.find(pat, at + 1)) {
-        if (at > 0 && (std::isalnum((unsigned char)text[at - 1]) || text[at - 1] == '_')) continue;
-        const size_t b = at + pat.size(), e = text.find('"', b);
-        out.insert(text.substr(b, e - b));
-    }
-    return out;
-}
-
-/* The page's script from `from` up to the line that closes the function starting there. */
-std::string function_body(const std::string& page, const std::string& from) {
-    const size_t at = page.find(from);
-    if (at == std::string::npos) return std::string();
-    const size_t end = page.find("\n}\n", at);
-    return page.substr(at, end == std::string::npos ? std::string::npos : end - at);
-}
 
 void each_field_is_emitted(const std::set<std::string>& names, const json& o, const char* what) {
     for (const std::string& n : names) {
@@ -239,6 +213,10 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(s["hit_cuts"].value("no_snapshot", (int64_t)0), (int64_t)2);
     CHECK_EQ(s["hit_cuts"].value("resumed_below", (int64_t)0), (int64_t)4);
     CHECK_EQ(s.value("hit_cut_tokens", (int64_t)0), (int64_t)9000);
+    CHECK_EQ(s.value("encode_items", (int64_t)0), (int64_t)3);
+    CHECK_EQ(s.value("encode_patches", (int64_t)0), (int64_t)12000);
+    CHECK_EQ(s.value("encode_ns", (int64_t)0), (int64_t)1500000000);
+    CHECK_EQ(s.value("encode_pending", (int64_t)0), (int64_t)1);
 
     CHECK_EQ(d.srv->router().call("GET", "/graph").status, 501);
     Dash g(true);
@@ -359,77 +337,64 @@ TEST(stats_reports_how_long_bringup_took_once_the_server_listens) {
     CHECK_EQ(d.get("/stats").value("startup_s", (int64_t)-1), (int64_t)47);
 }
 
-/* The pooled acceptance ring's element shape is a contract between two functions of the page,
- * and no browser runs here: accWindow returns {ratio, dr, da}, and acceptTriple reads the ring's
- * entries as `d` and `last`. A field name it reads that the ring does not carry is undefined in
- * JavaScript, and the pooled figures render as NaN. */
-TEST(the_pooled_acceptance_ring_reads_the_names_accWindow_writes) {
-    Dash d(false);
-    const std::string p = d.srv->router().call("GET", "/").body;
-    const std::string aw = function_body(p, "function accWindow(");
-    const std::string at = function_body(p, "function acceptTriple(");
-    REQUIRE(!aw.empty() && !at.empty());
-    /* what goes into the ring */
-    CHECK(aw.find("dr: dr") != std::string::npos);
-    CHECK(aw.find("da: da") != std::string::npos);
-    /* what comes out of it: every `d.<field>` and `last.<field>` must be a ring name */
-    const std::set<std::string> ring = {"dr", "da"};
-    for (const std::string& n : fields(at, "d")) {
-        CHECK(ring.count(n) == 1);
-        if (!ring.count(n))
-            fprintf(stderr, "    acceptTriple reads d.%s, which the ring does not carry\n", n.c_str());
-    }
-    for (const std::string& n : fields(at, "last")) {
-        CHECK(ring.count(n) == 1);
-        if (!ring.count(n))
-            fprintf(stderr, "    acceptTriple reads last.%s, which the ring does not carry\n", n.c_str());
-    }
-    /* only polls that drafted enter the ring */
-    CHECK(aw.find("dr <= 0") != std::string::npos);
-}
-
+/* The page is built from typed sources: every field it reads of a route's object is a member of an
+ * interface in dashboard/src/lib/api.ts, and the compiled-in header lists them (kPageReads). Each
+ * must be one the route emits for a populated engine. */
 TEST(every_field_the_page_reads_is_one_the_routes_emit) {
     Dash d(false);
     HttpResponse page = d.srv->router().call("GET", "/");
-    REQUIRE(page.status == 200 && has(page.body, "function update(s, dt)"));
-    const std::string& p = page.body;
+    REQUIRE(page.status == 200 && has(page.body, "<div id=\"root\">"));
     const json stats = d.get("/stats");
     const json sessions = d.get("/sessions");
+    const std::map<std::string, const json*> objects = {
+        { "stats", &stats },
+        { "requests", &stats["requests"][0] },
+        { "draft_positions", &stats["draft_positions"][0] },
+        { "experts", &stats["experts"] },
+        { "tiers", &stats["experts"]["tiers"][0] },
+        { "sessions", &sessions },
+        { "session", &sessions["sessions"][0] },
+    };
+    std::map<std::string, std::set<std::string>> reads;
+    for (const char* const* r = kPageReads; *r; ++r) {
+        const std::string e = *r;
+        const size_t dot = e.find('.');
+        REQUIRE(dot != std::string::npos);
+        reads[e.substr(0, dot)].insert(e.substr(dot + 1));
+    }
+    CHECK(reads["stats"].size() > 12);
+    for (const auto& [object, names] : reads) {
+        const auto it = objects.find(object);
+        CHECK(it != objects.end());
+        if (it != objects.end()) each_field_is_emitted(names, *it->second, object.c_str());
+    }
+}
 
-    const std::string update = function_body(p, "function update(s, dt)");
-    const std::string batch = function_body(p, "function renderBatch(list, s)");
-    REQUIRE(!update.empty() && !batch.empty());
-    std::set<std::string> top = fields(update, "s");
-    for (const std::string& n : fields(batch, "s")) top.insert(n);
-    CHECK(top.size() > 15);
-    each_field_is_emitted(top, stats, "stats");
-    each_field_is_emitted(fields(update, "ex"), stats["experts"], "experts");
-    each_field_is_emitted(fields(update, "t"), stats["experts"]["tiers"][0], "experts.tiers[]");
-    std::set<std::string> link = fields(update, "lk");
-    for (const char* fn : { "d", "pre", "dP" })
-        for (const std::string& n : called(update, fn)) link.insert(n);
-    each_field_is_emitted(link, stats["link"], "link");
-    each_field_is_emitted(fields(update, "c"), stats["cards"][0], "cards[]");
-    each_field_is_emitted(fields(update, "p"), stats["draft_positions"][0], "draft_positions[]");
-
-    /* The request table: renderBatch through renderRequests. */
-    const size_t rb = p.find("function renderBatch("), up = p.find("function update(s, dt)");
-    REQUIRE(rb != std::string::npos && up > rb);
-    each_field_is_emitted(fields(p.substr(rb, up - rb), "r"), stats["requests"][0], "requests[]");
-
-    /* The sessions view: its loader, and the rows from reuseOf through sessRow. */
-    const std::string load = function_body(p, "async function loadSessions()");
-    REQUIRE(!load.empty());
-    each_field_is_emitted(fields(load, "s"), sessions, "sessions");
-    each_field_is_emitted(fields(load, "mv"), sessions["snapshot_store"], "snapshot_store");
-    each_field_is_emitted(fields(load, "ln"), sessions["linear"], "linear");
-    each_field_is_emitted(fields(load, "pool"), sessions["pool"], "pool");
-    each_field_is_emitted(fields(load, "occ"), sessions["occupancy"], "occupancy");
-    const size_t ro = p.find("const reuseOf"), lo = p.find("async function loadSessions()");
-    REQUIRE(ro != std::string::npos && lo > ro);
-    std::set<std::string> rows = fields(p.substr(ro, lo - ro), "r");
-    for (const std::string& n : fields(load, "r")) rows.insert(n);
-    each_field_is_emitted(rows, sessions["sessions"][0], "sessions[]");
+/* The charts draw what the process samples (History), which reads /stats by field name as the page
+ * does. Fed a populated engine's /stats and an earlier one with every counter lower, the sampler
+ * must yield each figure a chart draws; a field the route renamed would leave its column out. */
+TEST(the_sampler_yields_every_charted_figure_from_the_stats_route) {
+    Dash d(false);
+    const json now = d.get("/stats");
+    std::function<json(const json&)> earlier = [&](const json& j) -> json {
+        if (j.is_number()) return json(j.get<double>() - 7.0);
+        if (j.is_object()) { json o = json::object(); for (auto it = j.begin(); it != j.end(); ++it) o[it.key()] = earlier(it.value()); return o; }
+        if (j.is_array()) { json a = json::array(); for (const json& e : j) a.push_back(earlier(e)); return a; }
+        return j;
+    };
+    json prev = earlier(now);
+    prev["started_at"] = now["started_at"];
+    const History::Row row = History::model_row(now, &prev, 1.0);
+    std::set<std::string> have;
+    for (const auto& [name, v] : row)
+        if (std::isfinite(v)) have.insert(name);
+    for (const char* k : { "decode", "prefill", "running", "waiting", "preempted", "flight", "hit", "kvUsed", "kvCap",
+                           "kvKept", "kvRead", "jobRun", "jobDone", "prefillRate", "reqRate", "stepAny", "step",
+                           "accept", "tokStep", "lkAr", "lkUp", "lkDn", "lkSsd", "lkStream", "expHit", "expIn",
+                           "expOut", "encBusy", "encRate", "encPatch", "encWait" }) {
+        CHECK(have.count(k) == 1);
+        if (!have.count(k)) fprintf(stderr, "    the sampler yields no '%s' from /stats\n", k);
+    }
 }
 
 /* ================================================================== the bridge's KV figures */

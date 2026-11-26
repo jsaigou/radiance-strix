@@ -1,6 +1,6 @@
 # Static YaRN
 
-A larger `--max-model-len` reserves a larger serving window; it does not change the model's rotary
+A larger `max-model-len` reserves a larger serving window; it does not change the model's rotary
 embedding. A checkpoint trained at 262144 positions can request static YaRN explicitly for a
 524288-token deployment. Whether the extension keeps useful accuracy must be measured on the model
 and workload.
@@ -17,9 +17,13 @@ The factor convention is the config's, as vLLM and transformers read it: `factor
 `original_max_position_embeddings` 262144 reaches 524288 positions.
 
 Validated: the Qwen3.8-27B and Qwen3.6-35B-A3B containers and both Flash-Next variants at factor 2,
-with retrieval at about 500K tokens, and TP3 perplexity with `--rope-scaling` within about ±1% of
+with retrieval at about 500K tokens, and TP3 perplexity with `rope-scaling` within about ±1% of
 the unscaled model at factor 2. The LLaMA plugins read the same keys and declare the same ops, but
-YaRN has not been run on a LLaMA model.
+YaRN has not been run on a LLaMA model. Muse Glimmer validated at factor 8 over 131072 (a 1M
+serving window) with retrieval at 913K tokens -- and, unusually, without any scaling at all
+(mechanical window extension to 495K, also retrieval-passing): only its 2048-wide sliding layers
+carry rotary and its full-attention layers are NoPE, so the unscaled window is the family's
+default recipe (docs/ARCHITECTURES.md, museglimmer).
 
 ## Metadata
 
@@ -44,10 +48,11 @@ is valid only for the same source weights and recipe; it cannot mix weights from
 revisions.
 
 ```sh
-rad-convert /checkpoints/Qwen3.8-27B-FP8 \
+rad-convert /checkpoints/Qwen3.8-27B \
   --draft-model /checkpoints/Qwen3.8-27B-DFlash2 \
-  --recipe data/recipes/q38-27b-fp8-df2.recipe \
-  --reuse /models/qwen3.8-27b-fp8.rad \
+  --recipe data/recipes/q38-27b-iq8r-rtn.recipe \
+  --set quantization_config.quant_method=w8a8 --set quantization_config.fmt=fwht128 \
+  --reuse /models/qwen3.8-27b-iq8r.rad \
   --set text_config.rope_parameters.rope_type=yarn \
   --set text_config.rope_parameters.factor=2 \
   --set text_config.rope_parameters.original_max_position_embeddings=262144 \
@@ -55,32 +60,45 @@ rad-convert /checkpoints/Qwen3.8-27B-FP8 \
   --set draft.rope_parameters.factor=2 \
   --set draft.rope_parameters.original_max_position_embeddings=262144 \
   --max-ctx 524288 --kv-cache-dtype bf16 \
-  -o /models/qwen3.8-27b-fp8-yarn2.rad
+  -o /models/qwen3.8-27b-iq8r-yarn2.rad
 ```
 
 Run it with `--plan-only` first. `--max-ctx` is the converter's graph bound; it replaces neither
-the YaRN metadata nor the server's `--max-model-len`. A `.rad` is not a converter input, so keep
+the YaRN metadata nor the server's `max-model-len`. A `.rad` is not a converter input, so keep
 the source checkpoints. After conversion, check the target and draft keys with `rad-info --meta`.
 
 Serve on enough memory for the requested window:
 
-```sh
-radiance --model /models/qwen3.8-27b-fp8-yarn2.rad \
-  --tp 4 --max-model-len 524288 --max-num-seqs 32 --kv-cache-dtype bf16
+```yaml
+# radiance.yaml
+models:
+  qwen3.8-27b-iq8r-yarn2:
+    model: /models/qwen3.8-27b-iq8r-yarn2.rad
+    tp: 4
+    max-model-len: 524288
+    max-num-seqs: 32
+    kv-cache-dtype: bf16
 ```
 
-`--kv-cache-dtype` sets both the target's and the drafter's KV cache. Check the startup capacity
-and real long requests; the command guarantees neither concurrency nor accuracy. Keep the
+```sh
+radiance --config radiance.yaml
+```
+
+`kv-cache-dtype` sets both the target's and the drafter's KV cache. Check the startup capacity
+and real long requests; the configuration guarantees neither concurrency nor accuracy. Keep the
 unmodified model and serving setup until long-context quality and speed meet the deployment's
 requirements.
 
-## Serving an existing container: `--rope-scaling`
+## Serving an existing container: `rope-scaling`
 
 The same metadata can be applied when the container is loaded instead of at conversion:
 
-```sh
-radiance --model /models/qwen3.8-next-flash-fp8.rad \
-  --rope-scaling yarn:2 --max-model-len 409600
+```yaml
+models:
+  qwen3.8-next-flash:
+    model: /models/qwen3.8-next-flash-iqr-v4.rad
+    rope-scaling: yarn:2
+    max-model-len: 409600
 ```
 
 `yarn:FACTOR[:ORIG]` (FACTOR above 1) sets `rope_type = yarn`, `factor` and
@@ -101,11 +119,11 @@ Startup logs the rotary:
 rope: YaRN factor 2 over 262144 trained positions -- the rotary reaches 524288; --max-model-len 409600 (--rope-scaling)
 ```
 
-It warns when `--max-model-len` is past what the rotary covers, and, with no scaling, past the
+It warns when `max-model-len` is past what the rotary covers, and, with no scaling, past the
 trained length.
 
-Use the flag to try a factor, or to serve a container whose source checkpoints are not at hand. A
-deployment that settles on a factor can convert it in as above and drop the flag.
+Use the key to try a factor, or to serve a container whose source checkpoints are not at hand. A
+deployment that settles on a factor can convert it in as above and drop the key.
 
 ## Kernel and test contract
 

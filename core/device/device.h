@@ -12,7 +12,10 @@
 #include "rad_abi.h"
 #include "rad_device.h"
 
+#include <atomic>
 #include <cstdint>
+#include <map>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -39,9 +42,19 @@ extern "C" void rad_dev_host_wrote(void);
 /* Chained launches: chainable rows run their chained forms (RadKernelChainFn), and the backend
  * lets a chained kernel (named r4dchain*) wait in its prologue instead of behind the barrier bit.
  * Only on the AQL backend, whose queues keep the completion counter, and only where the model's
- * plugin measured a gain with its speculative drafter (RadArchProbe::chain_pays) and that drafter
- * decodes speculatively (rad_dev_chain_infer, from the engine before any row resolves). */
+ * plugin measured a gain (RadArchProbe::chain_pays): with its drafter decoding speculatively, or
+ * with and without one (rad_dev_chain_infer, from the engine before any row resolves).
+ *
+ * rad_dev_chain_infer(2) says more: every chained form this engine can launch fences itself
+ * (RadKernelChainFn saying 2, abi/rad_abi.h). rad_dev_chain_unfenced then answers 1, and the
+ * backend issues a chained launch that has lost its barrier bit without the packet processor's
+ * acquire as well (aql.cpp, "the acquire of a chained launch"). */
 extern "C" int  rad_dev_chain_enabled(void);
+/* VRAM the runtime keeps resident as queue scratch on `props`' card once a kernel with a private
+ * segment has run (0 on the host backend and on unified memory). Charged to the VRAM budget with
+ * the hardware queues. */
+extern "C" int64_t rad_dev_resident_scratch_bytes(const RadDeviceProps* props);
+extern "C" int  rad_dev_chain_unfenced(void);
 extern "C" void rad_dev_chain_infer(int pays);
 
 /* One range of a ranged copy: `bytes` from source offset `src` to destination offset `dst`, all
@@ -90,6 +103,17 @@ extern "C" int rad_memcpy_list_async(const RadCopySeg* segs, int n, unsigned fla
  * its share at full rate. A 4 MB all-reduce message takes 165 us alone and 301 us beside a layer's
  * copies; the step waits on the collective, while the copies have the rest of the layer. */
 extern "C" int rad_link_hold(RadStream s, int on);
+
+/* The launches this thread issues between `on` 1 and `on` 0 are a collective's: their blocks wait
+ * for the other ranks' blocks of the same launch on another card. A recorded pass keeps the mark.
+ *
+ * rad_dev_cards_claim tells the backend which cards an engine uses (`on` 1, once per engine)
+ * and that the engine is gone (`on` 0). On a card more than one
+ * engine has claimed, nothing may wait on the card behind a collective except the collective's own
+ * blocks (aql.cpp, "collectives on a shared card"). A claim that makes a card shared returns once
+ * everything issued before it on that card's streams has finished. */
+extern "C" void rad_dev_peer_launch(int on);
+extern "C" int  rad_dev_cards_claim(const int* cards, int n, int on);
 
 /* The hold word, for a launch that ends its own hold: a 64-bit word reachable by every engine and
  * kernel of the card, odd while the link is held. A launch handed this address releases the hold
@@ -280,9 +304,14 @@ struct DeviceBackend {
      *
      * Contract:
      *   `vmem_reserve` takes address space, no pages.
-     *   `vmem_commit` backs one granule and `vmem_decommit` unbacks one. The driver unmaps a
-     *   mapping only exactly as it was mapped (four granules mapped in one call cannot be unmapped
-     *   singly), so VMem issues one call per granule.
+     *   `vmem_commit` backs one granule. The driver unmaps a mapping only exactly as it was
+     *   mapped (four granules mapped as one cannot be unmapped singly), so VMem maps a mapping per
+     *   granule, a run of them in one `vmem_commit_units` call where the backend has it. It
+     *   returns 1 when the backing is recycled memory that holds what its last mapping left, 0
+     *   when it reads zero.
+     *   `vmem_decommit` unbacks a range that is one mapping or a contiguous run of whole ones, in
+     *   one unmap: each unmap costs a driver round trip that grows with the mappings the process
+     *   holds (8.8 us a granule alone, 48 beside 6000 others; 26 for a run, per granule).
      *   `vmem_protect` grants this device read/write access to an already-backed range. It is
      *   separate from commit because access set on a granule adjacent to an accessible one is
      *   refused, while the whole contiguous run is accepted; VMem names the run.
@@ -355,6 +384,36 @@ struct DeviceBackend {
 
     /* ---- see dev_stuck_ms. Null on a backend that cannot tell. */
     int64_t (*stuck_ms)(void);
+
+    /* ---- host-backed mappings, for parking (paging.cpp). `vmem_commit_host` backs a reserved
+     * granule with pinned host memory that the reservation's card reads and writes in place, at
+     * that address, and the host can too. `vmem_swap` exchanges what backs two mapped ranges of
+     * equal size (each keeps its kind: a range of device memory stays device memory wherever it
+     * is mapped). Remapped addresses need dev_settle_maps before the card writes them. Null on a
+     * backend without them; parking then keeps no host copies. */
+    int     (*vmem_commit_host)(void* addr, int64_t bytes);
+    int     (*vmem_swap)(void* a, void* b, int64_t bytes);
+
+    /* ---- [addr, addr + bytes) backed as one mapping per `unit` bytes, each of which can be
+     * unbacked alone later, with access granted once over the run: per granule, granting access
+     * costs about as much as the map (41.9 us a granule backed singly, 24.6 as a run). All or
+     * nothing: on failure nothing of the run stays backed. Null: VMem backs a granule at a time. */
+    int     (*vmem_commit_units)(void* addr, int64_t bytes, int64_t unit);
+
+    /* ---- device memory a decommit kept for the next commit of its size (counted as free in
+     * props), given back to the driver: card `device`'s, or every card's for -1; the bytes. Null
+     * on a backend that keeps none. */
+    int64_t (*vmem_trim)(int device);
+    /* rad_dev_peer_launch and rad_dev_cards_claim. Null on a backend that never launches a kernel
+     * ahead of the one before it. */
+    void  (*peer_launch)(int on);
+    int   (*cards_claim)(const int* cards, int n, int on);
+    /* ---- the hardware queues card `device` has open and how many of them no stream holds (a
+     * closed stream's queue is kept for the card's next stream); and the kept ones destroyed
+     * until `keep` are left, the number destroyed, none while any queue of the card holds a
+     * packet. Null on a backend that keeps none. */
+    void    (*stream_counts)(int device, int* open, int* idle);
+    int     (*stream_trim)(int device, int keep);
 };
 
 
@@ -399,6 +458,24 @@ std::string dev_dma_lane(int device);
  * tell. */
 int64_t dev_stuck_ms();
 
+/* How long the device may be stuck (dev_stuck_ms) before the backend ends the process, in ms; 0
+ * never. Set from `scheduler.stuck-exit` before serving; a backend that can tell reads it when a
+ * stall is standing. A device that has advanced nothing for a minute is not coming back: the
+ * reported hangs stood for hours, and a stall that clears does so within seconds. */
+extern std::atomic<int64_t> dev_stuck_exit_ms;
+
+/* Whether at least one engine has finished bringup. The stuck-exit watchdog reads it: a stall
+ * verdict standing DURING load is a slow load -- a cold start faulting a mapped tier from disk
+ * advances none of the counters the verdict watches, and that is legitimate work, not a hang.
+ * A watchdog that fires there turns one patient start into a supervisor's crash loop. Nothing
+ * disarms: the phase the flag exempts is only the engine's first. */
+extern std::atomic<bool> dev_engine_ready;
+
+/* The NUMA node GPU-accessible pinned host memory prefers, -1 for the node nearest each card.
+ * Set from `memory.pinned-numa-node` before serving (the fleet validates the number); the AQL
+ * backend reads it wherever it pins. A reload moves only what it pins after. */
+extern std::atomic<int> dev_pinned_numa_node;
+
 /* Longest run of dispatches a played tape leaves unordered. Of any kTapeOverlapRun + 1
  * consecutive packets on a queue one carries the barrier bit, so a launched packet still proves
  * that everything more than that many packets earlier has completed. Argument slots and tape
@@ -411,11 +488,43 @@ constexpr int kTapeOverlapRun = 6;
  * kernel plugin that calls hipMalloc directly; see the ledger in dispatch.cpp. */
 void rad_dev_alloc_totals(int kind, int64_t* bytes, int64_t* count);
 
+/* `fn` is called after every device-memory free (RAD_MEM_DEVICE) with the range freed: a kernel
+ * library's rad_plugin_freed (abi/rad_abi.h), registered by the plugin loader. Registrations are
+ * counted: every registry that loads the library registers its hook, and rad_dev_off_free, which
+ * the loader calls before it closes the library, takes one back. The hook goes with the last,
+ * once no free is calling it: a library opened again can land at another address, and a hook
+ * left behind would call into memory nothing maps. */
+void rad_dev_on_free(void (*fn)(const void* base, int64_t bytes));
+void rad_dev_off_free(void (*fn)(const void* base, int64_t bytes));
+
 /* Event handles created and not yet destroyed, process-wide. */
 int64_t rad_dev_live_events(void);
 /* Calls to rad_event_sync and rad_stream_sync since process start, from any thread: the host
  * blocks the ABI makes. */
 int64_t rad_dev_host_blocks(void);
+
+/* A parked allocation's contents (docs/MULTIMODEL.md §7): in pinned host memory, in a file of the
+ * disk tier, or both. A copy written to disk can let its host memory go and be read back later. */
+struct HostCopy {
+    void*       host = nullptr;   /* pinned, `bytes` rounded up to the direct-I/O block */
+    int64_t     bytes = 0;
+    std::string file;             /* the disk tier's copy, when written */
+    bool        on_disk = false;  /* `file` holds exactly what `host` holds (or held) */
+
+    int64_t ram() const { return host ? bytes : 0; }
+    /* Pinned memory for `n` bytes; what the copy held before, host memory and file, is freed. */
+    int  alloc(int64_t n);
+    /* Writes the host bytes to a new file under `dir` (O_DIRECT). Between pieces it asks `gate`
+     * (when given): 0 goes on, 1 waits (a model loading reads its container from the same drive),
+     * -1 abandons the write (RAD_E_STATE, no file left). */
+    int  spill(const std::string& dir, const std::function<int()>& gate = {});
+    /* Frees the host memory of a copy that is on disk. */
+    void drop_host();
+    /* Reads the file back into fresh pinned memory when the host copy is gone. */
+    int  load();
+    /* Frees everything: the host memory and the file. */
+    void release();
+};
 
 /* ------------------------------------------------------------------ elastic memory
  * One reserved address range and which granules inside it are backed.
@@ -444,10 +553,15 @@ public:
     /* Movable, since owners live in vectors. The source is left empty so its destructor does not
      * unmap the range the destination now owns. */
     VMem(VMem&& o) noexcept
-        : base_(o.base_), size_(o.size_), committed_(o.committed_), ext_(std::move(o.ext_)) {
+        : base_(o.base_), size_(o.size_), committed_(o.committed_), ext_(std::move(o.ext_)),
+          device_(o.device_), copy_(std::move(o.copy_)), parked_(std::move(o.parked_)),
+          discarded_(o.discarded_) {
+        rekey(&o, this);
         o.base_ = nullptr;
         o.size_ = o.committed_ = 0;
         o.ext_.clear();
+        o.copy_ = HostCopy{};
+        o.parked_.clear();
     }
     VMem& operator=(VMem&& o) noexcept {
         if (this != &o) {
@@ -456,9 +570,16 @@ public:
             size_ = o.size_;
             committed_ = o.committed_;
             ext_ = std::move(o.ext_);
+            device_ = o.device_;
+            copy_ = std::move(o.copy_);
+            parked_ = std::move(o.parked_);
+            discarded_ = o.discarded_;
+            rekey(&o, this);
             o.base_ = nullptr;
             o.size_ = o.committed_ = 0;
             o.ext_.clear();
+            o.copy_ = HostCopy{};
+            o.parked_.clear();
         }
         return *this;
     }
@@ -481,19 +602,240 @@ public:
     /* Whether every byte of [off, off+bytes) is backed; check before handing a range to a
      * kernel. */
     bool is_committed(int64_t off, int64_t bytes) const;
+    /* Actual backing inside a range, and the contiguous backed suffix. A sum alone cannot
+     * prove that every address a top-down expert loan exposes is mapped. */
+    int64_t committed_bytes(int64_t off, int64_t bytes) const;
+    int64_t committed_suffix() const;
+
+    /* Parking (dev_page_out): every backed extent copied to pinned host memory on `s`, then
+     * unbacked; the bytes held on the host, or an error. page_in backs the same extents again and
+     * copies them back. With `discard` nothing in the range is kept (a cache with no live
+     * sequence and its index reset): page_out copies nothing and returns 0, and page_in backs the
+     * extents again without copying anything back. */
+    int64_t page_out(RadStream s, bool discard = false);
+    int     page_in(RadStream s);
+    bool    parked() const { return !parked_.empty(); }
+    int64_t parked_bytes() const {
+        int64_t n = 0;
+        for (const auto& e : parked_) n += e.second;
+        return n;
+    }
+    /* The card the range was reserved on, for the copies' stream. */
+    int     device() const { return device_; }
+    /* Host bytes held for the parked extents (zero once they live only on disk). */
+    int64_t host_bytes() const { return parked_.empty() ? 0 : copy_.ram(); }
+    /* The disk tier (dev_page_spill): write the parked copy out, or let its host memory go. */
+    int     spill(const std::string& dir, const std::function<int()>& gate = {}) {
+        return parked_.empty() ? RAD_OK : copy_.spill(dir, gate);
+    }
+    int64_t drop_host() {
+        if (parked_.empty() || !copy_.on_disk || !copy_.host) return 0;
+        const int64_t n = copy_.bytes;
+        copy_.drop_host();
+        return n;
+    }
 
 private:
+    /* The owner registry follows the object when it moves (reserve() files it under the thread's
+     * engine owner). */
+    static void rekey(VMem* from, VMem* to);
     void*   base_ = nullptr;
     int64_t size_ = 0;
     int64_t committed_ = 0;
     /* Backed extents (offset, bytes): sorted, disjoint and never adjacent, since a touching
      * commit merges. Length tracks live regions, not calls. */
     std::vector<std::pair<int64_t, int64_t>> ext_;
+    int     device_ = 0;
+    HostCopy copy_;                                       /* parked: the extents' contents */
+    std::vector<std::pair<int64_t, int64_t>> parked_;     /* parked: the extents to back again */
+    bool    discarded_ = false;                           /* parked without a copy */
 
     /* Adds a newly mapped piece and merges it with whatever it touches. */
     void add_extent(int64_t off, int64_t bytes);
     void drop_extent(int64_t off, int64_t bytes);
 };
+
+/* ------------------------------------------------------------------ parking (paging.cpp)
+ * docs/MULTIMODEL.md §7. A device allocation of 2 MiB or more made on a thread working for an
+ * engine (engine_owner, rad_internal.h) is reserved as one address range and mapped in chunks, and
+ * an elastic range reserved on such a thread is filed under the engine too, so the engine's memory
+ * can leave the card in part or whole and come back at the same addresses.
+ *
+ * A chunk out of the card is somewhere else: in pinned host memory, in a file of the disk tier,
+ * both, or nowhere when it was discarded (its contents not needed: an expert slab's free slots).
+ * Restoring maps every chunk out and copies back the ones that had a copy. The engine must be
+ * quiet for both: nothing it issued still runs, nothing new is issued until the page-in. */
+constexpr int64_t kPageMin = (int64_t)2 << 20;
+/* For rad_dev_alloc and rad_dev_free: an engine's pageable allocation, and its release (false when
+ * `p` is not one). */
+void* page_alloc(int64_t bytes, int owner, int device);
+bool  page_free(void* p);
+/* Device bytes `owner` holds on card `device`: its allocations and elastic backing (a load in
+ * flight, for the fleet's reservation). */
+int64_t dev_owner_bytes(int owner, int device);
+/* The backend rad_dev_* calls go to. */
+const DeviceBackend* active_backend();
+/* The owner's elastic ranges (dispatch.cpp's registry). */
+std::vector<VMem*> vmems_of(int owner);
+
+struct PageOut {
+    /* Bytes to take off each card; empty takes everything. */
+    std::map<int, int64_t> want;
+    /* New host memory the copies may take; past it they go to `dir`, and without a `dir` the
+     * page-out stops there. */
+    int64_t     host_budget = INT64_MAX;
+    std::string dir;
+    /* The elastic ranges (the KV cache) are dropped, not copied. */
+    bool        discard_elastic = false;
+};
+struct PageResult {
+    std::map<int, int64_t> freed;   /* bytes unmapped on each card */
+    int64_t host = 0;               /* host bytes the copies took */
+    int64_t disk = 0;               /* bytes written straight to the disk tier */
+    int64_t dropped = 0;            /* bytes unmapped with nothing kept (discarded) */
+    int64_t reused = 0;             /* bytes unmapped against a copy made earlier */
+    int64_t file = 0;               /* bytes unmapped against the container they were loaded from */
+    double  quiet_s = 0;            /* the engine coming to rest (responses drained, loop held) */
+    double  slab_s = 0;             /* lent slots recalled and the expert slab emptied */
+    double  out_s = 0;              /* the page-out itself */
+};
+int     dev_page_out(int owner, const PageOut& req, PageResult* out);
+/* A stretch of memory a page-in mapped for its owner to fill (dev_page_refilled). */
+struct PageSpan { char* p; int64_t bytes; int device; };
+/* Every chunk of the owner that is out comes back. Those of an allocation the owner refills are
+ * only mapped, and appended to `refill` for the owner to fill before anything reads them; a
+ * page-in with such chunks out and no `refill` fails (RAD_E_STATE) and maps nothing. */
+int     dev_page_in(int owner, std::vector<PageSpan>* refill = nullptr, bool elastic = true);
+/* The owner's elastic ranges backed again (and their copies, if they were kept), what a page-in
+ * does last; then the cards' translations settled. A page-in with `elastic` false leaves this to
+ * the caller, which can run it beside the refill: nothing of the refill reads those ranges, and
+ * an image model's KV cache is ten thousand commits (0.5 s). */
+int     dev_page_in_elastic(int owner);
+/* The owner's chunks wholly inside these ranges hold nothing that needs keeping: the next page-out
+ * unmaps them first and copies nothing (an expert slab's slots after it dropped its units). */
+void    dev_page_discard(int owner, const std::vector<std::pair<const void*, int64_t>>& ranges);
+/* Bytes mapped on cards, and bytes of host copies (parked or kept). */
+void    dev_page_stats(int owner, int64_t* device, int64_t* host);
+/* Bytes of the owner's pageable memory still on each card. */
+std::map<int, int64_t> dev_page_mapped_bytes(int owner);
+/* Bytes the owner has out of the card right now, by card. With `live`, only what dev_page_in_live
+ * would map: the sealed chunks parked in host memory stay out of the sum, read in place. */
+std::map<int, int64_t> dev_page_out_bytes(int owner, bool live = false);
+/* [off, off + bytes) of the pageable allocation `p` (all of it for bytes < 0) is never written after
+ * the load (a static plan's weights pool, a tiered one's statics): a copy, once made, is kept after
+ * the page-in, and later page-outs of those chunks only unmap. */
+void    dev_page_seal(void* p, int64_t off = 0, int64_t bytes = -1);
+/* The pageable allocation `p` is rebuilt by its owner from its source (a weights pool from its
+ * container) after a page-in: its sealed chunks leave the card with no copy at all, an unmap, and
+ * dev_page_in hands them back to be filled. Its chunks are no longer checked against the
+ * container (dev_page_source). */
+void    dev_page_refilled(void* p);
+/* [p, p + bytes) is being written (an expert moved into a slab slot): the kept copies of the
+ * chunks it touches are stale. A no-op for memory that is not pageable. Called when the write is
+ * issued and again when it lands, so a copy made across it is never taken as exact. */
+void    dev_page_invalidate(const void* p, int64_t bytes);
+/* Memory mapped again at an address that was mapped before (a page-in, a pool growing back) is not
+ * written until the cards' translation caches have been flushed in full: a map flushes them only
+ * lightly, and copies into such memory can land nowhere, so the memory reads back its previous
+ * owner's bytes or zeros (Linux 7.1 with gfx1201; tests/device_test.cpp
+ * two_allocations_of_one_owner_come_back_exact_from_the_disk_tier). Unpinning host memory makes
+ * the driver flush every card it was mapped on in full, so this pins one page and unpins it.
+ * Called after a batch of maps, before anything writes them. */
+/* Where address `a` lies among the elastic reservations and pageable allocations, for a fault report:
+ * its owner, card, offset, whether it is backed and what its paging chunk holds. Empty when it is in
+ * none. Takes no lock it would wait for, since a fault can arrive while one is held. */
+std::string dev_fault_where(const void* a);
+
+int     dev_settle_maps();
+
+/* VMem::commit on this thread leaves its flush (dev_settle_maps) for the end of this scope, so a
+ * run of ranges mapped together flushes once. Nothing may write the new ranges before end(), which
+ * reports the flush's result; the destructor ends a batch left open by an early return. */
+class MapBatch {
+public:
+    MapBatch();
+    ~MapBatch();
+    MapBatch(const MapBatch&) = delete;
+    MapBatch& operator=(const MapBatch&) = delete;
+    int end();
+private:
+    bool ended_ = false;
+};
+/* The backend's kept device memory on card `device` (-1: every card) back to the driver, the
+ * bytes; its pages come free as the driver wipes them (~95 GB/s). For a caller about to allocate
+ * outside the elastic calls, or done with the swap that would have reused it. */
+int64_t dev_vmem_trim(int device);
+/* The hardware queues card `device` has open, and how many of them are kept for its next streams
+ * (0 and 0 on a backend that keeps none). */
+void    dev_stream_counts(int device, int* open, int* idle);
+/* Card `device`'s kept queues destroyed until `keep` are left: the number destroyed, about 41 MiB
+ * of the card each. Nothing is destroyed while any queue of the card holds a packet, and the
+ * caller sees to it that nothing is launched on the card during the call: destroying a queue
+ * beside a busy one can reset the card. */
+int     dev_stream_trim(int device, int keep);
+/* The device this thread last selected with rad_dev_set. */
+int     dev_current();
+/* The container at `path`, by an id for dev_page_source (the same path gives the same id). */
+int     dev_page_file(const char* path);
+/* The load copied container `file`'s rows [0, ny) of wb bytes at foff + y * sp verbatim onto
+ * [dst, dst + ny * wb). A chunk of pageable memory filled this way can go out against the container
+ * instead of a copy: a page-out (or backup) reads the device bytes back, compares them with the
+ * container (zero where nothing was loaded) and writes nothing when they match; the page-in reads
+ * the container. A chunk written since (dev_page_invalidate) is copied as any other. A no-op for
+ * memory that is not pageable. */
+void    dev_page_source(const void* dst, int file, int64_t foff, int64_t wb, int64_t ny, int64_t sp);
+/* Bytes of the owner's mapped chunks a page-out would have to copy (no discard, no kept copy,
+ * not loaded verbatim from a container, not refilled by the owner). */
+int64_t dev_page_uncopied(int owner);
+/* A restore that serves at once: like dev_page_in, but a sealed chunk parked in host memory stays
+ * there, read in place over the link, until dev_page_promote moves it; *left is how much. */
+int dev_page_in_live(int owner, int64_t* left, std::vector<PageSpan>* refill = nullptr,
+                     bool elastic = true);
+/* dev_page_in (`left` null) or dev_page_in_live in two halves, for an owner that refills: the begin
+ * maps every chunk, hands back those to refill and starts the copies of the chunks held in host
+ * memory; the end waits for those copies and swaps their memory in, and must follow every begin
+ * that succeeded. The refill runs between the two, beside the copies: it writes none of those
+ * chunks. Elastic ranges are left to dev_page_in_elastic. */
+int dev_page_in_begin(int owner, int64_t* left, std::vector<PageSpan>* refill);
+int dev_page_in_end(int owner);
+/* Between the two halves: waits for the clears the begin issued on recycled refill chunks, which
+ * it does not wait for itself. The refill calls it before its first write into them; the end
+ * waits for them too. The calling thread's current device is kept. */
+int dev_page_in_cleared(int owner);
+/* Moves up to `max_bytes` of the chunks dev_page_in_live left in host memory onto their cards,
+ * while the engine serves: each is copied to device memory first, then `quiet` runs the swap of
+ * mappings with nothing of the engine in flight (Engine::run_quiet). Returns the bytes moved, 0
+ * when none is left, or an error (no device memory for them: the rest stays in host memory). */
+int64_t dev_page_promote(int owner, int64_t max_bytes,
+                         const std::function<int(const std::function<int()>&)>& quiet);
+/* Bytes of `owner`'s chunks served from host memory in place, on `device` (-1: all). */
+int64_t dev_page_live_bytes(int owner, int device = -1);
+/* Host memory all parked and kept copies hold (they are host-backed mappings, not pinned
+ * allocations, so rad_dev_alloc_totals does not count them). */
+int64_t dev_page_host_bytes();
+/* Frees host copies of mapped sealed chunks (a file copy stays). The host bytes freed. */
+int64_t dev_page_drop_copies(int owner);
+/* Writes every host copy without a file copy to the disk tier; `gate` as HostCopy::spill. */
+int64_t dev_page_spill(int owner, const std::string& dir, const std::function<int()>& gate = {});
+/* Frees host copies that have a file copy. The host bytes freed. */
+int64_t dev_page_drop_host(int owner);
+/* A parked owner's chunks whose only copy is the disk tier or its container: their bytes. */
+int64_t dev_page_fillable(int owner);
+/* The owner's parked chunks of allocations it refills that have no host memory yet, one span a
+ * chunk, in address order. */
+std::vector<PageSpan> dev_page_refill_chunks(int owner);
+/* A host fill by the owner (Engine::fill_host): host memory mapped at each of these chunks (from
+ * dev_page_refill_chunks), as a park to host memory leaves a chunk, for the owner to fill from its
+ * source; then dev_page_fill_end: `filled`, the chunks' host copies are theirs and the next restore
+ * copies them over the link (exact until written, so a later park keeps them); otherwise the host
+ * memory goes again and the chunks stay to be refilled. */
+int     dev_page_fill_begin(int owner, const std::vector<PageSpan>& chunks);
+void    dev_page_fill_end(int owner, const std::vector<PageSpan>& chunks, bool filled);
+/* Up to max_bytes of those read into host memory and mapped at their own addresses, as a park to
+ * host memory leaves them, so the next restore copies over the link instead of reading the drive
+ * (and a live restore serves from them in place). The owner must be parked and idle. Returns the
+ * bytes filled, or a negative status. */
+int64_t dev_page_fill_host(int owner, int64_t max_bytes);
 
 /* Bytes backed by every VMem in the process, for Engine::start's receipt. VMem commits bypass the
  * rad_dev_alloc ledger, so without this the engine's accounting would miss the elastic pools. */

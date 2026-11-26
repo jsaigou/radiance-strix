@@ -11,7 +11,7 @@
 #include "server/sink.h"
 #include "server/systemone.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cmath>

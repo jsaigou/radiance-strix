@@ -1,15 +1,15 @@
 #!/bin/sh
 # Rebuild the DSpark container for MiniCPM5-2B that scripts/mcserve.sh serves
-# (minicpm5-2b-dspark.v2.rad): the bf16 checkpoint with the drafter merged in, every linear made
-# block fp8 by data/recipes/minicpm5-2b-dspark.recipe, served by arch/llama_dense_fp8. The output
+# (minicpm5-2b-iq8r.rad): the bf16 checkpoint with the drafter merged in, every linear made
+# rotated int8 by data/recipes/minicpm5-2b-iq8r.recipe, served by arch/llama_dense_fp8. The output
 # is removed before conversion starts, so it is a .new.rad beside the served container.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="${BUILD:-$ROOT/build}"
 cd "$BUILD" || exit 1
-RECIPE=${RECIPE:-$ROOT/data/recipes/minicpm5-2b-dspark.recipe}
+RECIPE=${RECIPE:-$ROOT/data/recipes/minicpm5-2b-iq8r.recipe}
 SRC=$HOME/models/openbmb/MiniCPM5-2B
 DRAFT=$HOME/models/openbmb/MiniCPM5-2B-DSpark
-OUT=$HOME/models/rad/minicpm5-2b-dspark.new.rad
+OUT=$HOME/models/rad/minicpm5-2b-iq8r.new.rad
 [ -d "$DRAFT" ] || { echo "no drafter checkpoint at $DRAFT"; exit 1; }
 rm -f "$OUT"
 ./bin/rad-convert "$SRC" -o "$OUT" \

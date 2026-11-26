@@ -180,7 +180,8 @@ struct Model {
             b_qlogit = 0, b_field = 0;
 };
 
-static Model g_model;
+/* One per engine instance in the process, by slot (rad_builder.h, rad_build_slot). */
+static Model g_model[RAD_MAX_SLOTS];
 
 /* ================================================================== declare helpers */
 static rad_weight wcopy(RadBuilder* b, const char* dn, const char* src, uint32_t dtype,
@@ -890,7 +891,9 @@ static int declare_query(RadBuilder* b, Model& m) {
 }
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
-    Model& m = g_model;
+    if (!b || !meta || !ctx || ctx->rank < 0 || rad_build_slot(ctx) >= RAD_MAX_SLOTS)
+        return RAD_E_INVAL;
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(check_format(meta));
@@ -1197,7 +1200,7 @@ static void step_query(RadCtx* c, const RadShapeGenBatch* S, const Model& m) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model;
+    const Model& m = g_model[rad_slot(c)];
     const RadShapeGenBatch* S = batch->sgen_b;
     if (!batch->gen || !S) {
         rad_step_fail(c, "hunyuan3d2 is a shape generator and runs generator passes only");
@@ -1225,6 +1228,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 }  /* namespace hunyuan3d2 */
 
 RAD_ARCH_PROBE(hunyuan3d2)
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(hunyuan3d2, "hunyuan3d2", "", "0.1.0",
                 "Hunyuan3D-2's shape model: DINOv2-giant over the picture, a flow-matching DiT of "
                 "16 double and 32 single blocks over 3072 latents, and the shape VAE's geometry "

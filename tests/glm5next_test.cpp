@@ -6,13 +6,77 @@
 
 #include <array>
 #include <dlfcn.h>
+#include <filesystem>
 #include <map>
 #include <thread>
+#include <sys/stat.h>
 
 /* ==================================================================== the plugin under test */
 
 /* GLM-5.3-Flash: its blocks (through the plugin's includes) and the plugin. */
 #include "../arch/glm5next/glm5next.cpp"
+
+/* ==================================================================== the 2.x container */
+
+/* The 2.x container's encodings: an IQ8R trunk (rotated int8, a u8 scale a 256 of K under a bf16
+ * scale a row) and IQR routed experts (the rotated computed trellis at one f32 scale a row). */
+static RadEncoding glm_iq8r() {
+    RadEncoding e = rad_enc_affine(RAD_I8, RAD_U8, 1, 256);
+    rad_enc_add_plane(&e, "scale.1", RAD_BF16, 1, 0);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+static RadEncoding glm_iqr() {
+    RadEncoding e{};
+    rad_enc_clear(&e);
+    rad_enc_copy_str(e.scheme, "trellis");
+    rad_enc_add_plane(&e, "codes", RAD_U4, 1, 1);
+    rad_enc_add_plane(&e, "scale", RAD_F32, 1, 0);
+    const int t = rad_enc_add_table(&e, "trellis", RAD_I8, 1 << 16, 1);
+    e.plane[t].block[0] = 128;
+    rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
+    rad_enc_add_plane(&e, "scale.col", RAD_F32, 0, 128);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+/* The encodings by declared name: every trunk linear but KDA's (dense, MLA q_a/kv_a/q_b/output,
+ * shared experts) IQ8R, the routed experts `experts`, the rest as declared. The MLA layers' output
+ * projections are named by layer: KDA's share the name and stay bf16. */
+static std::vector<std::pair<std::string, RadEncoding>> glm_v2_encs(const RadEncoding& experts) {
+    const RadEncoding q = glm_iq8r();
+    std::vector<std::pair<std::string, RadEncoding>> e = {
+        { "ffn_gate_up_exps", experts }, { "ffn_down_exps", experts },
+        { "ffn_gate_up_shexp", q },      { "ffn_down_shexp", q },
+        { "ffn_gate_up.weight", q },     { "ffn_down.weight", q },
+        { "attn_q_a.weight", q },        { "attn_kv_a.weight", q },
+        { "attn_q_b.weight", q } };
+    for (int l = 3; l < 45; l += 4) e.push_back({ "blk." + std::to_string(l) + ".attn_output.", q });
+    return e;
+}
+static RadModelMeta glm_meta() {
+    static const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
+                                  "index_topk" };
+    static const char* vals[] = { "1", "4", "288", "2048" };
+    RadModelMeta meta{};
+    meta.n_layers = 45;
+    meta.n_embd = 4096;
+    meta.n_vocab = 154880;
+    meta.rms_eps = 1e-5f;
+    meta.n_kv = 4;
+    meta.kv_key = keys;
+    meta.kv_val = vals;
+    return meta;
+}
+
+/* Every declared weight is resolved by one map. A repeated target would make conversion-time
+ * resolution order-dependent; the checkpoint resolver takes maps for one name in declaration
+ * order. */
+static bool glm_maps_are_unique(const RadBuilder& b) {
+    std::set<std::string> seen;
+    for (const RecMap& m : b.maps)
+        if (!seen.insert(m.declared).second) return false;
+    return true;
+}
 
 /* ==================================================================== the blocks */
 
@@ -337,6 +401,7 @@ TEST(absorbed_mla_shards_complete_heads_and_reads_one_latent_cache) {
  * the gather sends whole runs into an output of world runs. Below the threshold, and at TP1, the
  * head form is unchanged, as it is unless the row form is opted into (the default). */
 TEST(glm_mla_splits_a_prefill_by_rows_over_ranks_from_the_row_threshold) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     using namespace rad::arch;
     for (int world : { 1, 2, 4, 8 })
         for (int rank = 0; rank < world; ++rank) {
@@ -514,6 +579,7 @@ TEST(glm_mla_splits_a_prefill_by_rows_over_ranks_from_the_row_threshold) {
 
 TEST(
     glm53_native_graph_declares_all_layers_preserves_mixed_formats_and_runs_mtp_only_in_draft_passes) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     using namespace rad::arch;
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
@@ -766,6 +832,7 @@ TEST(
  * into planes that hold every run. The query side (projection, cast, quantiser, head gates) runs
  * on the run's rows that exist. Below the threshold the indexer stays replicated. */
 TEST(glm53_indexer_scores_and_selects_one_run_of_query_rows_per_rank) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     using namespace rad::arch;
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
@@ -996,44 +1063,20 @@ TEST(glm53_indexer_scores_and_selects_one_run_of_query_rows_per_rank) {
 
 /* The engine's arena levels declare again at a smaller max_tok (RadBuildCtx::shape_probe) and
  * must get the real declare's graph: the same ops with the same fixed parameters, only ranged row
- * counts and buffer rows smaller. The TP splits declare its ops whatever the step size and their
- * gathers' message as a range, in the head and the row form of the MLA. */
+ * counts and buffer rows smaller. The 2.x fixture is head-form only: an IQ8R trunk refuses the
+ * MLA row form. */
 TEST(glm53_sizing_declares_match_the_real_graph_at_every_arena_level) {
-    const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
-                           "index_topk" };
-    const char* vals[] = { "1", "4", "288", "2048" };
-    RadModelMeta meta{};
-    meta.n_layers = 45;
-    meta.n_embd = 4096;
-    meta.n_vocab = 154880;
-    meta.rms_eps = 1e-5f;
-    meta.n_kv = 4;
-    meta.kv_key = keys;
-    meta.kv_val = vals;
-    const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
-    const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
+    const RadModelMeta meta = glm_meta();
     const int world = 8, rank = 3;
-    for (int rows_split : { 0, 1 })
     for (int64_t R : { 256, 3072 }) {
         auto encs = [&](RadBuilder& b) {
             b.kv_block = 4;
-            b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
-                       { "mtp.blk.45.ffn_down_exps", fp8 },
-                       { "ffn_gate_up_exps", mx },
-                       { "ffn_down_exps", mx },
-                       { "ffn_gate_up_shexp", mx },
-                       { "ffn_down_shexp", mx },
-                       { "ffn_gate_up.weight", fp8 },
-                       { "ffn_down.weight", fp8 } };
+            b.encs = glm_v2_encs(glm_iqr());
         };
-        RadBuildCtx c{};
-        c.rank = rank;
-        c.world_size = world;
+        RadBuildCtx c = spec_ctx(rank, world, 0);
         c.max_tok = 4096;
         c.max_seqs = 8;
         c.max_ctx = 32768;
-        c.max_spec = 3;
-        c.tp_attn_rows = rows_split;
         RadBuilder full;
         encs(full);
         REQUIRE_EQ(glm5next::declare(&full, &meta, &c), RAD_OK);
@@ -1079,6 +1122,7 @@ TEST(glm53_sizing_declares_match_the_real_graph_at_every_arena_level) {
 /* Each deployment or checkpoint the plugin cannot serve is refused with a line that names the
  * setting and the reason, not a bare status. */
 TEST(glm53_refusals_name_what_was_refused) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -1142,6 +1186,7 @@ TEST(glm53_refusals_name_what_was_refused) {
  * name fp8_e4m3, and the index tail, DSA index and KDA groups keep their dtypes. Under bf16 the
  * attention states no kv_dtype, the op it always declared. */
 TEST(glm53_fp8_kv_cache_narrows_the_latent_group_only) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -1206,6 +1251,7 @@ TEST(glm53_fp8_kv_cache_narrows_the_latent_group_only) {
  * launches it replaces are gone, with the step lint clean throughout. The sort writes each slot's
  * row (`moe_scatter_inv`) and the gather reads it (`moe_gather_inv`) in every MoE pass. */
 TEST(glm53_moe_decode_fusions_replace_their_launches_where_they_fit) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -1488,6 +1534,7 @@ TEST(dsa_cache_uses_distinct_index_and_attention_pages_and_a_speculative_tail_ri
 }
 
 TEST(glm_dense_ffn_keeps_clipping_and_disables_the_unclipped_fp8_epilogue) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     using namespace rad::arch;
     RadBuilder b;
     Names nm("");
@@ -1771,6 +1818,7 @@ TEST(kda_state_core_splits_mixed_batches_and_preserves_absolute_prefill_offsets)
  * after history, a mixed step, a decode step, a verify and its draft passes, at eight in both
  * MLA forms. */
 TEST(glm53_is_the_pinned_graph_and_steps) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -1833,9 +1881,391 @@ TEST(glm53_is_the_pinned_graph_and_steps) {
     }
 }
 
+/* An IQ8R trunk with IQR experts declares at every rank count, its experts whole at one and two
+ * ranks and split by width at four and eight (as MXFP4's are), with rotated int8 pairs at the trunk's 256 and the routed arm's 128, and KDA, the indexer and the router as they
+ * were. Where the norms cannot write the codes (a CPU engine), each linear quantises the bf16 plane
+ * and the routed arm takes its own rotated copy of the block input. */
+TEST(glm53_v2_declares_an_iq8r_trunk_with_iqr_experts) {
+    const RadModelMeta meta = glm_meta();
+    for (const bool fed : { true, false })
+        for (const int world : { 1, 2, 4, 8 }) {
+            RadBuilder b;
+            b.kv_block = 4;
+            b.encs = glm_v2_encs(glm_iqr());
+            if (!fed) b.undeclared = { "rmsnorm_had_quant_i8g" };
+            RadBuildCtx ctx = spec_ctx(0, world, 0);
+            ctx.max_tok = 256;
+            ctx.max_seqs = 4;
+            ctx.max_ctx = 32768;
+            REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+            const int64_t T = 256;
+            const RecBuf* nq = find_b(b, "normalized.q8");
+            const RecBuf* ns = find_b(b, "normalized.s8");
+            REQUIRE(nq && ns);
+            CHECK_EQ(nq->d.dtype, (uint32_t)RAD_I8);
+            CHECK_EQ(ns->d.shape[1], 4096 / 256);
+            /* The E4M3 pair only where the norm cannot write the codes. */
+            CHECK_EQ(find_b(b, "normalized.q") != nullptr, !fed);
+            const RecBuf* eq = find_b(b, "expert_ff.q8");
+            const RecBuf* es = find_b(b, "expert_ff.s8");
+            REQUIRE(eq && es);
+            CHECK_EQ(eq->d.shape[0], 8 * T);
+            const int64_t FE = world <= 2 ? 2048 : 2048 / world;  /* split by width from four */
+            CHECK_EQ(eq->d.shape[1], FE);
+            CHECK_EQ(es->d.shape[1], FE / 128);
+            CHECK(find_b(b, "expert_ff.q") == nullptr);
+            CHECK_EQ(find_b(b, "normalized_rot.q8") != nullptr, !fed);
+            for (const char* n : { "q_low.q8", "expanded.q8", "dense_ff.q8", "shared_ff.q8" })
+                CHECK(find_b(b, n) != nullptr);
+            for (const char* n : { "expanded.q", "dense_ff.q", "shared_ff.q" })
+                CHECK(find_b(b, n) == nullptr);
+            /* The trunk's int8 GEMMs are IQ8R's; KDA's projections stay bf16 GEMMs. */
+            int iq8r = 0;
+            for (const auto& o : b.ops)
+                if (o.op == "gemm_nt_q" && pstr(&o, "dtype") == "i8a8h") {
+                    CHECK_EQ(pint(&o, "group"), 256);
+                    ++iq8r;
+                }
+            /* 3 dense x 2 + 11 MLA x 4 + 42 shared x 2. */
+            CHECK_EQ(iq8r, 3 * 2 + 11 * 4 + 42 * 2);
+            CHECK(count_op(b, "moe_gemm_q") > 0);
+            CHECK(count_op(b, "gemm_nt") > 0);
+            CHECK(find_op(b, "quant_act_fp8") == nullptr);
+            /* A mixed step (two decode rows beside a 200-row prefill chunk) issues every op with
+             * the int8 pairs written before they are read. */
+            auto k = kit(b, { 1, 1 }, { 200 }, 300);
+            auto passes = run_passes(b, glm5next::step, { k.get() }, 0, world);
+            CHECK_PASSES(b, passes);
+        }
+}
+
+/* A protected bf16 expert pair among IQR experts is declared at the expert's own width (2048),
+ * not the dense layers' (12288), on one card where the experts are declared as one width slice. */
+TEST(glm53_v2_protected_experts_take_the_expert_width) {
+    const RadModelMeta meta = glm_meta();
+    RadBuilder b;
+    b.kv_block = 4;
+    const RadEncoding bf = rad_enc_plain(RAD_BF16);
+    b.encs = { { "blk.3.ffn_gate_up_exps.0.", bf }, { "blk.3.ffn_down_exps.0.", bf },
+               { "blk.3.ffn_gate_up_exps.1.", bf }, { "blk.3.ffn_down_exps.1.", bf } };
+    for (const auto& e : glm_v2_encs(glm_iqr())) b.encs.push_back(e);
+    RadBuildCtx ctx = spec_ctx(0, 1, 0);
+    ctx.max_tok = 256;
+    ctx.max_seqs = 4;
+    ctx.max_ctx = 32768;
+    REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+    const RecWeight* gu = find_w(b, "blk.3.ffn_gate_up_exps.0.weight");
+    const RecWeight* dn = find_w(b, "blk.3.ffn_down_exps.1.weight");
+    REQUIRE(gu && dn);
+    CHECK_EQ(gu->d.shape[0], 2 * 2048);
+    CHECK_EQ(dn->d.shape[1], 2048);
+}
+
+/* An IQ8R trunk's experts read its rotated int8 codes, so bf16 or unrotated experts beside it, and
+ * IQR experts beside a bf16 trunk, are refused; so is the MLA row form, which views int8 weights. */
+/* The 2.x container's latent cache at each --kv-cache-dtype: bf16 (default and stated), fp8 and the
+ * int8 row. Only the latent group narrows, at head_dim 256 and blocks of 4 on every rank; every MLA
+ * layer's store and its head-form attention name the cache (the attention states no kv_dtype at
+ * bf16, the op it always declared); the index tail, the DSA index and the KDA groups keep theirs.
+ * IQ8R serves the head form and no MTP layer, so 11 stores and 11 attentions a rank. f16 is
+ * refused. */
+TEST(glm53_v2_kv_cache_dtype_narrows_the_latent_group_only) {
+    const RadModelMeta meta = glm_meta();
+    struct Want { int dtype; uint32_t group; const char* store; const char* attn; };
+    const Want wants[] = {
+        { (int)RAD_DT_INVALID, RAD_BF16, "bf16", "<absent>" },
+        { (int)RAD_BF16, RAD_BF16, "bf16", "<absent>" },
+        { (int)RAD_F8E4M3, RAD_F8E4M3, "fp8_e4m3", "fp8_e4m3" },
+        { (int)RAD_I8, RAD_I8, "i8", "i8" },
+    };
+    for (const Want& w : wants)
+        for (const int world : { 1, 4, 8 })
+            for (int rank = 0; rank < world; rank += world > 1 ? world - 1 : 1) {
+                RadBuilder b;
+                b.kv_block = 4;
+                b.encs = glm_v2_encs(glm_iqr());
+                RadBuildCtx ctx = spec_ctx(rank, world, 0);
+                ctx.max_tok = 256;
+                ctx.max_seqs = 4;
+                ctx.max_ctx = 32768;
+                ctx.kv_dtype = w.dtype;
+                REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+                std::map<std::string, RadKVGroupDecl> groups;
+                for (const auto& g : b.kv_groups) groups[g.name] = g.d;
+                CHECK_EQ(groups["kv_latent"].dtype, w.group);
+                CHECK_EQ(groups["kv_latent"].head_dim, 256);
+                CHECK_EQ(groups["kv_latent"].n_head_kv, 1);
+                CHECK_EQ(groups["kv_index_tail"].dtype, (uint32_t)RAD_BF16);
+                CHECK_EQ(groups["kv_dsa_index"].dtype, (uint32_t)RAD_U8);
+                CHECK_EQ(groups["kv_kda"].dtype, (uint32_t)RAD_F32);
+                CHECK_EQ(groups["kv_kda_conv"].dtype, (uint32_t)RAD_BF16);
+                int stores = 0, attns = 0;
+                for (const auto& o : b.ops) {
+                    if (o.op == "kv_store" || o.op == "kv_store_streamed") {
+                        ++stores;
+                        CHECK_EQ(pstr(&o, "kv_dtype"), w.store);
+                    }
+                    if (o.op == "mla_attn") {
+                        ++attns;
+                        CHECK_EQ(pstr(&o, "kv_dtype"), w.attn);
+                        CHECK_EQ(pint(&o, "block_size"), 4);
+                    }
+                }
+                CHECK(stores >= 11);
+                CHECK_EQ(attns, 11);
+            }
+    RadBuilder b;
+    b.kv_block = 4;
+    b.encs = glm_v2_encs(glm_iqr());
+    RadBuildCtx ctx = spec_ctx(0, 4, 0);
+    ctx.max_tok = 256;
+    ctx.max_seqs = 4;
+    ctx.max_ctx = 32768;
+    ctx.kv_dtype = RAD_F16;
+    CHECK_EQ(glm5next::declare(&b, &meta, &ctx), RAD_E_UNSUPPORTED);
+}
+
+/* The clamped SwiGLU in front of an int8 consumer is one swiglu_clamped_had_quant_i8g where a loaded
+ * library declares it (the GLM kernel plugin), at the consumer's group: 128 for the routed and
+ * shared experts, IQ8R's 256 for the dense down projections. Where none does, it is the pair it
+ * replaces, swiglu_clamped then had_quant_act_i8g, and the fused op is never asked for. */
+TEST(glm53_v2_fuses_the_clamped_swiglu_where_a_library_declares_it) {
+    const RadModelMeta meta = glm_meta();
+    for (const bool declared : { true, false }) {
+        RadBuilder b;
+        b.kv_block = 4;
+        b.encs = glm_v2_encs(glm_iqr());
+        if (!declared) b.undeclared = { "swiglu_clamped_had_quant_i8g" };
+        RadBuildCtx ctx = spec_ctx(0, 4, 0);
+        ctx.max_tok = 256;
+        ctx.max_seqs = 4;
+        ctx.max_ctx = 32768;
+        REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+        int fused = 0, clamped = 0, quant = 0;
+        std::set<long long> groups;
+        for (const auto& o : b.ops) {
+            if (o.op == "swiglu_clamped_had_quant_i8g") {
+                ++fused;
+                for (const auto& p : o.p)
+                    if (p.key == "group") groups.insert(p.ival);
+            }
+            if (o.op == "swiglu_clamped") ++clamped;
+            if (o.op == "had_quant_act_i8g") ++quant;
+        }
+        if (declared) {
+            /* Three dense layers and 42 routed ones (their routed and shared arms), plus the
+             * vision tower's own unquantised swiglu_clamped, which feeds no int8 consumer. */
+            CHECK(fused >= 3 + 2 * 42);
+            CHECK(groups == (std::set<long long>{ 128, 256 }));
+            CHECK(clamped < fused);
+        } else {
+            CHECK_EQ(fused, 0);
+            CHECK(clamped >= 3 + 2 * 42);
+            CHECK(quant >= clamped - 1);
+        }
+        CHECK(std::find(b.asked_undeclared.begin(), b.asked_undeclared.end(),
+                        "swiglu_clamped_had_quant_i8g") == b.asked_undeclared.end());
+    }
+}
+
+TEST(glm53_v2_refuses_mixed_trunks_and_the_row_form) {
+    const RadModelMeta meta = glm_meta();
+    const auto declare = [&](const std::vector<std::pair<std::string, RadEncoding>>& encs,
+                             int rows) {
+        RadBuilder b;
+        b.kv_block = 4;
+        b.encs = encs;
+        RadBuildCtx ctx = spec_ctx(0, 4, 0);
+        ctx.max_tok = 256;
+        ctx.max_seqs = 4;
+        ctx.max_ctx = 32768;
+        ctx.tp_attn_rows = rows;
+        return glm5next::declare(&b, &meta, &ctx);
+    };
+    CHECK_EQ(declare(glm_v2_encs(rad_enc_plain(RAD_BF16)), 0), RAD_E_UNSUPPORTED);
+    CHECK_EQ(declare({ { "ffn_gate_up_exps", glm_iqr() }, { "ffn_down_exps", glm_iqr() } }, 0),
+             RAD_E_UNSUPPORTED);
+    CHECK_EQ(declare(glm_v2_encs(glm_iqr()), 2048), RAD_E_UNSUPPORTED);
+    /* The draft layer is not served on an IQ8R trunk yet. */
+    RadBuilder b;
+    b.kv_block = 4;
+    b.encs = glm_v2_encs(glm_iqr());
+    RadBuildCtx ctx = spec_ctx(0, 4, 3);
+    ctx.max_tok = 256;
+    ctx.max_seqs = 4;
+    ctx.max_ctx = 32768;
+    CHECK_EQ(glm5next::declare(&b, &meta, &ctx), RAD_E_UNSUPPORTED);
+}
+
+/* Expert parallelism gives every rank a disjoint whole-expert window: no width spans, the router
+ * still scores all 288 experts, and each grouped table holds only that rank's experts. */
+TEST(glm53_v2_expert_parallel_declares_one_expert_window_per_rank) {
+    const RadModelMeta meta = glm_meta();
+    for (const int world : { 4, 8 }) {
+        const int64_t n_local = 288 / world;
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            b.kv_block = 4;
+            b.encs = glm_v2_encs(glm_iqr());
+            RadBuildCtx ctx = spec_ctx(rank, world, 0);
+            ctx.max_tok = 256;
+            ctx.max_seqs = 4;
+            ctx.max_ctx = 32768;
+            /* IQR experts split by width at four and eight ranks; the drive tier keeps them whole. */
+            ctx.expert_file_tier = 1;
+            REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+            CHECK(glm_maps_are_unique(b));
+
+            const auto& m = *glm5next::models[rank];
+            const auto& c = m.moe_src[(size_t)3].cfg;
+            const int64_t base = rank * n_local;
+            CHECK_EQ(c.n_expert, n_local);
+            CHECK_EQ(c.n_expert_all, 288);
+            CHECK_EQ(c.expert_base, base);
+            CHECK_EQ(c.probed_expert, base);
+            CHECK_EQ(c.probed_count, 1);
+            CHECK_EQ(c.n_ff_exp, 2048);
+            CHECK_EQ(c.ff_lo[0], 0);
+            CHECK_EQ(c.ff_hi[0], 0);
+            CHECK_EQ(c.ff_lo[1], 0);
+            CHECK_EQ(c.ff_hi[1], 0);
+
+            /* Every owned expert has both projections; no neighbour's expert leaks onto this rank.
+             * EP weights are whole and have neither a width span nor row parts. */
+            for (int e = 0; e < 288; ++e) {
+                const bool owned = e >= base && e < base + n_local;
+                const auto gu = find_w(b, "blk.3.ffn_gate_up_exps." + std::to_string(e) + ".weight");
+                const auto dn = find_w(b, "blk.3.ffn_down_exps." + std::to_string(e) + ".weight");
+                CHECK_EQ(gu != nullptr, owned);
+                CHECK_EQ(dn != nullptr, owned);
+                if (!owned) continue;
+                REQUIRE(gu && dn);
+                CHECK_EQ(gu->d.shard, (int)RAD_SHARD_NONE);
+                CHECK_EQ(dn->d.shard, (int)RAD_SHARD_NONE);
+                CHECK(!gu->span_set && gu->d.n_row_parts == 0);
+                CHECK(!dn->span_set && dn->d.n_row_parts == 0);
+            }
+
+            /* Layer 3 has one gate-up and one down grouped GEMM. Each takes one code and one scale
+             * table entry for each regular expert (two parity classes). */
+            std::vector<const RecOp*> tables;
+            std::set<rad_weight> entries;
+            for (const auto& o : b.ops) {
+                if (o.op != "moe_gemm_q" || o.w.empty()) continue;
+                if (b.weights[(size_t)o.w.front() - 1].name.rfind("blk.3.ffn_", 0) != 0) continue;
+                tables.push_back(&o);
+                entries.insert(o.w.begin(), o.w.end());
+            }
+            REQUIRE_EQ(tables.size(), (size_t)2);
+            for (const auto* o : tables) {
+                CHECK_EQ(pint(o, "n_expert"), n_local);
+                CHECK_EQ(o->w.size(), (size_t)(2 * n_local));
+            }
+            CHECK_EQ(entries.size(), (size_t)(4 * n_local));
+            for (rad_weight h : entries) {
+                const auto& w = b.weights[(size_t)h - 1];
+                CHECK_EQ(w.d.shard, (int)RAD_SHARD_NONE);
+                CHECK(!w.span_set && w.d.n_row_parts == 0);
+            }
+        }
+    }
+}
+
+/* Protection is a whole-expert pair: both projections of a pair survive beside IQR, but one lone
+ * expert leaves an odd parity table, and a half-protected expert mixes encodings in one table. */
+TEST(glm53_v2_protected_bf16_experts_need_a_full_pair) {
+    const RadModelMeta meta = glm_meta();
+    const int base = 72;                 /* rank 1 of world 4 */
+    const RadEncoding bf = rad_enc_plain(RAD_BF16);
+    auto encs_with = [&](const std::vector<int>& gate_up, const std::vector<int>& down) {
+        auto encs = glm_v2_encs(glm_iqr());
+        for (int e : gate_up)
+            encs.insert(encs.begin(),
+                        { "blk.3.ffn_gate_up_exps." + std::to_string(e) + ".", bf });
+        for (int e : down)
+            encs.insert(encs.begin(), { "blk.3.ffn_down_exps." + std::to_string(e) + ".", bf });
+        return encs;
+    };
+    auto declare = [&](const std::vector<int>& gate_up, const std::vector<int>& down) {
+        RadBuilder b;
+        b.kv_block = 4;
+        b.encs = encs_with(gate_up, down);
+        RadBuildCtx ctx = spec_ctx(1, 4, 0);
+        ctx.max_tok = 256;
+        ctx.max_seqs = 4;
+        ctx.max_ctx = 32768;
+        const int rc = glm5next::declare(&b, &meta, &ctx);
+        if (rc == RAD_OK) CHECK(glm_maps_are_unique(b));
+        return rc;
+    };
+
+    /* Experts 72 and 73 are the rank's first local places (0 and 1). */
+    {
+        RadBuilder b;
+        b.kv_block = 4;
+        b.encs = encs_with({ 72, 73 }, { 72, 73 });
+        RadBuildCtx ctx = spec_ctx(1, 4, 0);
+        ctx.max_tok = 256;
+        ctx.max_seqs = 4;
+        ctx.max_ctx = 32768;
+        REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
+        CHECK(glm_maps_are_unique(b));
+
+        const auto& m = *glm5next::models[1];
+        const auto& c = m.moe_src[(size_t)3].cfg;
+        CHECK_EQ(c.expert_base, base);
+        CHECK_EQ(c.probed_expert, base);
+        CHECK_EQ(c.probed_count, 3);       /* bf16, bf16, then the first IQR expert */
+        const std::vector<int64_t> want_prot{ 0, 1 };
+        CHECK(m.layers[3].moe.prot == want_prot);
+        CHECK_EQ(m.layers[3].moe.n_reg, 70);
+
+        for (int e : { 72, 73 }) {
+            const auto gu = find_w(b, "blk.3.ffn_gate_up_exps." + std::to_string(e) + ".weight");
+            const auto dn = find_w(b, "blk.3.ffn_down_exps." + std::to_string(e) + ".weight");
+            REQUIRE(gu && dn);
+            CHECK_EQ(gu->d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(dn->d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(gu->d.shape[0], 2 * 2048);
+            CHECK_EQ(dn->d.shape[1], 2048);
+            CHECK_EQ(gu->d.shard, (int)RAD_SHARD_NONE);
+            CHECK_EQ(dn->d.shard, (int)RAD_SHARD_NONE);
+            CHECK(!gu->span_set && gu->d.n_row_parts == 0);
+            CHECK(!dn->span_set && dn->d.n_row_parts == 0);
+        }
+
+        /* The sort's protect list uses the rank-local places, after its model-numbered base. */
+        /* The sort is moe_scatter, moe_scatter_inv or the fused router's: the op with the list. */
+        const RecOp* scatter = nullptr;
+        for (const auto& o : b.ops)
+            if (param(&o, "protect") && pint(&o, "expert_base") == base) { scatter = &o; break; }
+        REQUIRE(scatter);
+        CHECK_EQ(pint(scatter, "expert_base"), base);
+        CHECK_EQ(pstr(scatter, "protect"), "0,1");
+
+        std::vector<const RecOp*> tables;
+        for (const auto& o : b.ops) {
+            if (o.op != "moe_gemm_q" || o.w.empty()) continue;
+            if (b.weights[(size_t)o.w.front() - 1].name.rfind("blk.3.ffn_", 0) == 0)
+                tables.push_back(&o);
+        }
+        REQUIRE_EQ(tables.size(), (size_t)2);
+        for (const auto* o : tables) {
+            CHECK_EQ(pint(o, "n_expert"), 70);
+            CHECK_EQ(o->w.size(), (size_t)140);
+        }
+    }
+
+    /* One protected expert leaves 71 regular experts, which cannot form two parity tables. */
+    CHECK_EQ(stderr_of_rc([&] { return declare({ 72 }, { 72 }); }), RAD_E_INVAL);
+    /* Expert 73 has one BF16 projection and one IQR projection: no whole-expert encoding. */
+    CHECK_EQ(stderr_of_rc([&] { return declare({ 72, 73 }, { 72 }); }), RAD_E_DTYPE);
+}
+
 /* The width split is for all-MXFP4 experts alone: anything else keeps whole experts at four ranks
  * and up, because a plain bf16 expert, even one protected among MXFP4 ones, cannot be sliced. */
 TEST(glm53_lays_out_its_experts_by_their_format) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -1955,7 +2385,7 @@ RadBuildCtx glm53_vl_ctx(int rank, int world, int64_t patches, int max_spec = 3)
  * under tensor parallelism instead of once a rank. The linear groups travel in the checkpoint
  * store and carry no such flag. The flag is outside graph_hash(), so the pinned graphs stand. */
 TEST(glm53_declares_its_latent_and_index_caches_replicated) {
-    MetaKV mk = glm53_vl_meta();
+    const RadModelMeta meta = glm_meta();
     auto ends_with = [](const std::string& s, const char* t) {
         const size_t n = std::strlen(t);
         return s.size() >= n && s.compare(s.size() - n, n, t) == 0;
@@ -1963,9 +2393,13 @@ TEST(glm53_declares_its_latent_and_index_caches_replicated) {
     for (int world : { 1, 2, 8 }) {
         for (int rank : { 0, world - 1 }) {
             RadBuilder b;
-            glm53_encs(b);
-            RadBuildCtx ctx = glm53_vl_ctx(rank, world, 0);
-            REQUIRE_EQ(glm5next::declare(&b, mk.meta(), &ctx), RAD_OK);
+            b.kv_block = 4;
+            b.encs = glm_v2_encs(glm_iqr());
+            RadBuildCtx ctx = spec_ctx(rank, world, 0);
+            ctx.max_tok = 512;
+            ctx.max_seqs = 4;
+            ctx.max_ctx = 4096;
+            REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
             REQUIRE_EQ(b.kv_groups.size(), 5u);
             int replicated = 0;
             for (const RecKV& g : b.kv_groups) {
@@ -1984,6 +2418,7 @@ TEST(glm53_declares_its_latent_and_index_caches_replicated) {
  * frequencies an axis, gate and up joined gate first; one scatter over the trunk's embedding and
  * one over the draft head's. */
 TEST(glm53_declares_its_vision_tower_when_the_engine_asks_for_it) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     MetaKV mk = glm53_vl_meta();
     for (int world : { 1, 8 }) {
         const int rank = world - 1;
@@ -2093,6 +2528,7 @@ TEST(glm53_declares_its_vision_tower_when_the_engine_asks_for_it) {
 
 /* What the tower does not serve is refused by name at declare, not computed as another model. */
 TEST(glm53_refuses_a_vision_tower_it_does_not_serve) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     const struct { const char* key; const char* val; int rc; } kCases[] = {
         { "vision_config.hidden_act", "gelu", RAD_E_UNSUPPORTED },
         { "vision_config.rope_parameters.rope_type", "default", RAD_E_UNSUPPORTED },
@@ -2114,6 +2550,7 @@ TEST(glm53_refuses_a_vision_tower_it_does_not_serve) {
  * downsample's unfold and GEMM, and the merger, over two pictures of 8 x 8 patches. The rotary
  * reads the row and column planes, attention and the unfold the segment bounds. */
 TEST(a_glm53_encoder_pass_issues_the_tower_and_nothing_else) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     MetaKV mk = glm53_vl_meta();
     for (int world : { 1, 8 }) {
         const int rank = world - 1;
@@ -2182,6 +2619,7 @@ TEST(a_glm53_encoder_pass_issues_the_tower_and_nothing_else) {
  * before the embedding's all-reduce, and so does the draft head's history pass over its own
  * lookup; a text-only step on the same program issues no scatter. */
 TEST(a_glm53_step_with_a_picture_scatters_its_rows_in_the_trunk_and_the_draft_head) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     MetaKV mk = glm53_vl_meta();
     for (int world : { 1, 4 }) {
         RadBuilder b;
@@ -2227,6 +2665,7 @@ TEST(a_glm53_step_with_a_picture_scatters_its_rows_in_the_trunk_and_the_draft_he
 /* A sizing declare with the tower is the real graph at fewer rows: the same ops with the same
  * fixed parameters (the attention's longest segment included), and nothing declared to the core. */
 TEST(glm53_sizing_declares_with_the_vision_tower_match_the_real_graph) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     MetaKV mk = glm53_vl_meta();
     for (int64_t R : { 256 }) {
         RadBuildCtx c = glm53_vl_ctx(3, 8, 16384);
@@ -2273,6 +2712,7 @@ TEST(glm53_sizing_declares_with_the_vision_tower_match_the_real_graph) {
 }
 
 TEST(glm53_declaring_without_streamed_ops_ignores_the_flag) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -2310,6 +2750,7 @@ TEST(glm53_declaring_without_streamed_ops_ignores_the_flag) {
 }
 
 TEST(glm53_streamed_decode_resolves_after_select_and_before_attention_with_the_entry_count) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -2510,10 +2951,13 @@ TEST(glm_tp_row_rule_rounds_to_whole_words_and_covers_a_step_once) {
 namespace {
 
 /* The op schemas the kernel libraries under $RADIANCE_HOME/kernels declare: libr4d's first, the
- * served vocabulary, then libref's for what it lacks. Empty without a home or a library, as
- * arch_test's libref vocabulary is. */
+ * served vocabulary, then libref's for what it lacks, then the GLM kernel plugin's own ops
+ * (plugin/glm, which glm5next issues only where that library declares them). Empty without a
+ * home or a library, as arch_test's libref vocabulary is. `n_required` is the count below which
+ * an issue is refused: the schema's operands less its trailing optional ones, which a caller may
+ * leave off (core/runtime/issue.cpp, the trailing-optional rule). */
 struct OpSpec {
-    int n_operands = 0, w_req = 0, w_max = 0, n_tab = 0;
+    int n_operands = 0, n_required = 0, w_req = 0, w_max = 0, n_tab = 0;
 };
 struct LoadedSchemas {
     std::map<std::string, OpSpec> ops;
@@ -2526,9 +2970,10 @@ const LoadedSchemas& loaded_schemas() {
     tried = true;
     const char* home = std::getenv("RADIANCE_HOME");
     if (!home) return s;
-    for (const char* lib : { "libr4d.so", "libref.so" }) {
+    for (const char* lib : { "libr4d.so", "libref.so", "glm.so" }) {
         const std::string path = std::string(home) + "/kernels/" + lib;
         void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!h && !std::strcmp(lib, "glm.so")) continue;   /* the plugin is optional */
         if (!h) {
             fprintf(stderr, "    cannot load %s: %s\n", path.c_str(), dlerror());
             continue;
@@ -2541,6 +2986,10 @@ const LoadedSchemas& loaded_schemas() {
             if (!sc || !sc->op || s.ops.count(sc->op)) continue;
             OpSpec spec;
             spec.n_operands = sc->n_operands;
+            spec.n_required = sc->n_operands;
+            while (sc->operands && spec.n_required > 0 &&
+                   sc->operands[spec.n_required - 1].optional)
+                --spec.n_required;
             for (int k = 0; sc->operands && k < sc->n_operands; ++k) {
                 if (sc->operands[k].role == RAD_OPD_WTAB) {
                     ++spec.n_tab;
@@ -2558,31 +3007,36 @@ const LoadedSchemas& loaded_schemas() {
 
 }  /* namespace */
 
-/* Every op the plugin issues carries as many operands as its schema declares, counted as
+/* Every op the plugin issues carries as many operands as its schema declares, less any trailing
+ * optional ones it leaves off (moe_gemm_q's `split`, set only on a checkpoint-cut step), counted as
  * core/runtime/issue.cpp counts them (an absent optional operand is one of them), and every op it
- * declares names as many weights as rad_builder.cpp admits. The steps: at eight ranks and at
- * one, a mixed step over the split threshold (two decode rows beside a 498-row chunk), a step
- * under it, a six-row verify and six single-row decodes, each with its history pass and a draft
- * round, and a verify of eight sequences at 32k of context, where the indexer splits a decode.
- * The engine refuses a step at the first mismatch, which the recording fakes do not check, so a
- * missing optional operand reaches no other host test. */
+ * declares names as many weights as rad_builder.cpp admits. The 2.x fixture is head-form at
+ * max_spec 0, so it covers the same trunk steps without MTP or the vision tower: at eight ranks and
+ * at one, a mixed step over the split threshold (two decode rows beside a 498-row chunk), a step
+ * under it, a six-row verify and six single-row decodes, and a verify of eight sequences at 32k of
+ * context, where the indexer splits a decode. The engine refuses a step at the first mismatch,
+ * which the recording fakes do not check, so a missing optional operand reaches no other host
+ * test. */
 TEST(glm53_issues_every_op_with_the_operand_count_its_schema_declares) {
     const LoadedSchemas& lib = loaded_schemas();
     if (lib.ops.empty()) {
         fprintf(stderr, "    no kernel library under $RADIANCE_HOME/kernels; nothing to count\n");
         return;
     }
-    MetaKV mk = glm53_vl_meta();
+    const RadModelMeta meta = glm_meta();
     std::set<std::string> uncovered, wrong;
     for (int world : { 8, 1 }) {
         const int rank = world == 8 ? 3 : 0;
         RadBuilder b;
-        glm53_encs(b);
-        RadBuildCtx ctx = glm53_vl_ctx(rank, world, 1024, 5);
+        b.kv_block = 4;
+        b.encs = glm_v2_encs(glm_iqr());
+        RadBuildCtx ctx = spec_ctx(rank, world, 0);
         ctx.max_tok = 4096;
         ctx.max_seqs = 8;
         ctx.max_ctx = 65536;
-        REQUIRE_EQ(glm5next::declare(&b, mk.meta(), &ctx), RAD_OK);
+        // Keep the multi-row KDA verifies and the split-decode logits without declaring MTP.
+        ctx.max_out_rows = 48;
+        REQUIRE_EQ(glm5next::declare(&b, &meta, &ctx), RAD_OK);
         for (const RecOp& r : b.ops) {
             auto it = lib.ops.find(r.op);
             if (it == lib.ops.end()) {
@@ -2600,17 +3054,10 @@ TEST(glm53_issues_every_op_with_the_operand_count_its_schema_declares) {
                         world, r.op.c_str(), n_w, s.w_max, s.w_req, s.n_tab);
         }
         std::vector<std::unique_ptr<Kit>> kits;
-        auto with_drafts = [&](std::unique_ptr<Kit> k) {
-            auto his = history_pass(b, *k);
-            auto round = round_pass(b, k->b.n_seq, 2);
-            kits.push_back(std::move(k));
-            kits.push_back(std::move(his));
-            kits.push_back(std::move(round));
-        };
-        with_drafts(kit(b, { 1, 1 }, { 498 }, 100));
-        with_drafts(kit(b, {}, { 255 }));
-        with_drafts(kit(b, { 6 }, {}));
-        with_drafts(kit(b, std::vector<int>(6, 1), {}));
+        kits.push_back(kit(b, { 1, 1 }, { 498 }, 100));
+        kits.push_back(kit(b, {}, { 255 }));
+        kits.push_back(kit(b, { 6 }, {}));
+        kits.push_back(kit(b, std::vector<int>(6, 1), {}));
         {
             auto dec = kit(b, std::vector<int>(8, 6), {});
             const int64_t pitch = 8192;
@@ -2636,11 +3083,14 @@ TEST(glm53_issues_every_op_with_the_operand_count_its_schema_declares) {
                     uncovered.insert(op->op);
                     continue;
                 }
-                if ((int)issue.opd.size() != it->second.n_operands && wrong.insert(op->op).second)
+                const int n = (int)issue.opd.size();
+                if ((n < it->second.n_required || n > it->second.n_operands) &&
+                    wrong.insert(op->op).second)
                     fprintf(stderr,
-                            "    world %d pass %zu: '%s' issued with %zu operands; the schema "
-                            "declares %d\n",
-                            world, p, op->op.c_str(), issue.opd.size(), it->second.n_operands);
+                            "    world %d pass %zu: '%s' issued with %d operands; the schema "
+                            "declares %d (%d required)\n",
+                            world, p, op->op.c_str(), n, it->second.n_operands,
+                            it->second.n_required);
             }
     }
     CHECK(wrong.empty());
@@ -2841,6 +3291,7 @@ std::string as_expert_zero(std::string n) {
  * from the table, as the container would answer. A full-width view declared as its own weight
  * at `fp8a8` passed every host test and left 88 bands with no kernel at the eight-card start. */
 TEST(glm53_declares_the_served_containers_names_and_their_encodings) {
+    SKIP("GLM-5.3's weights are MXFP4 and block fp8, which this build does not serve; the case returns with an int8 container");
     const Glm53Container& c = glm53_container();
     MetaKV mk = glm53_vl_meta();
     for (int world : { 8, 1 }) {
@@ -2906,4 +3357,39 @@ TEST(glm53_declares_the_served_containers_names_and_their_encodings) {
         }
         CHECK_EQ(wrong, 0);
     }
+}
+
+/* plugin/glm declines a machine whose cards are all another family's (rad_plugin_open, as libr4d
+ * does), so its schema cannot pick a fused form no device row serves there. Its check reads the
+ * KFD topology from a directory, here fake trees: no topology and a CPU node alone keep it, a
+ * gfx1151 card alone declines it, and any gfx12 card keeps it. */
+TEST(glm_plugin_declines_a_machine_with_only_another_familys_cards) {
+    const char* home = std::getenv("RADIANCE_HOME");
+    void* h = home ? dlopen((std::string(home) + "/kernels/glm.so").c_str(), RTLD_NOW | RTLD_LOCAL)
+                   : nullptr;
+    if (!h) SKIP("glm.so is not built here");
+    auto check = (int (*)(const char*))dlsym(h, "rad_glm_machine_check");
+    REQUIRE(check != nullptr);
+    REQUIRE(dlsym(h, "rad_plugin_open") != nullptr);
+    char tmpl[] = "/tmp/glm_kfd_XXXXXX";
+    REQUIRE(mkdtemp(tmpl) != nullptr);
+    const std::string root = tmpl;
+    int n = 0;
+    auto node = [&](const char* gfx) {
+        const std::string dir = root + "/" + std::to_string(n++);
+        REQUIRE(mkdir(dir.c_str(), 0700) == 0);
+        FILE* f = std::fopen((dir + "/properties").c_str(), "w");
+        REQUIRE(f != nullptr);
+        std::fprintf(f, "cpu_cores_count 0\ngfx_target_version %s\nnum_sdma_engines 2\n", gfx);
+        std::fclose(f);
+    };
+    CHECK_EQ(check((root + "/absent").c_str()), (int)RAD_OK);
+    node("0");                                    /* a CPU node */
+    CHECK_EQ(check(root.c_str()), (int)RAD_OK);
+    node("110501");                               /* gfx1151 */
+    CHECK_EQ(check(root.c_str()), (int)RAD_E_UNSUPPORTED);
+    node("120001");                               /* gfx1201 beside it */
+    CHECK_EQ(check(root.c_str()), (int)RAD_OK);
+    std::filesystem::remove_all(root);
+    dlclose(h);
 }

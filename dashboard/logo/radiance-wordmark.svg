@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 236 64" role="img" aria-label="radiance">
+  <!-- The mark beside the name, the name in the colour of the text around it. -->
+  <g fill="#6f9bff">
+  <rect x="17" y="11" width="8" height="42"/>
+  <path d="M29 11h7a12.5 12.5 0 0 1 0 25h-7v-8h7a4.5 4.5 0 0 0 0-9h-7z"/>
+  <path d="M33 40h9l8 13h-9z"/>
+  </g>
+  <text x="62" y="43" font-family="'Geist', 'Inter', ui-sans-serif, system-ui, sans-serif" font-size="32" font-weight="600" letter-spacing="-0.6" fill="currentColor">radiance</text>
+</svg>

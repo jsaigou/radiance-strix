@@ -31,7 +31,7 @@
 #include "rad_internal.h"
 #include "rad_plugin.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <chrono>
@@ -528,6 +528,14 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         const mm::FrameRGBA& last = r.images.back();
         dims_for((double)info.default_width * info.default_height,
                  (double)last.w / (double)last.h, mult, &r.w, &r.h);
+        /* Rounding the aspect-preserving size to the nearest grid can cross a tight
+         * deployment limit. Trim the longer side by grid units so auto remains usable. */
+        const int64_t max_pixels = info.max_tokens * info.latent_scale * info.latent_scale;
+        if ((int64_t)r.w * r.h > max_pixels) {
+            int32_t& longer = r.w >= r.h ? r.w : r.h;
+            const int32_t shorter = std::min(r.w, r.h);
+            longer = (int32_t)(max_pixels / shorter / mult * mult);
+        }
     } else {
         r.w = (int32_t)info.default_width;
         r.h = (int32_t)info.default_height;
@@ -741,11 +749,35 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             return error_response(err, req.peer);
     }
 
+    if (auto no = admit(1, req.peer)) return *no;
+    auto release_admission = [this](Server*) { release(1); };
+    std::unique_ptr<Server, decltype(release_admission)> admission(this, release_admission);
+
     /* ---- the adapters' slot, held until the request is done */
     std::string lora_note;
     if (!loras.empty()) {
         std::string why;
-        const int s = opt_.gen_lora_acquire(loras, &g->lora_slot, &g->lora_hold, &lora_note, &why);
+        std::unique_lock lock(image_adapter_mutex_);
+        const auto turn = image_adapter_waiters_.insert(image_adapter_waiters_.end(), 0);
+        auto finish_turn = [&](Server*) {
+            if (!lock.owns_lock()) lock.lock();
+            image_adapter_waiters_.erase(turn);
+            image_adapter_turn_.notify_all();
+        };
+        std::unique_ptr<Server, decltype(finish_turn)> waiting(this, finish_turn);
+        int s;
+        for (;;) {
+            if (req.peer_gone()) return HttpResponse::text(499, "client closed request\n");
+            if (stopping_.load()) return error_response(err_overloaded("server stopping"), req.peer);
+            if (turn == image_adapter_waiters_.begin()) {
+                lock.unlock();
+                s = opt_.gen_lora_acquire(loras, &g->lora_slot, &g->lora_hold, &lora_note, &why);
+                lock.lock();
+                if (s != RAD_E_FULL) break;
+            }
+            // Slot retirement happens in the generator, independently of the HTTP response.
+            image_adapter_turn_.wait_for(lock, std::chrono::milliseconds(50));
+        }
         if (s < 0) {
             ApiError e = err_bad("loras", why);
             if (s == RAD_E_NOTFOUND) { e.status = 404; e.type = "not_found_error"; }
@@ -754,19 +786,18 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         }
     }
 
-    /* ---- admitted and queued */
-    if (auto no = admit(1, req.peer)) return *no;
+    /* ---- queued */
     std::shared_ptr<gen::Ticket> ticket = g->ticket;
     {
         std::string why;
         const int s = deps_.images->submit(std::move(g), &why);
         if (s < 0) {
-            release(1);
             ApiError e = err_bad("", why.empty() ? std::string(rad_strerror(s)) : why);
             if (s != RAD_E_INVAL) { e.status = 503; e.type = "server_error"; }
             return error_response(e, req.peer);
         }
     }
+    admission.release(); // The response now owns the admission count.
     std::string lora_s;
     for (const auto& [n, w] : loras) lora_s += (lora_s.empty() ? " loras=" : ",") + n + fmt(":%g", w);
     RAD_INFO("images: %s %dx%d n=%d steps=%d seed=%llu%s%s%s%s", edit ? "edit" : "generation", r.w,

@@ -5,8 +5,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cpuid.h>
 #include <cstring>
 #include <immintrin.h>
+#include <x86intrin.h>   // Clang keeps MONITORX/MWAITX here, not in immintrin.h
+#include <pthread.h>
 
 #if !(defined(RAD_HAVE_HIP) && RAD_HAVE_HIP)
 /* A build without HIP has no kernels to launch: rad_xp_supported is 0 there, so nothing calls these. */
@@ -37,15 +40,69 @@ constexpr int64_t kXpBehind = 3;
 /* Dispatches after a dropped request's mark before its signal may be reused; far more than the
  * pass that completes it. */
 constexpr int64_t kXpMarkHold = 4096;
-/* Payoff. A used copy saves link time under the GEMM; an unused one costs link time the GEMMs
- * wanted, and the prediction always costs a little. On Qwen3.8-Flash-Next break-even is near a
- * quarter of copies used (--tp 1 used half and decode was 3.6% faster; --tp 2, where the pool holds
- * rarely routed experts, used a sixth and was 4-6% slower). Every kXpWindow predictions the share
- * used over the last window is judged; below kXpMinUse the prefetch rests for kXpRest passes. */
+/* Payoff, on one rank (the engine opens no prefetch over several: engine_bringup.cpp). A used copy
+ * saves link time under the GEMM; an unused one costs link time the GEMMs wanted, and the
+ * prediction always costs a little. On Qwen3.8-Flash-Next at --tp 1 break-even is near a quarter
+ * of copies used (half were, and decode was 3.6% faster). Every kXpWindow predictions the share
+ * used over the last window is judged; below kXpMinUse the prefetch rests for kXpRest passes. A
+ * window with fewer than kXpMinJudged copies is not judged, which one sequence with few misses
+ * never reaches. */
 constexpr int64_t  kXpWindow    = 2048;
 constexpr double   kXpMinUse    = 0.30;
 constexpr uint32_t kXpMinJudged = 512;
 constexpr int64_t  kXpRest      = 8192;
+/* The serving thread's waits read the clock once every this many pauses (plus one, a mask): a
+ * clock read is a system call on a host whose clocksource is not the TSC (HPET, ~1-2 us), which
+ * read on every pause kept two cores in the kernel through every wait, while a timeout of 100 ms
+ * or 5 s needs no finer look than ~1024 pauses (tens of microseconds). */
+constexpr uint32_t kXpSpinsPerLook = 1023;
+/* With MONITORX the thread sleeps until a store reaches the watched line (the plan kernel's write
+ * over the link invalidates it) or this many TSC cycles pass (~25 us), and reads the clock once
+ * every kXpNapsPerLook + 1 naps (a few ms). */
+constexpr uint32_t kXpNapCycles   = 100000;
+constexpr uint32_t kXpNapsPerLook = 63;
+
+/* AMD's MONITORX/MWAITX run at user level (CPUID 0x80000001 ECX bit 29). */
+bool xp_have_mwaitx() {
+    static const bool have = [] {
+        unsigned a, b, c, d;
+        return __get_cpuid(0x80000001u, &a, &b, &c, &d) && ((c >> 29) & 1u);
+    }();
+    return have;
+}
+
+__attribute__((target("mwaitx"))) void xp_arm(const volatile void* line) {
+    _mm_monitorx(const_cast<void*>(line), 0, 0);
+}
+
+__attribute__((target("mwaitx"))) void xp_nap() {
+    _mm_mwaitx(2 /* timer on */, 0, kXpNapCycles);
+}
+
+/* Waits until done() holds, `line` being where the awaited store lands. False once `limit` passed
+ * or *stop was set first. A mailbox is waited on for as long as the host runs ahead of the GPU, a
+ * pass or more: spinning on pause kept a core busy through all of it. */
+template <class Done>
+bool xp_wait(const volatile void* line, Done done, std::chrono::steady_clock::duration limit,
+             const std::atomic<bool>* stop) {
+    if (done()) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool nap = xp_have_mwaitx();
+    const uint32_t mask = nap ? kXpNapsPerLook : kXpSpinsPerLook;
+    for (uint32_t k = 1;; ++k) {
+        if (nap) {
+            xp_arm(line);
+            if (done()) return true;
+            xp_nap();
+        } else {
+            _mm_pause();
+        }
+        if (done()) return true;
+        if ((k & mask) == 0 && ((stop && stop->load(std::memory_order_relaxed)) ||
+                                std::chrono::steady_clock::now() - t0 > limit))
+            return false;
+    }
+}
 
 }  // namespace
 
@@ -151,6 +208,7 @@ void Ctx::xp_close() {
 
 /* Host thread: hands each request's mailbox to the DMA queue once the plan has written it. */
 void Ctx::xp_serve(XpState& x) {
+    pthread_setname_np(pthread_self(), "rad-xp");
     for (;;) {
         XpReq r;
         {
@@ -169,15 +227,8 @@ void Ctx::xp_serve(XpState& x) {
         /* The mailbox reaches the request number once the plan has run; a higher number means a
          * later request overwrote it and this one is stale. */
         volatile XpBox* b = x.box + r.g;
-        const auto t0 = std::chrono::steady_clock::now();
-        bool got = true;
-        while ((int32_t)(b->seq - r.seq) < 0) {
-            _mm_pause();
-            if (x.stop || std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) {
-                got = false;
-                break;
-            }
-        }
+        bool got = xp_wait(&b->seq, [&] { return (int32_t)(b->seq - r.seq) >= 0; }, std::chrono::seconds(5),
+                           &x.stop);
         if (got && b->seq != r.seq) got = false;
         std::atomic_thread_fence(std::memory_order_acquire);
         uint64_t src[kXpSlots], dst[kXpSlots], bytes[kXpSlots];
@@ -186,11 +237,11 @@ void Ctx::xp_serve(XpState& x) {
             n = std::min<int>((int)b->n, kXpSlots);
             for (int i = 0; i < n && got; ++i) {
                 /* A job seen before its own stores landed carries an older tag. */
-                const auto t1 = std::chrono::steady_clock::now();
-                while (b->jobs[i].tag != r.seq &&
-                       std::chrono::steady_clock::now() - t1 < std::chrono::milliseconds(100))
-                    _mm_pause();
-                if (b->jobs[i].tag != r.seq) { got = false; break; }
+                if (!xp_wait(&b->jobs[i].tag, [&] { return b->jobs[i].tag == r.seq; },
+                             std::chrono::milliseconds(100), nullptr)) {
+                    got = false;
+                    break;
+                }
                 std::atomic_thread_fence(std::memory_order_acquire);
                 src[i] = b->jobs[i].src;
                 dst[i] = b->jobs[i].dst;

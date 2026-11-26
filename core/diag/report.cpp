@@ -7,7 +7,7 @@
 #include "diag/diag.h"
 #include "rad_internal.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 
@@ -202,7 +202,7 @@ std::string render(const std::vector<ConfigRow>& config, const std::vector<Decis
 
 std::string to_json(const std::vector<ConfigRow>& config, const std::vector<Decision>& derived,
                     const Facts& f, const RunFacts& r, const std::vector<Finding>& findings) {
-    using J = nlohmann::ordered_json;
+    using J = Json;
     J o;
     o["startup_failed"] = r.failed;
     o["unsupported_configuration"] = r.unsupported;

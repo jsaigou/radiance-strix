@@ -2,7 +2,7 @@
  * Other embedding models continue through their existing template/raw-input paths. */
 #pragma once
 #include "server/iface.h"
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 struct RadModelMeta;
 

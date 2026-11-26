@@ -1,0 +1,28 @@
+# gemma4-26b-a4b-df-i8.recipe -- Gemma 4 26B-A4B with the DFlash drafter: the routed experts'
+# gate_up and the drafter at eight bits, and nothing in E4M3.
+#
+#   rad-convert <gemma-4-26B-A4B-it> --draft-model <gemma-4-26B-A4B-it-DFlash> \
+#       --recipe data/recipes/gemma4-26b-a4b-df-i8.recipe -o gemma4-26b-a4b-dflash-i8.rad
+#
+#   - Every routed expert's gate/up projection as rotated int8: codes in -127..127 with a bf16
+#     scale per (row, 128 of K), each 128 of K rotated by the unnormalised Hadamard
+#     (`transform=fwht128`), round to nearest with a scale search. The grouped GEMM reads them at
+#     i8a8h against int8 codes of the experts' input that the rotating norm writes
+#     (rmsnorm_had_quant_i8g, moe_gemm_i8a8). They are nine tenths of the weight bytes.
+#   - The experts' down projection stays bf16: its K is the
+#     expert's 704 columns, which whole 128-column scale groups do not tile.
+#   - The drafter's seven linears and its copy of the tied head on the int8 grid its block serves
+#     (arch/common/rad_gemma4_dflash.h): int8 codes with an f16 scale per (row, 128 columns),
+#     read at w8a8 against an int8 activation with a scale a row.
+#
+# The trunk's attention and dense arm, the norms, the router and the embedding stay bf16.
+
+blk.*.ffn_gate_up_exps.*.weight      rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.fc.weight                     rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.attn_q.weight           rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.attn_k.weight           rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.attn_v.weight           rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.attn_output.weight      rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.ffn_gate_up.weight      rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.ffn_down.weight         rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.draft_head.weight             rtn codes=i8 group=128 scale=f16 clamp=sym

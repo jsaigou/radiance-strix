@@ -59,7 +59,7 @@ struct Model {
     rad_kvgroup    kv_draft = 0;
     bool           have_ds = false;
 };
-static Model models[MAX_RANKS];
+static Model models[MAX_SLOTS];
 
 /* Whether the container carries a drafter at all (`--draft-model` merged one under `draft.`), and
  * whether this file implements it. A drafter this plugin cannot run is refused at declare rather
@@ -172,8 +172,10 @@ static bool needs_span(const Span& s, int64_t total, const Geom& g) {
 }
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
-    if (!b || !meta || !ctx || ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
-    Model& m = models[ctx->rank];
+    if (!b || !meta || !ctx || ctx->rank < 0 || ctx->rank >= MAX_RANKS ||
+        rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
+    Model& m = models[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     /* geom_from's even-only split cannot express a ragged GQA/FFN world. Read the whole geometry,
@@ -399,7 +401,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         rope.theta = (float)theta[kind];
         a.rq = rw(b, decl_rope(b, rope, T, g.head_dim, g.n_head, 0, rot[kind], "neox"), {m.q}, {m.q});
         a.rk = rw(b, decl_rope(b, rope, T, g.head_dim, g.n_head_kv, 0, rot[kind], "neox"), {m.k}, {m.k});
-        a.attn = rw(b, decl_attn(b, g, "attn_paged",
+        a.attn = rw(b, rad_decl_op(b, "attn_paged",
             RAD_PARAMS(RAD_RANGE("q_len", 1, T), RAD_INT("head_dim", g.head_dim),
                 RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1), RAD_INT("window", kind ? window : 0),
                 RAD_INT("n_head", g.n_head), RAD_INT("block_size", RAD_KV_BLOCK),
@@ -468,7 +470,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    Model& m = models[rad_rank(c)];
+    Model& m = models[rad_slot(c)];
     const Geom& g = m.g;
     /* A drafter pass; the sign gives the kind. Positive is the query pass, which denoises the whole
      * block and proposes from it; negative is the context pass, which turns the tokens the trunk
@@ -567,7 +569,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
 #ifdef SPARK25_HAVE_PREFILL_SPLIT
 static uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     if (!c || !batch) return 0;
-    Model& m = models[rad_rank(c)];
+    Model& m = models[rad_slot(c)];
     int group = -1;
     if (batch->kv) for (int i = 0; i < batch->n_kv_groups; ++i)
         if (batch->kv[i].group == m.kv) { group = i; break; }
@@ -615,6 +617,8 @@ static const RadChatFormat* chat_format(const RadModelMeta*) { return spark_chat
 }
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PROBE(spark25_bf16)
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(spark25_bf16, "spark25", "", "0.1.0", "Spark X2.6 BF16")
 RAD_ARCH_CHAT_FORMAT(spark25_bf16)
 #ifdef SPARK25_HAVE_PREFILL_SPLIT

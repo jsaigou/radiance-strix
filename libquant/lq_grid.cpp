@@ -99,6 +99,19 @@ const std::vector<NamedTable>& named_tables() {
                     14.0f, 16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 30.0f,
                     -0.8125f, -2.5f, -4.0f, -5.5f, -7.5f, -9.0f, -11.0f, -12.0f,
                     -14.0f, -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -30.0f } },
+        /* The 64-level form for libr4d's w6nl64a8h: 32 positive E4M3-exact magnitudes followed
+         * by their negatives. Fitted to group-64 absmax-normalised FWHT-128 BF16 Flash-Next
+         * down-weight samples for least weight error, not against activations
+         * (tools/fit_w6nl.py). The high code bit is the sign, and libr4d's layout verifies this
+         * complete table before serving it. */
+        { "w6nl", { 0.875f, 2.75f, 4.5f, 6.0f, 6.5f, 7.0f, 7.5f, 8.0f,
+                    9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f, 16.0f,
+                    18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f, 32.0f,
+                    36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f, 64.0f,
+                    -0.875f, -2.75f, -4.5f, -6.0f, -6.5f, -7.0f, -7.5f, -8.0f,
+                    -9.0f, -10.0f, -11.0f, -12.0f, -13.0f, -14.0f, -15.0f, -16.0f,
+                    -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -28.0f, -30.0f, -32.0f,
+                    -36.0f, -40.0f, -44.0f, -48.0f, -52.0f, -56.0f, -60.0f, -64.0f } },
         /* The 8-level form for the three-bit routed experts (w3nl64a8h): four magnitudes fitted the
          * same way at groups of 64 on rotated Qwen3.6-35B-A3B experts (alternating least squares of
          * the levels and the block scales; tests/w3_emulate_test.cpp, W3_TOP), the top level at 28
@@ -125,7 +138,7 @@ bool parse_table(const char* s, std::vector<float>* out, std::string* why) {
         char* end = nullptr;
         const float v = std::strtof(p, &end);
         if (end == p || !std::isfinite(v)) {
-            if (why) *why = fmt("table=%s is neither nf4, iq4nl, w4nl, w5nl, w3nl, binary, ternary nor a "
+            if (why) *why = fmt("table=%s is neither nf4, iq4nl, w4nl, w5nl, w6nl, w3nl, binary, ternary nor a "
                                 "`;`-separated list of values", s);
             return false;
         }
@@ -345,10 +358,15 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
         }
         char line[4096];
         double unit = 0.0;
+        int64_t rows = 0;
         while (std::fgets(line, sizeof line, f)) {
             if (line[0] == '#') {
                 double u = 0.0;
-                if (std::sscanf(line, "# unit %lf", &u) == 1) unit = u;
+                /* %lf parses "inf", and the fallback guard below is `!(unit > 0.0)`, which an
+                 * infinite unit passes: an infinite scale unit would flow into quantisation
+                 * where a NaN already falls back. Only a finite positive names the unit. */
+                if (std::sscanf(line, "# unit %lf", &u) == 1 && std::isfinite(u) && u > 0.0)
+                    unit = u;
                 continue;
             }
             std::vector<float> row;
@@ -361,6 +379,16 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
                 p = end;
             }
             if (row.empty()) continue;
+            /* Capped while appending, as table= is: the widest code is u12, so more than 4096
+             * codewords could not be indexed even with the memory read, and the file must be
+             * refused without first growing a vector over every line of it. */
+            if (++rows > 4096) {
+                std::fclose(f);
+                if (why)
+                    *why = fmt("vq=%s holds more than 4096 codewords; a codebook holds at most 4096",
+                               vf);
+                return RAD_E_INVAL;
+            }
             if (g->vdim == 0) g->vdim = (int64_t)row.size();
             bool ok = (int64_t)row.size() == g->vdim;
             for (float v : row) ok = ok && v >= -127.0f && v <= 127.0f;
@@ -461,7 +489,9 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
                     char rest[256] = {};
                     if (!std::fgets(rest, sizeof rest, f)) break;
                     double u = 0.0;
-                    if (std::sscanf(rest, " unit %lf", &u) == 1) lut_unit = u;
+                    if (std::sscanf(rest, " unit %lf", &u) == 1)
+                        lut_unit = (std::isfinite(u) && u > 0.0) ? u : 0.0;  // like vq=: only a
+                        // finite positive names a unit; "inf"/"nan" fall back to the entries' rms
                     continue;
                 }
                 v = std::strtol(tok, nullptr, 10);
@@ -478,8 +508,16 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
         }
         double ss = 0.0;
         for (float v2 : g->tcq_lut) ss += (double)v2 * v2;
-        g->vq_unit = (lut_unit > 0.0 ? lut_unit : std::sqrt(ss / (double)S)) /
-                     rad_param_getf(o, n_o, "tcq_gain", 1.0);
+        const double gain = rad_param_getf(o, n_o, "tcq_gain", 1.0);
+        if (!(gain > 0.0) || !std::isfinite(gain)) {
+            if (why) *why = "tcq_gain must be a positive finite number";
+            return RAD_E_INVAL;
+        }
+        g->vq_unit = (lut_unit > 0.0 ? lut_unit : std::sqrt(ss / (double)S)) / gain;
+        if (!std::isfinite(g->vq_unit)) {
+            if (why) *why = "the tcq unit is not finite; check tcq_lut's values";
+            return RAD_E_INVAL;
+        }
         if (rad_param_geti(o, n_o, "tcq_peak", 0))
             for (float v2 : g->tcq_lut) g->tcq_peak = std::max(g->tcq_peak, std::fabs(v2));
         g->tcq_rb = rad_param_geti(o, n_o, "tcq_rb", 0);
@@ -1395,6 +1433,11 @@ Scales grid_scales(const Grid& g, const float* w, int64_t rows, int64_t cols, co
         } else {
             s2r[k] = round_nz(g.scale2_dt, v);
             s.s2[k] = round_nz(g.scale2_dt, s2r[k] * resid);
+            /* An integer first level cannot pass its top, so a second level that rounded down
+             * takes the next value up: the largest scale under it then still fits. */
+            if (g.l1_int)
+                for (float up = 0x1p-12f; up < 0.5f && s.s2[k] / resid * g.l1max < peak[k]; up *= 2.0f)
+                    s.s2[k] = round_nz(g.scale2_dt, s2r[k] * resid * (1.0f + up));
         }
         /* As for a first level alone (store_first_level): the first level is taken relative to
          * what the reader multiplies by, which is N times the stored second level. */

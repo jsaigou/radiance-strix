@@ -11,7 +11,9 @@
 #include "rad_test.h"
 #include "rad_vae_geom.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
+
+using Json = rad::Json;
 
 #include <cmath>
 #include <cstdio>
@@ -24,15 +26,15 @@ using namespace minimaxh3;
 
 namespace {
 
-nlohmann::json& golden() {
-    static nlohmann::json g = [] {
+Json& golden() {
+    static Json g = [] {
         std::ifstream f(std::string(RAD_VAE_GOLDEN) + "/golden.json");
         if (!f.is_open()) {
             fprintf(stderr, "  FAIL golden.json missing -- regenerate with "
                             "tests/data/vae_geom/gen_golden.py\n");
             std::exit(1);
         }
-        return nlohmann::json::parse(f);
+        return Json::parse(f);
     }();
     return g;
 }

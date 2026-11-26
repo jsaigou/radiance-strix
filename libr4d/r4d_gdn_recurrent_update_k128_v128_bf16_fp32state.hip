@@ -27,12 +27,13 @@
 // attention page size (e.g. 421888 elements per slot vs 393216 from the shape), so a shape-derived
 // stride would read every slot but the first at the wrong offset there.
 #include <hip/hip_runtime.h>
+#include "r4d_keyed.h"
 #include "r4d.h"
 #include "r4d_gdn_args.h"
 #include "r4d_gdn_wmma.h"
 #include "r4d_common.h"
-#include "r4d_gdn_conv_tap.h"
 #include "r4d_chain.h"
+#include "r4d_gdn_conv_tap.h"
 #include "r4d_q8.h"         // the 8-bit codes the folded quantiser writes: E4M3 or int8
 #include "r4d_fwht.h"       // NORM 3: had_quant_act_i8g's rotation before the int8 codes
 #include <cstdlib>
@@ -201,6 +202,9 @@ struct RuConv {
   const int* cidx; long ci_stride;        // conv state slot per sequence; negative is padding
   unsigned int* ctr;                      // one arrival counter per (sequence, key head)
 };
+// NORM 4's arrival counters, one per (sequence, pair of value heads), are the same block's from
+// here on: the key heads' take the entries below it.
+constexpr unsigned kRuPairCtr = 2048;
 // Max tokens per sequence for the folded convolution (preloaded into registers, static indices).
 #define RU_CVT 8
 
@@ -217,35 +221,29 @@ __device__ __forceinline__ void ru_conv_rewrite(unsigned short* sp, const unsign
     if (t < T) sp[(size_t)(t + NH) * cs_tok] = xs[t];
 }
 
+#define RU_PARAMS                                                                              \
+  const unsigned short* __restrict__ q, const unsigned short* __restrict__ k, const           \
+  unsigned short* __restrict__ v, const void* __restrict__ av, const void* __restrict__       \
+  bv, long ab_stride, const float* __restrict__ A_log, const float* __restrict__ dt_bias,     \
+  typename ru_state<SDT>::T* __restrict__ state, long st_slot, long st_head, unsigned         \
+  short* __restrict__ o, unsigned char* __restrict__ oq, float* __restrict__ os, long         \
+  oq_pitch, long os_ld, const int* __restrict__ cu, const int* __restrict__ sidx, long        \
+  sidx_stride, const int* __restrict__ naccept, const unsigned short* __restrict__ zg,        \
+  long zg_pitch, const float* __restrict__ nw, float neps, int nact, int H, int Hg, float     \
+  scale, float sp_thr, const RuConv cv
 template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
           int CV = 0>
-__device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsigned short* __restrict__ q,
-                                     const unsigned short* __restrict__ k,
-                                     const unsigned short* __restrict__ v,
-                                     const void* __restrict__ av,
-                                     const void* __restrict__ bv, long ab_stride,
-                                     const float* __restrict__ A_log,
-                                     const float* __restrict__ dt_bias,
-                                     typename ru_state<SDT>::T* __restrict__ state,
-                                     long st_slot, long st_head,
-                                     unsigned short* __restrict__ o,
-                                     unsigned char* __restrict__ oq,
-                                     float* __restrict__ os, long oq_pitch,
-                                     long os_ld,
-                                     const int* __restrict__ cu,
-                                     const int* __restrict__ sidx, long sidx_stride,
-                                     const int* __restrict__ naccept,
-                                     const unsigned short* __restrict__ zg,
-                                     long zg_pitch,
-                                     const float* __restrict__ nw, float neps, int nact,
-                                     int H, int Hg, float scale, float sp_thr,
-                                     const RuConv cv) {
+__device__ __forceinline__ void ru_update_body(RU_PARAMS)
+{
   using ST = typename ru_state<SDT>::T;
   constexpr int NR = RU_V / VS;         // v rows this workgroup owns
   constexpr int THR = NR * 2;
   static_assert(!(NORM && VS > 1), "the fused row norm needs the whole 128-wide row");
+  static_assert(NORM != 4 || CV, "the pair's arrival counter is the folded convolution's block");
   __shared__ float wsum[THR / 32];
-  __shared__ float srot[NORM == 3 ? RU_V : 1];      // NORM 3: the row's bf16 output, for the rotation
+  // NORM 3: a block of tokens' bf16 output rows, for the rotation (one token a wave afterwards)
+  constexpr int RB = THR / 32;
+  __shared__ __attribute__((aligned(8))) unsigned short srot[NORM == 3 ? RB * RU_V : 1];
   __shared__ float spart[STG ? RU_TMAX * 4 : 1];   // per (token, half): sum q^2, sum k^2
   __shared__ float sscl [STG ? RU_TMAX * 2 : 1];   // per token: the two closed scales
   const int n = blockIdx.x, hv = blockIdx.y;
@@ -646,27 +644,34 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     // NORM == 3 writes had_quant_act_i8g's codes: the row's 128 stored bf16 values through
     // r4d_fwht_wave<128> in one wave (a lane four consecutive channels, that function's mapping),
     // then its amax / 127 scale and round-to-nearest-even, so the bytes are that quantiser's over
-    // `o`.
+    // `o`. Nothing in the token loop reads the codes, so the rows wait in LDS and every RB tokens
+    // (and after the last) each wave takes one token's: the rotation leaves the serial chain of
+    // the state update, which otherwise pays a barrier pair and one wave's work a token.
     if (NORM == 3 && oq) {
-      if (half == 0) srot[row] = bf2f(ob);
-      __syncthreads();
-      if (tid < 32) {
-        float rv[4];
+      const int tb = t % RB;
+      if (half == 0) srot[tb * RU_V + row] = ob;
+      if (tb == RB - 1 || t == T - 1) {
+        __syncthreads();
+        const int rw = tid >> 5, rl = tid & 31;
+        if (rw <= tb) {
+          const int rtok = tok - tb + rw;
+          const uint2 rr = *(const uint2*)(srot + rw * RU_V + 4 * rl);
+          float rv[4] = { bf2f((unsigned short)(rr.x & 0xFFFFu)), bf2f((unsigned short)(rr.x >> 16)),
+                          bf2f((unsigned short)(rr.y & 0xFFFFu)), bf2f((unsigned short)(rr.y >> 16)) };
+          r4d_fwht_wave<128>(rv, rl);
+          float m = fmaxf(fmaxf(fabsf(rv[0]), fabsf(rv[1])), fmaxf(fabsf(rv[2]), fabsf(rv[3])));
+          m = r4d_wave_max(m);
+          const float qs = m > 0.0f ? m * (1.0f / 127.0f) : 1.0f;
+          if (rl == 0) os[(size_t)rtok * os_ld + hv] = qs;
+          const float inv = 1.0f / qs;
+          uint32_t pk = 0;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) rv[j] = srot[4 * tid + j];
-        r4d_fwht_wave<128>(rv, tid);
-        float m = fmaxf(fmaxf(fabsf(rv[0]), fabsf(rv[1])), fmaxf(fabsf(rv[2]), fabsf(rv[3])));
-        m = r4d_wave_max(m);
-        const float qs = m > 0.0f ? m * (1.0f / 127.0f) : 1.0f;
-        if (tid == 0) os[(size_t)tok * os_ld + hv] = qs;
-        const float inv = 1.0f / qs;
-        uint32_t pk = 0;
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-          pk |= ((uint32_t)(int)rintf(fminf(fmaxf(rv[j] * inv, -127.0f), 127.0f)) & 0xFFu) << (8 * j);
-        *(uint32_t*)(oq + (size_t)tok * oq_pitch + (size_t)hv * RU_V + 4 * tid) = pk;
+          for (int j = 0; j < 4; ++j)
+            pk |= ((uint32_t)(int)rintf(fminf(fmaxf(rv[j] * inv, -127.0f), 127.0f)) & 0xFFu) << (8 * j);
+          *(uint32_t*)(oq + (size_t)rtok * oq_pitch + (size_t)hv * RU_V + 4 * rl) = pk;
+        }
+        __syncthreads();             // srot is reused by the next block of tokens
       }
-      __syncthreads();               // srot is reused by the next token
     }
     if ((NORM == 1 || NORM == 2) && oq) {
       const float ov = bf2f(ob);
@@ -707,6 +712,58 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
     }
   }
 
+  // NORM 4: had_quant_act_i8g's codes at IQ8R's group, one scale per 256 columns of `o`: two value
+  // heads' rows. A workgroup owns one head, so the second of a pair to arrive quantises both heads'
+  // rows for every token of the sequence, from the stored bf16 `o`: each head's 128 values through
+  // r4d_fwht_wave<128> in one wave (wave 0 the even head, wave 1 the odd), the amax over the pair,
+  // then that quantiser's amax / 127 scale and round-to-nearest-even, so the bytes are its over
+  // `o`. The arrival is router_gemm_topk_scatter_kernel's idiom: every store made visible
+  // device-wide before the arrival is published, and the workgroup completing the count resets
+  // it for the next launch and acquires its partner's rows. Every workgroup of a sequence takes
+  // the same early returns above, so a pair's two arrive or neither does.
+  if constexpr (NORM == 4) {
+    if (oq) {
+      __shared__ unsigned int s_pair;
+      __threadfence();
+      __syncthreads();
+      unsigned int* const pc = cv.ctr + kRuPairCtr + (size_t)n * (H / 2) + (hv >> 1);
+      if (tid == 0)
+        s_pair = __hip_atomic_fetch_add(pc, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+      __syncthreads();
+      if (s_pair == 1u) {
+        if (tid == 0) __hip_atomic_store(pc, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __threadfence();
+        const int hp = hv & ~1, pw = tid >> 5, pl = tid & 31;
+        for (int t = 0; t < T; ++t) {
+          const int tok = bos + t;
+          float rv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+          if (tid < 64) {
+            const unsigned short* src = o + ((size_t)tok * H + hp + pw) * RU_V + 4 * pl;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) rv[j] = bf2f(src[j]);
+            r4d_fwht_wave<128>(rv, pl);
+            float m = fmaxf(fmaxf(fabsf(rv[0]), fabsf(rv[1])), fmaxf(fabsf(rv[2]), fabsf(rv[3])));
+            m = r4d_wave_max(m);
+            if (pl == 0) wsum[pw] = m;
+          }
+          __syncthreads();
+          if (tid < 64) {
+            const float m = fmaxf(wsum[0], wsum[1]);
+            const float qs = m > 0.0f ? m * (1.0f / 127.0f) : 1.0f;
+            if (tid == 0) os[(size_t)tok * os_ld + (hp >> 1)] = qs;
+            const float inv = 1.0f / qs;
+            uint32_t pk = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+              pk |= ((uint32_t)(int)rintf(fminf(fmaxf(rv[j] * inv, -127.0f), 127.0f)) & 0xFFu) << (8 * j);
+            *(uint32_t*)(oq + (size_t)tok * oq_pitch + (size_t)(hp + pw) * RU_V + 4 * pl) = pk;
+          }
+          __syncthreads();             // wsum is reused by the next token
+        }
+      }
+    }
+  }
+
   if constexpr (CV) {
     // The last arriving reader rewrites the key head's q and k channels. The count was taken
     // before the token loop, hiding its latency.
@@ -731,61 +788,21 @@ __device__ __forceinline__ void r4d_gdn_recurrent_update_kernel_body(const unsig
   }
 }
 
-/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
-template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
-          int CV = 0>
+// The kernel around the body, whose workgroups return where their work ends: CH `r4dchain` is the
+// chained form (r4d_chain.h), every workgroup waiting before its first read and adding once after
+// its last write.
+template <int ABF16, int NORM, int VS, int NT, int ANC, int STG, int SDT, int CV, class CH>
 __global__ __launch_bounds__(RU_V / VS * 2)
-void r4d_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
-                                     const unsigned short* __restrict__ k,
-                                     const unsigned short* __restrict__ v,
-                                     const void* __restrict__ av,
-                                     const void* __restrict__ bv, long ab_stride,
-                                     const float* __restrict__ A_log,
-                                     const float* __restrict__ dt_bias,
-                                     typename ru_state<SDT>::T* __restrict__ state,
-                                     long st_slot, long st_head,
-                                     unsigned short* __restrict__ o,
-                                     unsigned char* __restrict__ oq,
-                                     float* __restrict__ os, long oq_pitch,
-                                     long os_ld,
-                                     const int* __restrict__ cu,
-                                     const int* __restrict__ sidx, long sidx_stride,
-                                     const int* __restrict__ naccept,
-                                     const unsigned short* __restrict__ zg,
-                                     long zg_pitch,
-                                     const float* __restrict__ nw, float neps, int nact,
-                                     int H, int Hg, float scale, float sp_thr,
-                                     const RuConv cv) {
-    r4d_gdn_recurrent_update_kernel_body<ABF16, NORM, VS, NT, ANC, STG, SDT, CV>(q, k, v, av, bv, ab_stride, A_log, dt_bias, state, st_slot, st_head, o, oq, os, oq_pitch, os_ld, cu, sidx, sidx_stride, naccept, zg, zg_pitch, nw, neps, nact, H, Hg, scale, sp_thr, cv);
+void r4d_gdn_recurrent_update_kernel(RU_PARAMS)
+{
+  if (CH::on) r4d_chain_wait();
+  ru_update_body<ABF16, NORM, VS, NT, ANC, STG, SDT, CV>(
+      q, k, v, av, bv, ab_stride, A_log, dt_bias, state, st_slot, st_head, o, oq, os, oq_pitch,
+      os_ld, cu, sidx, sidx_stride, naccept, zg, zg_pitch, nw, neps, nact, H, Hg, scale, sp_thr,
+      cv);
+  if (CH::on) r4d_chain_done();
 }
-template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
-          int CV = 0>
-__global__ __launch_bounds__(RU_V / VS * 2)
-void r4dchain_gdn_recurrent_update(const unsigned short* __restrict__ q,
-                                     const unsigned short* __restrict__ k,
-                                     const unsigned short* __restrict__ v,
-                                     const void* __restrict__ av,
-                                     const void* __restrict__ bv, long ab_stride,
-                                     const float* __restrict__ A_log,
-                                     const float* __restrict__ dt_bias,
-                                     typename ru_state<SDT>::T* __restrict__ state,
-                                     long st_slot, long st_head,
-                                     unsigned short* __restrict__ o,
-                                     unsigned char* __restrict__ oq,
-                                     float* __restrict__ os, long oq_pitch,
-                                     long os_ld,
-                                     const int* __restrict__ cu,
-                                     const int* __restrict__ sidx, long sidx_stride,
-                                     const int* __restrict__ naccept,
-                                     const unsigned short* __restrict__ zg,
-                                     long zg_pitch,
-                                     const float* __restrict__ nw, float neps, int nact,
-                                     int H, int Hg, float scale, float sp_thr,
-                                     const RuConv cv) {
-    r4d_chain_wait();
-    r4d_gdn_recurrent_update_kernel_body<ABF16, NORM, VS, NT, ANC, STG, SDT, CV>(q, k, v, av, bv, ab_stride, A_log, dt_bias, state, st_slot, st_head, o, oq, os, oq_pitch, os_ld, cu, sidx, sidx_stride, naccept, zg, zg_pitch, nw, neps, nact, H, Hg, scale, sp_thr, cv);
-    r4d_chain_done();
-}
+#undef RU_PARAMS
 
 // Non-temporal hint on the state load and store (TH_LOAD_NT / TH_STORE_NT): no result changes;
 // chosen per launch because its cost and saving land in different kernels. In isolation it makes
@@ -818,14 +835,6 @@ static bool ru_anchor() {
 #define RU_NT_MB 16
 
 // `oq_i8` picks the folded quantiser's codes: E4M3 (0) or int8 (1); see the kernel's epilogue.
-/* The chained form (r4d_chain.h) for this thread's launch: set by the plugin ABI entries below from
- * the row's `chain`, around their launch only, so the C entry point never chains. */
-static thread_local bool g_ru_chain = false;
-struct RuChainScope {
-  explicit RuChainScope(bool on) { g_ru_chain = on; }
-  ~RuChainScope() { g_ru_chain = false; }
-};
-
 static int ru_update_launch(
     const void* q, const void* k, const void* v, const void* a, const void* b,
     long ab_stride, int ab_is_bf16, const void* A_log, const void* dt_bias, void* state,
@@ -851,8 +860,8 @@ static int ru_update_launch(
   dim3 grid(N, H, vs), blk(RU_V / vs * 2);
   // Every switch is a template parameter; the nested pick macros enumerate the instantiations.
 #define RU_LAUNCH(AB, NM, VSC, NTC, ANCC, STGC, SDTC)                                         \
-  hipLaunchKernelGGL((g_ru_chain ? &r4dchain_gdn_recurrent_update<AB, NM, VSC, NTC, ANCC, STGC, SDTC> \
-                                  : &r4d_gdn_recurrent_update_kernel<AB, NM, VSC, NTC, ANCC, STGC, SDTC>), \
+  hipLaunchKernelGGL((r4d_gdn_recurrent_update_kernel<AB, NM, VSC, NTC, ANCC, STGC, SDTC, 0,  \
+                                                      R4dUnchained>),                         \
                      grid, blk, 0, (hipStream_t)stream,                                       \
                      (const unsigned short*)q, (const unsigned short*)k,                      \
                      (const unsigned short*)v, a, b, ab_stride,                               \
@@ -937,41 +946,18 @@ extern "C" int r4d_gdn_recurrent_update_k128_v128_bf16_fp32state(
 // sharing a block must not overlap: different streams get different blocks, and launches on one
 // stream sharing an output are ordered by their dependency.
 constexpr unsigned kMaxConvCtr = 4096;
+static_assert(kRuPairCtr * 2 == kMaxConvCtr, "the pairs' counters are the block's upper half");
 
 static unsigned int* ru_conv_ctr(RadStream s, const void* out) {
-  static std::mutex m;
-  static std::map<std::pair<RadStream, const void*>, unsigned int*> blocks;
-  const auto key = std::make_pair(s, out);
-  {
-    // Not held while the block is made, as in split_ctr: the zeroing waits for the card.
-    std::lock_guard<std::mutex> lk(m);
-    if (auto it = blocks.find(key); it != blocks.end()) return it->second;
-  }
-  void* p = nullptr;
-  if (hipMalloc(&p, (size_t)kMaxConvCtr * sizeof(unsigned int)) != hipSuccess) return nullptr;
-  // Zero before any launch reads it. In the engine hipMemset is the AQL backend's and has finished
-  // when it returns (core/device/aql.cpp); under HIP's own runtime (r4d_selftest) it runs on the
-  // null stream, which a non-blocking stream does not wait for, so wait here.
-  if (hipMemset(p, 0, (size_t)kMaxConvCtr * sizeof(unsigned int)) != hipSuccess ||
-      hipDeviceSynchronize() != hipSuccess) {
-    (void)hipFree(p);
-    return nullptr;
-  }
-  unsigned int* kept = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(m);
-    const auto [it, fresh] = blocks.emplace(key, (unsigned int*)p);
-    if (fresh) return it->second;
-    kept = it->second;
-  }
-  (void)hipFree(p);  // another thread made this key's block in the meantime
-  return kept;
+  return r4d::keyed_block(r4d::Keyed::GdnConv, s, out,
+                          (size_t)kMaxConvCtr * sizeof(unsigned int));
 }
 
 // The recurrent update with gdn_conv_update folded in, decode shape only (bf16 a/b, fused row
 // norm, one workgroup per (sequence, value head)). State contract, non-temporal choice and
 // factor-block bounds are as in ru_update_launch. `w_f32` is the conv weight's type. `oq_i8`:
-// E4M3 codes (0), int8 (1), or had_quant_act_i8g's rotated int8 (2).
+// E4M3 codes (0), int8 (1), had_quant_act_i8g's rotated int8 (2), or those at IQ8R's one scale
+// per 256 columns (3). `chain`: the chained form (r4d_chain.h); the launch is the op's only one.
 static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void* b, long ab_stride,
                                     const void* A_log, const void* dt_bias, void* state,
                                     long st_slot, long st_head, void* o, void* oq, void* os,
@@ -979,7 +965,8 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
                                     long sidx_stride, const void* nacc, const void* z,
                                     long z_pitch, const void* nw, float neps, int nact, int N,
                                     int H, int Hg, float scale, float thr, int state_fp16,
-                                    RadStream stream, int oq_i8, bool anc, bool w_f32) {
+                                    RadStream stream, int oq_i8, bool anc, bool w_f32,
+                                    bool chain) {
   if (anc && sidx_stride < 6) return RAD_E_SHAPE;
   if (anc && sidx_stride * RU_FSTR > st_head) return RAD_E_SHAPE;
   const int sdt = state_fp16 ? 1 : 0;
@@ -988,12 +975,15 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
   const dim3 grid(N, H, 1), blk(RU_V * 2);
 #define RC_LAUNCH(NTC, ANCC, SDTC, CVC)                                                       \
-  do { if (oq_i8 == 2) RC_LAUNCH_NM(3, NTC, ANCC, SDTC, CVC);                                  \
+  do { if (oq_i8 == 3) RC_LAUNCH_NM(4, NTC, ANCC, SDTC, CVC);                                  \
+       else if (oq_i8 == 2) RC_LAUNCH_NM(3, NTC, ANCC, SDTC, CVC);                             \
        else if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC, CVC);                                  \
        else            RC_LAUNCH_NM(1, NTC, ANCC, SDTC, CVC); } while (0)
 #define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC, CVC)                                                \
-  hipLaunchKernelGGL((g_ru_chain ? &r4dchain_gdn_recurrent_update<1, NM, 1, NTC, ANCC, 0, SDTC, CVC> \
-                                  : &r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, CVC>), \
+  do { if (chain) RC_LAUNCH_CH(NM, NTC, ANCC, SDTC, CVC, r4dchain);                            \
+       else       RC_LAUNCH_CH(NM, NTC, ANCC, SDTC, CVC, R4dUnchained); } while (0)
+#define RC_LAUNCH_CH(NM, NTC, ANCC, SDTC, CVC, CH_)                                           \
+  hipLaunchKernelGGL((r4d_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, CVC, CH_>), \
                      grid, blk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,       \
                      ab_stride, (const float*)A_log, (const float*)dt_bias,                    \
                      (ru_state<SDTC>::T*)state, st_slot, st_head, (unsigned short*)o,          \
@@ -1013,6 +1003,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
 #undef RC_PICKNT
 #undef RC_LAUNCH
 #undef RC_LAUNCH_NM
+#undef RC_LAUNCH_CH
   return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
@@ -1116,7 +1107,6 @@ extern "C" int r4d_rad_gdn_recurrent_update(const RadArgs* a, RadStream s) {
 
     /* Slot and head strides come from the tensor, so a cache with padded slots is served too
      * (see the header); the engine's own state cache is dense ([n_states, H, V, K] per layer). */
-    const RuChainScope chain_scope(r4d_geti_or(a, "chain", 0) != 0);
     return R4D_RAW(ru_update_launch(
         q->data, k->data, v->data, ta->data, tb->data, (long)ab_stride, ab_is_bf16,
         alog->data, dtb->data, state->data,
@@ -1190,6 +1180,14 @@ static int gdn_conv_recurrent_entry(const RadArgs* a, RadStream s, bool had) {
     const long long nhv = r4d_geti_or(a, "n_head_v", 0);
     if (nhv > 0 && nhv != H) return R4D_NO(RAD_E_SHAPE);
     if ((long long)N * Hg > (long long)kMaxConvCtr) return R4D_NO(RAD_E_SHAPE);
+    /* `group` 256 (the `_had` op alone): one scale per two value heads, whose arrival counters
+     * share the block with the key heads'. */
+    const long long qgrp = r4d_geti_or(a, "group", RU_V);
+    const bool wide = had && qgrp == 2 * RU_V;
+    if (qgrp != RU_V && !wide) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (wide && (H % 2 || (long long)N * Hg > (long long)kRuPairCtr ||
+                 (long long)N * (H / 2) > (long long)kRuPairCtr))
+        return R4D_NO(RAD_E_SHAPE);
 
     const long long xpitch = r4d_row_pitch(x);
     if (xpitch < 0) return R4D_NO(RAD_E_STRIDE);
@@ -1237,7 +1235,6 @@ static int gdn_conv_recurrent_entry(const RadArgs* a, RadStream s, bool had) {
     cv.ctr = ru_conv_ctr(s, o->data);
     if (!cv.ctr) return R4D_NO(RAD_E_NOMEM);
 
-    const RuChainScope chain_scope(r4d_geti_or(a, "chain", 0) != 0);
     return ru_conv_recurrent_launch(
         cv, ta->data, tb->data, (long)ab_stride, alog->data, dtb->data, state->data,
         (long)state->stride[0], (long)state->stride[1], o->data, oq ? oq->data : nullptr,
@@ -1245,7 +1242,9 @@ static int gdn_conv_recurrent_entry(const RadArgs* a, RadStream s, bool had) {
         os ? (long)r4d_row_pitch(os) : 0, cu->data, sidx->data, (long)sidx->stride[0],
         nacc ? nacc->data : nullptr, z->data, (long)z_row, nw->data, neps, nact, N, (int)H,
         (int)Hg, scale, thr, state->dtype == RAD_F16 ? 1 : 0, s,
-        had ? 2 : oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0, cw->dtype == RAD_F32);
+        wide ? 3 : had ? 2 : oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0,
+        cw->dtype == RAD_F32,
+        r4d_geti_or(a, "chain", 0) != 0);
 }
 
 extern "C" int r4d_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) {

@@ -43,9 +43,26 @@ struct SchedMetrics {
      * (Scheduler::step_next). Every other step leaves the card idle during the host's commit and
      * staging. */
     int64_t steps_ahead = 0;
-    /* Prefill chunks capped to leave room for decode rows or a waiting admission in the same
-     * step (--busy-prefill-chunk). Zero under `off`. */
+    /* Prefill chunks capped to leave room for other work in the same step, by the fixed busy
+     * policy or the adaptive mixed-step target. */
     int64_t prefill_chunks_capped = 0;
+    /* --mixed-step-target-ms: mixed steps observed, those over their target, and the current
+     * seeded or learned aggregate prefill-row cap (0 when the policy is disabled). */
+    int64_t mixed_step_target_steps = 0;
+    int64_t mixed_step_target_misses = 0;
+    int64_t mixed_step_target_prefill_cap = 0;
+
+    /* Runtime LoRA, by slot index (the names ride the same index: rad::Engine::lora_names()).
+     * What has completed under each slot, and what runs there now. The scheduler counts rows;
+     * a slot with no adapter is all-zero. */
+    static const int MAX_LORA_SLOTS = 16;
+    struct LoraCount {
+        int64_t requests = 0;       /* closed Finished */
+        int64_t prompt_tokens = 0;  /* summed over those */
+        int64_t output_tokens = 0;
+        int64_t running = 0;        /* instantaneous: rows on the card right now */
+    };
+    LoraCount loras[MAX_LORA_SLOTS] = {};
 
     /* Cumulative nanoseconds spent inside steps, total and for decode steps only. Wall time over
      * a step count is not a step time: it charges idle gaps between requests to steps and mixes
@@ -59,6 +76,19 @@ struct SchedMetrics {
      * step at more sequences is a different measurement and does not count. */
     int64_t step_ns_decode_best = 0;
     int64_t step_ns_decode_recent = 0;
+
+    /* The encoder (engine_mm.cpp): items and patches encoded and the nanoseconds the passes took,
+     * cumulative, and the items waiting for it or being encoded now. Encoding runs between
+     * steps, so a model that is encoding steps nothing and its step figures stay flat; these say
+     * where the time went. */
+    int64_t encode_items = 0;
+    int64_t encode_patches = 0;
+    int64_t encode_ns = 0;
+    int64_t encode_pending = 0;
+    /* When the pass under way began (steady clock, ns), 0 when none. metrics() and
+     * observed_metrics() add the time since to encode_ns, so a long pass reads as busy while
+     * it runs; the field is how the observers' copy carries that between publications. */
+    int64_t encode_started_ns = 0;
 
     /* Per KV group. `name` points into the Program, which outlives any scrape. */
     int n_kv_groups = 0;
@@ -159,6 +189,13 @@ struct SchedMetrics {
     int64_t lookup_held = 0;
     int64_t lookup_held_drafts = 0;
     int64_t lookup_held_hits = 0;
+    /* --draft-suffix (suffix.h): verifies that carried a suffix chain, the rows they carried and the
+     * drafts accepted; decode steps not issued ahead because the sequence was in a recurring
+     * pattern (where the lookup could run after the commit instead). */
+    int64_t suffix_steps = 0;
+    int64_t suffix_rows = 0;
+    int64_t suffix_accepted = 0;
+    int64_t suffix_held_ahead = 0;
 };
 
 
@@ -211,6 +248,87 @@ private:
     bool    warmed_   = false;  /* one window has completed */
     int64_t seen_     = 0;      /* samples seen, rejected ones included */
     double  mean_     = 0.0;    /* the rejection reference */
+};
+
+/* Feedback controller for --mixed-step-target-ms. Completed mixed-step service time includes the
+ * forward and drafter work, but not queueing or HTTP transport. Scale rows by target/observed when the
+ * target is missed; grow only after three representative steps below 95% of the target and by at
+ * most a quarter of the measured headroom. A one-quantum probe lets a conservative cap recover
+ * when fixed decode cost makes proportional scaling alone predict no larger legal chunk.
+ *
+ * The controller is deliberately model-agnostic. It may take a cap below an expert stager's
+ * throughput floor: satisfying an explicitly requested latency target while decoders are active
+ * is the point of the flag. With the flag off no caller consults it. */
+struct MixedStepTarget {
+    void reset() { cap_ = 0; good_ = 0; }
+
+    /* A new server has no mixed-step timing yet. Begin at a conservative fraction of that
+     * model's declared mixed-step capacity instead of allowing one unbounded calibration miss;
+     * subsequent observations replace or grow this seed exactly like any learned cap. */
+    void seed(int64_t rows, int64_t quantum, int64_t max_rows) {
+        if (rows <= 0 || max_rows <= 0) return;
+        const int64_t q = quantum > 0 ? quantum : 1;
+        max_rows = std::max<int64_t>(q, max_rows / q * q);
+        rows = std::max<int64_t>(q, rows / q * q);
+        cap_ = std::min(rows, max_rows);
+        good_ = 0;
+    }
+
+    void observe(int64_t rows, int64_t ns, int64_t target_ns, int64_t quantum,
+                 int64_t max_rows, bool representative = true) {
+        if (rows <= 0 || ns <= 0 || target_ns <= 0 || max_rows <= 0) return;
+        const int64_t q = quantum > 0 ? quantum : 1;
+        max_rows = max_rows / q * q;
+        if (max_rows < q) max_rows = q;
+
+        long double scaled = (long double)rows * (long double)target_ns / (long double)ns;
+        int64_t want = scaled >= (long double)max_rows ? max_rows : (int64_t)scaled;
+        want = want / q * q;
+        if (want < q) want = q;
+
+        if (cap_ == 0) {
+            cap_ = want;
+            good_ = 0;
+            return;
+        }
+        if (ns > target_ns) {
+            good_ = 0;
+            /* A prompt tail did not exercise a reusable limit. A checkpoint, fixed busy cap or
+             * other policy boundary still leaves the prompt unfinished and is representative:
+             * reducing this controller below that boundary can shorten the next mixed step. */
+            if (!representative) return;
+            /* A representative miss corrects immediately. */
+            if (want < cap_) cap_ = want;
+            return;
+        }
+        /* A short tail did not exercise the cap and cannot justify growing it. Near-target steps
+         * reset the recovery streak; three clearly fast full-cap samples earn one probe. */
+        if (!representative || ns * 20 >= target_ns * 19 || cap_ >= max_rows) {
+            good_ = 0;
+            return;
+        }
+        if (++good_ < 3) return;
+        good_ = 0;
+        const int64_t goal = std::max<int64_t>(want, std::min(max_rows, cap_ + q));
+        int64_t grow = (goal - cap_) / 4;
+        if (grow < q) grow = q;
+        cap_ = cap_ + grow;
+        cap_ = cap_ / q * q;
+        if (cap_ > goal) cap_ = goal;
+        if (cap_ > max_rows) cap_ = max_rows;
+    }
+
+    int64_t cap() const { return cap_; }
+    int64_t limit(int64_t budget, int64_t quantum) const {
+        if (cap_ <= 0 || budget <= 0) return budget;
+        const int64_t q = quantum > 0 ? quantum : 1;
+        const int64_t c = cap_ / q * q;
+        return c > 0 && c < budget ? c : budget;
+    }
+
+private:
+    int64_t cap_ = 0;
+    int     good_ = 0;
 };
 
 }  /* namespace rad */

@@ -1,7 +1,7 @@
 #pragma once
 
 // TODO: use json_fwd.hpp when possible
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 // Healing marker (empty if the JSON was fully parsed / wasn't healed).
 struct common_healing_marker {
@@ -14,7 +14,7 @@ struct common_healing_marker {
 
 // Represents a parsed JSON object, with its optional healing marker (a JSON dump fragment that can be used to find the position of healing in the JSON dump string)
 struct common_json {
-    nlohmann::ordered_json json;
+    rad::Json json;
 
     common_healing_marker healing_marker;
 };

@@ -47,6 +47,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <list>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -290,7 +291,8 @@ public:
                const std::vector<MMContentKey>& mm,
                const std::vector<std::vector<int32_t>>& blocks,
                int64_t n_tokens,
-               const std::string& label = std::string());
+               const std::string& label = std::string(),
+               int32_t lora_slot = -1);
 
     /* Release up to `n_entries` least recently used entries' KV references; returns how many went.
      * Entries a live sequence also holds are skipped, since releasing them frees nothing. With the
@@ -305,8 +307,17 @@ public:
     int64_t trim(int64_t n_entries);
     /* Give up every VRAM copy that costs nothing to drop: host copy landed and no running sequence
      * reading it. Used when the memory has a better use (the expert slab's loan). Entries still
-     * shared are retried after a sequence frees blocks. Returns how many entries left VRAM. */
-    int64_t drop_clean();
+     * shared are retried after a sequence frees blocks. Returns how many entries left VRAM.
+     *
+     * `loan_goal` is the loan the slab is short of, in tokens (0: none). An entry with no host
+     * copy coming (the host tier is full of context worth more) never becomes clean, and the
+     * loan reaches down only to the highest held block: a few such entries high in the pool keep
+     * the slab from everything below them for as long as the server runs. Where they are
+     * stragglers (KVManager::straggler_mark: giving them up lends at least sixteen blocks for
+     * each one lost) and stand inside `loan_goal`, they are forgotten, and their tokens are
+     * prefilled again if their conversation returns. Context that fills its part of the pool
+     * stays: there the cache is worth more than the loan it holds back. */
+    int64_t drop_clean(int64_t loan_goal = 0);
     int64_t size() const { return (int64_t)map_.size(); }
     /* Entries holding blocks in the pool, as opposed to only a copy off the card. */
     int64_t resident() const { return (int64_t)lru_.size(); }
@@ -488,6 +499,7 @@ private:
     std::vector<BlockHash> chain_all(const std::vector<int32_t>& tokens,
                                      const std::vector<MMContentKey>& mm,
                                      int64_t n_blocks) const;
+    void touch(Entry& e, uint64_t now_ns) const;
     void touch(const BlockHash& h, uint64_t now_ns) const;
     /* trim(), leaving the entries in `spare` (when given) where they are. */
     int64_t trim_sparing(int64_t n_entries,
@@ -518,8 +530,9 @@ private:
      * monotonic stamp. */
     bool is_tip(const Ckpt& c) const;
     /* The deepest valid snapshot on the chain `hs` at or below `limit` tokens; end() if none.
-     * Checkpoints sit on any block boundary (the interval or a prompt's tail), so this walks the
-     * snapshots, a few hundred, rather than the chain's blocks. */
+     * Checkpoints sit on any block boundary (the interval or a prompt's tail), so this probes the
+     * distinct snapshot positions deepest-first (ck_positions_) rather than either every snapshot
+     * or every block of the chain. */
     std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator
     deepest_ckpt(const std::vector<BlockHash>& hs, int64_t limit) const;
     static double idle_s(uint64_t used_ns);
@@ -541,6 +554,11 @@ private:
      * sequence-free count then. They are rechecked only once that count moves. */
     std::vector<BlockHash> drop_wait_;
     std::vector<BlockHash> drop_scratch_;
+    /* drop_stragglers: the marks and held tops it last walked the list for, and when. It walks
+     * again when a sequence frees blocks, or once they have moved and a second has passed. */
+    std::vector<int64_t> strag_mark_, strag_seen_;
+    uint64_t    strag_ns_ = 0;
+    int64_t drop_stragglers(int64_t loan_goal, bool recheck);
     uint64_t    frees_seen_ = 0;
     /* hold(): keys per waiting request, and holders per key. A release also triggers a recheck
      * of drop_wait_. */
@@ -549,6 +567,9 @@ private:
     bool        released_ = false;
     mutable std::unordered_map<BlockHash, Ckpt, BlockHashHash> ck_by_prefix_;
     mutable std::unordered_map<uint64_t, std::vector<BlockHash>> ck_by_session_;
+    /* Snapshots per token position, for deepest_ckpt's deepest-first probe. Maintained where
+     * ck_by_prefix_ gains (reserve_checkpoint) and loses (retire_ckpt) an entry. */
+    std::map<int64_t, int64_t> ck_positions_;
     /* Snapshots lookup handed out since begin_step; kept in their slots until the next one. */
     mutable std::vector<BlockHash> handed_;
     bool handed(const BlockHash& h) const {

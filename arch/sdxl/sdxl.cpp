@@ -450,7 +450,7 @@ struct Model {
     rad_op  op_dscale = 0, op_dcast = 0, op_rgb = 0;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* ================================================================== the recorded UNet's issue */
 RadOperand Net::opd(RadCtx* c, const Opd& o, const Geo& g) const {
@@ -913,13 +913,14 @@ static int declare_decoder(RadBuilder* b, Model& m) {
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
     if (ctx->world_size > 1) {
         fprintf(stderr, "radiance: sdxl runs on one card; serve it with a tensor-parallel size "
                         "of 1\n");
         return RAD_E_UNSUPPORTED;
     }
-    Model& m = g_model[ctx->rank];
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     Names& nm = m.nm;
@@ -1202,7 +1203,7 @@ static void step_decode(RadCtx* c, const RadBatch* batch, const Model& m) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
+    const Model& m = g_model[rad_slot(c)];
     if (!batch->gen || !batch->gen_b) {
         rad_step_fail(c, "sdxl is an image generator and runs generator passes only");
         return;
@@ -1229,6 +1230,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PROBE(sdxl)
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(sdxl, "sdxl", "", "0.1.0",
                 "Stable Diffusion XL and its finetunes (Illustrious, NoobAI, Pony): CLIP ViT-L and "
                 "OpenCLIP bigG text encoders, a 2.6B UNet sampled by k-diffusion's Euler, Euler "

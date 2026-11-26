@@ -152,7 +152,7 @@ static Program stream_program(const KVGroupInfo& g, int64_t sel_pitch, bool with
         oi.op = "kv_store_streamed";
         oi.bands.resize(1);
         if (store_resolved) oi.bands[0].dom[RAD_DOMAIN_DEVICE].row = &a_resolved_row();
-        else oi.bands[0].miss[RAD_DOMAIN_DEVICE] = "kv_dtype in {fp8_e4m3}, have fp8_v4";
+        else oi.bands[0].miss[RAD_DOMAIN_DEVICE] = "kv_dtype in {bf16}, have i8";
         oi.base.set_i("block_size", g.block_size);
         p.ops.push_back(std::move(oi));
     }
@@ -652,6 +652,40 @@ TEST(the_engine_s_queues_come_off_the_card_before_the_split) {
                             - c2.vram_weights_mib * MiB - c2.vram_kv_mib * MiB;
     CHECK(unclaimed >= 112 * MiB);
     CHECK(unclaimed < 114 * MiB);
+}
+
+/* The runtime keeps queue scratch resident once a kernel with a private segment has run
+ * (rad_dev_resident_scratch_bytes); it is part of the hardware queues' term, the largest rank's. */
+TEST(resident_queue_scratch_is_charged_with_the_hardware_queues) {
+    Config c = small_config();
+    c.vram_weights_mib = 0;
+    c.vram_kv_mib      = 0;
+    c.gpu_headroom_mib = 96;
+    VramFacts f{};
+    f.capacity   = 32LL << 30;
+    f.free       = f.capacity - (512LL << 20);
+    f.arena      = 144LL << 20;
+    f.staging    = 98LL << 20;
+    f.statics    = 2LL << 30;
+    f.experts    = 200LL << 30;
+    f.kv_ceiling = 100LL << 30;
+    f.n_queues = 2; f.queue_bytes = 33LL << 20;
+    VramBudget b0, b1;
+    Config c0 = c, c1 = c;
+    CHECK_OK(vram_budget_resolve(c0, { f }, &b0));
+    f.queue_scratch = 160LL << 20;
+    CHECK_OK(vram_budget_resolve(c1, { f }, &b1));
+    CHECK_EQ(b0.queues, 66LL << 20);
+    CHECK_EQ(b1.queues, (66LL << 20) + (160LL << 20));
+    CHECK_EQ(b1.claimable, b0.claimable - (160LL << 20));
+    /* The minimum the fleet asks of the card moves by the same bytes. */
+    int64_t need0 = 0, want0 = 0, need1 = 0, want1 = 0;
+    f.queue_scratch = 0;
+    vram_budget_need({ f }, &need0, &want0);
+    f.queue_scratch = 160LL << 20;
+    vram_budget_need({ f }, &need1, &want1);
+    CHECK_EQ(need1 - need0, 160LL << 20);
+    CHECK_EQ(want1 - want0, 160LL << 20);
 }
 
 TEST(the_smallest_card_binds_and_a_short_one_refuses_by_name) {
@@ -1425,7 +1459,7 @@ TEST(a_ring_below_one_decode_step_s_selection_is_raised_to_the_ceiling) {
     f.cfg.n_spec = 0;
     f.cfg.vram_kv_mib = 64;
     std::vector<KVGroupInfo> groups = hybrid_groups();
-    groups[G_FULL].decl.dtype = RAD_F8E4M3;               /* the streamed store's one row */
+    groups[G_FULL].decl.dtype = RAD_I8;                   /* a streamed store's row */
     groups[G_FULL].bytes_per_block = 2048;                 /* as declare sets it */
     const int64_t sel_pitch = 2048;                        /* a synthetic indexer's topk + 1 */
     const int64_t ctx_blocks = 2 * (65536 / 16);           /* 8192 blocks of 16 tokens */
@@ -1569,7 +1603,7 @@ TEST(a_declared_streamed_store_with_no_kernel_is_not_a_streamed_path) {
     f.cfg.max_seqs = 2;
     f.cfg.kv_resident = 256;                             /* under the ring floor, so it is raised */
     std::vector<KVGroupInfo> groups = hybrid_groups();
-    groups[G_FULL].decl.dtype = RAD_F8E4M3;
+    groups[G_FULL].decl.dtype = RAD_I8;
     groups[G_FULL].bytes_per_block = 2048;
     /* The resolve resolves; the store is declared with no row (both domains null). */
     const Program unresolved = stream_program(groups[G_FULL], 8, true, true, /*store_resolved=*/false);
@@ -1595,45 +1629,6 @@ TEST(a_declared_streamed_store_with_no_kernel_is_not_a_streamed_path) {
     CHECK(has(log, "ignored"));
     CHECK(has(log, "kv_store_streamed"));                /* the op that is missing, by name */
 
-}
-
-TEST(a_packed_cache_warns_that_the_layout_has_no_writer_and_serves_non_streamed) {
-    /* --kv-cache-dtype fp8_v4 / k6_v4: the architecture declares the resolve and no streamed store,
-     * because libr4d's streamed rows are E4M3 and bf16 and a packed cache has base-store rows only
-     * (arch/common/rad_block_attn_gated_fp8.h). The group is declared to the core as plain E4M3, so
-     * no dtype gate downstream can see the layout: the operator has to be told the *layout* has no
-     * writer, not that the architecture cannot stream -- and the group must run the base path.
-     * Before this the op was declared against a table with no row for it, which is a weightless
-     * device hole: startup refused with or without --kv-resident, naming a kernel band and never the
-     * flag. */
-    for (const char* dtype : { "fp8_v4", "k6_v4" }) {
-        Fixture f;
-        f.cfg.checkpoint_slots = 0;
-        f.cfg.max_ctx = 65536;   /* above the 32 768-token ring floor */
-        f.cfg.max_seqs = 2;
-        f.cfg.kv_resident = 256;                         /* under the ring floor, so it is raised */
-        f.cfg.kv_cache_dtype = dtype;
-        std::vector<KVGroupInfo> groups = hybrid_groups();
-        groups[G_FULL].decl.dtype = RAD_F8E4M3;          /* what declare gives the core, packed or not */
-        groups[G_FULL].bytes_per_block = 2048;
-        /* What the gated plugin emits for a packed cache: the layout-blind resolve, no store. */
-        const Program packed = stream_program(groups[G_FULL], 8, true, /*with_store=*/false);
-        KVStreamSetup s;
-        int st = RAD_OK;
-        const std::string log = stderr_of([&] {
-            st = kvstream_configure(f.cfg, 65536, groups, packed, &s);
-        });
-        CHECK_OK(st);                                    /* started, not refused */
-        CHECK_EQ(s.group, -1);
-        CHECK_EQ(s.asked_tokens, (int64_t)0);
-        CHECK_EQ(s.stage_blocks, (int64_t)0);
-        CHECK(has(log, "ignored"));
-        CHECK(has(log, std::string("group 'full' has a ") + dtype + " cache"));
-        CHECK(has(log, "has no writer for that layout (E4M3 and bf16 only)"));
-        CHECK(!has(log, "declares no"));                 /* not that sentence: the arch declared it */
-        CHECK(!has(log, "raised to"));                   /* and not the ring's */
-
-    }
 }
 
 TEST(a_resolve_declared_for_another_group_does_not_enable_streaming) {
@@ -2176,6 +2171,17 @@ TEST(chained_hash_identity) {
 
     /* The same span, same parent, different position is also a different block. */
     CHECK(chain_block_hash(a0, shared.data(), 16, nullptr, 0, 32) != a1);
+
+    /* Token order matters both inside a packed pair and across the hash's four lanes, and the
+     * length is part of the identity even where one span is the other's prefix. */
+    auto swapped = a;
+    std::swap(swapped[0], swapped[1]);
+    CHECK(chain_block_hash(root, swapped.data(), 16, nullptr, 0, 0) != a0);
+    swapped = a;
+    std::swap(swapped[0], swapped[8]);
+    std::swap(swapped[1], swapped[9]);
+    CHECK(chain_block_hash(root, swapped.data(), 16, nullptr, 0, 0) != a0);
+    CHECK(chain_block_hash(root, a.data(), 15, nullptr, 0, 0) != a0);
 
     /* Multimodal blocks hash by content: identical placeholder ids, different content keys. */
     MMContentKey m1{ 0, 16, 0x1111 };
@@ -3816,6 +3822,39 @@ TEST(the_lowest_free_block_is_the_one_handed_out) {
  * loan only on a timer would refuse it, and the scheduler waiting or preempting would never create
  * the demand that triggers the reclaim. So admission is decided against the whole carve, and the
  * recall happens on the path that needs it, through the slab owner. */
+TEST(admission_reports_only_recoverable_external_capacity_as_a_fleet_wait) {
+    Lender e;
+    REQUIRE_EQ(e.build(), RAD_OK);
+    const int64_t all = e.kv.total_blocks(G_FULL);
+    CHECK_OK(e.kv.set_loan(e.kv.spare_tokens()));
+    const int64_t idle = e.kv.live_blocks(G_FULL);
+    const int64_t tokens = (idle + all) / 2 * e.bs();
+    /* The test pool is already backed; enable just the flex quota and callback protocol. */
+    e.kv.set_flex(1);
+    e.kv.set_flex_room(0);
+    CHECK_OK(e.kv.add_sequence(1));
+    bool waiting = false;
+    CHECK_EQ(e.kv.ensure(1, tokens, -1, &waiting), RAD_E_FULL);
+    CHECK(waiting);
+    CHECK_EQ(e.kv.ensure(1, (all + 1) * e.bs(), -1, &waiting), RAD_E_FULL);
+    CHECK(!waiting);                              /* no future grant can exceed the full carve */
+    e.kv.set_flex_room(tokens);
+    bool deny = true;
+    e.kv.set_fleet_reclaim([&](int64_t, bool* pending) {
+        if (deny) { if (pending) *pending = true; return (int)RAD_E_FULL; }
+        return (int)RAD_OK;
+    });
+    CHECK_EQ(e.kv.ensure(1, tokens, -1, &waiting), RAD_E_FULL);
+    CHECK(waiting);                               /* allowance was optimistic; actual grant denied */
+    e.kv.set_fleet_reclaim([](int64_t, bool*) { return (int)RAD_E_NOMEM; });
+    CHECK_EQ(e.kv.ensure(1, tokens, -1, &waiting), RAD_E_NOMEM);
+    CHECK(!waiting);                              /* a backing failure is an operational error */
+    deny = false;
+    e.kv.set_fleet_reclaim([&](int64_t, bool*) { return (int)RAD_OK; });
+    CHECK_OK(e.kv.ensure(1, tokens, -1, &waiting));
+    CHECK(!waiting);
+}
+
 TEST(a_request_past_the_mark_takes_the_loan_back) {
     Lender e;
     CHECK_OK(e.build());
@@ -4751,6 +4790,110 @@ TEST(dropping_a_clean_entry_gives_its_vram_back_and_keeps_it_restorable) {
     CHECK_EQ(x.f.pc.lookup(prompt, {}).n_attn_tokens, 0);
     CHECK_EQ(x.f.pc.restorable_from(prompt, {}).size(), 20u);
     CHECK_EQ(x.f.pc.drop_clean(), 0);               /* nothing left to drop */
+}
+
+/* A conversation larger than the host tier keeps its end in VRAM only, with no host copy coming,
+ * so it never becomes clean. Left high in the pool by sequences that have since gone, a few such
+ * blocks stop the expert loan below them for as long as the server runs. drop_clean forgets them
+ * where giving them up lends far more than it loses, inside the loan it is asked about and once
+ * no sequence reads them. */
+struct Stragglers {
+    Fixture f;
+    IdleTiers t;
+    int64_t all = 0;
+    /* `slots` host entries; a sequence 9 over the bottom `under` blocks. */
+    int build(int slots, int under) {
+        int s = f.build(/*with_linear=*/false, 0);
+        if (s < 0) return s;
+        IdleTiers::Config c = tier_config(slots * 1024, 1024);
+        c.block_tokens = 16;
+        s = t.configure(c);
+        if (s < 0) return s;
+        f.pc.set_tiers(&t);
+        all = f.kv.total_blocks(G_FULL);
+        if (under <= 0) return RAD_OK;
+        s = f.kv.add_sequence(9);
+        return s < 0 ? s : f.kv.ensure(9, 16 * under);
+    }
+    /* A sequence that comes and goes: what makes drop_clean look again. */
+    void pass() {
+        CHECK_OK(f.kv.add_sequence(77));
+        CHECK_OK(f.kv.ensure(77, 16));
+        f.kv.free_sequence(77);
+    }
+};
+
+TEST(stragglers_with_no_host_copy_coming_leave_vram_for_the_loan) {
+    Stragglers x;
+    CHECK_OK(x.build(/*slots=*/16, /*under=*/300));
+    REQUIRE(x.all >= 400);
+    const auto prompt = tok_run(7700, 336);
+    publish(x.f, 1, prompt, 320);                   /* twenty blocks, at 300 and up */
+    CHECK_EQ(copy_now(x.t).size(), 16u);
+    CHECK_EQ(x.t.stats().held_back, 4ll);
+    const int64_t goal = (x.all - 100) * 16;        /* a loan down to block 100 */
+
+    /* Still read by its sequence: nothing goes, whatever the loan. */
+    CHECK_EQ(x.f.pc.drop_clean(goal), 0);
+    x.f.kv.free_sequence(9);
+    x.f.kv.free_sequence(1);
+
+    /* No loan asked for: the copied start leaves VRAM, the four blocks past the tier stay. */
+    CHECK_EQ(x.f.pc.drop_clean(), 16);
+    CHECK_EQ(x.f.pc.resident(), 4ll);
+    CHECK_EQ(x.f.pc.stats().evictions, 0ll);
+    CHECK_EQ(x.f.kv.straggler_mark(G_FULL), 0ll);   /* four blocks keep 316 from the loan */
+    const int64_t pinned = x.f.kv.spare_tokens();
+    CHECK(pinned <= (x.all - 316) * 16);
+    /* A loan that stops above them takes nothing. */
+    x.pass();
+    CHECK_EQ(x.f.pc.drop_clean((x.all - 330) * 16), 0);
+    CHECK_EQ(x.f.pc.resident(), 4ll);
+
+    /* The loan the slab is short of reaches below them: they are forgotten, the start is not. */
+    x.pass();
+    CHECK_EQ(x.f.pc.drop_clean(goal), 4);
+    CHECK_EQ(x.f.pc.resident(), 0ll);
+    CHECK_EQ(x.f.pc.size(), 16ll);
+    CHECK_EQ(x.f.pc.stats().evictions, 4ll);
+    CHECK_EQ(x.f.kv.pool_bytes_used(G_FULL), 0ll);
+    CHECK(x.f.kv.spare_tokens() > pinned);
+    CHECK_OK(x.f.kv.set_loan(x.f.kv.spare_tokens()));
+    CHECK_EQ(x.f.pc.restorable_from(prompt, {}).size(), 16u);
+}
+
+/* Context that fills its part of the pool is not a straggler, with or without a host copy: the
+ * loan stops at its edge and takes none of it, however large the loan asked about. The end of an
+ * older conversation left far above it is, and goes alone. */
+TEST(cached_context_that_fills_its_part_of_the_pool_stays_and_the_blocks_far_above_it_go) {
+    Stragglers x;
+    CHECK_OK(x.build(/*slots=*/8, /*under=*/300));
+    REQUIRE(x.all >= 400);
+    const auto older = tok_run(7800, 16 * 12 + 16);
+    publish(x.f, 1, older, 16 * 12);                /* twelve blocks, at 300 and up */
+    CHECK_EQ(copy_now(x.t).size(), 8u);             /* its start fills the tier */
+    x.f.kv.free_sequence(9);
+    x.f.kv.free_sequence(1);
+    const auto dense = tok_run(9100, 16 * 200 + 16);
+    publish(x.f, 2, dense, 16 * 200);               /* two hundred blocks from the bottom */
+    CHECK_EQ(copy_now(x.t).size(), 0u);             /* no room, and none is made here */
+    x.f.kv.free_sequence(2);
+
+    CHECK_EQ(x.f.pc.drop_clean(), 8);               /* the older start, to the host */
+    CHECK_EQ(x.f.pc.resident(), 204ll);
+    CHECK_EQ(x.f.kv.held_top_blocks(G_FULL), 312ll);
+    CHECK_EQ(x.f.kv.straggler_mark(G_FULL), 200ll); /* the edge of the dense part */
+
+    x.pass();
+    const int64_t goal = x.all * 16;                /* every block the pool has */
+    CHECK_EQ(x.f.pc.drop_clean(goal), 4);
+    CHECK_EQ(x.f.pc.resident(), 200ll);
+    CHECK_EQ(x.f.kv.held_top_blocks(G_FULL), 200ll);
+    CHECK_EQ(x.f.kv.straggler_mark(G_FULL), 200ll); /* nothing above the dense part now */
+    x.pass();
+    CHECK_EQ(x.f.pc.drop_clean(goal), 0);           /* which keeps every block */
+    CHECK_EQ(x.f.pc.resident(), 200ll);
+    CHECK_EQ(x.f.pc.lookup(dense, {}).n_attn_tokens, 16 * 200);
 }
 
 TEST(a_recomputed_shared_prefix_keeps_its_original_host_copy_and_snapshot) {
@@ -6123,6 +6266,30 @@ TEST(a_window_shift_and_a_seeded_window_mark_the_whole_row) {
  * speculation a linear group's sequence owns two physical slots (copy k of s at s + k *
  * n_seq_states) and both are named; a conv group keeps one copy. The index row the kernels read
  * names copy 0 three times, then copy 1. */
+/* Giving idle slots back leaves a sequence that holds tokens its slot: ensure() grabs one only as
+ * the sequence grows, so its next step would have no recurrent state. */
+TEST(giving_idle_state_slots_back_leaves_a_sequence_holding_tokens_its_slot) {
+    Fixture f;
+    REQUIRE_EQ(f.build_groups(hybrid_conv_groups()), RAD_OK);
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16));
+    CHECK_OK(f.kv.add_sequence(2));
+    CHECK_OK(f.kv.ensure(2, 16));
+    const int32_t s1 = f.kv.state_slot(1, G_GDN);
+    REQUIRE(s1 >= 0);
+    /* Preempted, then handed a slot it holds at zero tokens: that one goes back. */
+    CHECK_OK(f.kv.preempt(2));
+    CHECK_EQ(f.kv.state_slot(2, G_GDN), -1);
+    const int64_t free_before = f.kv.free_states(G_GDN);
+    CHECK_EQ(f.kv.release_idle_states(), 0);
+    CHECK_EQ(f.kv.state_slot(1, G_GDN), s1);
+    CHECK_EQ(f.kv.free_states(G_GDN), free_before);
+    /* A slot held is not free, however many times the slots are counted. */
+    for (int i = 0; i < 3; ++i) (void)f.kv.release_idle_states();
+    CHECK_OK(f.kv.ensure(2, 16));
+    CHECK(f.kv.state_slot(2, G_GDN) != s1);
+}
+
 TEST(a_handed_out_state_slot_is_named_for_clearing_once_per_copy) {
     Fixture f;
     f.cfg.n_spec = 2;

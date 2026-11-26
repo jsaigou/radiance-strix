@@ -104,14 +104,29 @@ struct PleLayer {
     /* The two projections are bf16 as the checkpoint ships them (the FP8 release's
      * `modules_to_not_convert`), or the ggml Q8_0 / Q6_K forms when a UD map keeps Unsloth's
      * planes. See `key_form`: 0 bf16, 1 Q8_0, 2 Q6_K. */
-    rad_weight w_key = 0, w_value = 0, w_nk = 0, w_nq = 0, w_nc = 0, w_conv = 0;
-    rad_weight w_key_scale = 0, w_value_scale = 0, w_key_ref = 0, w_value_ref = 0;
+    /* Fork-only: the ggml forms' weights and planes (key_form 1: Q8_0, 2: Q6_K; 0 means bf16 or
+     * the rotated int8 LinearFP8 pair below). */
+    rad_weight w_key = 0, w_value = 0, w_key_scale = 0, w_value_scale = 0, w_key_ref = 0,
+               w_value_ref = 0;
     int        key_form = 0, value_form = 0;
+    rad_weight w_nk = 0, w_nq = 0, w_nc = 0, w_conv = 0;
+    /* The two projections of the gathered embedding, each in the encoding its container stores:
+     * plain bf16 as the checkpoint ships them, or rotated int8 (or a narrower rotated form), which
+     * halves the bytes a pass waits for once the rows are on the card. `a_embd` is their input and
+     * `a_fed` the same planes for the second projection, whose codes the first one's quantiser
+     * wrote. */
+    LinearFP8  key{}, value{};
+    ActFP8     a_embd{}, a_fed{};
 
     rad_kvgroup kv_tok = 0, kv_conv = 0;
     rad_buf b_ids = 0, b_emb = 0, b_embd = 0, b_k = 0, b_v = 0, b_gv = 0, b_gvn = 0, b_out = 0;
     rad_op  op_ids = 0, op_gather = 0, op_embd = 0, op_key = 0, op_value = 0;
     rad_op  op_gate = 0, op_conv = 0, op_add = 0;
+    /* The draft passes' hint (hint_ids, hint_fetch), where a drafter and `ngram_hint` exist: the
+     * per-slot tails the hash continues from, the hinted ids (host domain, as `ple_ids`) and the
+     * rows fetched for them, which nothing reads. */
+    rad_buf b_tail = 0, b_hint_ids = 0, b_hint_emb = 0;
+    rad_op  op_hint_hist = 0, op_hint_round = 0, op_hint_gather = 0;
 
     int64_t hn() const { return c.hc * g.n_embd; }
     /* The read-ahead queue's depth in steps: batch.cpp's k_ahead_chunks steps of the following
@@ -131,6 +146,14 @@ struct PleLayer {
     /* The hash, issued at the top of the step; the rest at the layer (see ids()). */
     void ids(RadCtx* c_, const RadBatch* batch) const;
     void step(RadCtx* c_, const RadBatch* batch) const;
+    /* On a draft head's pass: the ids of each sequence's newest token, first in the pass, and
+     * the fetch of their rows, last in it (see hint_ids()). */
+    void hint_ids(RadCtx* c_, const RadBatch* batch) const;
+    void hint_fetch(RadCtx* c_, const RadBatch* batch) const;
+    bool hints(const RadBatch* batch) const {
+        return op_hint_gather != 0 &&
+               (batch->draft_pass > 1 || (batch->draft_pass < 0 && batch->n_draft_out > 0));
+    }
 };
 
 inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& cfg,
@@ -186,7 +209,7 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
     /* E4M3 with one scale for all 320 million rows (Qwen3.8-Flash-Next-FP8's choice; E4M3 has its
      * own exponent, a row's dynamic range is 2.3x, and the scale sits on a three-octave plateau).
      * One stored weight, `fp8_e4m3*bf16[*x*]`: codes plus a one-element scale plane, made by the
-     * recipe (data/recipes/qwen4exp-w4.recipe) or read as that release ships it (its shards under
+     * recipe (data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe) or read as that release ships it (its shards under
      * one `weight_scale`); the gather takes them as two operands. The name map
      * joins the shards along rows and is declared first, since the encoding is looked up through
      * it. RAD_ACCESS_VOCAB: it is a vocabulary table, just not the token one. */
@@ -244,6 +267,10 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
                    RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
 
     /* ---- the projections and the three gains ------------------------------------------------ */
+    /* bf16 as shipped (the FP8 checkpoint's `modules_to_not_convert` names both projections), a
+     * recipe's rotated int8 (declared below by LinearFP8), or the ggml Q8_0/Q6_K planes a UD map
+     * keeps (declared here; both read the bf16 embedding directly). The name maps come first: the
+     * encodings, looked up through them, say which. */
     /* bf16 as the FP8 checkpoint's `modules_to_not_convert` ships them, or the ggml Q8_0/Q6_K
      * planes a UD map keeps. Both forms read the bf16 embedding directly. */
     const char* kn = nm.f("blk.%d.ple_key.weight", layer);
@@ -284,9 +311,6 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
         w_key_scale = decl_view(b, nm.f("%s.scale", kn), kn, "scale", RAD_F16,
                                 {HN, c.embed_dim / 32}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
                                 grp_model());
-    } else {
-        w_key = decl_w(b, kn, RAD_BF16, {HN, c.embed_dim},
-                       RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
     }
     if (value_form == 2) {
         w_value = decl_view(b, vn, nullptr, "codes", RAD_I6, {g.n_embd, c.embed_dim},
@@ -303,9 +327,6 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
         w_value_scale = decl_view(b, nm.f("%s.scale", vn), vn, "scale", RAD_F16,
                                   {g.n_embd, c.embed_dim / 32}, RAD_ACCESS_PER_TOKEN,
                                   RAD_SHARD_NONE, grp_model());
-    } else {
-        w_value = decl_w(b, vn, RAD_BF16, {g.n_embd, c.embed_dim},
-                         RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
     }
 
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.ple_norm_key.weight", layer), src.norm_key));
@@ -324,7 +345,7 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
     w_conv = decl_w(b, nm.f("blk.%d.ple_conv.weight", layer), RAD_BF16, {HN, c.conv_width},
                     RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
 
-    if (!w_table || (!table_bf16 && !w_scale) || !w_mult || !w_vsz || !w_off || !w_key || !w_value ||
+    if (!w_table || (!table_bf16 && !w_scale) || !w_mult || !w_vsz || !w_off ||
         !w_nk || !w_nq || !w_nc || !w_conv) return RAD_E_INVAL;
 
     /* ---- the two rolling windows ------------------------------------------------------------ */
@@ -430,12 +451,85 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
                       {b_ids}, {b_emb});
     }
 
+    /* ---- the draft passes' hint. A verify step's rows are the token the last verify chose and
+     * the drafter's proposals, each known a draft pass or more before the verify hashes it,
+     * except the last. Each draft pass hashes its sequences' newest token (`ngram_hint`) and
+     * gathers those rows through the same row source, which for a table on a drive reads them
+     * into its row cache; the verify step's gather then waits for the last proposal's rows
+     * only. All three ops or none: without a drafter, or where no library hashes the hint,
+     * nothing is declared and the verify step reads every row itself, as before. */
+    if (g.max_spec > 0 && rad_op_declared(b, "ngram_hint")) {
+        const int64_t ctx = c.ngram - 1;
+        b_tail = decl_b(b, nm.f("ple_hint_tail"), RAD_I32, {g.max_seqs, 2 * ctx}, RAD_BUF_PERSIST);
+        RadBufDecl hi{};
+        hi.dtype = RAD_I32; hi.rank = 2;
+        hi.shape[0] = g.max_seqs; hi.shape[1] = c.heads;
+        hi.kind = RAD_BUF_PERSIST; hi.domain = RAD_DOMAIN_HOST;
+        b_hint_ids = rad_decl_buffer(b, nm.f("ple_hint_ids"), &hi);
+        /* PERSIST although nothing reads it: a transient's bytes are shared by declared op
+         * order, and the fetch runs on the host while the draft pass's other buffers are live. */
+        RadBufDecl he{};
+        he.dtype = g.act_dtype; he.rank = 2;
+        he.shape[0] = g.max_seqs; he.shape[1] = c.embed_dim;
+        he.kind = RAD_BUF_PERSIST; he.domain = RAD_DOMAIN_HOST;
+        b_hint_emb = rad_decl_buffer(b, nm.f("ple_hint_emb"), &he);
+        if (!b_tail || !b_hint_ids || !b_hint_emb) return RAD_E_INVAL;
+        for (const int hist : { 1, 0 })
+            (hist ? op_hint_hist : op_hint_round) =
+                rw(b, RAD_OP(b, "ngram_hint",
+                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs), RAD_INT("heads", c.heads),
+                                  RAD_INT("ngram", c.ngram), RAD_INT("eos", c.eos),
+                                  RAD_INT("hist", hist)),
+                       RAD_WEIGHTS(w_mult, w_vsz, w_off)),
+                   {b_tail}, {b_tail, b_hint_ids});
+        const rad_weight wt[2] = { w_table, w_scale };
+        op_hint_gather = rw(b, RAD_OP(b, "embed_lookup_q",
+                               RAD_PARAMS(RAD_RANGE("M", 1, g.max_seqs * c.heads),
+                                          RAD_INT("n_embd", HD), RAD_INT("n_vocab", c.rows),
+                                          RAD_STR("dtype", g.dtype)),
+                               wt, table_bf16 ? 1 : 2),
+                           {b_hint_ids}, {b_hint_emb});
+        if (!op_hint_hist || !op_hint_round || !op_hint_gather)
+            op_hint_hist = op_hint_round = op_hint_gather = 0;
+    }
+
     op_embd = rw(b, RAD_OP(b, "cast",
                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", c.embed_dim),
                                 RAD_STR("from", g.dtype), RAD_STR("to", g.dtype)),
                      RAD_NOWEIGHTS),
                  {b_emb}, {b_embd});
 
+    if (key_form == 0) {
+    /* The projections. An int8 one reads the embedding's int8 codes at its own scale group; the
+     * first such quantises the bf16 plane and a second reads those codes, so two int8 projections
+     * must agree in rotation and group (LinearFP8 refuses the pair otherwise). */
+    {
+        const char* kb = nm.f("blk.%d.ple_key", layer);
+        const char* vb = nm.f("blk.%d.ple_value", layer);
+        RadEncoding ke{}, ve{};
+        const bool kk = weight_enc(b, nm.f("%s.weight", kb), &ke);
+        const bool vk = weight_enc(b, nm.f("%s.weight", vb), &ve);
+        const bool k8 = !g.w_bf16 && kk && (linear_is_w8(ke) || linear_is_w8h(ke));
+        const bool v8 = !g.w_bf16 && vk && (linear_is_w8(ve) || linear_is_w8h(ve));
+        a_embd.x = b_embd;
+        if (k8 || v8)
+            RAD_ARCH_TRY(a_embd.declare_qs(b, nm, g, "ple_emb_dev", c.embed_dim, 0, true, false,
+                                           linear_w8h_group(k8 ? ke : ve)));
+        a_fed = a_embd;
+        if (k8 && v8) {
+            a_fed.q8_fed = true;
+            a_fed.q8_rot = linear_is_w8h(ke);
+        }
+        key.mapped = value.mapped = true;
+        /* Anything but an int8 form is the plain bf16 GEMM, in a quantised model too. */
+        Geom gb = g;
+        gb.w_bf16 = true;
+        RAD_ARCH_TRY(key.declare(b, nm, k8 ? g : gb, kb, HN, c.embed_dim, RAD_SHARD_NONE,
+                                 grp_model(), { src.key_proj }, a_embd, b_k));
+        RAD_ARCH_TRY(value.declare(b, nm, v8 ? g : gb, vb, g.n_embd, c.embed_dim, RAD_SHARD_NONE,
+                                   grp_model(), { src.value_proj }, a_fed, b_v));
+    }
+    } else {
     if (key_form == 2)
         op_key = rw(b, RAD_OP(b, "gemm_nt_q",
                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", HN),
@@ -476,6 +570,7 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
                                     RAD_INT("K", c.embed_dim), RAD_STR("dtype", g.dtype)),
                          RAD_WEIGHTS(w_value)),
                      {b_embd}, {b_v});
+    }
 
     /* `q` is the incoming stream, un-normed; the op applies all three norms because the third is
      * over bytes it writes. */
@@ -501,7 +596,7 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
                    RAD_NOWEIGHTS),
                {w.h, b_out}, {w.h});
 
-    if (!op_ids || !op_gather || !op_embd || !op_key || !op_value || !op_gate || !op_conv ||
+    if (!op_ids || !op_gather || !op_embd || (key_form ? (!op_key || !op_value) : (!key.op || !value.op)) || !op_gate || !op_conv ||
         !op_add)
         return RAD_E_INVAL;
     return RAD_OK;
@@ -544,7 +639,24 @@ inline void PleLayer::ids(RadCtx* c_, const RadBatch* batch) const {
      * after the step's (`tok` reaches A tokens past the step); the window left behind is the
      * step's alone. */
     const int64_t A = P > 0 ? ahead_rows(batch) : 0;
-    if (P > 0)
+    /* A checkpoint inside the step (RadBatch::ckpt_cut): the rows before it, the window's
+     * snapshot, then the rest with the ahead rows, each as a chunk of those rows hashes them. */
+    const int64_t ck = batch->ckpt_cut;
+    if (P == 1 && D == 0 && ck > 0 && ck < T && batch->ckpt_cu) {
+        for (int64_t p = 0; p < 2; ++p) {
+            const int64_t r0 = p == 0 ? 0 : ck, n = p == 0 ? ck : T - ck;
+            RAD_ISSUE_N(c_, op_ids, n,
+                        praw(batch->token_ids, RAD_I32, T + A), kv_cache(kv_tok, layer_),
+                        praw(batch->ckpt_cu + p, RAD_I32, 2),
+                        RAD_W(w_mult), RAD_W(w_vsz), RAD_W(w_off),
+                        praw(tk_idx, RAD_I32, 1),
+                        praw(p == 0 ? batch->ctx_lens : batch->positions + r0, RAD_I32, 1),
+                        RAD_NONE,
+                        brows(b_ids, T),
+                        p == 1 && A > 0 ? brow_slice(b_ids, T, A, c.heads) : RAD_NONE);
+            if (p == 0) rad_ckpt_snap(c_, kv_tok, layer_);
+        }
+    } else if (P > 0)
         RAD_ISSUE_N(c_, op_ids, T,
                     praw(batch->token_ids, RAD_I32, T + A), kv_cache(kv_tok, layer_),
                     praw(batch->cu_seqlens + D, RAD_I32, P + 1),
@@ -554,6 +666,33 @@ inline void PleLayer::ids(RadCtx* c_, const RadBatch* batch) const {
                     RAD_NONE,
                     brows(b_ids, T),
                     A > 0 ? brow_slice(b_ids, T, A, c.heads) : RAD_NONE);
+}
+
+/* The hint of a draft head's pass. The history pass ends at the token the verify chose and each
+ * later round reads the proposal before it (RadBatch::draft_pass), so the pass's newest token per
+ * sequence is one the next verify step runs. hint_ids() hashes it first in the pass, so the ids
+ * are in host memory as the pass starts; hint_fetch() goes last, where the host has issued the
+ * whole pass and only waits for that one kernel, and the rows it reads arrive while the card
+ * drafts. A history pass that drafts nothing gets neither. */
+inline void PleLayer::hint_ids(RadCtx* c_, const RadBatch* batch) const {
+    if (!hints(batch)) return;
+    const int64_t T = batch->n_tok, S = batch->n_seq;
+    const RadKVGroupBatch* tk = kv_batch(batch, kv_tok);
+    const int32_t* tk_idx = tk ? tk->state_index : nullptr;
+    RAD_ISSUE_N(c_, batch->draft_pass < 0 ? op_hint_hist : op_hint_round, S,
+                praw(batch->token_ids, RAD_I32, T), praw(batch->positions, RAD_I32, T),
+                praw(batch->cu_seqlens, RAD_I32, S + 1),
+                RAD_W(w_mult), RAD_W(w_vsz), RAD_W(w_off),
+                tk_idx ? praw(tk_idx, RAD_I32, S) : RAD_NONE,
+                RAD_B(b_tail), brows(b_hint_ids, S));
+}
+
+inline void PleLayer::hint_fetch(RadCtx* c_, const RadBatch* batch) const {
+    if (!hints(batch)) return;
+    const int64_t S = batch->n_seq;
+    RAD_ISSUE_N(c_, op_hint_gather, S * c.heads,
+                brows(b_hint_ids, S), RAD_W(w_table), table_bf16 ? RAD_NONE : RAD_W(w_scale),
+                brows(b_hint_emb, S), RAD_NONE);
 }
 
 inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
@@ -577,22 +716,27 @@ inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
                 A > 0 ? brow_slice(b_ids, T, A, c.heads) : RAD_NONE);
 
     RAD_ISSUE_N(c_, op_embd,  T, brows(b_emb, T), brows(b_embd, T));
-    if (key_form == 2)
-        RAD_ISSUE_N(c_, op_key, T, brows(b_embd, T), RAD_NONE, RAD_W(w_key),
-                    RAD_W(w_key_scale), brows(b_k, T), RAD_NONE, RAD_W(w_key_ref));
-    else if (key_form == 1)
-        RAD_ISSUE_N(c_, op_key, T, brows(b_embd, T), RAD_NONE, RAD_W(w_key),
-                    RAD_W(w_key_scale), brows(b_k, T), RAD_NONE, RAD_NONE);
-    else
-        RAD_ISSUE_N(c_, op_key,   T, brows(b_embd, T), RAD_W(w_key),   brows(b_k, T));
-    if (value_form == 2)
-        RAD_ISSUE_N(c_, op_value, T, brows(b_embd, T), RAD_NONE, RAD_W(w_value),
-                    RAD_W(w_value_scale), brows(b_v, T), RAD_NONE, RAD_W(w_value_ref));
-    else if (value_form == 1)
-        RAD_ISSUE_N(c_, op_value, T, brows(b_embd, T), RAD_NONE, RAD_W(w_value),
-                    RAD_W(w_value_scale), brows(b_v, T), RAD_NONE, RAD_NONE);
-    else
-        RAD_ISSUE_N(c_, op_value, T, brows(b_embd, T), RAD_W(w_value), brows(b_v, T));
+    if (key_form == 0) {
+        key.step(c_, a_embd, b_k, T, 0, T);
+        value.step(c_, a_fed, b_v, T, 0, T);
+    } else {
+        if (key_form == 2)
+            RAD_ISSUE_N(c_, op_key, T, brows(b_embd, T), RAD_NONE, RAD_W(w_key),
+                        RAD_W(w_key_scale), brows(b_k, T), RAD_NONE, RAD_W(w_key_ref));
+        else if (key_form == 1)
+            RAD_ISSUE_N(c_, op_key, T, brows(b_embd, T), RAD_NONE, RAD_W(w_key),
+                        RAD_W(w_key_scale), brows(b_k, T), RAD_NONE, RAD_NONE);
+        else
+            RAD_ISSUE_N(c_, op_key,   T, brows(b_embd, T), RAD_W(w_key),   brows(b_k, T));
+        if (value_form == 2)
+            RAD_ISSUE_N(c_, op_value, T, brows(b_embd, T), RAD_NONE, RAD_W(w_value),
+                        RAD_W(w_value_scale), brows(b_v, T), RAD_NONE, RAD_W(w_value_ref));
+        else if (value_form == 1)
+            RAD_ISSUE_N(c_, op_value, T, brows(b_embd, T), RAD_NONE, RAD_W(w_value),
+                        RAD_W(w_value_scale), brows(b_v, T), RAD_NONE, RAD_NONE);
+        else
+            RAD_ISSUE_N(c_, op_value, T, brows(b_embd, T), RAD_W(w_value), brows(b_v, T));
+    }
 
     RAD_ISSUE_N(c_, op_gate, T,
                 brows(b_k, T), brows(w.h, T), brows(b_v, T),
@@ -607,7 +751,21 @@ inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
                     praw(batch->ctx_lens, RAD_I32, D),
                     praw(batch->num_accepted, RAD_I32, D),
                     brows(b_out, DT));
-    if (P > 0)
+    const int64_t ck = batch->ckpt_cut;
+    if (P == 1 && D == 0 && ck > 0 && ck < T && batch->ckpt_cu) {
+        /* A checkpoint inside the step: the window over the rows before it, its snapshot, then
+         * the rest (as ids()). */
+        for (int64_t p = 0; p < 2; ++p) {
+            RAD_ISSUE_N(c_, op_conv, p == 0 ? ck : T - ck,
+                        brows(b_gvn, T), RAD_W(w_conv), kv_cache(kv_conv, layer_),
+                        praw(batch->ckpt_cu + p, RAD_I32, 2), brows(b_gv, T),
+                        praw(cv_idx, RAD_I32, 1),
+                        praw(p == 0 ? batch->ctx_lens : batch->positions + ck, RAD_I32, 1),
+                        RAD_NONE,
+                        brows(b_out, T));
+            if (p == 0) rad_ckpt_snap(c_, kv_conv, layer_);
+        }
+    } else if (P > 0)
         RAD_ISSUE_N(c_, op_conv, T,
                     brows(b_gvn, T), RAD_W(w_conv), kv_cache(kv_conv, layer_),
                     praw(batch->cu_seqlens + D, RAD_I32, P + 1), brows(b_gv, T),

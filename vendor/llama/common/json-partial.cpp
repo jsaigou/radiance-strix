@@ -2,12 +2,12 @@
 
 #include "log.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <string>
 #include <regex>
 
-using json = nlohmann::ordered_json;
+using json = rad::Json;
 
 enum common_json_stack_element_type {
     COMMON_JSON_STACK_ELEMENT_OBJECT,
@@ -36,84 +36,164 @@ bool common_json_parse(
     const std::string & healing_marker,
     common_json & out)
 {
-    // // https://json.nlohmann.me/features/parsing/sax_interface/
-    struct json_error_locator : public nlohmann::json_sax<json> {
-        std::size_t position;
-        bool found_error;
-        std::string last_token;
-        std::string exception_message;
+    // What the healing below needs from a failed parse: where it stopped and which
+    // containers (and object key) were still open there. This was a SAX walk
+    // before the DOM swap; a small scanner over the (usually truncated) input produces the
+    // same stack and cut point. It only ever runs on text json::parse has already refused,
+    // and every healing candidate is re-parsed before it is believed, so the scanner tracks
+    // structure, not validity in the small (number and literal spellings are consumed, not
+    // checked).
+    struct json_error_locator {
+        std::size_t position = 0;
+        bool found_error = false;
         std::vector<common_json_stack_element> stack;
 
-        json_error_locator() : position(0), found_error(false) {}
-
-        bool parse_error(std::size_t position, const std::string & last_token, const json::exception & ex) override { // NOLINT
-            this->position = position - 1;
-            this->found_error = true;
-            this->last_token = last_token;
-            this->exception_message = ex.what();
-            return false;
-        }
         void close_value() {
             if (!stack.empty() && (stack.back().type == COMMON_JSON_STACK_ELEMENT_KEY)) {
                 stack.pop_back();
             }
         }
-        bool null() override { // NOLINT
-            close_value();
-            return true;
-        }
-        bool boolean(bool) override { // NOLINT
-            close_value();
-            return true;
-        }
-        bool number_integer(number_integer_t) override { // NOLINT
-            close_value();
-            return true;
-        }
-        bool number_unsigned(number_unsigned_t) override { // NOLINT
-            close_value();
-            return true;
-        }
-        bool number_float(number_float_t, const string_t &) override { // NOLINT
-            close_value();
-            return true;
-        }
-        bool string(string_t &) override { // NOLINT
-            close_value();
-            return true;
-        }
-        bool binary(binary_t &) override { // NOLINT
-            close_value();
-            return true;
-        }
-        bool start_object(std::size_t) override { // NOLINT
-            stack.push_back({COMMON_JSON_STACK_ELEMENT_OBJECT, ""});
-            return true;
-        }
-        bool end_object() override {
-            GGML_ASSERT(!stack.empty() && stack.back().type == COMMON_JSON_STACK_ELEMENT_OBJECT);
-            stack.pop_back();
-            close_value();
-            return true;
-        }
-        bool key(string_t & key) override { // NOLINT
-            stack.push_back({COMMON_JSON_STACK_ELEMENT_KEY, key});
-            return true;
-        }
-        bool start_array(std::size_t) override { // NOLINT
-            stack.push_back({COMMON_JSON_STACK_ELEMENT_ARRAY, ""});
-            return true;
-        }
-        bool end_array() override {
-            GGML_ASSERT(!stack.empty() && stack.back().type == COMMON_JSON_STACK_ELEMENT_ARRAY);
-            stack.pop_back();
-            close_value();
-            return true;
-        }
     };
     json_error_locator err_loc;
     auto start = it;
-    json::sax_parse(it, end, &err_loc);
+    {
+        const std::string text(it, end);
+        const char * s = text.data();
+        const size_t n = text.size();
+        size_t i = 0;
+        struct scan_stop {};
+        auto fail = [&](size_t at) {
+            err_loc.found_error = true;
+            err_loc.position = at;
+            throw scan_stop{};
+        };
+        std::function<void()> skip_ws = [&]() {
+            while (i < n && (s[i] == ' ' || s[i] == '\n' || s[i] == '\r' || s[i] == '\t')) {
+                ++i;
+            }
+        };
+        std::function<bool()> scan_string = [&]() {
+            ++i;  // opening quote
+            while (true) {
+                if (i >= n) fail(n);
+                const char c = s[i];
+                if (c == '"') {
+                    ++i;
+                    return true;
+                }
+                if (c == '\\') {
+                    ++i;
+                    if (i >= n) fail(n);
+                    if (s[i] == 'u') {
+                        for (int k = 0; k < 4; ++k) {
+                            ++i;
+                            if (i >= n || !std::isxdigit((unsigned char) s[i])) fail(i >= n ? n : i);
+                        }
+                    }
+                    ++i;
+                    continue;
+                }
+                if ((unsigned char) c < 0x20) fail(i);
+                ++i;
+            }
+        };
+        std::function<void(int)> scan_value = [&](int depth) {
+            if (depth > 512) fail(i);
+            skip_ws();
+            if (i >= n) fail(n);
+            const char c = s[i];
+            if (c == '{') {
+                ++i;
+                err_loc.stack.push_back({COMMON_JSON_STACK_ELEMENT_OBJECT, ""});
+                skip_ws();
+                if (i < n && s[i] == '}') {
+                    ++i;
+                    err_loc.stack.pop_back();
+                    err_loc.close_value();
+                    return;
+                }
+                while (true) {
+                    skip_ws();
+                    if (i >= n) fail(n);
+                    if (s[i] != '"') fail(i);
+                    scan_string();
+                    err_loc.stack.push_back({COMMON_JSON_STACK_ELEMENT_KEY, ""});
+                    skip_ws();
+                    if (i >= n) fail(n);
+                    if (s[i] != ':') fail(i);
+                    ++i;
+                    scan_value(depth + 1);
+                    skip_ws();
+                    if (i >= n) fail(n);
+                    if (s[i] == ',') {
+                        ++i;
+                        continue;
+                    }
+                    if (s[i] == '}') {
+                        ++i;
+                        err_loc.stack.pop_back();
+                        err_loc.close_value();
+                        return;
+                    }
+                    fail(i);
+                }
+            }
+            if (c == '[') {
+                ++i;
+                err_loc.stack.push_back({COMMON_JSON_STACK_ELEMENT_ARRAY, ""});
+                skip_ws();
+                if (i < n && s[i] == ']') {
+                    ++i;
+                    err_loc.stack.pop_back();
+                    err_loc.close_value();
+                    return;
+                }
+                while (true) {
+                    scan_value(depth + 1);
+                    skip_ws();
+                    if (i >= n) fail(n);
+                    if (s[i] == ',') {
+                        ++i;
+                        continue;
+                    }
+                    if (s[i] == ']') {
+                        ++i;
+                        err_loc.stack.pop_back();
+                        err_loc.close_value();
+                        return;
+                    }
+                    fail(i);
+                }
+            }
+            if (c == '"') {
+                scan_string();
+                err_loc.close_value();
+                return;
+            }
+            if (c == '-' || (c >= '0' && c <= '9')) {
+                while (i < n && (std::isdigit((unsigned char) s[i]) || s[i] == '-' || s[i] == '+' ||
+                                 s[i] == '.' || s[i] == 'e' || s[i] == 'E')) {
+                    ++i;
+                }
+                err_loc.close_value();
+                return;
+            }
+            if (std::isalpha((unsigned char) c)) {
+                while (i < n && std::isalpha((unsigned char) s[i])) {
+                    ++i;
+                }
+                err_loc.close_value();
+                return;
+            }
+            fail(i);
+        };
+        try {
+            scan_value(0);
+            skip_ws();
+            if (i < n) fail(i);
+        } catch (const scan_stop &) {
+        }
+    }
 
     if (err_loc.found_error) {
         it = start;
@@ -318,7 +398,7 @@ bool common_json_parse(
         }
         return false;
     }
-    out.json = json::parse(it, end);
+    out.json = json::parse(std::string(it, end));
     it = end;
     return true;
 }

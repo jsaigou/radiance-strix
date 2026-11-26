@@ -10,7 +10,7 @@
 # DIR holds the trunk's Hessians, recorded from the bf16 checkpoint by arch/gemma4's calibration
 # tap (RADIANCE_CALIB_DIR; its files carry this container's weight names): every layer's q|k|v and
 # gate|up input whole, and attn_o's and ffn_down's as one block a rank (`.part`), which libquant
-# places on the diagonal. The corpus is the GPTQ one in docs/GEMMA4-31B-GPTQ.md: Gemma 4's tool
+# places on the diagonal. The corpus and the run are in docs/ARCHITECTURES.md (gemma4, "The 31B by GPTQ"): Gemma 4's tool
 # calls among chat, code, math and reasoning, rendered with the model's own template.
 #
 # Why: round to nearest moves the 31B's distribution where a reply is most constrained. After an
@@ -26,16 +26,16 @@ blk.*.ffn_gate_up.weight  gptq codes=i4 group=128 scale=f16 rule=search calib=$C
 
 output.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym
 
-# The drafter's seven linears: block fp8, read at fp8a8 against an E4M3 activation, as the block
-# declares them (rad_fp8.h's DenseFP8). The convolution projections, the selector and the norms
+# The drafter's seven linears: rotated int8 with a bf16 scale per row and 128 of K, read at i8a8h
+# against an int8 activation rotated the same way (rad_fp8.h's DenseFP8). The convolution projections, the selector and the norms
 # stay bf16, as the block reads them.
-dflash.fc.weight                 rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.attn_q.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.attn_k.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.attn_v.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.attn_output.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.ffn_gate_up.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.ffn_down.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.fc.weight                 rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.blk.*.attn_q.weight       rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.blk.*.attn_k.weight       rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.blk.*.attn_v.weight       rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.blk.*.attn_output.weight  rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.blk.*.ffn_gate_up.weight  rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dflash.blk.*.ffn_down.weight     rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
 
 # The draft head: the trunk's tied table under the block's own name, int8 with an f16 scale per
 # (row, 128 of K), which the block reads at w8a8 (rad_block_dflash2.h, head_i8). Not the 2-bit

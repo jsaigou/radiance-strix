@@ -22,6 +22,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -100,6 +101,8 @@ struct HostStream {
 
     uint64_t submitted = 0;            /* tasks ever pushed */
     uint64_t retired   = 0;            /* tasks ever finished executing */
+    int      sync_waiters = 0;         /* h_stream_sync calls inside cv_done.wait */
+    int      room_waiters = 0;         /* stream_push calls inside cv_room.wait */
     int      gates     = 0;            /* closed gates (rad_stream_gate) queued on this stream */
 
     std::thread worker;
@@ -117,27 +120,48 @@ int stream_push(HostStream* s, const Task& t) {
                          "(rad_gate_open) first");
         return RAD_E_STATE;
     }
+    ++s->room_waiters;
     s->cv_room.wait(lk, [s] { return s->count < s->ring.size(); });
+    --s->room_waiters;
+    /* The worker can only be asleep on cv_work when the ring was empty, so only that push pays
+     * the futex wake; its wait re-tests the predicate under the lock, so a wake it did not need
+     * (it was already running) is the only kind this can lose. */
+    const bool was_empty = s->count == 0;
     s->ring[s->tail] = t;
     s->tail = (s->tail + 1) % s->ring.size();
     ++s->count;
     ++s->submitted;
     lk.unlock();
-    s->cv_work.notify_one();
+    if (was_empty) s->cv_work.notify_one();
     return RAD_OK;
 }
 
+/* Pop the head task, with the stream lock held. Notifies are the caller's, after the unlock:
+ * cv_room is only worth a wake while a producer is asleep on it (room_waiters). Every pop
+ * wakes one while any is: a pop that only wakes on leaving a full ring loses the second of two
+ * producers behind it, when the next pop comes before the first one has pushed. */
+static Task stream_pop_locked(HostStream* s, bool* wake_room) {
+    *wake_room = s->room_waiters > 0;
+    Task t = s->ring[s->head];
+    s->head = (s->head + 1) % s->ring.size();
+    --s->count;
+    return t;
+}
+
 void stream_run(HostStream* s) {
+    Task t;
+    bool have = false;   /* t holds a task popped under the previous task's retire lock */
     for (;;) {
-        Task t;
-        {
-            std::unique_lock<std::mutex> lk(s->m);
-            s->cv_work.wait(lk, [s] { return s->count > 0; });
-            t = s->ring[s->head];
-            s->head = (s->head + 1) % s->ring.size();
-            --s->count;
+        if (!have) {
+            bool wake_room = false;
+            {
+                std::unique_lock<std::mutex> lk(s->m);
+                s->cv_work.wait(lk, [s] { return s->count > 0; });
+                t = stream_pop_locked(s, &wake_room);
+            }
+            if (wake_room) s->cv_room.notify_one();
         }
-        s->cv_room.notify_one();
+        have = false;
 
         bool done = false;
         switch (t.kind) {
@@ -191,11 +215,22 @@ void stream_run(HostStream* s) {
         /* After the event lock is released: this may be the last reference. */
         if (t.ev) event_release(t.ev);
 
+        /* Retire this task and take the next under the same lock, so a busy stream pays one lock
+         * a task instead of two. cv_done is only worth a futex wake when a sync is actually
+         * asleep on it (sync_waiters, under this lock; the wait's predicate is re-tested under
+         * the lock too, so no retire can be missed). */
+        bool notify_done = false, wake_room = false;
         {
             std::lock_guard<std::mutex> lk(s->m);
             ++s->retired;
+            notify_done = s->sync_waiters > 0;
+            if (!done && s->count > 0) {
+                t = stream_pop_locked(s, &wake_room);
+                have = true;
+            }
         }
-        s->cv_done.notify_all();
+        if (notify_done) s->cv_done.notify_all();
+        if (wake_room) s->cv_room.notify_one();
         if (done) return;
     }
 }
@@ -446,7 +481,9 @@ int h_stream_sync(RadStream st) {
     /* Waits only for work submitted before this call, as hipStreamSynchronize does; the
      * scheduler relies on sync returning while another thread keeps pushing. */
     const uint64_t target = s->submitted;
+    ++s->sync_waiters;
     s->cv_done.wait(lk, [s, target] { return s->retired >= target; });
+    --s->sync_waiters;
     return RAD_OK;
 }
 
@@ -784,8 +821,24 @@ int h_vmem_commit(void* addr, int64_t bytes) {
     return RAD_OK;
 }
 
+/* Pages are what an mmap backs, so a run is one commit and any part of it decommits alone. */
+int h_vmem_commit_units(void* addr, int64_t bytes, int64_t unit) {
+    if (unit <= 0 || bytes % unit) return RAD_E_INVAL;
+    return h_vmem_commit(addr, bytes);
+}
+
+/* Ranges backed as host memory (h_vmem_commit_host): not counted as the device's. */
+std::mutex             g_hostkind_mu;
+std::set<const char*>  g_hostkind;
+
+bool take_hostkind(const void* addr) {
+    std::lock_guard<std::mutex> lk(g_hostkind_mu);
+    return g_hostkind.erase((const char*)addr) > 0;
+}
+
 int h_vmem_decommit(void* addr, int64_t bytes) {
     if (!addr || bytes <= 0) return RAD_E_INVAL;
+    const bool host = take_hostkind(addr);
     /* MAP_FIXED rather than munmap: a hole in the reservation could be handed to an unrelated
      * mmap. */
     void* p = ::mmap(addr, (size_t)bytes, PROT_NONE,
@@ -794,7 +847,40 @@ int h_vmem_decommit(void* addr, int64_t bytes) {
         device_set_error("vmem_decommit(%p, %lld): mmap failed", addr, (long long)bytes);
         return RAD_E_INVAL;
     }
-    g_used[vmem_device_of(addr)].fetch_sub(bytes, std::memory_order_relaxed);
+    if (!host) g_used[vmem_device_of(addr)].fetch_sub(bytes, std::memory_order_relaxed);
+    return RAD_OK;
+}
+
+/* Host memory is all there is here: the same pages as a commit, not charged to the device. */
+int h_vmem_commit_host(void* addr, int64_t bytes) {
+    if (!addr || bytes <= 0) return RAD_E_INVAL;
+    void* p = ::mmap(addr, (size_t)bytes, PROT_READ | PROT_WRITE,
+                     MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p != addr) {
+        device_set_error("vmem_commit_host(%p, %lld): mmap failed", addr, (long long)bytes);
+        return RAD_E_NOMEM;
+    }
+    std::lock_guard<std::mutex> lk(g_hostkind_mu);
+    g_hostkind.insert((const char*)addr);
+    return RAD_OK;
+}
+
+/* The pages move with mremap, through a spare range, so each keeps its bytes and its kind. */
+int h_vmem_swap(void* a, void* b, int64_t bytes) {
+    if (!a || !b || bytes <= 0) return RAD_E_INVAL;
+    const size_t n = (size_t)bytes;
+    void* t = ::mmap(nullptr, n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (t == MAP_FAILED) return RAD_E_NOMEM;
+    if (::mremap(a, n, n, MREMAP_MAYMOVE | MREMAP_FIXED, t) != t ||
+        ::mremap(b, n, n, MREMAP_MAYMOVE | MREMAP_FIXED, a) != a ||
+        ::mremap(t, n, n, MREMAP_MAYMOVE | MREMAP_FIXED, b) != b) {
+        device_set_error("vmem_swap(%p, %p, %lld): mremap failed", a, b, (long long)bytes);
+        return RAD_E_INVAL;
+    }
+    std::lock_guard<std::mutex> lk(g_hostkind_mu);
+    const bool ha = g_hostkind.erase((const char*)a) > 0, hb = g_hostkind.erase((const char*)b) > 0;
+    if (hb) g_hostkind.insert((const char*)a);
+    if (ha) g_hostkind.insert((const char*)b);
     return RAD_OK;
 }
 
@@ -842,6 +928,10 @@ const DeviceBackend g_host = {
 
     h_stream_gate, h_gate_open, h_gate_room,
     nullptr,                     /* event_dma: no DMA queue */
+    nullptr,                     /* map_file */
+    nullptr,                     /* stuck_ms */
+    h_vmem_commit_host, h_vmem_swap,
+    h_vmem_commit_units,
 };
 
 }  /* namespace */

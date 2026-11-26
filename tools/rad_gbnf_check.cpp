@@ -42,7 +42,7 @@
 #include "text/token_view.h"
 #include "text/tokenizer.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <chrono>
@@ -58,7 +58,7 @@
 #include <unistd.h>
 
 using namespace rad;
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 using Clock = std::chrono::steady_clock;
 
 namespace {

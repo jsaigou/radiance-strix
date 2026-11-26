@@ -107,7 +107,7 @@ AVX_KERNEL(hc_read) {
     const RadTensor* inj = rad_arg_in(a, 6);
     const RadTensor* q = rad_arg_in(a, 7);
     const RadTensor* s = rad_arg_in(a, 8);
-    const RadTensor* rq = rad_arg_in(a, 9);     /* rotated fp8 form, for a w4a8h consumer */
+    const RadTensor* rq = rad_arg_in(a, 9);     /* rotated form, for a w4a8h consumer */
     const RadTensor* rs = rad_arg_in(a, 10);
 
     const int64_t n = p_int(a, "n", 0);
@@ -146,8 +146,9 @@ AVX_KERNEL(hc_read) {
         ngrp = (n + g - 1) / g;
         if (numel(q) < rows * n || !s || !s->data || numel(s) < rows * ngrp) return RAD_E_SHAPE;
     }
-    /* The rotated form is had_quant_act_fp8 of the stored `x`: each scale group is rotated whole,
-     * so the group must be a power of two that tiles the row. */
+    /* The rotated form is had_quant_act_fp8 of the stored `x`, or had_quant_act_i8g into an int8
+     * buffer: each scale group is rotated whole, so the group must be a power of two that tiles
+     * the row. */
     int64_t rg = 0;
     if (rq && rq->data) {
         rg = p_int(a, "group", 0);
@@ -251,7 +252,7 @@ AVX_KERNEL(hc_read) {
             }
         }
 
-        /* ---- optional fp8 form of x, taken from the stored (narrowed) value rather than the
+        /* ---- optional code form of x, taken from the stored (narrowed) value rather than the
          * accumulator, as a fused kernel must, so the two agree bit for bit. */
         if (((q && q->data) || rg) && x->dtype != RAD_F32) {
             row_from_f32(x->dtype, xv, tmp, n);
@@ -262,13 +263,14 @@ AVX_KERNEL(hc_read) {
             for (int64_t gi = 0; gi < ngrp; ++gi) {
                 const int64_t k0 = gi * g, k1 = (k0 + g < n) ? k0 + g : n;
                 float sc;
-                fp8_group(xv, qv, k0, k1, &sc);
+                fp8_group(xv, qv, k0, k1, &sc, q->dtype == RAD_I8 ? 127.0f : 448.0f);
                 stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
             }
             out_row(q, rowoff(q, r, n), n, qv);
         }
 
-        /* ---- optional rotated fp8 form of x, from the same stored values. */
+        /* ---- optional rotated form of x, from the same stored values: E4M3 codes, or int8
+         * (had_quant_act_i8g's) where the buffer is. */
         if (rg) {
             float* rv = N;     /* N and tmp are dead once the plain codes are stored. */
             float* rc = tmp;
@@ -277,7 +279,8 @@ AVX_KERNEL(hc_read) {
             const int64_t rgrp = n / rg;
             for (int64_t gi = 0; gi < rgrp; ++gi) {
                 float sc;
-                fp8_group(rv, rc, gi * rg, gi * rg + rg, &sc);
+                fp8_group(rv, rc, gi * rg, gi * rg + rg, &sc,
+                          rq->dtype == RAD_I8 ? 127.0f : 448.0f);
                 stt(rs, rowoff(rs, r, rgrp) + gi * laststride(rs), sc);
             }
             out_row(rq, rowoff(rq, r, n), n, rc);

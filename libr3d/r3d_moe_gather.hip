@@ -125,7 +125,10 @@ int r3d_rad_moe_gather(const RadArgs* a, RadStream s)
     const uint32_t ew_ld = (uint32_t)ew->stride[0];
     const uint32_t y_ld = (uint32_t)y->stride[0];
     const uint32_t T = (uint32_t)r3d_numel(sorted);
-    if (T < M * top_k) return R3D_NO(RAD_E_SHAPE);
+    /* M is the batch capacity, not the token count: the engine pads the batch, and the slot
+     * table covers only the tokens present, so it may be shorter than M * top_k (the kernel
+     * zeroes the padding rows). It may never be longer. */
+    if (T > (uint64_t)M * top_k) return R3D_NO(RAD_E_SHAPE);
 
     // The optional shared arm (operands 3 and 4, present together).
     const RadTensor* sh = r3d_opt(a, 3), *sg = r3d_opt(a, 4);

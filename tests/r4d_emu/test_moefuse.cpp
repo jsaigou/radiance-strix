@@ -8,11 +8,6 @@
  * wrapping over the waves, the sort's bound and its refusal past it. Pitch padding, guards past
  * every output and the gate's untouched rows show an overrun.
  *
- * swiglu_clamped_quant_fp8 against swiglu_clamped then quant_act_fp8 (both emulated): codes,
- * scales and the optional bf16 product, at GLM's widths and ragged ones, with values far past the
- * clamp, exactly on it and one bf16 step beyond, all-zero groups (scale 1), a gate so negative the
- * sigmoid underflows, and NaN and infinite inputs.
- *
  * moe_scatter_inv and moe_gather_inv: the small sort's kernel with the inverse against itself
  * without, and the inverse against the table the gather builds from `sorted`; then moe_gather's
  * kernel reading that inverse against its self-scan (T <= 512) or the prepass's table (above), at
@@ -370,152 +365,6 @@ void router_scatter_cases(std::mt19937& rng, int& cases, int& fails) {
     }
 }
 
-struct QuantShape {
-    int M, n;
-    float limit;
-    int mode; /* 0 random past the clamp, 1 clamp edges and zero groups, 2 NaN and inf */
-    bool y; /* the fused op also writes the bf16 product */
-};
-
-void swiglu_quant_cases(std::mt19937& rng, int& cases, int& fails) {
-    const QuantShape shapes[] = {
-        { 1, 256, 10.f, 0, false },   { 8, 256, 10.f, 0, true },  { 48, 256, 10.f, 1, false },
-        { 384, 256, 10.f, 0, false }, { 6, 1536, 10.f, 0, true }, { 3, 2048, 10.f, 1, true },
-        { 5, 132, 7.f, 1, true },     { 7, 4, 10.f, 0, true },    { 9, 256, 10.f, 2, true },
-        { 2, 260, 0.5f, 2, false },
-    };
-    std::normal_distribution<float> nd(0.f, 1.f);
-    std::uniform_int_distribution<int> ud(0, 15);
-    for (const QuantShape& sh : shapes) {
-        const int M = sh.M, n = sh.n, nkb = (n + 127) / 128;
-        const int gp = 2 * n + 6, yp = n + 5, qp = n + 8, sp = nkb + 3;
-        std::vector<uint16_t> gu((size_t)M * gp, f2b(-3.f));
-        const uint16_t lim = f2b(sh.limit), past = (uint16_t)(lim + 1);
-        for (int r = 0; r < M; ++r)
-            for (int c = 0; c < 2 * n; ++c) {
-                float v = nd(rng) * 6.f;
-                uint16_t h = f2b(v);
-                if (sh.mode == 1) {
-                    const int pick = ud(rng);
-                    if (pick == 0)
-                        h = lim;
-                    else if (pick == 1)
-                        h = past;
-                    else if (pick == 2)
-                        h = (uint16_t)(lim | 0x8000u);
-                    else if (pick == 3)
-                        h = (uint16_t)(past | 0x8000u);
-                    else if (pick == 4)
-                        h = f2b(-200.f);
-                    /* rows divisible by 3 hold an all-zero first group */
-                    if (r % 3 == 0 && (c % n) < 128) h = (c < n && (c & 1)) ? f2b(-0.f) : 0;
-                } else if (sh.mode == 2) {
-                    const int pick = ud(rng);
-                    if (pick == 0)
-                        h = 0x7fc0; /* NaN */
-                    else if (pick == 1)
-                        h = 0x7f80; /* +inf */
-                    else if (pick == 2)
-                        h = 0xff80; /* -inf */
-                }
-                gu[(size_t)r * gp + c] = h;
-            }
-        RadTensor t[4]{};
-        t[0].data = gu.data();
-        t[0].dtype = RAD_BF16;
-        t[0].rank = 2;
-        t[0].shape[0] = M;
-        t[0].shape[1] = 2 * n;
-        t[0].stride[0] = gp;
-        t[0].stride[1] = 1;
-        auto mat = [](RadTensor& x, uint32_t dt, int r, int c, int pitch) {
-            x.dtype = dt;
-            x.rank = 2;
-            x.shape[0] = r;
-            x.shape[1] = c;
-            x.stride[0] = pitch;
-            x.stride[1] = 1;
-        };
-        RadParam pc[4]{};
-        pc[0] = { "M", RAD_P_INT, M };
-        pc[1] = { "n", RAD_P_INT, n };
-        pc[2].key = "limit";
-        pc[2].kind = RAD_P_F64;
-        pc[2].dval = sh.limit;
-        pc[3].key = "dtype";
-        pc[3].kind = RAD_P_STR;
-        pc[3].sval = "bf16";
-        RadParam pq[4]{};
-        pq[0] = { "M", RAD_P_INT, M };
-        pq[1] = { "n", RAD_P_INT, n };
-        pq[2] = { "group", RAD_P_INT, 128 };
-        pq[3].key = "dtype";
-        pq[3].kind = RAD_P_STR;
-        pq[3].sval = "bf16";
-        RadParam pf[5]{};
-        pf[0] = pc[0];
-        pf[1] = pc[1];
-        pf[2] = pc[2];
-        pf[3] = pq[2];
-        pf[4] = pc[3];
-
-        std::vector<uint16_t> y_ref((size_t)M * yp, 0x7e57), y((size_t)M * yp, 0x7e57);
-        std::vector<uint8_t> q_ref((size_t)M * qp, 0xa5), q((size_t)M * qp, 0xa5);
-        std::vector<float> s_ref((size_t)M * sp, -7.25f), s((size_t)M * sp, -7.25f);
-        RadTensor tc[2] = { t[0], {} };
-        mat(tc[1], RAD_BF16, M, n, yp);
-        tc[1].data = y_ref.data();
-        RadArgs ac{};
-        ac.t = tc;
-        ac.n_t = 2;
-        ac.p = pc;
-        ac.n_p = 4;
-        RadTensor tq[3] = { tc[1], {}, {} };
-        mat(tq[1], RAD_F8E4M3, M, n, qp);
-        tq[1].data = q_ref.data();
-        mat(tq[2], RAD_F32, M, nkb, sp);
-        tq[2].data = s_ref.data();
-        RadArgs aq{};
-        aq.t = tq;
-        aq.n_t = 3;
-        aq.p = pq;
-        aq.n_p = 4;
-        ++cases;
-        if (r4d_rad_swiglu_clamped(&ac, nullptr) != RAD_OK ||
-            r4d_rad_quant_act_fp8(&aq, nullptr) != RAD_OK) {
-            std::printf("FAIL swiglu_clamped + quant_act_fp8 launch M=%d n=%d\n", M, n);
-            ++fails;
-            continue;
-        }
-        RadTensor tf[4] = { t[0], {}, {}, {} };
-        mat(tf[1], RAD_F8E4M3, M, n, qp);
-        tf[1].data = q.data();
-        mat(tf[2], RAD_F32, M, nkb, sp);
-        tf[2].data = s.data();
-        mat(tf[3], RAD_BF16, M, n, yp);
-        tf[3].data = sh.y ? y.data() : nullptr;
-        RadArgs af{};
-        af.t = tf;
-        af.n_t = 4;
-        af.p = pf;
-        af.n_p = 5;
-        const int rc = r4d_rad_swiglu_clamped_quant_fp8(&af, nullptr);
-        int bad = 0;
-        bad += q != q_ref;
-        bad += std::memcmp(s.data(), s_ref.data(), s.size() * 4) != 0;
-        if (sh.y)
-            bad += y != y_ref;
-        else
-            for (uint16_t v : y) bad += v != 0x7e57;
-        if (rc != RAD_OK || bad) {
-            std::printf("FAIL swiglu_clamped_quant_fp8 at M=%d n=%d limit %g mode %d%s (rc %d, %d "
-                        "mismatching outputs)\n",
-                        M, n, (double)sh.limit, sh.mode, sh.y ? " with bf16" : "", rc, bad);
-            ++fails;
-        }
-    }
-}
-
 struct GatherShape {
     int M, n, nl, base;
     bool f32w; /* GLM's f32 routing weights, else bf16 */
@@ -607,7 +456,6 @@ int main() {
     std::mt19937 rng(23);
     int fails = 0, cases = 0;
     router_scatter_cases(rng, cases, fails);
-    swiglu_quant_cases(rng, cases, fails);
     gather_inverse_cases(rng, cases, fails);
     std::printf("%d case(s), %d failure(s)\n", cases, fails);
     return fails ? 1 : 0;

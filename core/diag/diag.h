@@ -126,6 +126,22 @@ struct Facts {
  * process reads them only for its own cards. Null reads them for every card. */
 Facts collect(const std::string& root, const std::vector<std::string>* managed = nullptr);
 
+/* A CARD'S STATE AT ONE MOMENT, for --diagnose to read before and after each run: a run that
+ * starts hotter, or under a different performance level, than the one it is compared with is
+ * measuring a different card. Read under the same root as collect(); unreadable fields stay unknown.
+ * The power-management files are answered by the SMU under its lock, so this is read between
+ * runs, never during one. */
+struct CardSample {
+    std::string bdf;
+    int64_t     edge_mc = -1, junction_mc = -1, mem_mc = -1;   /* hwmon temperatures, millidegrees C */
+    int64_t     power_uw = -1;      /* power1_average, else power1_input */
+    std::string perf_level;         /* power_dpm_force_performance_level: auto, high, profile_peak, ... */
+    std::string sclk_cur, mclk_cur; /* the DPM level marked current, as the driver lists it */
+    int         busy_percent = -1;
+};
+
+std::vector<CardSample> sample_cards(const std::string& root, const std::vector<std::string>& bdfs);
+
 /* Fills what only a system call answers for the live process: the memlock limit and whether
  * io_uring is allowed (a container's seccomp profile may refuse it). */
 void probe_process(HostFacts* h);

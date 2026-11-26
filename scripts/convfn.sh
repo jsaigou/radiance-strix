@@ -12,10 +12,6 @@
 # (docs/MOE-W4.md, "Calibration"). Grams from another checkpoint do not transfer, and a layer with
 # no file is packed without error feedback.
 #
-# A recipe that does not name $CALIB (e.g. RECIPE=data/recipes/qwen4exp-w4.recipe) rounds experts
-# to nearest with absmax scales; setting CALIB=<dir> then applies int4 GPTQ through the --quant
-# rule that recipe's header names, which takes precedence over the recipe's own rule.
-#
 # OUT is removed before conversion starts, so it defaults to a .new.rad beside the served
 # container.
 #

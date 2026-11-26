@@ -26,7 +26,7 @@
 #include <arch/rad_arch.h>
 #include <arch/rad_fp8.h>
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <cmath>
 #include <cstdio>
@@ -46,7 +46,7 @@
 
 using namespace rad;
 namespace AR = rad::arch;
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 
 namespace {
 
@@ -873,12 +873,42 @@ TEST(weight_targeted_reads_only_what_exists_at_the_moment) {
     const rad_weight w = rad_decl_weight(&b, "blk.0.attn_q.weight", &d);
     REQUIRE(w != 0);
     CHECK(!lora::weight_targeted(b.program(), w, t));        /* no name map yet */
+    CHECK(lora::source_targeted(b.program(), t, "model.layers.0.self_attn.q_proj.weight"));
+    b.set_lora_targets(&t);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.layers.0.self_attn.q_proj.weight"), 1);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.layers.0.self_attn.k_proj.weight"), 0);
+    CHECK_EQ(rad_lora_source_targeted(&b, "mtp.layers.0.self_attn.q_proj.weight"), 0);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.visual.q_proj.weight"), 0);
+    const lora::TargetSet head{ "embed_tokens", "lm_head" };
+    b.set_lora_targets(&head);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.embed_tokens.weight"), 0);
+    CHECK_EQ(rad_lora_source_targeted(&b, "lm_head.weight"), 0);
+    b.set_lora_targets(&t);
+    CHECK_EQ(rad_lora_source_targeted(&b, nullptr), 0);
+    b.set_lora_targets(nullptr);
+    CHECK_EQ(rad_lora_source_targeted(&b, "model.layers.0.self_attn.q_proj.weight"), 0);
     REQUIRE_EQ(AR::map_copy(&b, "blk.0.attn_q.weight", "model.layers.0.self_attn.q_proj.weight"), RAD_OK);
     CHECK(lora::weight_targeted(b.program(), w, t));
     CHECK(!lora::weight_targeted(b.program(), w, { "k_proj" }));
     CHECK(!lora::weight_targeted(b.program(), w, {}));
     CHECK(!lora::weight_targeted(b.program(), 0, t));
     CHECK(!lora::weight_targeted(b.program(), 999, t));
+}
+
+TEST(lora_source_targeted_on_a_generator_is_the_declared_root) {
+    const RadModelMeta meta = llama_meta();
+    const RadBuildCtx ctx = ctx_for(0, 1);
+    Builder b(empty_registry(), meta, ctx);
+    const lora::TargetSet star{ "*" };
+    b.set_lora_targets(&star);
+    CHECK_EQ(rad_lora_source_targeted(&b, "diffusion_model.blocks.0.attn.q.weight"), 0);
+    REQUIRE_EQ(rad_lora_root(&b, "diffusion_model", "-"), RAD_OK);
+    CHECK_EQ(rad_lora_source_targeted(&b, "diffusion_model.blocks.0.attn.q.weight"), 1);
+    CHECK_EQ(rad_lora_source_targeted(&b, "text_encoder.blocks.0.attn.q.weight"), 0);
+    const lora::TargetSet q{ "q" };
+    b.set_lora_targets(&q);
+    CHECK_EQ(rad_lora_source_targeted(&b, "diffusion_model.blocks.0.attn.q.weight"), 1);
+    CHECK_EQ(rad_lora_source_targeted(&b, "diffusion_model.blocks.0.attn.k.weight"), 0);
 }
 
 TEST(scopes_that_are_never_targets) {
@@ -1006,7 +1036,8 @@ TEST(a_transformed_or_rotated_weight_is_not_a_site) {
     const rad_weight wu = decl("blk.0.ffn_up.weight", "model.layers.0.mlp.up_proj.weight");
     REQUIRE(wq && wk && wv && wo && wu);
     REQUIRE(b.program().weights[wq].enc_known);
-    push_op(b, gemm_op("gemm_nt", 128, 256, "bf16", 1, 64, { wq }, { 1 }, false));
+    /* A quantised GEMM over the transformed weight: fed the rotated codes of its activation. */
+    push_op(b, gemm_op("gemm_nt_q", 128, 256, "mxfp4a8", 1, 64, { wq, wq }, { 2, 3 }, true));
     OpInfo parts = gemm_op("gemm_nt_q", 128, 256, "mxfp4a8", 1, 64, { wk, wk }, { 2, 3 }, true);
     parts.base.set_i("pb1", 64);
     push_op(b, parts);
@@ -1035,6 +1066,37 @@ TEST(a_transformed_or_rotated_weight_is_not_a_site) {
 /* Adapters serve the token steps of a model that writes logits, or a generator that names its
  * adapter keys: declare refuses a generator that names none, an embedding model and a program with
  * no logits by name, and lets a text model through. */
+/* A plain fp GEMM over a transform-basis weight is a site: it is fed plain activations, and the
+ * kernel library that serves it presents the weight in the plain basis at load (a plain row
+ * without such a relayout refuses the encoding at declare). */
+TEST(a_plain_gemm_over_a_transformed_weight_is_a_site) {
+    const RadModelMeta meta = llama_meta();
+    const RadBuildCtx ctx = ctx_for(0, 1);
+    Builder b(empty_registry(), meta, ctx);
+    b.set_sources([](const std::string& name, const Program&, WeightSource* out) {
+        if (name != "blk.0.attn_q.weight") return (int)RAD_E_NOTFOUND;
+        out->enc = rad_enc_plain(RAD_BF16);
+        rad_enc_copy_str(out->enc.transform, "fwht128");
+        out->rank = 2; out->shape[0] = 128; out->shape[1] = 256;
+        return (int)RAD_OK;
+    });
+    AR::map_copy(&b, "blk.0.attn_q.weight", "model.layers.0.self_attn.q_proj.weight");
+    RadWeightDecl d{};
+    d.dtype = RAD_BF16; d.rank = 2; d.shape[0] = 128; d.shape[1] = 256;
+    d.access = RAD_ACCESS_PER_TOKEN; d.shard = RAD_SHARD_NONE; d.group = AR::grp_layer(0);
+    const rad_weight wq = rad_decl_weight(&b, "blk.0.attn_q.weight", &d);
+    REQUIRE(wq);
+    REQUIRE(b.program().weights[wq].enc_known);
+    push_op(b, gemm_op("gemm_nt", 128, 256, "bf16", 1, 64, { wq }, { 1 }, false));
+    const lora::TargetSet t{ "q_proj" };
+    std::vector<lora::UnsupportedUse> un;
+    CHECK_EQ(lora::find_unsupported_uses(b.program(), t, &un), 0);
+    std::vector<lora::Site> s;
+    std::string err;
+    REQUIRE_EQ(lora::build_sites(b.program(), t, 16, &s, &err), RAD_OK);
+    CHECK_EQ(s.size(), (size_t)1);
+}
+
 TEST(declare_refuses_a_model_that_does_not_generate_text) {
     const RadModelMeta meta = llama_meta();
     const RadBuildCtx ctx = ctx_for(0, 1);
@@ -1429,6 +1491,35 @@ TEST(a_slot_is_never_reloaded_under_a_live_hold) {
 TEST(nothing_here_touches_a_device) {
     /* A guard on the guard: the Registry these programs were declared against has no plugin. */
     CHECK_EQ(empty_registry().plugins().size(), (size_t)0);
+}
+
+
+TEST(a_matching_published_combination_wins_over_a_full_slot_table) {
+    std::atomic<uint64_t> epoch{0};
+    lora::SlotTable table;
+    table.reset(1, &epoch);
+    int32_t slot = -1;
+    uint64_t uid = 0;
+    std::shared_ptr<void> request;
+    bool all_held = true;
+    CHECK_EQ(table.acquire("same", &slot, &uid, &request, &all_held), RAD_E_NOTFOUND);
+    CHECK(!all_held);
+    // Another request publishes after the first cache miss. A single atomic lookup must
+    // acquire that exact combination, even though it occupies the only slot and is held.
+    int reserved = -1;
+    bool cooling = false;
+    std::string why;
+    REQUIRE_EQ(table.reserve("same", &reserved, &cooling, &why), RAD_OK);
+    const uint64_t published = table.publish(reserved, "same", "");
+    std::shared_ptr<void> other;
+    REQUIRE_EQ(table.acquire("same", &slot, &uid, &other), RAD_OK);
+    REQUIRE_EQ(table.acquire("same", &slot, &uid, &request, &all_held), RAD_OK);
+    CHECK(!all_held);
+    CHECK_EQ(uid, published);
+    CHECK_EQ(slot, reserved);
+    std::shared_ptr<void> missing;
+    CHECK_EQ(table.acquire("different", &slot, &uid, &missing, &all_held), RAD_E_NOTFOUND);
+    CHECK(all_held);
 }
 
 RAD_TEST_MAIN()

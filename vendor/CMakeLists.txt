@@ -29,6 +29,10 @@ add_library(rad_vendor_llama STATIC
   llama/common/regex-partial.cpp
   shim/llama_shim.cpp)
 target_compile_options(rad_vendor_llama PRIVATE -w)
+# The chat lift's JSON DOM is ours (core/util/json.h) since the DOM swap; its
+# translation units include it by that path and link the same small library core does.
+target_include_directories(rad_vendor_llama PRIVATE ${CMAKE_SOURCE_DIR}/core)
+target_link_libraries(rad_vendor_llama PUBLIC rad_json)
 # SYSTEM, so vendored headers included by our sources do not warn either (`-w` covers only the
 # vendor's own translation units).
 target_include_directories(rad_vendor_llama SYSTEM PUBLIC
@@ -62,12 +66,27 @@ target_compile_definitions(rad_vendor_httplib PUBLIC
   # hundred milliseconds a message; a larger message closes the connection.
   CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH=2097152)
 
+# rapidyaml 0.16.0 ships as one amalgamated header; shim/ryml_impl.cpp compiles its implementation
+# once. The include directory is SYSTEM so the header does not warn in our translation units. The
+# YAML configuration reader (core/fleet/config.cpp) is its only user.
+add_library(rad_vendor_ryml STATIC shim/ryml_impl.cpp)
+target_compile_options(rad_vendor_ryml PRIVATE -w)
+target_include_directories(rad_vendor_ryml SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/rapidyaml)
+
+# yyjson: the reader inside the tree's JSON DOM (core/util/json.cpp converts its tree into
+# rad::Json, the DOM everything downstream consumes). One C file; the header rides on
+# rad_vendor_yyjson's include path (<yyjson/yyjson.h>).
+add_library(rad_vendor_yyjson STATIC yyjson/yyjson.c)
+target_compile_options(rad_vendor_yyjson PRIVATE -w)
+target_include_directories(rad_vendor_yyjson SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
 # ---------------------------------------------------------------- the public face
 # Header-only vendors need only a path:
-#   <nlohmann/json.hpp>          vendor/nlohmann/json.hpp
 #   <cpp-httplib/httplib.h>      vendor/cpp-httplib/httplib.h   (or plain "httplib.h")
 #   "llama/src/unicode.h"        the tokeniser's codepoint tables
 #   "llama/common/jinja/*.h"     the jinja engine
+#   <ryml.hpp>                   vendor/rapidyaml/ryml.hpp
 add_library(rad_vendor INTERFACE)
 target_include_directories(rad_vendor INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(rad_vendor INTERFACE rad_vendor_llama rad_vendor_httplib)
+target_link_libraries(rad_vendor INTERFACE rad_vendor_llama rad_vendor_httplib rad_vendor_ryml
+                      rad_vendor_yyjson)

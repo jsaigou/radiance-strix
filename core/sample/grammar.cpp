@@ -4,10 +4,12 @@
 #include "gbnf.h"
 
 #include <json-schema-to-grammar.h>
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <exception>
+#include <map>
+#include <mutex>
 #include <new>
 
 namespace rad {
@@ -21,8 +23,8 @@ int64_t grammar_mask_words(int64_t n_vocab) { return bitmask_words(n_vocab); }
 static constexpr size_t kMaxSchemaDepth = 512;
 
 /* Iterative, because the values it must catch are too deep to recurse over. */
-static size_t json_depth(const nlohmann::ordered_json& root) {
-    std::vector<std::pair<const nlohmann::ordered_json*, size_t>> todo{ { &root, 1 } };
+static size_t json_depth(const Json& root) {
+    std::vector<std::pair<const Json*, size_t>> todo{ { &root, 1 } };
     size_t deepest = 0;
     while (!todo.empty()) {
         const auto [j, d] = todo.back();
@@ -33,6 +35,57 @@ static size_t json_depth(const nlohmann::ordered_json& root) {
     }
     return deepest;
 }
+
+namespace {
+
+/* Converted grammars by schema text. A client resends its schema on every request, and
+ * conversion is the expensive half of what the compiled-program cache downstream cannot
+ * save (it keys on grammar text). Capped like that cache because keys come from clients;
+ * only successful conversions are kept, and conversion runs outside the lock. */
+struct SchemaCache {
+    struct Entry {
+        std::string gbnf;
+        uint64_t    used = 0;
+    };
+    std::mutex                       mu;
+    std::map<std::string, Entry>     by_schema;
+    uint64_t                         clock = 0;
+    static constexpr size_t kMaxEntries = 32;
+    static constexpr size_t kMaxBytes   = 64ull << 20;  /* schema text plus grammar text */
+
+    bool find(const std::string& schema, std::string* out) {
+        std::lock_guard<std::mutex> lk(mu);
+        const auto it = by_schema.find(schema);
+        if (it == by_schema.end()) return false;
+        it->second.used = ++clock;
+        *out = it->second.gbnf;
+        return true;
+    }
+    void put(const std::string& schema, const std::string& gbnf) {
+        std::lock_guard<std::mutex> lk(mu);
+        by_schema[schema] = Entry{ gbnf, ++clock };
+        for (;;) {
+            size_t bytes = 0;
+            auto   victim = by_schema.end();
+            for (auto it = by_schema.begin(); it != by_schema.end(); ++it) {
+                bytes += it->first.size() + it->second.gbnf.size();
+                if (victim == by_schema.end() || it->second.used < victim->second.used)
+                    victim = it;
+            }
+            if ((by_schema.size() <= kMaxEntries && bytes <= kMaxBytes) ||
+                by_schema.size() <= 1)
+                break;
+            by_schema.erase(victim);
+        }
+    }
+};
+
+SchemaCache& schema_cache() {
+    static SchemaCache c;
+    return c;
+}
+
+}  /* namespace */
 
 /* Uses the vendored converter, the only JSON Schema compiler in the tree; its hardening for
  * client data is in vendor/patches 0003 and 0004. Client schemas reach it from /v1/completions
@@ -48,8 +101,27 @@ int grammar_from_json_schema(const std::string& schema_json, const std::string& 
         if (err) *err = "this converter always names the top rule 'root'";
         return RAD_E_UNSUPPORTED;
     }
+    if (schema_cache().find(schema_json, out_gbnf)) return RAD_OK;
     try {
-        const auto schema = nlohmann::ordered_json::parse(schema_json);
+        /* A bounded read: this entry point takes any text, whether or not its caller parsed
+         * it under bounds before. The depth bound fires during the read, before a nested tree
+         * exists to be dumped or destroyed, either of which recurses once per level. */
+        bool over = false, deep = false;
+        const auto schema = Json::parse_bounded(schema_json, 1 << 20, (int)kMaxSchemaDepth,
+                                                &over, &deep);
+        if (deep) {
+            if (err) *err = "the schema nests more than " + std::to_string(kMaxSchemaDepth) +
+                            " levels deep";
+            return RAD_E_INVAL;
+        }
+        if (over) {
+            if (err) *err = "the schema carries more than 2^20 values";
+            return RAD_E_INVAL;
+        }
+        if (schema.is_discarded()) {
+            if (err) *err = "the schema is not valid JSON";
+            return RAD_E_INVAL;
+        }
         if (json_depth(schema) > kMaxSchemaDepth) {
             if (err) *err = "the schema nests more than " + std::to_string(kMaxSchemaDepth) +
                             " levels deep";
@@ -64,6 +136,7 @@ int grammar_from_json_schema(const std::string& schema_json, const std::string& 
         if (err) *err = "the schema compiled to an empty grammar";
         return RAD_E_INVAL;
     }
+    schema_cache().put(schema_json, *out_gbnf);
     return RAD_OK;
 }
 

@@ -86,7 +86,7 @@ struct Model {
     Gemma4Audio aud;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* The layer schedule, read rather than derived: layer_types states which layers attend to the
  * whole input, and an assumed pattern would silently be wrong for a sibling checkpoint that
@@ -123,7 +123,8 @@ static int read_schedule(const RadModelMeta* meta, int64_t n_layer, std::vector<
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
     /* A 270M encoder fits easily on one card; tensor parallelism would only add an all-reduce per
      * layer, so it is not offered. */
     if (ctx->world_size > 1) {
@@ -132,7 +133,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_UNSUPPORTED;
     }
 
-    Model& m = g_model[ctx->rank];
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(geom_from(m.g, meta, ctx, "bf16", RAD_BF16));
@@ -417,7 +418,7 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    const Model& m = g_model[rad_rank(c)];
+    const Model& m = g_model[rad_slot(c)];
     const Geom& g = m.g;
     const int64_t T = batch->n_tok, S = batch->n_seq, E = g.n_embd;
     if (batch->enc) {
@@ -480,6 +481,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
 }  /* namespace embgemma2 */
 
 #ifndef RAD_ARCH_NO_EXPORTS
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 RAD_ARCH_PLUGIN(embgemma2, "embeddinggemma2", "", "0.1.0",
                 "EmbeddingGemma 2: a bidirectional Gemma encoder with per-layer embeddings, "
                 "mean-pooled to one vector an input; bf16")

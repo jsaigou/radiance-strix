@@ -137,7 +137,7 @@ inline int AttnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, r
 
     /* Declared before kv_store, which reads back the resolved `block_size` (rad_block_attn_gated.h
      * explains declare vs issue order). */
-    op_attn = rw(b, decl_attn(b, g, "attn_paged",
+    op_attn = rw(b, rad_decl_op(b, "attn_paged",
                      RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
                                 RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
                                 RAD_INT("window", 0), RAD_INT("n_head", g.n_head),
@@ -156,8 +156,9 @@ inline int AttnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, r
                      {w.qkv}, {});
 
     /* The out-projection's input quantiser; a plain `quant_act_fp8`, as there is no gate pass to
-     * fold it into. */
-    RAD_ARCH_TRY(q_attn.declare(b, g, w.attn, q_dim));
+     * fold it into. Declared where the activation carries a code pair its producer writes: an int8
+     * trunk that leaves each linear to quantise its own input declares none (nemotronh). */
+    if (w.attn.cq()) RAD_ARCH_TRY(q_attn.declare(b, g, w.attn, q_dim));
     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
                            RAD_SHARD_COL, grp_layer(l), { src.o }, w.attn, w.h.x));
 

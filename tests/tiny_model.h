@@ -24,7 +24,9 @@
 #include "rad_plugin.h"
 #include "rad_test.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
+
+using Json = rad::Json;
 
 #include <algorithm>
 #include <cerrno>
@@ -136,7 +138,7 @@ inline Tensor linear(const std::string& name, int64_t n_out, int64_t n_in, Rng& 
 
 /* One safetensors file holding `ts` in order, with the header padded to 8 bytes. */
 inline bool write_safetensors(const std::string& path, const std::vector<Tensor>& ts) {
-    nlohmann::ordered_json h = nlohmann::ordered_json::object();
+    Json h = Json::object();
     uint64_t off = 0;
     for (const Tensor& t : ts) {
         h[t.name] = { { "dtype", t.dtype }, { "shape", t.shape },
@@ -163,7 +165,7 @@ inline std::vector<Tensor> read_safetensors(const std::string& path) {
     uint64_t n = 0;
     std::memcpy(&n, raw.data(), 8);
     if (8 + n > raw.size()) return ts;
-    const auto h = nlohmann::ordered_json::parse(raw.substr(8, n), nullptr, false);
+    const auto h = Json::parse(raw.substr(8, n), nullptr, false);
     if (!h.is_object()) return ts;
     for (auto it = h.begin(); it != h.end(); ++it) {
         if (it.key() == "__metadata__") continue;
@@ -205,18 +207,18 @@ enum : int32_t { kEndOfText = 256, kImStart = 257, kImEnd = 258, kTokenizerSize 
 /* tokenizer.json: byte-level BPE, ids 0..255 the bytes, no merges, then the specials, then
  * `extra` special tokens from kTokenizerSize on. */
 inline std::string tokenizer_json(const std::vector<std::string>& extra = {}) {
-    nlohmann::ordered_json vocab = nlohmann::ordered_json::object();
+    Json vocab = Json::object();
     for (int b = 0; b < 256; ++b) vocab[byte_symbol(b)] = b;
     std::vector<std::string> specials = { "<|endoftext|>", "<|im_start|>", "<|im_end|>" };
     specials.insert(specials.end(), extra.begin(), extra.end());
-    nlohmann::ordered_json added = nlohmann::ordered_json::array();
+    Json added = Json::array();
     for (int i = 0; i < (int)specials.size(); ++i) {
         vocab[specials[(size_t)i]] = 256 + i;
         added.push_back({ { "id", 256 + i }, { "content", specials[(size_t)i] },
                           { "single_word", false }, { "lstrip", false }, { "rstrip", false },
                           { "normalized", false }, { "special", true } });
     }
-    nlohmann::ordered_json j;
+    Json j;
     j["version"] = "1.0";
     j["added_tokens"] = added;
     j["normalizer"] = nullptr;
@@ -227,7 +229,7 @@ inline std::string tokenizer_json(const std::vector<std::string>& extra = {}) {
                      { "trim_offsets", false }, { "use_regex", true } };
     j["model"] = { { "type", "BPE" }, { "dropout", nullptr }, { "unk_token", nullptr },
                    { "byte_fallback", false }, { "vocab", vocab },
-                   { "merges", nlohmann::ordered_json::array() } };
+                   { "merges", Json::array() } };
     return j.dump();
 }
 
@@ -239,7 +241,7 @@ inline std::vector<int32_t> byte_ids(const std::string& text) {
 }
 
 /* config.json, model.safetensors and tokenizer.json in `dir`. */
-inline bool write_checkpoint(const std::string& dir, const nlohmann::ordered_json& config,
+inline bool write_checkpoint(const std::string& dir, const Json& config,
                              const std::vector<Tensor>& ts,
                              const std::vector<std::string>& extra_specials = {}) {
     return write_text(dir + "/config.json", config.dump(2)) &&
@@ -262,10 +264,10 @@ struct Qwen35 {
 
 inline bool write_qwen35(const std::string& dir, const Qwen35& s) {
     Rng r(s.seed);
-    nlohmann::ordered_json types = nlohmann::ordered_json::array();
+    Json types = Json::array();
     for (int64_t l = 0; l < s.layers; ++l)
         types.push_back((l + 1) % s.interval == 0 ? "full_attention" : "linear_attention");
-    nlohmann::ordered_json c;
+    Json c;
     c["architectures"] = { "Qwen3_5ForConditionalGeneration" };
     c["model_type"] = "qwen3_5";
     c["vocab_size"] = s.vocab;
@@ -344,9 +346,9 @@ struct Lfm2 {
 inline bool write_lfm2(const std::string& dir, const Lfm2& s) {
     Rng r(s.seed);
     const int64_t H = s.hidden, hd = s.hidden / s.heads, kv = s.kv_heads * hd;
-    nlohmann::ordered_json types = nlohmann::ordered_json::array();
+    Json types = Json::array();
     for (int64_t l = 0; l < s.layers; ++l) types.push_back(l % 2 ? "full_attention" : "conv");
-    nlohmann::ordered_json c;
+    Json c;
     c["architectures"] = { "Lfm2ForCausalLM" };
     c["model_type"] = "lfm2";
     c["vocab_size"] = s.vocab;
@@ -396,6 +398,233 @@ inline bool write_lfm2(const std::string& dir, const Lfm2& s) {
     return write_checkpoint(dir, c, ts);
 }
 
+/* ------------------------------------------------------------------ lfm3: conv + full + sliding */
+
+/* LFM3 (`lfm3`, served by lfm3_bf16): LFM2's convolutions and attention with sandwich norms, a
+ * gate per query head, a partial rotary on the full layers and sliding-window layers at their own
+ * theta. Layers go conv, full, conv, sliding; the window is shorter than every test document and
+ * the convolution as wide as the release's. */
+struct Lfm3 {
+    int64_t layers = 4, hidden = 64, heads = 4, kv_heads = 2, ffn = 128, vocab = 320, ctx = 4096;
+    int64_t conv = 7;                           /* conv_L_cache */
+    int64_t window = 8;                         /* sliding_window */
+    float    branch = 0.2f, head = 0.5f;        /* see Gains; head is the tied table's amplitude */
+    /* With this seed the greedy continuation of the speculation test's prompt repeats itself in
+     * part, so prompt lookup drafts and the model rejects some of what it drafts. */
+    uint64_t seed = 59;
+};
+
+inline bool write_lfm3(const std::string& dir, const Lfm3& s) {
+    Rng r(s.seed);
+    const int64_t H = s.hidden, hd = s.hidden / s.heads, kv = s.kv_heads * hd;
+    auto kind = [](int64_t l) { return l % 2 == 0 ? 0 : l % 4 == 1 ? 1 : 2; };
+    Json types = Json::array();
+    for (int64_t l = 0; l < s.layers; ++l)
+        types.push_back(kind(l) == 0 ? "conv" : kind(l) == 1 ? "full_attention" : "sliding_attention");
+    Json c;
+    c["architectures"] = { "Lfm3ForCausalLM" };
+    c["model_type"] = "lfm3";
+    c["vocab_size"] = s.vocab;
+    c["hidden_size"] = H;
+    c["intermediate_size"] = s.ffn;
+    c["num_hidden_layers"] = s.layers;
+    c["num_attention_heads"] = s.heads;
+    c["num_key_value_heads"] = s.kv_heads;
+    c["head_dim"] = hd;
+    c["max_position_embeddings"] = s.ctx;
+    c["norm_eps"] = 1e-5;
+    c["rope_parameters"] = {
+        /* A low theta: over a test document the release's 1e6 turns the unrotated half's would-be
+         * frequencies by a hundredth of a radian, and a full rotary would pass for the partial one. */
+        { "full_attention", { { "rope_type", "default" }, { "rope_theta", 100.0 },
+                              { "partial_rotary_factor", 0.5 } } },
+        { "sliding_attention", { { "rope_type", "default" }, { "rope_theta", 10000.0 } } } };
+    c["sliding_window"] = s.window;
+    c["use_sandwich_norm"] = true;
+    c["conv_bias"] = false;
+    c["conv_L_cache"] = s.conv;
+    c["layer_types"] = types;
+    c["tie_word_embeddings"] = true;
+    c["eos_token_id"] = (int)kEndOfText;
+
+    const std::string m = "model.";
+    std::vector<Tensor> ts;
+    ts.push_back(noise(m + "embed_tokens.weight", { s.vocab, H }, r, s.head));
+    for (int64_t l = 0; l < s.layers; ++l) {
+        const std::string p = m + "layers." + std::to_string(l) + ".";
+        ts.push_back(noise(p + "operator_norm.weight", { H }, r, 0.1f, 1.0f));
+        if (kind(l) != 0) {
+            ts.push_back(linear(p + "self_attn.q_proj.weight", H, H, r));
+            ts.push_back(linear(p + "self_attn.k_proj.weight", kv, H, r));
+            ts.push_back(linear(p + "self_attn.v_proj.weight", kv, H, r));
+            ts.push_back(linear(p + "self_attn.o_proj.weight", H, H, r));
+            ts.push_back(noise(p + "self_attn.q_norm.weight", { hd }, r, 0.1f, 1.0f));
+            ts.push_back(noise(p + "self_attn.k_norm.weight", { hd }, r, 0.1f, 1.0f));
+            /* gates spread over (0, 1), a head apart from its neighbours */
+            ts.push_back(linear(p + "self_attn.gate_proj.weight", s.heads, H, r, 2.0f));
+        } else {
+            ts.push_back(linear(p + "conv.in_proj.weight", 3 * H, H, r));
+            ts.push_back(noise(p + "conv.conv.weight", { H, 1, s.conv }, r, 0.5f));
+            ts.push_back(linear(p + "conv.out_proj.weight", H, H, r));
+        }
+        /* The post norms' gains set each branch's size in the stream, as the out projections'
+         * do in a pre-norm model. */
+        ts.push_back(noise(p + "post_operator_norm.weight", { H }, r, 0.02f, s.branch));
+        ts.push_back(noise(p + "ffn_norm.weight", { H }, r, 0.1f, 1.0f));
+        ts.push_back(linear(p + "feed_forward.w1.weight", s.ffn, H, r));
+        ts.push_back(linear(p + "feed_forward.w3.weight", s.ffn, H, r));
+        ts.push_back(linear(p + "feed_forward.w2.weight", H, s.ffn, r));
+        ts.push_back(noise(p + "post_ffn_norm.weight", { H }, r, 0.02f, s.branch));
+    }
+    /* Signed gains around 0, as LFM2's: a tied head would otherwise score a token's own row. */
+    ts.push_back(noise(m + "embedding_norm.weight", { H }, r, 1.0f));
+    return write_checkpoint(dir, c, ts);
+}
+
+/* ------------------------------------------------------------------ inkling2: the loop */
+
+/* Inkling 2 Mini's text backbone (`inkling2_loop`, served by arch/inkling2), at a size the host
+ * backend runs in a blink: the release's 24 physical layers, with the loop core 6..18 run three
+ * times, so 48 layer applications, and the release's attention-residual blocks of 6 layers. Full
+ * attention on layers 5, 11, 17 and 23, local elsewhere. The window is shorter than the golden
+ * prompt and the relative table's extent shorter still, so the window and the distance clip both
+ * bite; the clip thresholds are below the release's, and the position tau turns on at 32 tokens,
+ * so each of those paths runs. The names are the raw checkpoint's, which mkinkling2golden.py reads
+ * under the `model.` prefix. */
+struct Inkling2 {
+    int64_t layers = 24, hidden = 64, heads = 6, kv_heads = 2, head_dim = 16, d_rel = 8;
+    int64_t ffn = 32, experts = 8, top_k = 2, rank = 8;
+    int64_t vocab = 300, vocab_real = 300, extent = 32, window = 32, conv = 4;
+    int64_t core_start = 6, core_end = 18, passes = 3, block = 6;
+    int64_t tau_floor = 32;
+    float    qk_clip = 3.0f, rel_clip = 2.0f, tau_alpha = 0.1f, route_scale = 2.5f;
+    float    gate_cap = 4.0f, up_cap = 25.0f, final_cap = 30.0f;
+    float    branch = 0.5f, head = 3.0f;        /* the residual gain; the head amplitude: logits about 3 apart */
+    uint64_t seed = 71;
+    bool is_full(int64_t l) const { return l == 5 || l == 11 || l == 17 || l == 23; }
+};
+
+inline bool write_inkling2(const std::string& dir, const Inkling2& s) {
+    Rng r(s.seed);
+    const int64_t H = s.hidden, hd = s.head_dim, nh = s.heads, kv = s.kv_heads;
+    const int64_t Q = nh * hd, KV = kv * hd;
+    Json local = Json::array();
+    for (int64_t l = 0; l < s.layers; ++l)
+        if (!s.is_full(l)) local.push_back(l);
+    Json c;
+    c["architectures"] = { "Inkling2LoopForConditionalGeneration" };
+    c["model_type"] = "inkling2_loop";
+    c["hidden_size"] = H;
+    c["num_hidden_layers"] = s.layers;
+    c["num_attention_heads"] = nh;
+    c["num_key_value_heads"] = kv;
+    c["head_dim"] = hd;
+    c["local_layer_ids"] = local;
+    c["n_layers_per_attn_res_block"] = s.block;
+    c["sconv_kernel_size"] = s.conv;
+    c["sliding_window_size"] = s.window;
+    c["rel_extent"] = s.extent;
+    c["d_rel"] = s.d_rel;
+    c["qk_l2_clip_threshold"] = s.qk_clip;
+    c["rel_l2_clip_threshold"] = s.rel_clip;
+    c["log_scaling_n_floor"] = s.tau_floor;
+    c["log_scaling_alpha"] = s.tau_alpha;
+    c["n_routed_experts"] = s.experts;
+    c["num_experts_per_tok"] = s.top_k;
+    c["moe_intermediate_size"] = s.ffn;
+    c["intermediate_size"] = s.ffn;
+    c["route_scale"] = s.route_scale;
+    c["scoring_func"] = "sigmoid";
+    c["mlp_gate_softcap"] = s.gate_cap;
+    c["mlp_up_softcap"] = s.up_cap;
+    c["final_logit_softcapping"] = s.final_cap;
+    c["n_shared_experts"] = 0;
+    c["use_value_norm_no_gamma"] = true;
+    c["attn_res_normalize_values"] = true;
+    c["q_bias"] = false;
+    c["o_bias"] = false;
+    c["vocab_size"] = s.vocab;
+    c["unpadded_vocab_size"] = s.vocab_real;
+    c["max_position_embeddings"] = 4096;
+    c["tie_word_embeddings"] = false;
+    c["eos_token_id"] = (int)kEndOfText;
+    c["loop_config"] = { { "core_start", s.core_start }, { "core_end", s.core_end },
+                         { "num_passes", s.passes }, { "gate_rank", s.rank },
+                         { "is_varloop", false } };
+
+    const std::string m = "model.";
+    std::vector<Tensor> ts;
+    const int64_t n_cross = 2 * (s.core_end - s.core_start);
+    ts.push_back(noise(m + "embed.weight", { s.vocab, H }, r, s.head));
+    ts.push_back(noise(m + "embed_norm.weight", { H }, r, 0.1f, 1.0f));
+    ts.push_back(linear(m + "unembed.weight", s.vocab, H, r, s.head));
+    ts.push_back(noise(m + "norm.weight", { H }, r, 0.1f, 1.0f));
+    /* attn_queries[i] feeds layer i + 1: 3 queries on a full layer, 1 on a local one */
+    for (int64_t ip = 1; ip < s.layers; ++ip) {
+        const int64_t q = s.is_full(ip) ? 3 : 1;
+        ts.push_back(noise(m + "attn_res.attn_queries." + std::to_string(ip - 1), { q, H }, r, 0.3f));
+    }
+    for (int64_t ip = 0; ip < s.layers; ++ip)
+        ts.push_back(noise(m + "attn_res.mlp_queries." + std::to_string(ip), { H }, r, 0.3f));
+    ts.push_back(noise(m + "attn_res.output_query", { H }, r, 0.3f));
+    /* the cross-pass queries of the core: two rows per core layer, [q, kv] */
+    ts.push_back(noise(m + "middle_cycle_cross_pass_queries", { n_cross, H }, r, 0.3f));
+    ts.push_back(noise(m + "middle_cycle_cross_pass_kv_queries", { n_cross, H }, r, 0.3f));
+
+    for (int64_t l = 0; l < s.layers; ++l) {
+        const std::string p = m + "layers." + std::to_string(l) + ".";
+        const std::string a = p + "attn.";
+        const bool full = s.is_full(l);
+        ts.push_back(linear(a + "wq_du.weight", Q, H, r));
+        ts.push_back(linear(a + "wk_dv.weight", KV, H, r));
+        ts.push_back(linear(a + "wv_dv.weight", KV, H, r));
+        ts.push_back(linear(a + "wr_du.weight", nh * s.d_rel, H, r));
+        ts.push_back(linear(a + "wo_ud.weight", H, Q, r, s.branch));
+        ts.push_back(linear(a + "gate_attn.weight", Q, H, r));
+        ts.push_back(linear(a + "attn_sink_proj.weight", nh, H, r));
+        ts.push_back(noise(a + "rel_logits_proj.proj", { s.d_rel, s.extent }, r, 0.5f));
+        ts.push_back(noise(a + "q_l2_clip.scale", { nh, hd }, r, 0.1f, 1.0f));
+        ts.push_back(noise(a + "rel_l2_clip.scale", { nh, s.d_rel }, r, 0.1f, 1.0f));
+        if (full) {
+            /* a full layer's K and V convolutions take input-dependent taps too */
+            ts.push_back(noise(a + "k_sconv.weight", { KV, s.conv }, r, 0.5f));
+            ts.push_back(noise(a + "v_sconv.weight", { KV, s.conv }, r, 0.5f));
+            ts.push_back(linear(a + "k_sconv.weight_proj", kv * s.conv, H, r));
+            ts.push_back(linear(a + "v_sconv.weight_proj", kv * s.conv, H, r));
+            ts.push_back(noise(p + "q_input_norm.weight", { H }, r, 0.1f, 1.0f));
+            ts.push_back(noise(p + "k_input_norm.weight", { H }, r, 0.1f, 1.0f));
+            ts.push_back(noise(p + "v_input_norm.weight", { H }, r, 0.1f, 1.0f));
+        } else {
+            /* the convolutions are [channels, width] weights, the conv1d layout with the current tap last */
+            ts.push_back(noise(a + "k_sconv.weight", { KV, s.conv }, r, 0.5f));
+            ts.push_back(noise(a + "v_sconv.weight", { KV, s.conv }, r, 0.5f));
+            ts.push_back(noise(p + "attn_norm.weight", { H }, r, 0.1f, 1.0f));
+        }
+        ts.push_back(noise(p + "attn_sconv.weight", { H, s.conv }, r, 0.5f));
+
+        const std::string f = p + "mlp.";
+        ts.push_back(linear(f + "gate.weight", s.experts, H, r));
+        ts.push_back(noise(f + "gate.bias", { s.experts }, r, 0.1f));
+        ts.push_back(noise(f + "experts.w13_weight", { s.experts, 2 * s.ffn, H }, r,
+                           std::sqrt(3.0f / (float)H)));
+        ts.push_back(noise(f + "experts.w2_weight", { s.experts, H, s.ffn }, r,
+                           s.branch * std::sqrt(3.0f / (float)s.ffn)));
+        ts.push_back(noise(p + "mlp_norm.weight", { H }, r, 0.1f, 1.0f));
+        ts.push_back(noise(p + "mlp_sconv.weight", { H, s.conv }, r, 0.5f));
+
+        if (l >= s.core_start && l < s.core_end) {
+            /* the loop core's controllers: down [rank, 2H], gain and forget [H, rank] */
+            for (const char* w : { "attn", "k", "v", "mlp" }) {
+                const std::string q = p + "controllers." + w + ".";
+                ts.push_back(linear(q + "down_weight", s.rank, 2 * H, r));
+                ts.push_back(linear(q + "gain_weight", H, s.rank, r));
+                ts.push_back(linear(q + "forget_weight", H, s.rank, r));
+            }
+        }
+    }
+    return write_checkpoint(dir, c, ts);
+}
+
 /* ------------------------------------------------------------------ gemma4: sliding + global */
 
 /* Gemma 4 dense (`gemma4`, served by the gemma4 plugin as written), shaped like the 31B: sliding
@@ -414,10 +643,10 @@ struct Gemma4 {
 inline bool write_gemma4(const std::string& dir, const Gemma4& s) {
     Rng r(s.seed);
     const int64_t H = s.hidden;
-    nlohmann::ordered_json types = nlohmann::ordered_json::array();
+    Json types = Json::array();
     for (int64_t l = 0; l < s.layers; ++l)
         types.push_back((l + 1) % s.interval == 0 ? "full_attention" : "sliding_attention");
-    nlohmann::ordered_json t;
+    Json t;
     t["model_type"] = "gemma4_text";
     t["vocab_size"] = s.vocab;
     t["hidden_size"] = H;
@@ -442,7 +671,7 @@ inline bool write_gemma4(const std::string& dir, const Gemma4& s) {
         { "sliding_attention", { { "rope_type", "default" }, { "rope_theta", 10000.0 } } },
         { "full_attention", { { "rope_type", "proportional" }, { "rope_theta", 1000000.0 },
                               { "partial_rotary_factor", 0.25 } } } };
-    nlohmann::ordered_json c;
+    Json c;
     c["architectures"] = { "Gemma4ForConditionalGeneration" };
     c["model_type"] = "gemma4";
     c["text_config"] = t;
@@ -505,9 +734,9 @@ struct DFlash2 {
 inline bool write_dflash2(const std::string& dir, const DFlash2& s) {
     Rng r(s.seed);
     const int64_t H = s.hidden, q = s.heads * s.head_dim, kv = s.kv_heads * s.head_dim;
-    nlohmann::ordered_json types = nlohmann::ordered_json::array();
+    Json types = Json::array();
     for (int64_t l = 0; l < s.layers; ++l) types.push_back("sliding_attention");
-    nlohmann::ordered_json t;
+    Json t;
     t["attention_bias"] = false;
     t["head_dim"] = s.head_dim;
     t["hidden_act"] = "silu";
@@ -524,18 +753,18 @@ inline bool write_dflash2(const std::string& dir, const DFlash2& s) {
     t["sliding_window"] = s.window;
     t["use_sliding_window"] = true;
     t["vocab_size"] = s.vocab;
-    nlohmann::ordered_json greedy;
+    Json greedy;
     greedy["proposal_type"] = "greedy";
     greedy["speculative_tokens"] = s.block - 1;
-    nlohmann::ordered_json verifier;
+    Json verifier;
     verifier["architectures"] = { "Gemma4ForConditionalGeneration" };
     verifier["name_or_path"] = "tiny";
-    nlohmann::ordered_json spec;
+    Json spec;
     spec["algorithm"] = "dflash2";
     spec["default_proposal_method"] = "greedy";
-    spec["proposal_methods"] = nlohmann::ordered_json::array({ greedy });
+    spec["proposal_methods"] = Json::array({ greedy });
     spec["verifier"] = verifier;
-    nlohmann::ordered_json c;
+    Json c;
     c["architectures"] = { "DFlash2DraftModel" };
     c["aux_hidden_state_layer_ids"] = s.taps;
     c["block_size"] = s.block;
@@ -599,7 +828,7 @@ struct Llama {
 inline bool write_llama(const std::string& dir, const Llama& s) {
     Rng r(s.seed);
     const int64_t H = s.hidden, q = s.heads * s.head_dim, kv = s.kv_heads * s.head_dim;
-    nlohmann::ordered_json c;
+    Json c;
     c["architectures"] = { "LlamaForCausalLM" };
     c["model_type"] = "llama";
     c["vocab_size"] = s.vocab;
@@ -692,7 +921,7 @@ inline bool write_llama_ct_int4(const std::string& dir, const Llama& s, bool asy
         out.push_back(std::move(sc));
         if (asym) out.push_back(std::move(zp));
     }
-    nlohmann::ordered_json c = nlohmann::ordered_json::parse(read_text(dir + "/config.json"));
+    Json c = Json::parse(read_text(dir + "/config.json"));
     c["quantization_config"] = {
         { "quant_method", "compressed-tensors" }, { "format", "pack-quantized" },
         { "config_groups",
@@ -702,7 +931,7 @@ inline bool write_llama_ct_int4(const std::string& dir, const Llama& s, bool asy
                 { "weights",
                   { { "num_bits", 4 }, { "type", "int" }, { "symmetric", !asym },
                     { "strategy", "group" }, { "group_size", G }, { "dynamic", false },
-                    { "actorder", asym ? nullptr : nlohmann::ordered_json("static") } } } } } } },
+                    { "actorder", asym ? nullptr : Json("static") } } } } } } },
         { "ignore", { "lm_head" } } };
     return write_text(dir + "/config.json", c.dump(2)) &&
            write_safetensors(dir + "/model.safetensors", out);
@@ -734,7 +963,7 @@ inline bool write_qwen3asr(const std::string& dir, const Qwen3Asr& s) {
     const int64_t H = s.hidden, q = s.heads * s.head_dim, kv = s.kv_heads * s.head_dim;
     const int64_t A = s.a_dim, C = s.a_channels;
     const int64_t f3 = ((((s.mels + 1) / 2) + 1) / 2 + 1) / 2;
-    nlohmann::ordered_json c;
+    Json c;
     c["architectures"] = { "Qwen3ASRForConditionalGeneration" };
     c["model_type"] = "qwen3_asr";
     c["audio_token_id"] = (int)kAsrAudioPad;
@@ -806,7 +1035,7 @@ inline bool write_qwen3asr(const std::string& dir, const Qwen3Asr& s) {
     }
     ts.push_back(noise(m + "norm.weight", { H }, r, 0.1f, 1.0f));
 
-    nlohmann::ordered_json fe;
+    Json fe;
     fe["feature_extractor"] = { { "feature_extractor_type", "Qwen3ASRFeatureExtractor" },
                                 { "feature_size", s.mels }, { "hop_length", 160 },
                                 { "n_fft", 400 }, { "sampling_rate", 16000 }, { "dither", 0.0 },
@@ -832,7 +1061,7 @@ inline bool write_lora(const std::string& dir, const std::string& base,
     if (ws.empty()) return false;
     const float scale = (float)(alpha / (double)r);
     std::vector<Tensor> ad;
-    nlohmann::ordered_json leaves = nlohmann::ordered_json::array();
+    Json leaves = Json::array();
     for (Tensor& w : ws) {
         const std::string sfx = ".weight";
         if (w.shape.size() != 2 || w.dtype != "BF16" || w.name.size() <= sfx.size() ||
@@ -863,7 +1092,7 @@ inline bool write_lora(const std::string& dir, const std::string& base,
         ad.push_back(std::move(B));
     }
     for (const std::string& t : targets) leaves.push_back(t);
-    nlohmann::ordered_json c;
+    Json c;
     c["peft_type"] = "LORA";
     c["base_model_name_or_path"] = base;
     c["r"] = r;
@@ -884,21 +1113,14 @@ inline bool write_lora(const std::string& dir, const std::string& base,
            write_safetensors(merged + "/model.safetensors", ws);
 }
 
-/* The rad-convert recipe that makes llama_dense_fp8's linears block fp8, as
- * data/recipes/minicpm5-2b-dspark.recipe does for the trunk. */
-inline const char* kLlamaFp8Recipe =
-    "blk.*.attn_qkv.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
-    "blk.*.attn_output.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
-    "blk.*.ffn_gate_up.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
-    "blk.*.ffn_down.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16\n";
-
-/* The same trunk as OCP-MXFP4: e2m1 codes with an E8M0 exponent per 32 of K, read by gemm_nt_q at
- * mxfp4a8 against the E4M3 activation pair scaled per 128. */
-inline const char* kLlamaMxfp4Recipe =
-    "blk.*.attn_qkv.weight     rtn codes=fp4_e2m1 group=32 scale=e8m0\n"
-    "blk.*.attn_output.weight  rtn codes=fp4_e2m1 group=32 scale=e8m0\n"
-    "blk.*.ffn_gate_up.weight  rtn codes=fp4_e2m1 group=32 scale=e8m0\n"
-    "blk.*.ffn_down.weight     rtn codes=fp4_e2m1 group=32 scale=e8m0\n";
+/* The rad-convert recipe that makes llama_dense_fp8's linears rotated int8 with a bf16 scale per
+ * row and 128 of K (the 128-wide Hadamard domain), read by gemm_nt_q at i8a8h against int8
+ * activations rotated the same way. */
+inline const char* kLlamaI8Recipe =
+    "blk.*.attn_qkv.weight     rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n"
+    "blk.*.attn_output.weight  rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n"
+    "blk.*.ffn_gate_up.weight  rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n"
+    "blk.*.ffn_down.weight     rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n";
 
 /* ------------------------------------------------------------------ Qwen-Image 2.1 */
 
@@ -918,7 +1140,7 @@ struct QwenImage {
 
 inline bool write_qwen_image(const std::string& dir, const QwenImage& s) {
     Rng r(s.seed);
-    using oj = nlohmann::ordered_json;
+    using oj = Json;
     for (const char* sub : { "text_encoder", "transformer", "vae", "scheduler", "tokenizer" })
         if (mkdir((dir + "/" + sub).c_str(), 0755) != 0 && errno != EEXIST) return false;
     oj index;
@@ -1091,21 +1313,19 @@ inline bool write_qwen_image(const std::string& dir, const QwenImage& s) {
            write_text(dir + "/tokenizer/tokenizer.json", tokenizer_json());
 }
 
-/* The rad-convert recipe that makes the DiT's linears block fp8, as a shipped fp8 container holds
- * them; the plugin then takes the fp8 forms of its norms and attention scores. The text encoder's
- * 64-wide linears are no whole 128 x 128 block and stay bf16. */
-inline const char* kQwenImageFp8Recipe =
-    "dit.blk.*.attn_qkv.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
-    "dit.blk.*.attn_output.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
-    "dit.blk.*.ffn_gate_up.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
-    "dit.blk.*.ffn_down.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16\n";
+/* The rad-convert recipe that makes the DiT's linears rotated int8 with a bf16 scale per row and
+ * 128 of K, as a shipped int8 container holds them; the plugin then takes the int8 forms of its
+ * norms and attention scores. The text encoder's 64-wide linears are no whole 128 of K and stay
+ * bf16. */
+inline const char* kQwenImageI8Recipe =
+    "dit.blk.*.attn_qkv.weight     rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n"
+    "dit.blk.*.attn_output.weight  rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n"
+    "dit.blk.*.ffn_gate_up.weight  rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n"
+    "dit.blk.*.ffn_down.weight     rtn codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym\n";
 
-/* The lm head quantised as the shipped containers hold it, one rule each, after the trunk's:
- * block fp8 (the 27B family, data/recipes/q38-27b-fp8-df2.recipe) and int8 with a bf16 scale per
- * row and 128 of K (Flash-Next's, Gemma 4 31B's). Declared over all its planes, the head is joined
- * on the host (abi/rad_planes.h). */
-inline const char* kLlamaFp8HeadRule =
-    "output.weight             rtn codes=fp8_e4m3 block=128x128 scale=bf16\n";
+/* The lm head quantised as the shipped containers hold it, after the trunk's rules: int8 with a
+ * bf16 scale per row and 128 of K (Flash-Next's, Gemma 4 31B's). Declared over all its planes, the
+ * head is joined on the host (abi/rad_planes.h). */
 inline const char* kLlamaI8HeadRule =
     "output.weight             rtn codes=i8 group=128 scale=bf16 clamp=sym\n";
 

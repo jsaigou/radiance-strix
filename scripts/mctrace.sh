@@ -14,10 +14,10 @@ pkill -f "bin/radianc[e]"; while pgrep -f "bin/radianc[e]" >/dev/null; do sleep 
 rm -rf "$OUT"; mkdir -p "$OUT"
 env GPU_MAX_ALLOC_PERCENT=100 GPU_MAX_HEAP_SIZE=100 $EXTRA_ENV \
   "$ROOT/libr4d/isa/trace.sh" "$OUT" -- \
-  ./bin/radiance --model "$M" \
+  "$ROOT/scripts/radiance-flags" ./bin/radiance --model "$M" \
     --radiance-home radiance_home \
     --max-num-seqs 8 --max-model-len 16384 --tp 2 \
-    --gpu-headroom-mib 160 --kv-cache-dtype fp8 --max-num-batched-tokens 512 \
+    --gpu-headroom-mib 160 --kv-cache-dtype i8 --max-num-batched-tokens 512 \
     $EXTRA --port $P > "$HOME/mctrace.log" 2>&1 &
 for i in $(seq 1 90); do
   [ "$(curl -s -m 3 -o /dev/null -w %{http_code} http://localhost:$P/health 2>/dev/null)" = 200 ] && break

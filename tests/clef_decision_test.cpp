@@ -92,7 +92,7 @@ bool write_tiny_clef(const std::string& dir, uint64_t seed) {
     ts.push_back(tiny::noise("joint_logit_scale", {}, r, 0.0f, 0.5f));
     ts.push_back(tiny::noise("residual_gate", {}, r, 0.0f, -1.0f));
     if (!tiny::write_safetensors(dir + "/joint_head.safetensors", ts)) return false;
-    nlohmann::ordered_json c;
+    Json c;
     c["hidden_size"] = E;
     c["width"] = W;
     c["routing_layers"] = 1;
@@ -206,10 +206,11 @@ TEST(a_clef_container_decides_every_question_on_the_card_and_matches_the_release
     img["images"] = json::array({ "data:image/png;base64,AAAA" });
     call(s.port, "POST", "/v1/systemone", img, &status);
     CHECK_EQ(status, 501);
+    /* A model the process does not serve is not found, as OpenAI answers an unknown model. */
     json wrong = gold["request"];
     wrong["model"] = "other";
     call(s.port, "POST", "/v1/systemone", wrong, &status);
-    CHECK_EQ(status, 400);
+    CHECK_EQ(status, 404);
 
     CHECK_EQ(s.stop(), 0);
 }

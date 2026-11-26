@@ -193,6 +193,27 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
             add((uint32_t)RAD_BF16, {M, N});                /* y */
             add((uint32_t)RAD_F32,  {K / group, (M + 15) / 16 * 16});  /* a_sum, group-major */
             skip_opd();                                      /* b_ref */
+        } else if (q && (std::strcmp(q, "w5a8i8") == 0 || std::strcmp(q, "w4a8i8_asym") == 0)) {
+            /* The same grids against an int8 activation (libr4d/r4d_gemm_wpa8i8_tiled.hip):
+             * givens_dense_quant's int8 codes, parts side by side, with an f32 scale per (row,
+             * part, 128 of K). The weight is libr4d/r4d_layout.cpp's int4 / int5 form: a nibble
+             * plane of N*K/2 bytes, then (int5 only) a fifth-bit plane of N*K/8, and one dword per
+             * row and 128 of K holding the f16 scale and zero. Random bytes suffice for timing. */
+            if (N <= 0 || K <= 0 || group != 128 || (K % 128) || (N % 16))
+                return RAD_E_UNSUPPORTED;
+            const int64_t pb1 = gi("pb1", 0), pb2 = gi("pb2", 0);
+            const int64_t e1 = pb1 > 0 && pb1 < N ? pb1 : N;
+            int64_t e2 = pb2 > 0 && pb2 < N ? pb2 : N;
+            if (e2 < e1) e2 = e1;
+            const int64_t parts = e2 < N ? 3 : (e1 < N ? 2 : 1);
+            const bool five = std::strcmp(q, "w5a8i8") == 0;
+            add((uint32_t)RAD_I8,   {M, parts * K});                         /* a       */
+            add((uint32_t)RAD_F32,  {M, parts * (K / 128)});                 /* a_scale */
+            add((uint32_t)RAD_U8,   {N, five ? K * 5 / 8 : K / 2});          /* b       */
+            add((uint32_t)RAD_U32,  {N, K / group});                         /* b_scale */
+            add((uint32_t)RAD_BF16, {M, N});                                 /* y       */
+            skip_opd();                                                      /* a_sum   */
+            skip_opd();                                                      /* b_ref   */
         } else {
             const bool a8  = q && std::strcmp(q, "fp8a8")  == 0;
             const bool a16 = q && std::strcmp(q, "fp8a16") == 0;
@@ -224,6 +245,7 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
     /* ---- the paged pair, sharing the layout stated in libref/ref_ops.h:
      *
      *     kv_cache[num_blocks, kv_heads, block_size, 2 * head_dim]   K first, V second in a slot
+     *     (2 * head_dim + 4 at the int8 cache: rad_kv_row_elems)
      *
      * The block count and context length are this tool's choice; any cache large enough for the
      * case works as long as the indices land inside it. */
@@ -241,7 +263,8 @@ int rad_operand_shapes(const std::string& op, const Geometry& g, int n_opd, int6
         add((uint32_t)RAD_BF16, {M, kvh, head_dim});
         add((uint32_t)RAD_BF16, {M, kvh, head_dim});
         add_idx({M}, nb * bs, -1, /*uniq*/ true);
-        add(kvd == (uint32_t)RAD_DT_INVALID ? (uint32_t)RAD_BF16 : kvd, {nb, kvh, bs, 2 * head_dim});
+        const uint32_t cd = kvd == (uint32_t)RAD_DT_INVALID ? (uint32_t)RAD_BF16 : kvd;
+        add(cd, {nb, kvh, bs, rad_kv_row_elems(cd, head_dim)});
     }
     else if (op == "attn_paged") {
         /* `M` is q_len (decode and prefill are different kernels, docs/OPS.md). One sequence whose

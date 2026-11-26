@@ -1,0 +1,13 @@
+# Ling-3.0-tiny from the IQ4_NL GGUF, fully decoded to bf16: a coherence control that removes
+# the quantisation from the equation (the container is the dequantised GGUF, ~15 GiB).
+blk.*.attn_norm.weight          cast dtype=f32
+blk.*.attn_q_a_norm.weight        cast dtype=f32
+blk.*.attn_kv_a_norm.weight       cast dtype=f32
+blk.*.ffn_norm.weight           cast dtype=f32
+blk.*.ssm_norm.weight           cast dtype=f32
+blk.*.ssm_a                     cast dtype=f32
+blk.*.ssm_dt_bias               cast dtype=f32
+blk.*.glm_router.weight         cast dtype=f32
+blk.*.glm_router.correction     cast dtype=f32
+output_norm.weight              cast dtype=f32
+* cast dtype=bf16

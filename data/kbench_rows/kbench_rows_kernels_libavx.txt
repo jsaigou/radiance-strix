@@ -7,7 +7,6 @@ avx_attn_paged
 avx_cast
 avx_dflash_select
 avx_embed_lookup
-avx_gated_quant_fp8
 avx_gather_rows
 avx_gdn_chunk_scan
 avx_gdn_conv_update
@@ -17,15 +16,13 @@ avx_gdn_recurrent_update
 avx_gemm_nt
 avx_gemm_nt_bias
 avx_gemm_nt_q
-avx_gemm_nt_q_gated
 avx_grid_embed
+avx_had_quant_act_i8g
 avx_kv_store
 avx_layernorm
 avx_logits_gemm
-avx_quant_act_fp8
 avx_quant_act_i8
 avx_rmsnorm
-avx_rmsnorm_quant_fp8
 avx_rope
 avx_rope_table
 avx_row_topk
@@ -34,6 +31,7 @@ avx_sample_dry
 avx_sample_logprobs
 avx_sample_mask
 avx_sample_minp
+avx_sample_ngram_ban
 avx_sample_penalties
 avx_sample_pick
 avx_sample_temp

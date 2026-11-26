@@ -5,13 +5,13 @@
 #include "text/chatparse.h"
 #include "../arch/spark25_bf16/chat.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
 
 using namespace rad;
-using json = nlohmann::ordered_json;
+using json = Json;
 
 static const json& tools() {
     static const json t = json::parse(R"([

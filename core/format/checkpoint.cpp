@@ -4,10 +4,9 @@
 #include "rad_plugin.h"
 #include "../rad_internal.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
-#include <climits>
 #include <filesystem>
 #include <cctype>
 #include <cmath>
@@ -65,7 +64,7 @@ void MetaOwn::finish() {
 /* An array's scalars appended to `s` space-separated, nested arrays flattened row-major (a
  * vocoder's per-resnet dilations, [[1, 3, 5], [1, 3, 5]], read as "1 3 5 1 3 5"); false for an
  * array holding an object or a null. */
-static bool join_scalars(const nlohmann::json& v, std::string* s) {
+static bool join_scalars(const Json& v, std::string* s) {
     for (const auto& e : v) {
         if (e.is_array()) {
             if (!join_scalars(e, s)) return false;
@@ -81,10 +80,10 @@ static bool join_scalars(const nlohmann::json& v, std::string* s) {
     return true;
 }
 
-static void flatten_json(const nlohmann::json& j, const std::string& prefix, MetaOwn* out) {
+static void flatten_json(const Json& j, const std::string& prefix, MetaOwn* out) {
     for (auto it = j.begin(); it != j.end(); ++it) {
         const std::string key = prefix.empty() ? it.key() : prefix + "." + it.key();
-        const nlohmann::json& v = it.value();
+        const Json& v = it.value();
         /* Retain otherwise invisible Quark weight overrides so import validation can reject
          * null/empty schemes instead of accidentally inheriting global MXFP4 packing. */
         if (key.rfind("quantization_config.layer_quant_config.", 0) == 0 &&
@@ -130,7 +129,7 @@ int meta_merge_config_json(const std::string& dir, const std::string& prefix, Me
                 "-- and none of it is derivable from the target.", dir.c_str());
         return RAD_E_NOTFOUND;
     }
-    nlohmann::json j;
+    Json j;
     try { f >> j; }
     catch (const std::exception& e) { RAD_ERR("%s: %s", path.c_str(), e.what()); return RAD_E_FORMAT; }
     flatten_json(j, prefix, out);
@@ -147,7 +146,7 @@ int meta_merge_generation_config(const std::string& dir, MetaOwn* out) {
     const std::string path = dir + "/generation_config.json";
     std::ifstream f(path);
     if (!f) return RAD_OK;               /* optional */
-    nlohmann::json j;
+    Json j;
     try { f >> j; }
     catch (const std::exception& e) {
         RAD_WARN("%s: %s; no sampling defaults are carried", path.c_str(), e.what());
@@ -182,7 +181,7 @@ int meta_merge_preprocessor_configs(const std::string& dir, MetaOwn* out) {
         const std::string path = dir + "/" + f.file;
         std::ifstream in(path);
         if (!in) continue;
-        nlohmann::json j;
+        Json j;
         try { in >> j; }
         catch (const std::exception& e) {
             RAD_WARN("%s: %s; it is not carried", path.c_str(), e.what());
@@ -201,7 +200,7 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
                 "dimensions there; without it nothing can be sized.", dir.c_str());
         return RAD_E_NOTFOUND;
     }
-    nlohmann::json j;
+    Json j;
     try { f >> j; }
     catch (const std::exception& e) {
         RAD_ERR("%s: %s", path.c_str(), e.what());
@@ -258,14 +257,19 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
         if (out->arch == "gemma4unified") out->arch = "gemma4";
         /* Nemotron-H Omni wraps a Nemotron-H Puzzle text model (`llm_config`) the same way. */
         if (out->arch == "nemotronhomni") out->arch = "nemotronh";
+        /* Inkling 2's loop checkpoint (`inkling2_loop`) is the one plugin's model: its loop is
+         * read from loop_config, the schedule the rest of the family runs. */
+        if (out->arch == "inkling2loop") out->arch = "inkling2";
     }
     if (const char* nm = gs("_name_or_path")) out->name = nm;
 
     RadModelMeta& m = out->m;
+    // UMT5 is the text encoder in Wan's Diffusers package. Its dimensions use the T5 names.
+    const bool umt5 = out->arch == "umt5";
     /* Nomic BERT states its geometry with n_layer, n_embd, n_head, n_inner, n_positions and
      * moe_top_k. They are the last fallbacks in each chain, so a config carrying both spellings
      * reads the HuggingFace one. */
-    m.n_layers    = gi("num_hidden_layers", gi("n_layer", 0));
+    m.n_layers    = gi("num_hidden_layers", gi("n_layer", umt5 ? gi("num_layers", 0) : 0));
     /* Nemotron-H Puzzle states no count: HF derives it from the per-layer list. */
     if (m.n_layers == 0)
         if (const char* types = nested("layers_block_type"))
@@ -275,17 +279,19 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
                 ++m.n_layers;
                 while (*p && *p != ' ') ++p;
             }
-    m.n_embd      = gi("hidden_size", gi("n_embd", 0));
-    m.n_head      = gi("num_attention_heads", gi("n_head", 0));
+    m.n_embd      = gi("hidden_size", gi("n_embd", umt5 ? gi("d_model", 0) : 0));
+    m.n_head      = gi("num_attention_heads", gi("n_head", umt5 ? gi("num_heads", 0) : 0));
     m.n_head_kv   = gi("num_key_value_heads", m.n_head);
     /* Read head_dim; derive it only as a fallback. On qwen35 it is 256 while
      * hidden_size/num_attention_heads is 213. */
-    m.head_dim    = gi("head_dim", m.n_head ? m.n_embd / m.n_head : 0);
+    const int64_t inferred_head_dim = m.n_head ? m.n_embd / m.n_head : 0;
+    m.head_dim    = gi("head_dim", umt5 ? gi("d_kv", inferred_head_dim) : inferred_head_dim);
     /* A routed config has no `intermediate_size`, only `moe_intermediate_size` (one expert's
      * width, which is what a GEMM sees and what n_ff means) and
      * `shared_expert_intermediate_size` (read by the plugin from the free-form table). Nomic
      * spells the same width n_inner. */
-    m.n_ff        = gi("intermediate_size", gi("moe_intermediate_size", gi("n_inner", 0)));
+    m.n_ff        = gi("intermediate_size", gi("moe_intermediate_size",
+                                              gi("n_inner", umt5 ? gi("d_ff", 0) : 0)));
     m.n_vocab     = gi("vocab_size", 0);
     m.n_ctx_train = gi("max_position_embeddings", gi("n_positions", 0));
     /* The DeepSeek spelling: Unlimited-OCR's decoder is a DeepSeek-V2 MoE and states its expert
@@ -349,6 +355,7 @@ int meta_from_gguf(GgufFile& g, MetaOwn* out) {
      * pass through in the free-form list. */
     const std::string a = out->arch;
     if (a == "hy_v3") out->arch = "hyv3";
+    if (a == "bailingmoe3") out->arch = "bailinghybrid";
     auto gi = [&](const char* suffix, int64_t dflt) -> int64_t {
         int64_t v = 0;
         return g.get_i64(a + "." + suffix, &v) ? v : dflt;
@@ -445,6 +452,63 @@ int meta_from_gguf(GgufFile& g, MetaOwn* out) {
         out->kv("attention_bias", "0");
         out->kv("mlp_bias", "0");
     }
+    if (a == "bailingmoe3") {
+        /* Ling 3.0 (the arch alias above): the release GGUF spells the family's keys
+         * bailingmoe3.*, and the plugin (arch/bailing_hybrid) reads them as the checkpoint's
+         * config.json names, so the reader re-spells them here and one plugin serves both
+         * formats. eps and rope_theta take the generic paths above. Four of the family's
+         * design choices the GGUF does not carry are Ling 3.0's, stated as constants. */
+        /* Bounds on the family gates too (see bailingmoe3_layouts): the layout rebuild's
+         * products -- heads * (nope + rope) rows, the fused kv's heads * 256 * latent -- are
+         * int64 products of these values handed to sized allocations, so the widths they are
+         * built from may not roam free. 128/64 is the shipped geometry. */
+        if (gi("kda.head_dim", 0) <= 0 || gi("kda.head_dim", 0) > 512 ||
+            gi("rope.dimension_count", 0) <= 0 || gi("rope.dimension_count", 0) > 256 ||
+            gi("attention.key_length_mla", 0) <= gi("rope.dimension_count", 0) ||
+            gi("attention.key_length_mla", 0) > 65536)
+            return RAD_E_FORMAT;
+        out->kv("num_attention_heads", fmt("%lld", (long long)m.n_head));
+        /* The typed head_dim the generic pass fell back to (the MLA query width) is not the
+         * KDA head the plugin asserts; rad-convert publishes the typed fields before the kv
+         * table, and lookups take the first row, so the typed field must carry the 128. */
+        out->m.head_dim = (int)gi("kda.head_dim", 0);
+        out->kv("head_dim", fmt("%lld", (long long)gi("kda.head_dim", 0)));
+        /* The GGUF's key_length_mla is the full query (nope + rotary); the plugin's
+         * qk_nope_head_dim is the rotary part subtracted. */
+        out->kv("qk_nope_head_dim",
+                fmt("%lld", (long long)(gi("attention.key_length_mla", 0) - gi("rope.dimension_count", 0))));
+        out->kv("qk_rope_head_dim", fmt("%lld", (long long)gi("rope.dimension_count", 0)));
+        out->kv("v_head_dim", fmt("%lld", (long long)gi("attention.value_length_mla", 0)));
+        out->kv("kv_lora_rank", fmt("%lld", (long long)gi("attention.kv_lora_rank", 0)));
+        out->kv("q_lora_rank", fmt("%lld", (long long)gi("attention.q_lora_rank", 0)));
+        out->kv("num_experts", fmt("%lld", (long long)m.n_expert));
+        out->kv("num_experts_per_tok", fmt("%lld", (long long)m.n_expert_used));
+        out->kv("n_group", fmt("%lld", (long long)gi("expert_group_count", 0)));
+        out->kv("topk_group", fmt("%lld", (long long)gi("expert_group_used_count", 0)));
+        out->kv("moe_intermediate_size", fmt("%lld", (long long)gi("expert_feed_forward_length", 0)));
+        out->kv("moe_shared_expert_intermediate_size",
+                fmt("%lld", (long long)gi("expert_shared_feed_forward_length", 0)));
+        out->kv("num_shared_experts", fmt("%lld", (long long)m.n_expert_shared));
+        out->kv("intermediate_size", fmt("%lld", (long long)m.n_ff));
+        out->kv("first_k_dense_replace", fmt("%lld", (long long)gi("leading_dense_block_count", 0)));
+        out->kv("short_conv_kernel_size", fmt("%lld", (long long)gi("ssm.conv_kernel", 0)));
+        out->kv("kda_lower_bound", fmt("%.17g", gf("kda.gate_lower_bound", 0.0)));
+        out->kv("routed_scaling_factor", fmt("%.17g", gf("expert_weights_scale", 1.0)));
+        out->kv("norm_topk_prob", fmt("%lld", (long long)gi("expert_weights_norm", 0)));
+        out->kv("kda_safe_gate", fmt("%lld", (long long)gi("kda.safe_gate", 0)));
+        out->kv("layer_group_size", "4");
+        out->kv("no_kda_lora", "1");
+        out->kv("rope_interleave", "1");
+        out->kv("gated_attention_proj_granularity_type", "head_wise");
+        out->kv("num_nextn_predict_layers", "0");
+        /* The plugin picks its checkpoint names from this: the GGUF spells the family's tensors
+         * blk. and ssm. names (and carries the layouts bailingmoe3_layouts rebuilds), the safetensors
+         * their config.json spellings. */
+        out->kv("gguf_source", "1");
+        std::string gating = "sigmoid";
+        g.get_str("bailingmoe3.expert_gating_func", &gating);
+        out->kv("score_function", gating);
+    }
 
     /* Everything else, stringified, for the plugin. Arrays are summarised (small integer arrays
      * spelled out); tokenizer keys are skipped, since the vocab has its own section. */
@@ -499,20 +563,9 @@ int Checkpoint::open_gguf(const std::string& path) {
         index_.emplace(s.name, tensors_.size());
         tensors_.push_back(std::move(s));
     }
-    return meta_from_gguf(gguf_, &meta_);
-}
-
-/* Whether the file `p` really is -- symlinks resolved -- lives inside `dir`. Screening the NAME
- * is not enough: a model dir can carry a symlink whose honest-looking name resolves outside
- * it, and the index can name exactly that file. (A legit symlink that stays inside the dir
- * still passes: the resolution is inside too. Both sides resolve, so a dir path that itself
- * runs through a symlink compares against its own real location.) */
-static bool resolves_under(const std::string& dir, const std::string& p) {
-    char rd[PATH_MAX], rp[PATH_MAX];
-    if (::realpath(dir.c_str(), rd) == nullptr) return false;
-    if (::realpath(p.c_str(), rp) == nullptr) return false;
-    const size_t n = std::strlen(rd);
-    return rp[n] == '/' && std::strncmp(rp, rd, n) == 0;
+    RAD_TRY(meta_from_gguf(gguf_, &meta_));
+    if (meta_.arch == "bailinghybrid") RAD_TRY(bailingmoe3_layouts());
+    return RAD_OK;
 }
 
 int Checkpoint::add_shard(const std::string& p, const std::string& prefix,
@@ -553,11 +606,12 @@ int Checkpoint::add_shard(const std::string& p, const std::string& prefix,
 
 namespace {
 
-/* The index's shard names are checkpoint-supplied data. They must stay under `dir`: hfget
- * screens the LISTING's names, but the index is one of the listed files, and a weight_map of
- * "../../etc/passwd" passes that screen as easily as it escapes the model dir -- the engine
- * would open the named file, outside the dir, as the serving user. Relative subdirs are legal
- * in real repos; an empty component, "." or ".." is not. */
+/* Whether an index may name `f` as a shard. The index is data the checkpoint supplies, and its
+ * names are joined under the model directory and opened as the serving user, so a name must stay
+ * under that directory: relative, with no empty component, "." or "..". Subdirectories are legal.
+ * Only the name is screened. A shard that is a symbolic link is followed like any file the
+ * operator points the engine at: a Hugging Face cache snapshot is a directory of links into its
+ * blob store. */
 bool shard_name_ok(const std::string& f) {
     if (f.empty() || f.front() == '/') return false;
     size_t i = 0;
@@ -572,10 +626,10 @@ bool shard_name_ok(const std::string& f) {
     return true;
 }
 
-/* Every shard an index names, once each and in name order, or the one model.safetensors; `map`
- * is the index's weight_map, empty without one. */
 static bool path_exists(const std::string& p) { std::ifstream f(p); return (bool)f; }
 
+/* Every shard an index names, once each and in name order, or the one model.safetensors; `map`
+ * is the index's weight_map, empty without one. */
 int shard_list(const std::string& dir, const std::string& index, bool index_given,
                std::vector<std::string>* out, std::unordered_map<std::string, std::string>* map) {
     const int s = st_load_index(index, map);
@@ -591,30 +645,15 @@ int shard_list(const std::string& dir, const std::string& index, bool index_give
             }
         std::sort(out->begin(), out->end());
         for (auto& f : *out) f = dir + "/" + f;
-        /* The join is honest; the FILE may not be: an honest name can be a symlink planted in
-         * the dir that resolves outside it. Refuse before any open of it. (Containment reads
-         * relative to the dir actually being loaded, which is why it lives here and not in
-         * add_shard: a drafter's shards legitimately join under the DRAFT's dir.) */
-        for (const std::string& f : *out)
-            if (path_exists(f) && !resolves_under(dir, f)) {
-                RAD_ERR("%s: the shard '%s' resolves outside the model directory; refusing it",
-                        index.c_str(), log_sanitize(f).c_str());
-                return RAD_E_FORMAT;
-            }
         return RAD_OK;
     }
     if (s != RAD_E_NOTFOUND || index_given) return s;
     out->push_back(dir + "/model.safetensors");
-    if (!resolves_under(dir, out->back())) {
-        RAD_ERR("%s: %s resolves outside the model directory; refusing it",
-                index.c_str(), log_sanitize(out->back()).c_str());
-        out->pop_back();
-        return RAD_E_FORMAT;
-    }
     return RAD_OK;
 }
 
 }  /* namespace */
+
 
 /* A JSON file flattened under `prefix`; absent is not an error when `optional`. */
 static int meta_merge_json_file(const std::string& path, const std::string& prefix, bool optional,
@@ -625,7 +664,7 @@ static int meta_merge_json_file(const std::string& path, const std::string& pref
         RAD_ERR("%s: cannot read it", path.c_str());
         return RAD_E_NOTFOUND;
     }
-    nlohmann::json j;
+    Json j;
     try { f >> j; }
     catch (const std::exception& e) { RAD_ERR("%s: %s", path.c_str(), e.what()); return RAD_E_FORMAT; }
     if (!j.is_object()) {
@@ -1169,6 +1208,10 @@ int Checkpoint::open_safetensors(const std::string& path) {
             fp8_bc_ = c;
         }
     }
+    if (meta_.arch == "inkling2") {
+        RAD_TRY(regroup_inkling_w13());
+        RAD_TRY(regroup_inkling_static_w());
+    }
     detect_import();
     meta_.finish();
     return RAD_OK;
@@ -1254,7 +1297,109 @@ int Checkpoint::add_torch_files() {
 
 /* Which published quantisation this is, from quantization_config alone; import_piece checks the
  * tensors weight by weight, refusing a file at the first weight that disagrees. */
+bool Checkpoint::detect_per_tensor() {
+    std::ifstream in(dir_ + "/hf_quant_config.json");
+    if (!in) return false;
+    Json j;
+    try { in >> j; }
+    catch (const std::exception&) { return false; }
+    if (!j.is_object() || !j.contains("model") || !j["model"].is_object() ||
+        !j["model"].contains("parameter_groups") || !j["model"]["parameter_groups"].is_array())
+        return false;
+    for (const Json& g : j["model"]["parameter_groups"]) {
+        if (!g.is_object() || !g.contains("compute_dtype") || !g["compute_dtype"].is_string())
+            continue;
+        const std::string cd = g["compute_dtype"].get<std::string>();
+        if (cd != "nvfp4" && cd != "mxfp8") continue;   /* every other group reads as shipped */
+        if (!g.contains("tensors") || !g["tensors"].is_array()) {
+            import_why_ = "hf_quant_config.json's " + cd + " group names no tensors";
+            continue;
+        }
+        for (const Json& t : g["tensors"])
+            if (t.is_string()) per_tensor_form_[t.get<std::string>()] = cd;
+    }
+    import_ = Import::PerTensor;
+    return true;
+}
+
+/* Inkling 2's routed experts: w13 is [E, 2F, K] with the expert's gate and up rows interleaved
+ * (row 2i the gate's i-th row, 2i+1 the up's), and the engine reads [gate; up] (situ_mul takes the
+ * gate in the first half). The rows are permuted here, once, in an owned copy, so every reader --
+ * the bf16 expert, the NVFP4 and MXFP8 stacks and their scale planes -- sees the regrouped rows.
+ * The codes and their scale rows move together; the per-expert level (amax and denominator) is a
+ * scalar per expert and stays where it is. Only tensors named `experts.w13_weight` and
+ * `experts.w13_weight_scale` are touched, and only in an Inkling 2 checkpoint. */
+int Checkpoint::regroup_inkling_w13() {
+    for (SrcTensor& t : tensors_) {
+        const bool codes = t.name.size() >= 18 &&
+                           t.name.compare(t.name.size() - 18, 18, "experts.w13_weight") == 0;
+        const bool scale = t.name.size() >= 24 &&
+                           t.name.compare(t.name.size() - 24, 24, "experts.w13_weight_scale") == 0;
+        if (!codes && !scale) continue;
+        if (t.shape.size() != 3 || t.shape[0] <= 0 || t.shape[1] <= 0 || t.shape[1] % 2)
+            return RAD_E_SHAPE;
+        if (scale && t.rad_dtype != RAD_F8E4M3 && t.rad_dtype != RAD_U8)
+            return RAD_E_FORMAT;
+        const int64_t E = t.shape[0], N = t.shape[1];
+        const int64_t row = t.bytes / (E * N);
+        if (row <= 0 || row * E * N != t.bytes || !t.data) return RAD_E_SHAPE;
+        auto out = std::make_unique<uint8_t[]>((size_t)t.bytes);
+        const uint8_t* src = static_cast<const uint8_t*>(t.data);
+        for (int64_t e = 0; e < E; ++e)
+            for (int64_t i = 0; i < N / 2; ++i) {
+                std::memcpy(out.get() + (size_t)((e * N + i) * row),
+                            src + (size_t)((e * N + 2 * i) * row), (size_t)row);
+                std::memcpy(out.get() + (size_t)((e * N + N / 2 + i) * row),
+                            src + (size_t)((e * N + 2 * i + 1) * row), (size_t)row);
+            }
+        t.data = out.get();
+        owned_.push_back(std::move(out));
+    }
+    return RAD_OK;
+}
+
+/* Inkling 2's full-attention layers store their K and V short convolutions as `static_w` [k, C]:
+ * row `lag` multiplies the input `lag` steps back, so row 0 is the current tap. Every other conv
+ * weight is causal_conv1d's `[C, 1, k]` with the current tap last (what the plugin and the tiny
+ * model read). The tensor is rewritten here, once, to that layout under the `.weight` name, so the
+ * plugin maps it like the rest: w[c][j] = static_w[k - 1 - j][c]. Only `attn.{k,v}_sconv.static_w`
+ * in an Inkling 2 checkpoint is touched; the name index follows the rename. */
+int Checkpoint::regroup_inkling_static_w() {
+    for (SrcTensor& t : tensors_) {
+        const std::string sfx = ".static_w";
+        const bool conv = t.name.find(".attn.k_sconv.") != std::string::npos ||
+                          t.name.find(".attn.v_sconv.") != std::string::npos;
+        if (!conv || t.name.size() < sfx.size() ||
+            t.name.compare(t.name.size() - sfx.size(), sfx.size(), sfx) != 0)
+            continue;
+        if (t.shape.size() != 2 || t.shape[0] <= 0 || t.shape[1] <= 0 || !t.data || t.bytes <= 0)
+            return RAD_E_SHAPE;
+        const int64_t k = t.shape[0], C = t.shape[1];
+        if (t.bytes % (k * C)) return RAD_E_SHAPE;
+        const int64_t el = t.bytes / (k * C);
+        auto out = std::make_unique<uint8_t[]>((size_t)t.bytes);
+        const uint8_t* src = static_cast<const uint8_t*>(t.data);
+        for (int64_t c = 0; c < C; ++c)
+            for (int64_t j = 0; j < k; ++j)
+                std::memcpy(out.get() + (size_t)((c * k + j) * el),
+                            src + (size_t)(((k - 1 - j) * C + c) * el), (size_t)el);
+        const std::string old = t.name;
+        const std::string neu = old.substr(0, old.size() - sfx.size()) + ".weight";
+        index_.erase(old);
+        index_.emplace(neu, (size_t)(&t - tensors_.data()));
+        index_shard_.emplace(neu, index_shard_[old]);
+        t.name = neu;
+        t.shape = { C, 1, k };
+        t.data = out.get();
+        owned_.push_back(std::move(out));
+    }
+    return RAD_OK;
+}
+
 void Checkpoint::detect_import() {
+    /* Inkling 2 publishes its quantisation per tensor (hf_quant_config.json) and states a
+     * config.json quantization_config that is not the truth of each tensor; the file governs. */
+    if (detect_per_tensor()) return;
     auto qc = [&](const std::string& k) {
         const char* v = meta_.get("quantization_config." + k);
         return v ? std::string(v) : std::string();
@@ -1439,10 +1584,13 @@ void Checkpoint::detect_import() {
                           "; it is read in groups of 16";
         if (algos.empty() && import_why_.empty())
             import_why_ = "ModelOpt's quantization_config names no quant_algo";
+        /* W4A16_NVFP4 is the same NVFP4 weight with bf16 activations, which is what this reader
+         * serves either way: activations are quantised from their own values, never from a stored
+         * input scale. NVIDIA's Muse Glimmer release states it per layer beside FP8. */
         for (const std::string& a : algos)
-            if (a != "NVFP4" && a != "FP8" && import_why_.empty())
-                import_why_ = "ModelOpt's quant_algo '" + a + "' is not one this reads; NVFP4 "
-                              "and FP8 (per tensor), alone or per layer, are";
+            if (a != "NVFP4" && a != "W4A16_NVFP4" && a != "FP8" && import_why_.empty())
+                import_why_ = "ModelOpt's quant_algo '" + a + "' is not one this reads; NVFP4, "
+                              "W4A16_NVFP4 and FP8 (per tensor), alone or per layer, are";
         if (import_why_.empty()) import_ = Import::ModelOpt;
         else import_why_ = "modelopt: " + import_why_;
     } else if (qm == "paroquant") {
@@ -1498,6 +1646,63 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
     if (auto hit = imported_.find(name); hit != imported_.end()) {
         *codes = hit->second.first;
         *scale = hit->second.second;
+        return RAD_OK;
+    }
+
+    if (im == Import::PerTensor) {
+        /* Inkling 2's stacked experts, as the stack: codes [E, N, K] of e2m1 (NVFP4, two codes a
+         * byte, U8 [E, N, K/2] as shipped) or e4m3 (MXFP8), and the scales beside them, checked by
+         * shape here. The values (the level, the NaN scan) are per expert, in import_expert. */
+        const auto form = per_tensor_form_.find(name);
+        if (form == per_tensor_form_.end()) return RAD_E_NOTFOUND;
+        const SrcTensor* p = find(name);
+        if (!p) return RAD_E_NOTFOUND;
+        const SrcTensor* sc = find(name + "_scale");
+        if (form->second == "nvfp4") {
+            if (p->rad_dtype != RAD_U8 || p->shape.size() != 3)
+                return refuse(RAD_E_FORMAT, "'" + name + "' is listed NVFP4 but is not the U8 [E, N, "
+                                            "K/2] codes of a stack of experts");
+            const int64_t E = p->shape[0], N = p->shape[1], K = p->shape[2] * 2;
+            if (E <= 0 || N <= 0 || p->shape[2] <= 0)
+                return refuse(RAD_E_SHAPE, "'" + name + "' holds no experts");
+            if (K % 16)
+                return refuse(RAD_E_SHAPE, "'" + name + "' packs " + std::to_string(K) + " columns "
+                                           "of K, which the 16-wide NVFP4 scale does not divide");
+            if (!sc || sc->rad_dtype != RAD_F8E4M3 || sc->shape != std::vector<int64_t>{ E, N, K / 16 })
+                return refuse(RAD_E_SHAPE, "'" + name + "' has no e4m3 [" + std::to_string(E) + ", " +
+                                           std::to_string(N) + ", " + std::to_string(K / 16) +
+                                           "] scale '" + name + "_scale' beside its codes");
+            if (!find(name + "_amax") || !find(name + "_outer_scale_denominator"))
+                return refuse(RAD_E_FORMAT, "'" + name + "' has no '_amax' and "
+                                            "'_outer_scale_denominator' beside its codes, which is "
+                                            "the NVFP4 per-tensor form");
+            SrcTensor pv = *p;
+            pv.rad_dtype = RAD_FP4E2M1;
+            pv.shape     = { E, N, K };
+            sliced_.push_back(std::move(pv));
+            *codes = &sliced_.back();
+            *scale = sc;   /* as shipped: the scale is not folded with the level */
+        } else {
+            if (p->rad_dtype != RAD_F8E4M3 || p->shape.size() != 3)
+                return refuse(RAD_E_FORMAT, "'" + name + "' is listed MXFP8 but is not the e4m3 "
+                                            "[E, N, K] codes of a stack of experts");
+            const int64_t E = p->shape[0], N = p->shape[1], K = p->shape[2];
+            if (E <= 0 || N <= 0 || K <= 0)
+                return refuse(RAD_E_SHAPE, "'" + name + "' holds no experts");
+            if (K % 32)
+                return refuse(RAD_E_SHAPE, "'" + name + "' has " + std::to_string(K) + " columns of "
+                                           "K, which the 32-wide MXFP8 scale does not divide");
+            if (!sc || sc->rad_dtype != RAD_U8 || sc->shape != std::vector<int64_t>{ E, N, K / 32 })
+                return refuse(RAD_E_SHAPE, "'" + name + "' has no ue8m0 [" + std::to_string(E) + ", " +
+                                           std::to_string(N) + ", " + std::to_string(K / 32) +
+                                           "] scale '" + name + "_scale' beside its codes");
+            SrcTensor sv = *sc;
+            sv.rad_dtype = RAD_E8M0;   /* the byte is the exponent, 2^(s - 127) */
+            sliced_.push_back(std::move(sv));
+            *codes = p;
+            *scale = &sliced_.back();
+        }
+        imported_[name] = { *codes, *scale };
         return RAD_OK;
     }
 
@@ -1853,6 +2058,69 @@ const SrcTensor* Checkpoint::import_meta(const std::string& name) const {
     return it == imported_meta_.end() ? nullptr : it->second;
 }
 
+int Checkpoint::import_expert(const std::string& name, int index, const SrcTensor** codes,
+                              const SrcTensor** scale, const SrcTensor** level, std::string* why) {
+    auto refuse = [&](int rc, std::string m) {
+        if (why) *why = std::move(m);
+        return rc;
+    };
+    if (level) *level = nullptr;
+    if (imports_at(name) != Import::PerTensor) return RAD_E_NOTFOUND;
+    const auto form = per_tensor_form_.find(name);
+    if (form == per_tensor_form_.end()) return RAD_E_NOTFOUND;
+    const SrcTensor *C = nullptr, *S = nullptr;
+    std::string w;
+    const int rc = import_piece(name, &C, &S, &w);
+    if (rc != RAD_OK) return refuse(rc, w);
+    if (index < 0 || index >= C->shape[0])
+        return refuse(RAD_E_SHAPE, "expert " + std::to_string(index) + " of '" + name + "', which "
+                                   "holds " + std::to_string(C->shape[0]));
+    const SrcTensor* ce = slice(*C, index, name.c_str());
+    const SrcTensor* se = slice(*S, index, name.c_str());
+    if (!ce || !se) return refuse(RAD_E_SHAPE, "expert " + std::to_string(index) + " of '" + name +
+                                               "' cannot be sliced");
+    const bool nv = form->second == "nvfp4";
+    /* A NaN scale is refused, not read: e4m3's NaN is 0x7f or 0xff, ue8m0's is 0xff. */
+    const uint8_t* sb = (const uint8_t*)se->data;
+    for (int64_t i = 0; i < se->numel(); ++i) {
+        const bool nan = nv ? (sb[i] & 0x7fu) == 0x7fu : sb[i] == 0xffu;
+        if (nan)
+            return refuse(RAD_E_FORMAT, "'" + name + "' expert " + std::to_string(index) +
+                                        " holds a NaN scale at element " + std::to_string(i));
+    }
+    *codes = ce;
+    *scale = se;
+    if (!nv) return RAD_OK;
+
+    /* NVFP4's level: the expert's amax over the file's one divisor, one f32 in owned storage. */
+    const SrcTensor* am = find(name + "_amax");
+    const SrcTensor* dn = find(name + "_outer_scale_denominator");
+    float a = 0.0f, d = 0.0f;
+    std::memcpy(&a, (const uint8_t*)am->data + (size_t)index * 4, 4);
+    std::memcpy(&d, dn->data, 4);
+    if (!(d > 0.0f) || !std::isfinite(d))
+        return refuse(RAD_E_FORMAT, "'" + dn->name + "' is not a usable f32 divisor: " +
+                                    std::to_string(d));
+    if (!(a >= 0.0f) || !std::isfinite(a))
+        return refuse(RAD_E_FORMAT, "'" + am->name + "' holds a NaN, negative or infinite amax at "
+                                    "expert " + std::to_string(index));
+    const float lv = a / d;
+    if (!std::isfinite(lv))
+        return refuse(RAD_E_FORMAT, "'" + name + "' expert " + std::to_string(index) + " has a "
+                                    "level that is not finite");
+    owned_.push_back(std::make_unique<uint8_t[]>(4));
+    std::memcpy(owned_.back().get(), &lv, 4);
+    SrcTensor lt;
+    lt.name      = name + "[" + std::to_string(index) + "].level";
+    lt.rad_dtype = RAD_F32;
+    lt.shape     = { 1 };
+    lt.data      = owned_.back().get();
+    lt.bytes     = 4;
+    sliced_.push_back(std::move(lt));
+    if (level) *level = &sliced_.back();
+    return RAD_OK;
+}
+
 int Checkpoint::open(const std::string& path) {
     path_ = path;
     const bool gguf = path.size() > 5 && path.compare(path.size() - 5, 5, ".gguf") == 0;
@@ -1938,15 +2206,15 @@ struct LoraRule {
 };
 
 /* Read the map file: {"strip": [...], "modules": {"<pat>": ["<t>", ...], ...}}. The module
- * order is preserved (an nlohmann object keeps insertion order), so the first rule whose
+ * order is preserved (the DOM keeps insertion order), so the first rule whose
  * pattern matches a module wins. */
 static int lora_map_read(const std::string& file, std::vector<std::string>* strip,
                          std::vector<LoraRule>* rules) {
     std::ifstream f(file);
     if (!f) { RAD_ERR("lora: --lora-map %s cannot be read", file.c_str()); return RAD_E_NOTFOUND; }
-    nlohmann::ordered_json j;
+    Json j;
     try {
-        j = nlohmann::ordered_json::parse(f);
+        j = Json::parse(f);
     } catch (const std::exception& e) {
         RAD_ERR("lora: --lora-map %s: %s", file.c_str(), e.what());
         return RAD_E_FORMAT;
@@ -2001,8 +2269,7 @@ int Checkpoint::add_lora(const std::string& path, double strength,
     }
     std::vector<std::string> files;
     std::error_code ec;
-    const bool scanned = std::filesystem::is_directory(path, ec);
-    if (scanned) {
+    if (std::filesystem::is_directory(path, ec)) {
         for (const auto& e : std::filesystem::directory_iterator(path, ec))
             if (e.path().extension() == ".safetensors") files.push_back(e.path().string());
         std::sort(files.begin(), files.end());
@@ -2025,14 +2292,6 @@ int Checkpoint::add_lora(const std::string& path, double strength,
 
     int n_merged = 0;
     for (const std::string& f : files) {
-        /* A scanned name can be a symlink planted in the adapter dir resolving outside it --
-         * same rule as the model dir's shards. A file the operator named outright needs no
-         * screen: following its symlink is where they pointed it. */
-        if (scanned && !resolves_under(path, f)) {
-            RAD_ERR("lora: %s resolves outside the adapter directory; refusing it",
-                    log_sanitize(f).c_str());
-            return RAD_E_FORMAT;
-        }
         SafeTensorsFile st;
         if (st.open(f) != RAD_OK) return RAD_E_FORMAT;
         std::vector<Pair> pairs;
@@ -2821,11 +3080,29 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                 if ((sc = ck.find(n.substr(0, at) + ".weight_scale"))) shard_scaled = true;
         }
         /* A weight shipped in an imported form is read through that form's views. */
+        const SrcTensor* lv = nullptr;
+        bool per_tensor = false;
         {
             const SrcTensor *ic = nullptr, *is = nullptr;
             std::string iw;
             const int ir = ck.import_piece(s1.name, &ic, &is, &iw);
-            if (ir == RAD_OK) {
+            if (ir == RAD_OK && ck.imports_at(s1.name) == Checkpoint::Import::PerTensor) {
+                /* A stack of experts is read one expert at a time: the map names the index. */
+                if (s1.index < 0)
+                    return refuse(RAD_E_SHAPE, "it is the stacked experts '" + std::string(s1.name) +
+                                               "', which the map must name one expert of");
+                if (row_pieces)
+                    return refuse(RAD_E_UNSUPPORTED, "it takes rows of the stacked experts '" +
+                                                     std::string(s1.name) + "'");
+                const SrcTensor *ec = nullptr, *es = nullptr, *el = nullptr;
+                std::string ew;
+                const int er = ck.import_expert(s1.name, s1.index, &ec, &es, &el, &ew);
+                if (er != RAD_OK) return refuse(er, ew);
+                st = ec;
+                sc = es;
+                lv = el;
+                per_tensor = true;
+            } else if (ir == RAD_OK) {
                 if (s1.index >= 0)
                     return refuse(RAD_E_UNSUPPORTED, "it is a slice of '" + std::string(s1.name) +
                                                      "', which the checkpoint ships quantised; an "
@@ -2846,8 +3123,9 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
         }
         /* A sub-tensor index is always applied (ignoring it would give every expert the whole
          * stack). Its scale plane is sliced at the same index. A stack flattened into the rows of
-         * a rank-2 tensor takes src_rows as the sub-tensor's row count. */
-        else if (st && s1.index >= 0) {
+         * a rank-2 tensor takes src_rows as the sub-tensor's row count. A per-tensor expert is
+         * already one expert. */
+        else if (st && s1.index >= 0 && !per_tensor) {
             if (s1.rows > 0 && st->shape.size() == 2)
                 st = ck.rows(*st, (int64_t)s1.index * s1.rows, s1.rows, name.c_str());
             else
@@ -2864,6 +3142,7 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
         }
         out->pieces.push_back(st);
         out->scales.push_back(sc);
+        if (per_tensor) out->levels.push_back(lv);
         if (alternatives) break;
     }
     if (out->pieces.empty()) {
@@ -2980,6 +3259,37 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             out->why = "it is GPTQ-packed int" + std::to_string(p0.gptq_bits) + ", which "
                        "rad-convert imports with its scales rounded to bf16 -- serve the "
                        "container it writes";
+        }
+    } else if (ck.imports_at(p0.name) == Checkpoint::Import::PerTensor && scaled) {
+        /* Inkling 2's per-tensor experts (import_expert): one piece, its codes and scales as the
+         * checkpoint ships them, so the planes are the stored bytes. NVFP4 is codes fp4_e2m1, a
+         * scale e4m3 per 16 of K and the expert's f32 level; MXFP8 is e4m3 codes and an e8m0
+         * exponent per 32 of K. Neither is trivial: a recipe keeps or re-quantises it. */
+        if (out->pieces.size() != 1) {
+            out->why = "its per-tensor expert pieces are joined";
+        } else if (dt == RAD_FP4E2M1) {
+            if (out->levels.size() != 1 || !out->levels[0]) {
+                out->why = "its NVFP4 expert has no level beside its scales";
+            } else {
+                out->imported = true;
+                rad_enc_clear(&out->enc);
+                rad_enc_copy_str(out->enc.scheme, "affine");
+                rad_enc_add_plane(&out->enc, "codes", RAD_FP4E2M1, 1, 1);
+                rad_enc_add_plane(&out->enc, "scale", RAD_F8E4M3, 1, 16);
+                rad_enc_add_plane(&out->enc, "scale.1", RAD_F32, 0, 0);
+                out->why = "it is NVFP4 (e2m1 codes, an e4m3 scale per 16 of K and an f32 level per "
+                           "expert), kept as the checkpoint ships it";
+            }
+        } else if (dt == RAD_F8E4M3 && out->scales[0]->rad_dtype == RAD_E8M0) {
+            out->imported = true;
+            rad_enc_clear(&out->enc);
+            rad_enc_copy_str(out->enc.scheme, "affine");
+            rad_enc_add_plane(&out->enc, "codes", RAD_F8E4M3, 1, 1);
+            rad_enc_add_plane(&out->enc, "scale", RAD_E8M0, 1, 32);
+            out->why = "it is MXFP8 (e4m3 codes and an e8m0 exponent per 32 of K), kept as the "
+                       "checkpoint ships it";
+        } else {
+            out->why = "its per-tensor expert is neither NVFP4 nor MXFP8 as the file's groups name it";
         }
     } else if (dt == RAD_FP4E2M1 && scaled &&
                (ck.imports_at(p0.name) == Checkpoint::Import::Nvfp4 ||
@@ -3179,9 +3489,17 @@ namespace {
 /* ---------------------------------------------------------------- GGUF block types
  *
  * ggml block types decodable to f32. Their geometry lives in core/text; decoding lives here, where
- * weights are read. Q4_K and Q6_K are the K-quants this HYV3 GGUF adapter needs. */
+ * weights are read. Q4_K, Q5_K and Q6_K are the K-quants the GGUF releases ship, IQ4_NL the
+ * non-linear 4-bit. */
 enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q4_1 = 3, GGML_Q5_0 = 6, GGML_Q5_1 = 7,
-       GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_BF16 = 30 };
+       GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_BF16 = 30,
+       GGML_IQ4_NL = 20 };
+
+/* IQ4_NL's non-linear levels (llama.cpp's kvalues_iq4nl), one per 4-bit code. */
+static const int8_t kIq4NlLevels[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
 
 int ggml_rows_f32(uint32_t type, const uint8_t* p, int64_t n, float* dst) {
     auto half = [&](const uint8_t* q) { uint16_t h; std::memcpy(&h, q, 2); return rad_f16_to_f32(h); };
@@ -3241,13 +3559,7 @@ int ggml_rows_f32(uint32_t type, const uint8_t* p, int64_t n, float* dst) {
                 const uint8_t* qs = p + 16;
                 for (int j = 0; j < 8; ++j) {
                     uint32_t sc, mn;
-                    if (j < 4) {
-                        sc = scales[j] & 63u;
-                        mn = scales[j + 4] & 63u;
-                    } else {
-                        sc = (scales[j + 4] & 15u) | ((uint32_t)(scales[j - 4] >> 6) << 4);
-                        mn = (scales[j + 4] >> 4) | ((uint32_t)(scales[j] >> 6) << 4);
-                    }
+                    ggml_planes::k4_scale_min(j, scales, &sc, &mn);
                     const float ds = d * (float)sc, ms = dmin * (float)mn;
                     for (int l = 0; l < 32; ++l) {
                         const int v = j * 32 + l;
@@ -3259,34 +3571,32 @@ int ggml_rows_f32(uint32_t type, const uint8_t* p, int64_t n, float* dst) {
             }
             return RAD_OK;
         case GGML_Q5_K:
-            /* block_q5_K: d, dmin, scales[12], qh[32] @16, qs[128] @48. Q4_K's scale and min, a
-             * fifth code bit from qh[v % 32] bit v / 32 (dequantize_row_q5_K). */
+            /* block: d, dmin, scales[12], qh[32], qs[128]. The fifth bit of value v is bit
+             * (v/64)*2 + (v%64)/32 of qh's byte (v/64)*32 + v%32. */
             for (int64_t b = 0; b < n / 256; ++b, p += 176) {
                 const float d = half(p), dmin = half(p + 2);
                 const uint8_t* scales = p + 4;
                 const uint8_t* qh = p + 16;
                 const uint8_t* qs = p + 48;
-                for (int j = 0; j < 8; ++j) {
-                    uint32_t sc, mn;
-                    if (j < 4) {
-                        sc = scales[j] & 63u;
-                        mn = scales[j + 4] & 63u;
-                    } else {
-                        sc = (scales[j + 4] & 15u) | ((uint32_t)(scales[j - 4] >> 6) << 4);
-                        mn = (scales[j + 4] >> 4) | ((uint32_t)(scales[j] >> 6) << 4);
-                    }
-                    const float ds = d * (float)sc, ms = dmin * (float)mn;
-                    for (int l = 0; l < 32; ++l) {
-                        const int v = j * 32 + l;
-                        const uint8_t q = qs[32 * (v / 64) + v % 32];
-                        const int code = ((v % 64) < 32 ? q & 15 : q >> 4) |
-                                         (((qh[l] >> j) & 1) << 4);
-                        dst[b * 256 + v] = ds * (float)code - ms;
-                    }
+                for (int j = 0; j < 256; j += 64) {
+                    const int hb = j / 64;
+                    const uint32_t u1 = 1u << (2 * hb), u2 = 1u << (2 * hb + 1);
+                    uint32_t sc1, m1, sc2, m2;
+                    ggml_planes::k4_scale_min(j / 32, scales, &sc1, &m1);
+                    ggml_planes::k4_scale_min(j / 32 + 1, scales, &sc2, &m2);
+                    const float d1 = d * (float)sc1, m1f = dmin * (float)m1;
+                    const float d2 = d * (float)sc2, m2f = dmin * (float)m2;
+                    const uint8_t* ql = qs + (j / 2);
+                    /* The 32 qh bytes are shared across all four 64-blocks; only the mask moves. */
+                    for (int l = 0; l < 32; ++l)
+                        dst[b * 256 + j + l] = d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1f;
+                    for (int l = 0; l < 32; ++l)
+                        dst[b * 256 + j + 32 + l] = d2 * (float)((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2f;
                 }
             }
             return RAD_OK;
         case GGML_Q6_K:
+            /* block: ql[128], qh[64], scales[16], d. */
             for (int64_t b = 0; b < n / 256; ++b, p += 210) {
                 const uint8_t* ql = p;
                 const uint8_t* qh = p + 128;
@@ -3298,6 +3608,16 @@ int ggml_rows_f32(uint32_t type, const uint8_t* p, int64_t n, float* dst) {
                     const int code = (int)((t < 2 ? lo & 15 : lo >> 4) |
                                            (((qh[32 * n128 + l] >> (2 * t)) & 3) << 4));
                     dst[b * 256 + k] = d * (float)scales[k / 16] * (float)(code - 32);
+                }
+            }
+            return RAD_OK;
+        case GGML_IQ4_NL:
+            for (int64_t b = 0; b < n / 32; ++b, p += 18) {
+                const float d = half(p);
+                const uint8_t* qs = p + 2;
+                for (int j = 0; j < 16; ++j) {
+                    dst[b * 32 + j]      = d * (float)kIq4NlLevels[qs[j] & 0x0F];
+                    dst[b * 32 + j + 16] = d * (float)kIq4NlLevels[qs[j] >> 4];
                 }
             }
             return RAD_OK;
@@ -3524,11 +3844,17 @@ int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::
             const int64_t sc = (pc + bc - 1) / bc;
             /* A piece's single scale (FP8 per tensor) covers every one of its rows. */
             const bool one = per_tensor_scale(sk, pr);
+            const float lv = k < w.levels.size() && w.levels[k]
+                                 ? rad_load_f32(w.levels[k]->data, RAD_F32, 0) : 1.0f;
             for (int64_t r = std::max(r0, base); r < std::min(r0 + nr, base + pr); ++r)
-                for (int64_t c = 0; c < w.cols; ++c)
+                for (int64_t c = 0; c < w.cols; ++c) {
+                    /* Scale, then level: the order the golden reference multiplies in, so the
+                     * product rounds the same way (a combined factor differs in the last bit). */
                     out[(r - r0) * w.cols + c] *=
                         rad_load_f32(sk.data, sk.rad_dtype,
                                      one ? 0 : ((r - base) / br) * sc + c / bc);
+                    out[(r - r0) * w.cols + c] *= lv;
+                }
             base += pr;
         }
     }
@@ -3710,6 +4036,159 @@ int ckpt_import_form(CkptWeight* w, const ImportForm& f, std::string* why) {
     return RAD_OK;
 }
 
+
+int Checkpoint::bailingmoe3_layouts() {
+    /* The release GGUF keeps layouts the plugin's names cannot spell through the row and slice
+     * maps. The MLA layers' latent projections are head-last: k_b [128, 512, heads] and
+     * v_b [512, 128, heads] (a 128-row k block and a 128-row v block a head), where the plugin
+     * reads one interleaved kv_b [heads * 2 * 128, 512] -- head h's k rows [2 * 128 * h,
+     * + 128), its v rows the next 128. The MoE layers' routed stacks are expert-last (gate and
+     * up [ff, emb, E], down [emb, ff, E]); the reader's fastest-first flip orients them, and
+     * the block's split-stacked source slices one expert off the flipped [E, ...] stack, so
+     * they stay where they are. Everything the flip already hands over in the plugin's
+     * orientation (the shared expert, the KDA and the norms) needs only a name, which the
+     * plugin takes from the gguf_source meta. */
+    const int64_t n_layer = meta_.m.n_layers;
+    const char* grp_s = meta_.get("layer_group_size");
+    const int64_t group = grp_s ? std::stoll(grp_s) : 4;
+    const char* dense_s = meta_.get("first_k_dense_replace");
+    const int64_t dense = dense_s ? std::stoll(dense_s) : 1;
+    const char* heads_s = meta_.get("num_attention_heads");
+    const int64_t heads = heads_s ? std::stoll(heads_s) : 16;
+    const char* latent_s = meta_.get("kv_lora_rank");
+    const int64_t latent = latent_s ? std::stoll(latent_s) : 512;
+    const char* ff_s = meta_.get("moe_intermediate_size");
+    const int64_t ff = ff_s ? std::stoll(ff_s) : 512;
+    /* The experts' third axis is the embedding width, not the dense feed-forward's. */
+    const int64_t emb = meta_.m.n_embd;
+    const char* nexp_s = meta_.get("num_experts");
+    const int64_t n_expert = nexp_s ? std::stoll(nexp_s) : 0;
+    /* Every loop below walks to n_layer on the open path, so the counts must be bounded HERE:
+     * a GGUF claiming 2^62 layers would spend centuries in name probes, never answering, never
+     * refusing -- a hostile container's hang, not a slow load. No real model of this family is
+     * near 4096 layers. And the MoE suffix loop starts at the dense prefix, so the prefix must
+     * lie inside the stack: negative opens a walk of twice the range, beyond the end is a
+     * container that means nothing by it. The head and rank caps are the same discipline one
+     * order down: the rebuild's products (heads * (nope + rope) rows, heads * 256 * latent
+     * bytes of fused kv) are computed in int64 and handed to vectors sized through size_t, and
+     * a product past that type's range truncates to a small allocation the copy then overruns.
+     * No family model is near 4096 heads or ranks; 256 rope dimensions is already
+     * far past what the rope kernel addresses. */
+    if (n_layer < 1 || n_layer > 4096 || dense < 0 || dense > n_layer ||
+        group < 2 || group > n_layer || heads < 1 || heads > 4096 ||
+        latent < 1 || latent > 4096 || ff < 1 || emb < 1)
+        return RAD_E_FORMAT;
+
+    /* Decode a whole source tensor to f32: a block type row by row, a plain one a copy. */
+    auto whole = [&](const SrcTensor* t, std::vector<float>& dst) -> int {
+        const int64_t n = t->numel();
+        dst.resize((size_t)n);
+        return piece_f32(*t, 0, n, dst.data());
+    };
+    auto add = [&](const std::string& name, std::vector<int64_t> shape,
+                   std::vector<float>&& v) -> int {
+        if (index_.count(name)) return RAD_OK;   /* the checkpoint already spells it */
+        SrcTensor s;
+        s.name      = name;
+        s.rad_dtype = RAD_F32;
+        s.shape     = std::move(shape);
+        s.owned     = std::move(v);
+        s.data      = s.owned.data();
+        s.bytes     = (int64_t)(s.owned.size() * sizeof(float));
+        index_.emplace(s.name, tensors_.size());
+        tensors_.push_back(std::move(s));
+        return RAD_OK;
+    };
+
+    /* The exporter's ssm_a is exp(A_log) (llama.cpp's bailingmoe3 modify_tensors); the KDA
+     * kernel exponentiates internally, so the container wants the log values back. */
+    for (int64_t l = 0; l < n_layer; ++l) {
+        if ((l + 1) % group == 0) continue;   /* the MLA layers carry no ssm_a */
+        const SrcTensor* sa = find(fmt("blk.%lld.ssm_a", (long long)l));
+        if (!sa) continue;
+        std::vector<float> a3, raw;
+        RAD_TRY(whole(sa, a3));
+        raw.resize(a3.size());
+        for (size_t i = 0; i < a3.size(); ++i)
+            raw[i] = std::log(a3[i] > 0.0f ? a3[i] : 1.0f);
+        RAD_TRY(add(fmt("blk.%lld.ssm_a_raw", (long long)l), sa->shape, std::move(raw)));
+    }
+
+    for (int64_t l = 1; l < n_layer; ++l) {
+        if ((l + 1) % group) continue;   /* the MLA layers */
+        const std::string kn = fmt("blk.%lld.attn_k_b.weight", (long long)l);
+        const std::string vn = fmt("blk.%lld.attn_v_b.weight", (long long)l);
+        const SrcTensor* k = find(kn);
+        const SrcTensor* v = find(vn);
+        if (!k || !v) continue;
+        if (k->shape.size() != 3 || v->shape.size() != 3 || k->shape[0] != heads ||
+            k->shape[1] != latent || k->shape[2] != 128 || v->shape[0] != heads ||
+            v->shape[1] != 128 || v->shape[2] != latent)
+            return RAD_E_SHAPE;
+        std::vector<float> k3, v3, fused;
+        RAD_TRY(whole(k, k3));
+        RAD_TRY(whole(v, v3));
+        fused.assign((size_t)(heads * (2 * 128) * latent), 0.0f);
+        for (int64_t h = 0; h < heads; ++h)
+            for (int64_t d = 0; d < 128; ++d) {
+                /* k_b's head block [latent, 128] transposed into the 128 k rows. */
+                for (int64_t l2 = 0; l2 < latent; ++l2)
+                    fused[((h * 2 + 0) * 128 + d) * latent + l2] = k3[((h * latent + l2) * 128) + d];
+                /* v_b's head block [128, latent] already runs its v rows. */
+                std::memcpy(&fused[((h * 2 + 1) * 128 + d) * latent],
+                            &v3[((h * 128 + d) * latent)], (size_t)latent * sizeof(float));
+            }
+        RAD_TRY(add(fmt("blk.%lld.attn_kv_b.weight", (long long)l),
+                    { heads * 2 * 128, latent }, std::move(fused)));
+        /* q_b is one [heads * (nope + rope), q_lora] matrix the plugin row-maps; a quantised
+         * source cannot be row-mapped, so split it into the plain nope and rope blocks. The
+         * per-head boundary comes from the meta the reader republished, so the split only runs
+         * when the geometry is the one the plugin will consume. */
+        const char* nps = meta_.get("qk_nope_head_dim"), *rps = meta_.get("qk_rope_head_dim");
+        const int64_t qn = nps ? std::stoll(nps) : 0, qr = rps ? std::stoll(rps) : 0;
+        const SrcTensor* qb = find(fmt("blk.%lld.attn_q_b.weight", (long long)l));
+        /* The row product is checked, not trusted: heads and the two rope widths arrive from
+         * the container, and a wrapped product that happened to equal the tensor's rows would
+         * run the split at the wrong per-head boundary. */
+        int64_t w = 0, qb_rows = 0;
+        if (qb && qb->shape.size() == 2 && qb->shape[1] > 0 && qn > 0 && qr > 0 &&
+            !__builtin_add_overflow(qn, qr, &w) && !__builtin_mul_overflow(heads, w, &qb_rows) &&
+            qb->shape[0] == qb_rows) {
+            const int64_t ql = qb->shape[1];
+            std::vector<float> q3, nblk, rblk;
+            RAD_TRY(whole(qb, q3));
+            nblk.assign((size_t)(heads * qn) * ql, 0.0f);
+            rblk.assign((size_t)(heads * qr) * ql, 0.0f);
+            for (int64_t h = 0; h < heads; ++h) {
+                std::memcpy(&nblk[(h * qn) * ql], &q3[(h * w) * ql], (size_t)(qn * ql) * sizeof(float));
+                std::memcpy(&rblk[(h * qr) * ql], &q3[(h * w + qn) * ql], (size_t)(qr * ql) * sizeof(float));
+            }
+            RAD_TRY(add(fmt("blk.%lld.attn_q_b_nope.weight", (long long)l), { heads * qn, ql }, std::move(nblk)));
+            RAD_TRY(add(fmt("blk.%lld.attn_q_b_rope.weight", (long long)l), { heads * qr, ql }, std::move(rblk)));
+        }
+    }
+    for (int64_t l = dense; l < n_layer; ++l) {
+        if (n_expert < 1) continue;
+        /* The routed stacks stay where they are: the block's split-stacked source
+         * (gate, up, down per expert, a dim-0 slice each) slices the reader's flipped
+         * [E, ff, emb] / [E, emb, ff] tensors directly. Only the shared expert needs
+         * re-spelling under the block's prefix: copies, the reader's flip already
+         * orienting them. */
+        const char* sh[3] = { "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp" };
+        const char* shd[3] = { "mlp.shared_experts.gate_proj.weight",
+                               "mlp.shared_experts.up_proj.weight",
+                               "mlp.shared_experts.down_proj.weight" };
+        for (int q = 0; q < 3; ++q) {
+            const SrcTensor* t = find(fmt("blk.%lld.%s.weight", (long long)l, sh[q]));
+            if (!t) continue;
+            std::vector<float> v;
+            RAD_TRY(whole(t, v));
+            RAD_TRY(add(fmt("blk.%lld.%s", (long long)l, shd[q]), t->shape, std::move(v)));
+        }
+    }
+    return RAD_OK;
+}
+
 int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* dst,
                     std::string* why) {
     auto refuse = [&](int rc, std::string m) {
@@ -3718,6 +4197,13 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
     };
     if (!(w.trivial || w.imported) || k < 0 || k >= w.enc.n_planes)
         return refuse(RAD_E_STATE, "not a plane of a trivial or imported encoding");
+    /* A per-tensor NVFP4 level: one f32 for the piece (the plane's whole extent is one element). */
+    if (!w.levels.empty() && !std::strcmp(w.enc.plane[k].role, "scale.1")) {
+        if (r0 != 0 || nr != 1 || !w.levels[0])
+            return refuse(RAD_E_SHAPE, "the level plane of '" + w.name + "' is one element");
+        rad_store_f32(dst, w.enc.plane[k].dtype, 0, rad_load_f32(w.levels[0]->data, RAD_F32, 0));
+        return RAD_OK;
+    }
     const std::vector<const SrcTensor*>& src = k == 0 ? w.pieces : w.scales;
     int64_t pr = 0, pc = 0;
     rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr, &pc);

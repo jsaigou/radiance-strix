@@ -13,6 +13,7 @@
 #pragma once
 #include <functional>
 #include "mem/prefix.h"
+#include "mem/seqwindow.h"
 #include "rad_core.h"
 #include "mm/processor.h"
 
@@ -40,6 +41,13 @@ struct IKVManager {
     virtual int  ensure_from(uint64_t seq, int64_t n_tokens, int64_t keep_from) {
         (void)keep_from;
         return ensure(seq, n_tokens);
+    }
+    /* Admission needs to distinguish local exhaustion from a Fleet grant that may arrive
+     * after another model yields memory. The reason belongs to this exact allocation attempt. */
+    virtual int ensure_admission(uint64_t seq, int64_t n, int64_t keep_from,
+                                 bool* waiting_for_fleet) {
+        *waiting_for_fleet = false;
+        return ensure_from(seq, n, keep_from);
     }
     /* After a committed step, a window group frees what no later query can read
      * (KVManager::trim_window). */
@@ -152,6 +160,22 @@ struct IKVManager {
      * Reading clears it, so the batch builder, which keeps the device copy and stages only the
      * changed tail, must be the only caller. 0 is always correct (restage the whole table). */
     virtual int64_t take_table_changes(uint64_t seq, int32_t group) const = 0;
+
+    /* The batch builder's reads about (seq, group) in one call (SeqGroupView, mem/seqwindow.h).
+     * The default composes the accessors above, so a manager that does not override it answers
+     * identically; the concrete manager overrides it to find the sequence once. `take_changes`
+     * additionally performs take_table_changes (batch build only, as there). */
+    virtual void seq_group(uint64_t seq, int32_t group, bool take_changes,
+                           SeqGroupView* out) const {
+        const std::vector<int32_t>& bt = block_table(seq, group);
+        out->bt    = bt.data();
+        out->bt_n  = bt.size();
+        out->first = first_block_pos(seq, group);
+        out->has_win = runtime_window(seq, group, &out->win);
+        if (!out->has_win) out->win = SeqWindow{};
+        out->state = state_slot(seq, group);
+        out->changed_from = take_changes ? take_table_changes(seq, group) : 0;
+    }
 
     /* Whether the snapshot store still holds `slot`. The scheduler checks before building a
      * restore step, since a released slot may hold another session's state. */
@@ -320,6 +344,78 @@ struct KVGeom {
         if (bi < 0 || bi >= (int64_t)bt.size()) return -1;
         return (int32_t)(bt[(size_t)bi] * e.block_size + (pos % e.block_size));
     }
+
+    /* Steps until trunc(x / bs) next changes as x increases: the run over which a quotient (and
+     * the matching C++ remainder, x - trunc(x/bs)*bs) stays affine. Truncation toward zero makes
+     * the negative side differ from floor: the quotient of a negative x next changes one past a
+     * multiple, not at it. */
+    static int64_t trunc_steps(int64_t x, int64_t bs) {
+        const int64_t q = x / bs;
+        return (q >= 0 ? (q + 1) * bs : q * bs + 1) - x;
+    }
+
+    /* slot() at n consecutive positions pos0, pos0+1, ..., identical values with one division a
+     * segment instead of two a token. A segment ends where the block index or the in-block
+     * offset would change rule (trunc_steps of (pos - first_pos) and of pos); inside it the slot
+     * is (block base + off + k), or -1 throughout when the block index is outside the table.
+     * bt is the table's data and length where slot() takes the vector. */
+    void slots(int gi, const int32_t* bt, size_t bt_n, int64_t first_pos, int64_t pos0,
+               int64_t n, int32_t* out) const {
+        const int64_t bs = g[(size_t)gi].block_size;
+        int64_t done = 0;
+        while (done < n) {
+            const int64_t pos = pos0 + done;
+            const int64_t rel = pos - first_pos;
+            const int64_t bi = rel / bs;
+            int64_t len = trunc_steps(rel, bs);
+            const int64_t lo = trunc_steps(pos, bs);
+            if (lo < len) len = lo;
+            if (len > n - done) len = n - done;
+            if (bi < 0 || (size_t)bi >= bt_n) {
+                for (int64_t k = 0; k < len; ++k) out[done + k] = -1;
+            } else {
+                const int64_t base = (int64_t)bt[(size_t)bi] * bs + pos % bs;
+                for (int64_t k = 0; k < len; ++k) out[done + k] = (int32_t)(base + k);
+            }
+            done += len;
+        }
+    }
+
+    /* slot_ring() at n consecutive positions, the same treatment. Positions before ring_pos go
+     * through slots(); in the ring the block index advances where (pos - ring_pos) crosses a
+     * block multiple, wrapping modulo ring_blocks at those same points. A window with no ring
+     * blocks cannot be armed (KVManager::set_window clamps the ring to at least one block and
+     * slot_ring's modulo would be by zero), so it takes the plain mapping. */
+    void slots_ring(int gi, const int32_t* bt, size_t bt_n, int64_t first_pos, int64_t pos0,
+                    int64_t n, const SeqWindow& w, int32_t* out) const {
+        if (!w.set || w.ring_blocks <= 0) {
+            slots(gi, bt, bt_n, first_pos, pos0, n, out);
+            return;
+        }
+        const int64_t bs = g[(size_t)gi].block_size;
+        int64_t done = 0;
+        if (pos0 < w.ring_pos) {
+            done = w.ring_pos - pos0 < n ? w.ring_pos - pos0 : n;
+            slots(gi, bt, bt_n, first_pos, pos0, done, out);
+        }
+        const int64_t ring_bi0 = w.ring_pos / bs;
+        while (done < n) {
+            const int64_t pos = pos0 + done;
+            const int64_t rp = pos - w.ring_pos;
+            const int64_t bi = ring_bi0 + (rp / bs) % w.ring_blocks;
+            int64_t len = trunc_steps(rp, bs);
+            const int64_t lo = trunc_steps(pos, bs);
+            if (lo < len) len = lo;
+            if (len > n - done) len = n - done;
+            if (bi < 0 || (size_t)bi >= bt_n) {
+                for (int64_t k = 0; k < len; ++k) out[done + k] = -1;
+            } else {
+                const int64_t base = (int64_t)bt[(size_t)bi] * bs + pos % bs;
+                for (int64_t k = 0; k < len; ++k) out[done + k] = (int32_t)(base + k);
+            }
+            done += len;
+        }
+    }
 };
 
 /* ------------------------------------------------------------------ binding the concrete classes */
@@ -334,6 +430,9 @@ struct KVBinding final : IKVManager {
     void free_sequence(uint64_t s) override         { m->free_sequence(s); }
     int  ensure(uint64_t s, int64_t n) override     { return m->ensure(s, n); }
     int  ensure_from(uint64_t s, int64_t n, int64_t k) override { return m->ensure(s, n, k); }
+    int ensure_admission(uint64_t s, int64_t n, int64_t k, bool* waiting) override {
+        return m->ensure(s, n, k, waiting);
+    }
     void trim_window(uint64_t s, int64_t k) override { m->trim_window(s, k); }
     int64_t runtime_window_tokens(int32_t g) const override { return m->runtime_window_tokens(g); }
     int  set_window(uint64_t s, int64_t lo, int64_t w) override { return m->set_window(s, lo, w); }
@@ -386,6 +485,9 @@ struct KVBinding final : IKVManager {
     }
     int64_t take_table_changes(uint64_t s, int32_t g) const override {
         return m->take_table_changes(s, g);
+    }
+    void seq_group(uint64_t s, int32_t g, bool take, SeqGroupView* o) const override {
+        m->seq_group(s, g, take, o);
     }
     bool checkpoint_held(int32_t slot) const override { return m->checkpoint_held(slot); }
 };
@@ -503,9 +605,10 @@ struct PCBinding final : IPrefixCache {
         toks.insert(toks.end(), r.prompt.begin(), r.prompt.end());
         toks.insert(toks.end(), r.output.begin(), r.output.end());
         if (n_tokens > (int64_t)toks.size()) n_tokens = (int64_t)toks.size();
-        /* r.id is the session, the same id reserve_checkpoint keys its snapshots by. */
+        /* r.id is the session, the same id reserve_checkpoint keys its snapshots by.
+         * The slot rides along so the session row knows which adapter answered last. */
         media_keys(r, &mm_, salt_id);
-        return m->insert(r.id, toks, mm_, blocks, n_tokens, r.session_label);
+        return m->insert(r.id, toks, mm_, blocks, n_tokens, r.session_label, r.lora_slot);
     }
     /* Installed by the engine when the idle tiers are on: lands every pending host copy now and
      * returns whether any landed. Runs on the step thread under the scheduler's lock. */

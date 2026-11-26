@@ -54,3 +54,28 @@ __device__ __forceinline__ void r4d_fwht_wave(float* v, int lane) {
     r4d_fwht_xstage<VPL, 8>(v, lane);
     r4d_fwht_xstage<VPL, 16>(v, lane);
 }
+
+// The same transform of a block a part of the wave holds: VPL contiguous values per lane and LPG
+// adjacent lanes (a power of two, the block HAD = VPL * LPG wide, lane-major from a lane that is a
+// multiple of LPG). Stages run by ascending stride as in r4d_fwht_wave, and a butterfly's two
+// results do not depend on which lane holds which index, so any (VPL, LPG) with the same product
+// gives the same bits: r4d_fwht_part<8, 16> over sixteen lanes is r4d_fwht_wave<128> over a wave.
+template <int VPL, int LPG>
+__device__ __forceinline__ void r4d_fwht_part(float* v, int lane) {
+#pragma unroll
+    for (int h = 1; h < VPL; h <<= 1) {
+#pragma unroll
+        for (int j = 0; j < VPL; j++) {
+            if ((j & h) == 0) {
+                const float a = v[j], b = v[j + h];
+                v[j] = a + b;
+                v[j + h] = a - b;
+            }
+        }
+    }
+    if constexpr (LPG > 1)  r4d_fwht_xstage<VPL, 1>(v, lane);
+    if constexpr (LPG > 2)  r4d_fwht_xstage<VPL, 2>(v, lane);
+    if constexpr (LPG > 4)  r4d_fwht_xstage<VPL, 4>(v, lane);
+    if constexpr (LPG > 8)  r4d_fwht_xstage<VPL, 8>(v, lane);
+    if constexpr (LPG > 16) r4d_fwht_xstage<VPL, 16>(v, lane);
+}

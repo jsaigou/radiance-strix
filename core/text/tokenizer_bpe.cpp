@@ -1,7 +1,6 @@
 #include "text/tokenizer_bpe.h"
 
 #include <algorithm>
-#include <queue>
 
 namespace rad {
 
@@ -130,32 +129,39 @@ void merge_linear(std::vector<BpeSym>& syms, const MergeTable& merges) {
     syms.resize(len);
 }
 
-void merge_heap(std::vector<BpeSym>& syms, const MergeTable& merges) {
-    struct Node { int32_t prev, next; uint32_t ver; bool alive; };
-    struct Cand {
-        uint32_t rank, left, right, vl, vr;
-        int32_t  merged;
-        /* priority_queue is a max-heap: the pair that should come out first compares greatest. */
-        bool operator<(const Cand& o) const {
-            return rank != o.rank ? rank > o.rank : left > o.left;
-        }
-    };
+void merge_heap(std::vector<BpeSym>& syms, const MergeTable& merges, BpeMergeScratch& sc) {
+    using Node = BpeMergeScratch::Node;
+    using Cand = BpeMergeScratch::Cand;
     const size_t n = syms.size();
-    std::vector<Node> node(n);
+    std::vector<Cand>& heap = sc.heap;
+    heap.clear();
+    /* Bulk-build the initial heap: candidates all carry the nodes' initial version, so they can
+     * be collected before the node array exists, and a word with no merging pair returns without
+     * allocating or initialising it. make_heap is linear where pushing every pair is n log n. */
+    for (size_t i = 0; i + 1 < n; ++i) {
+        int32_t m = -1;
+        const uint32_t rank = merges.find(syms[i].id, syms[i + 1].id, &m);
+        if (rank != UINT32_MAX)
+            heap.push_back({ rank, (uint32_t)i, (uint32_t)(i + 1), 0, 0, m });
+    }
+    if (heap.empty()) return;
+    std::make_heap(heap.begin(), heap.end());
+    std::vector<Node>& node = sc.nodes;
+    node.resize(n);
     for (size_t i = 0; i < n; ++i)
         node[i] = { (int32_t)i - 1, i + 1 < n ? (int32_t)(i + 1) : -1, 0, true };
-    std::priority_queue<Cand> heap;
     auto offer = [&](int32_t l, int32_t r) {
         if (l < 0 || r < 0) return;
         int32_t m = -1;
         const uint32_t rank = merges.find(syms[l].id, syms[r].id, &m);
         if (rank == UINT32_MAX) return;
-        heap.push({ rank, (uint32_t)l, (uint32_t)r, node[l].ver, node[r].ver, m });
+        heap.push_back({ rank, (uint32_t)l, (uint32_t)r, node[l].ver, node[r].ver, m });
+        std::push_heap(heap.begin(), heap.end());
     };
-    for (size_t i = 0; i + 1 < n; ++i) offer((int32_t)i, (int32_t)(i + 1));
     while (!heap.empty()) {
-        const Cand c = heap.top();
-        heap.pop();
+        const Cand c = heap.front();
+        std::pop_heap(heap.begin(), heap.end());
+        heap.pop_back();
         Node& l = node[c.left];
         Node& r = node[c.right];
         if (!l.alive || !r.alive || l.ver != c.vl || r.ver != c.vr) continue;
@@ -176,10 +182,16 @@ void merge_heap(std::vector<BpeSym>& syms, const MergeTable& merges) {
 
 }  /* namespace */
 
-void bpe_merge(std::vector<BpeSym>& syms, const MergeTable& merges, bool force_heap) {
+void bpe_merge(std::vector<BpeSym>& syms, const MergeTable& merges, BpeMergeScratch& scratch,
+               bool force_heap) {
     if (syms.size() < 2) return;
     if (syms.size() <= kBpeLinearMax && !force_heap) merge_linear(syms, merges);
-    else                                              merge_heap(syms, merges);
+    else                                              merge_heap(syms, merges, scratch);
+}
+
+void bpe_merge(std::vector<BpeSym>& syms, const MergeTable& merges, bool force_heap) {
+    BpeMergeScratch scratch;
+    bpe_merge(syms, merges, scratch, force_heap);
 }
 
 }  /* namespace rad */

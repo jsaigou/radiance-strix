@@ -14,10 +14,10 @@
  *
  *   llama_fp8        quant "fp8_e4m3"    the checkpoint holds E4M3 codes and a `weight_scale_inv`
  *                                        plane per linear, as the engine reads them.
- *   llama_dense_fp8  quant ""            the checkpoint is dense bf16, and a recipe quantises each
- *                                        linear to those two planes at convert time
- *                                        (data/recipes/minicpm5-2b-dspark.recipe: amax per 128x128
- *                                        block, scale = amax/448 rounded to bf16).
+ *   llama_dense_fp8  quant ""            the checkpoint is dense bf16, and a recipe quantises its
+ *                                        linears at convert time
+ *                                        (data/recipes/minicpm5-2b-iq8r.recipe: rotated int8, a
+ *                                        scale per (row, 256 of K)) or leaves them bf16.
  *
  * MiniCPM5-2B needs the second, since it is published only in bf16. Both builds declare the same
  * weights and ops, so nothing downstream can tell which one ran.
@@ -28,8 +28,17 @@
  *   BF16, no plane                       every norm and the embedding
  *
  * The lm_head is declared at whatever the model holds: bf16 as llama checkpoints ship it, or block
- * fp8 where a recipe quantised it (the widest GEMM at half the bytes), and the logits kernel for
- * that encoding is selected. Both vocabulary edges are row-sharded with the vocabulary.
+ * fp8 or int8 where a recipe quantised it (the widest GEMM at half the bytes), and the logits
+ * kernel for that encoding is selected. Both vocabulary edges are row-sharded with the vocabulary.
+ *
+ * ============================== AN INT8 TRUNK ==============================
+ *
+ * The dense build also serves a recipe that makes the linears rotated int8 (IQ8R:
+ * data/recipes/minicpm5-2b-iq8r.recipe). Each is a LinearFP8, which reads what the container holds,
+ * and declare() learns the format from the first layer's q|k|v before it declares the activations:
+ * they then carry int8 codes with one scale per (token, scale group) in place of the E4M3 pair,
+ * written by the norms, the gated product and the attention output's quantiser. The DSpark
+ * drafter's linears follow their own encodings the same way (rad_block_dspark.h).
  */
 #ifndef LLAMA_DENSE_SRC
 #define LLAMA_DENSE_SRC 0
@@ -67,6 +76,12 @@ struct Model {
 
     rad_kvgroup kv_full = 0;
 
+    /* The trunk's linears are rotated int8 (IQ8R, or the 128-group int8 before it), read from the
+     * first layer's fused q|k|v: the activations then carry int8 code pairs at `trunk_g8` columns
+     * a scale, written by the norms, the gated product and the attention output's quantiser. */
+    bool    trunk_i8 = false;
+    int64_t trunk_g8 = RAD_FP8_BLOCK;
+
     rad_buf b_x = 0, b_hout = 0, b_logits = 0;
     ActFP8  a_h{};
     rad_buf b_qkv = 0;
@@ -101,7 +116,7 @@ struct Model {
     std::vector<Layer> layers;
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 /* The quantisation descriptor is the selection key but is checked anyway: `--arch` can override
  * the architecture id at convert time, and a plugin handed the wrong checkpoint should say which
@@ -205,6 +220,13 @@ static int declare_dspark(RadBuilder* b, const RadModelMeta* meta, const RadBuil
         return RAD_E_UNSUPPORTED;
     }
 
+    /* The drafter's own stored format, which decides its activation pairs below. */
+    RAD_ARCH_TRY(Dspark::probe_i8(b, nm, "draft", &dc.act_i8, &dc.act_g8));
+    dc.fc_mapped = true;
+    const uint32_t dqt = dc.act_i8 ? RAD_I8 : RAD_F8E4M3;
+    const int64_t  dqg = dc.act_i8 ? dc.act_g8 : (int64_t)RAD_FP8_BLOCK;
+    auto dqcols = [dqg](int64_t n) { return (n + dqg - 1) / dqg; };
+
     /* DSpark's published config sets `sliding_window: null`, so this is normally a full cache. */
     RAD_ARCH_TRY(drafter_kv_group(b, nm, ctx, dg, dc.window, base_layer, &m.kv_draft));
 
@@ -223,28 +245,35 @@ static int declare_dspark(RadBuilder* b, const RadModelMeta* meta, const RadBuil
     dw.c    = decl_b(b, nm.f("ds_c"),  dg.act_dtype, {dg.max_tok, dg.n_embd});
     dw.ck   = decl_b(b, nm.f("ds_ck"), dg.act_dtype, {dg.max_tok, kvd});
     dw.cv   = decl_b(b, nm.f("ds_cv"), dg.act_dtype, {dg.max_tok, kvd});
-    /* FP8 copies for the context pass. `srcq` is the largest (20 MiB at a 2048-token chunk, five
-     * taps, hidden 2048) and halves the bytes of the context pass's dominant GEMM. */
-    dw.srcq = decl_b(b, nm.f("ds_srcq"), RAD_F8E4M3, {dg.max_tok, dc.n_taps * dg.n_embd});
-    dw.srcs = decl_b(b, nm.f("ds_srcs"), RAD_F32,
-                     {dg.max_tok, fp8_blocks(dc.n_taps * dg.n_embd)});
-    dw.cq   = decl_b(b, nm.f("ds_cq"), RAD_F8E4M3, {dg.max_tok, dg.n_embd});
-    dw.cs   = decl_b(b, nm.f("ds_cs"), RAD_F32,    {dg.max_tok, fp8_blocks(dg.n_embd)});
+    /* Eight-bit copies for the context pass, at the code type and scale group the drafter's
+     * linears read. `srcq` is the largest (20 MiB at a 2048-token chunk, five taps, hidden 2048)
+     * and halves the bytes of the context pass's dominant GEMM. */
+    if (dc.act_i8 && (qd % dqg || dg.n_embd % dqg || dg.n_ff % dqg)) {
+        fprintf(stderr, "radiance: the DSpark drafter's int8 linears keep one scale a %lld of K, "
+                        "which does not divide its widths (hidden %lld, attention %lld, "
+                        "feed-forward %lld)\n",
+                (long long)dqg, (long long)dg.n_embd, (long long)qd, (long long)dg.n_ff);
+        return RAD_E_UNSUPPORTED;
+    }
+    dw.srcq = decl_b(b, nm.f("ds_srcq"), dqt, {dg.max_tok, dc.n_taps * dg.n_embd});
+    dw.srcs = decl_b(b, nm.f("ds_srcs"), RAD_F32, {dg.max_tok, dqcols(dc.n_taps * dg.n_embd)});
+    dw.cq   = decl_b(b, nm.f("ds_cq"), dqt,     {dg.max_tok, dg.n_embd});
+    dw.cs   = decl_b(b, nm.f("ds_cs"), RAD_F32, {dg.max_tok, dqcols(dg.n_embd)});
 
     dw.x      = decl_b(b, nm.f("ds_x"), dg.act_dtype, {qr, dg.n_embd});
     dw.h.x    = decl_b(b, nm.f("ds_h"), dg.act_dtype, {qr, dg.n_embd});
-    dw.h.q    = decl_b(b, nm.f("ds_h.q"), RAD_F8E4M3, {qr, dg.n_embd});
-    dw.h.s    = decl_b(b, nm.f("ds_h.s"), RAD_F32,    {qr, fp8_blocks(dg.n_embd)});
+    dw.h.q    = decl_b(b, nm.f("ds_h.q"), dqt,     {qr, dg.n_embd});
+    dw.h.s    = decl_b(b, nm.f("ds_h.s"), RAD_F32, {qr, dqcols(dg.n_embd)});
     dw.q      = decl_b(b, nm.f("ds_q"), dg.act_dtype, {qr, qd});
     dw.k      = decl_b(b, nm.f("ds_k"), dg.act_dtype, {qr, kvd});
     dw.v      = decl_b(b, nm.f("ds_v"), dg.act_dtype, {qr, kvd});
     dw.attn.x = decl_b(b, nm.f("ds_attn"), dg.act_dtype, {qr, qd});
-    dw.attn.q = decl_b(b, nm.f("ds_attn.q"), RAD_F8E4M3, {qr, qd});
-    dw.attn.s = decl_b(b, nm.f("ds_attn.s"), RAD_F32,    {qr, fp8_blocks(qd)});
+    dw.attn.q = decl_b(b, nm.f("ds_attn.q"), dqt,     {qr, qd});
+    dw.attn.s = decl_b(b, nm.f("ds_attn.s"), RAD_F32, {qr, dqcols(qd)});
     dw.gate_up = decl_b(b, nm.f("ds_gate_up"), dg.act_dtype, {qr, 2 * dg.n_ff});
     dw.ffn.x  = decl_b(b, nm.f("ds_ffn"), dg.act_dtype, {qr, dg.n_ff});
-    dw.ffn.q  = decl_b(b, nm.f("ds_ffn.q"), RAD_F8E4M3, {qr, dg.n_ff});
-    dw.ffn.s  = decl_b(b, nm.f("ds_ffn.s"), RAD_F32,    {qr, fp8_blocks(dg.n_ff)});
+    dw.ffn.q  = decl_b(b, nm.f("ds_ffn.q"), dqt,     {qr, dg.n_ff});
+    dw.ffn.s  = decl_b(b, nm.f("ds_ffn.s"), RAD_F32, {qr, dqcols(dg.n_ff)});
 
     dw.sel_h  = decl_b(b, nm.f("ds_selh"), dg.act_dtype, {sr, dg.n_embd});
     dw.dq     = decl_b(b, nm.f("ds_dq"), RAD_I8,  {sr, dg.n_embd});
@@ -310,9 +339,10 @@ static int declare_dspark(RadBuilder* b, const RadModelMeta* meta, const RadBuil
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
-    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS) return RAD_E_INVAL;
+    if (ctx->rank < 0 || ctx->rank >= MAX_RANKS || rad_build_slot(ctx) >= MAX_SLOTS)
+        return RAD_E_INVAL;
 
-    Model& m = g_model[ctx->rank];
+    Model& m = g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     RAD_ARCH_TRY(check_format(meta));
@@ -346,18 +376,58 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.kv_full = rad_decl_kv_group(b, nm.f("kv_attn"), &fd);
     g.kv_dtype = rad_dtype_name(fd.dtype);
 
-    /* ---- activations. */
+    /* ---- the trunk's stored format, read from the first layer's fused q|k|v before any
+     * activation is declared: only an int8 trunk's activations carry an int8 code pair. The probe
+     * maps the weight through the layer's own LinearFP8, which then does not map it again; the
+     * resize before the layer loop keeps the layers sized here. */
     const int64_t q_dim = g.q_dim(), kv_dim = g.kv_dim();
+    m.layers.resize((size_t)m.n_main);
+    if (m.n_main > 0) {
+        const char* pre = "model.layers";
+        RAD_ARCH_TRY(m.layers[0].attn.qkv.probe(
+            b, nm, g, nm.f("blk.0.attn_qkv"),
+            { nm.ckpt("%s.0.self_attn.q_proj.weight", pre),
+              nm.ckpt("%s.0.self_attn.k_proj.weight", pre),
+              nm.ckpt("%s.0.self_attn.v_proj.weight", pre) }));
+        RadEncoding enc{};
+        m.trunk_i8 = weight_enc(b, nm.f("blk.0.attn_qkv.weight"), &enc) &&
+                     (linear_is_w8h(enc) || linear_is_wnh(enc));
+        if (m.trunk_i8) m.trunk_g8 = linear_w8h_group(enc);
+    }
+    if (m.trunk_i8 && (g.n_embd % m.trunk_g8 || q_dim % m.trunk_g8 || g.n_ff % m.trunk_g8)) {
+        fprintf(stderr, "radiance: llama: the int8 trunk keeps one scale a %lld of K, which does "
+                        "not divide this rank's widths (hidden %lld, attention %lld, "
+                        "feed-forward %lld)\n",
+                (long long)m.trunk_g8, (long long)g.n_embd, (long long)q_dim, (long long)g.n_ff);
+        return RAD_E_UNSUPPORTED;
+    }
+
+    /* ---- activations. An int8 trunk's quantisers sit in their producers where the kernels serve
+     * the rotated forms: the norms write had_quant_act_i8g's codes for q|k|v and gate|up, the
+     * gated product for the down projection, and the attention output's own quantiser for the
+     * out-projection, so no projection declares one and the activation carries no E4M3 pair.
+     * Where a form is not declared (the CPU kernels), the producer keeps its E4M3 pair and each
+     * projection quantises its own input from the bf16 plane. */
+    if (m.trunk_i8) {
+        if (rad_op_declared(b, "rmsnorm_had_quant_i8g") &&
+            (g.world != 2 || rad_op_declared(b, "ar_rmsnorm_had_quant_i8g")))
+            m.a_h.q8_fed = m.a_h.q8_rot = true;
+        if (rad_op_declared(b, "gated_had_quant_i8g")) m.a_ffn.q8_fed = m.a_ffn.q8_rot = true;
+        if (rad_op_declared(b, "had_quant_act_i8g")) m.a_attn.q8_fed = m.a_attn.q8_rot = true;
+    }
     m.b_x      = decl_b(b, nm.f("x"),        g.act_dtype, {g.max_tok, g.n_embd});
     m.a_h.x    = decl_b(b, nm.f("h"),        g.act_dtype, {g.max_tok, g.n_embd});
-    RAD_ARCH_TRY(m.a_h.declare_qs(b, nm, g, "h", g.n_embd));
+    RAD_ARCH_TRY(m.a_h.declare_qs(b, nm, g, "h", g.n_embd, 0, m.trunk_i8, !m.a_h.q8_fed,
+                                 m.trunk_g8));
     m.b_qkv    = decl_b(b, nm.f("attn_qkv"), g.act_dtype, {g.max_tok, q_dim + 2 * kv_dim});
     m.b_q      = decl_b(b, nm.f("attn_q"),   g.act_dtype, {g.max_tok, q_dim});
     m.a_attn.x = decl_b(b, nm.f("attn_out"), g.act_dtype, {g.max_tok, q_dim});
-    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "attn_out", q_dim));
+    RAD_ARCH_TRY(m.a_attn.declare_qs(b, nm, g, "attn_out", q_dim, 0, m.trunk_i8,
+                                    !m.a_attn.q8_fed, m.trunk_g8));
     m.b_gate_up = decl_b(b, nm.f("gate_up"), g.act_dtype, {g.max_tok, 2 * g.n_ff});
     m.a_ffn.x   = decl_b(b, nm.f("ffn"),     g.act_dtype, {g.max_tok, g.n_ff});
-    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff));
+    RAD_ARCH_TRY(m.a_ffn.declare_qs(b, nm, g, "ffn", g.n_ff, 0, m.trunk_i8, !m.a_ffn.q8_fed,
+                                   m.trunk_g8));
     m.b_hout   = decl_b(b, nm.f("h_out"),    g.act_dtype, {g.max_logit_rows, g.n_embd});
 
     /* ---- the drafter's taps, only when the container carries a drafter that reads them and the
@@ -431,7 +501,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     MlpFP8::Wire mw{};
     mw.x = m.b_x; mw.h = m.a_h; mw.gate_up = m.b_gate_up; mw.ffn = m.a_ffn;
 
-    m.layers.resize((size_t)m.n_main);
     for (int64_t l = 0; l < m.n_main; ++l) {
         Layer& lay = m.layers[(size_t)l];
         /* Residual fold and collective placement: rad_fp8.h, layer_fold. */
@@ -496,6 +565,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              (long long)g.head_dim, (long long)m.n_rot, (long long)g.n_ff,
              (long long)g.vocab_off, (long long)(g.vocab_off + g.n_vocab));
 #if LLAMA_DENSE_SRC
+    if (m.trunk_i8)
+        rad_note(b, "a dense bf16 checkpoint, every linear quantised by the recipe to rotated "
+                    "int8 with one scale a [1 x %lld] of K, read against int8 activations with a "
+                    "scale per (token, %lld)", (long long)m.trunk_g8, (long long)m.trunk_g8);
+    else
     rad_note(b, "a dense bf16 checkpoint, every linear quantised by the recipe to E4M3 with a "
                 "bf16 [N/%d,K/%d] scale plane (scale = block amax / 448, rounded to bf16)",
              RAD_FP8_BLOCK, RAD_FP8_BLOCK);
@@ -523,7 +597,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    Model& m = g_model[rad_rank(c)];
+    Model& m = g_model[rad_slot(c)];
     /* A drafter pass; the sign gives the kind. Positive is the query pass, proposing the whole
      * block at once; negative is the context pass, turning the tokens the trunk just committed
      * into the drafter's own K and V. Zero is a trunk step. */
@@ -579,6 +653,14 @@ static void step(RadCtx* c, const RadBatch* batch) {
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     out->draft_depth = 0;
+#if LLAMA_DENSE_SRC
+    /* Chained launches pay on an IQ8R trunk with and without its drafter: libr4d's
+     * rad_kernel_chain holds the IQ8R decode rows. MiniCPM5-2B on one R9700, ms a decode step
+     * unchained / chained: 5.57 / 5.17 at one sequence and 6.09 / 5.71 at eight without a drafter,
+     * and with DSpark 7.32 / 6.87 at one and 8.15 / 7.92 at four. A block-fp8 trunk gains less
+     * and loses nowhere: 5.45 / 5.40 and 5.92 / 5.89 without, 7.14 / 7.12 and 8.17 / 8.16 with. */
+    out->chain_pays = RAD_CHAIN_ALWAYS;
+#endif
     const char* da = rad_meta_gets(meta, "draft.architectures", "");
     if (da && (std::strstr(da, "DSpark") || std::strstr(da, "DFlash"))) {
         const long long bs = rad_meta_geti(meta, "draft.block_size", 0);
@@ -596,6 +678,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 /* One more level of expansion so `#NS` sees the expanded namespace. */
 #define LLAMA_PROBE_X(NS)        RAD_ARCH_PROBE(NS)
 #define LLAMA_PLUGIN_X(NS, ...)  RAD_ARCH_PLUGIN(NS, __VA_ARGS__)
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
 LLAMA_PROBE_X(LLAMA_NS)
 #if LLAMA_DENSE_SRC
 LLAMA_PLUGIN_X(LLAMA_NS, "llama", LLAMA_QUANT, "0.1.0",

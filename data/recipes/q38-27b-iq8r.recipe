@@ -1,0 +1,51 @@
+# q38-27b-iq8r.recipe -- Qwen3.8-27B from its bf16 release in IQ8R, the int8 format that replaces
+# block fp8, with the DFlash2 drafter, served by qwen35_w8a8.
+#
+#   CALIB=<calib Hessians, RADGRAM2> rad-convert <Qwen3.8-27B bf16 checkpoint> \
+#       --draft-model <z-lab/Qwen3.8-27B-DFlash2> --recipe data/recipes/q38-27b-iq8r.recipe \
+#       --set quantization_config.quant_method=w8a8 --set quantization_config.fmt=fwht128 \
+#       -o q38-27b-iq8r.rad
+#
+# The --set keys make the container's descriptor `w8a8_fwht128`, which selects qwen35_w8a8.
+#
+#   - IQ8R: every trunk linear (attention q/gate, k, v and output, the delta net's qkv/z and output,
+#     the MLP's gate/up and down) as int8 codes in -127..127 with one u8 scale per (row, 256 of
+#     K) under one bf16 scale a row, each 128 of K rotated by the unnormalised Hadamard before
+#     rounding and the 1/128 kept in the row scale (`transform=fwht128`), fitted by GPTQ against
+#     the calibration Hessians. gemm_nt_q
+#     reads them at i8a8h, group 256, against an int8 activation with one scale per (token, 256)
+#     under the same rotation.
+#   - The delta net's a/b projections, the norms, the embedding and the vision tower stay bf16.
+#   - The lm_head int8 unrotated with a bf16 scale per (row, 128) (logits_gemm_i8), GPTQ'd against
+#     the head's input Hessian.
+#   - The drafter's linears at four bits on the same rotated grid, as IQ4R stores a weight: the
+#     16-level integer codebook with a bf16 scale per (row, 128 of K) under fwht128, round to
+#     nearest (it has no Hessians), read at i8a8h by gemm_iqr against int8 activations. Against an
+#     MXFP4 drafter (as q38-27b-w8a8-df2.recipe makes it) on one R9700, ms a speculative step at 1, 4 and 8
+#     sequences: 54.97 / 59.91 / 70.43 against 54.2..54.6 / 59.0..59.5 / 68.6, at 3.64 / 14.9 /
+#     29.6 tokens a step against 3.75 / 15.0 / 29.2. In IQ8R instead (the trunk's lines) a step
+#     is 57.24 / 61.95 / 69.87 at 3.78 / 15.1 / 30.2 tokens.
+#   - A 2-bit copy of the target's head (u2 with a u8 zero) whose top 32 the engine rescores
+#     against the target's head.
+#
+# Without Hessians, `rtn` in place of `gptq` (and no calib=) gives the round-to-nearest container.
+
+blk.*.attn_qg.weight                 gptq  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search calib=$CALIB
+blk.*.attn_k.weight                  gptq  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search calib=$CALIB
+blk.*.attn_v.weight                  gptq  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search calib=$CALIB
+blk.*.attn_output.weight             gptq  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search calib=$CALIB
+blk.*.ssm_inz.weight                 gptq  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search calib=$CALIB
+blk.*.ssm_out.weight                 gptq  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search calib=$CALIB
+blk.*.ffn_gate_up.weight             gptq  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search calib=$CALIB
+blk.*.ffn_down.weight                gptq  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search calib=$CALIB
+
+output.weight                        gptq  codes=i8 group=128 scale=bf16 clamp=sym rule=search calib=$CALIB
+dflash.draft_head.weight             rtn   codes=u2 zero=u8 group=128 scale=f16 rule=search
+
+dflash.fc.weight                     rtn   table=-127;-97;-75;-58;-43;-30;-18;-6;6;18;30;43;58;75;97;127 group=128 scale=bf16 transform=fwht128 rule=search
+dflash.blk.*.attn_q.weight           rtn   table=-127;-97;-75;-58;-43;-30;-18;-6;6;18;30;43;58;75;97;127 group=128 scale=bf16 transform=fwht128 rule=search
+dflash.blk.*.attn_k.weight           rtn   table=-127;-97;-75;-58;-43;-30;-18;-6;6;18;30;43;58;75;97;127 group=128 scale=bf16 transform=fwht128 rule=search
+dflash.blk.*.attn_v.weight           rtn   table=-127;-97;-75;-58;-43;-30;-18;-6;6;18;30;43;58;75;97;127 group=128 scale=bf16 transform=fwht128 rule=search
+dflash.blk.*.attn_output.weight      rtn   table=-127;-97;-75;-58;-43;-30;-18;-6;6;18;30;43;58;75;97;127 group=128 scale=bf16 transform=fwht128 rule=search
+dflash.blk.*.ffn_gate_up.weight      rtn   table=-127;-97;-75;-58;-43;-30;-18;-6;6;18;30;43;58;75;97;127 group=128 scale=bf16 transform=fwht128 rule=search
+dflash.blk.*.ffn_down.weight         rtn   table=-127;-97;-75;-58;-43;-30;-18;-6;6;18;30;43;58;75;97;127 group=128 scale=bf16 transform=fwht128 rule=search

@@ -4,19 +4,23 @@
 
 // note: the json dependency is only for defining input in a convenient way
 // we can remove it in the future when we figure out a better way to define inputs using jinja::value
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <functional>
 #include <sstream>
 
 #define FILENAME "jinja-caps"
 
-using json = nlohmann::ordered_json;
+using json = rad::Json;
 
 namespace jinja {
 
 using caps_json_fn = std::function<json()>;
 using caps_analyze_fn = std::function<void(bool, value &, value &)>;
+
+// RADIANCE: where caps_get collects the first exception of a probe that carried tools
+// (caps::probe_error).
+static thread_local std::string * caps_probe_error = nullptr;
 
 static void caps_try_execute(jinja::program & prog,
                              const caps_json_fn & messages_fn,
@@ -45,6 +49,10 @@ static void caps_try_execute(jinja::program & prog,
         success = true;
     } catch (const std::exception & e) {
         JJ_DEBUG("Exception during execution: %s", e.what());
+        if (caps_probe_error && caps_probe_error->empty() && is_val<value_array>(tools) &&
+            !tools->as_array().empty()) {
+            *caps_probe_error = e.what();
+        }
         result = "";
         // ignore exceptions during capability analysis
     }
@@ -90,6 +98,7 @@ std::string caps::to_string() const {
 
 caps caps_get(jinja::program & prog) {
     caps result;
+    caps_probe_error = &result.probe_error;
 
     static const auto has_op = [](value & v, const std::string & op_name) {
         return v->stats.ops.find(op_name) != v->stats.ops.end();
@@ -475,6 +484,7 @@ caps caps_get(jinja::program & prog) {
 
     JJ_DEBUG("%s\n", result.to_string().c_str());
 
+    caps_probe_error = nullptr;
     return result;
 }
 

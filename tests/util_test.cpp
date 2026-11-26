@@ -1,5 +1,7 @@
-/* util_test.cpp -- core/util/rad_util.cpp, which every other translation unit links against, and
- * core/util/stallwatch.cpp, which reports where a phase that has gone quiet is waiting.
+/* util_test.cpp -- core/util/rad_util.cpp, which every other translation unit links against,
+ * core/util/stallwatch.cpp, which reports where a phase that has gone quiet is waiting, and
+ * core/util/rowpool.cpp, which spreads a loop's independent rows over threads kept for the
+ * process.
  *
  * `Geometry` and `constraint_holds` decide which kernel runs. A geometry that hands a kernel
  * dangling parameter pointers, or a constraint that holds when it should not, does not fail: it
@@ -11,8 +13,10 @@
 #include "rad_test.h"
 
 #include "rad_internal.h"
+#include "util/rowpool.h"
 #include "util/stallwatch.h"
 
+#include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <chrono>
@@ -531,6 +535,74 @@ TEST(a_phase_that_marks_progress_is_never_reported) {
         }
     });
     CHECK(out.find("nothing has been logged") == std::string::npos);
+}
+
+/* ================================================================== the row pool */
+
+/* Each row runs exactly once, whatever the width, and the call returns only after all of them. */
+TEST(the_row_pool_runs_every_row_once) {
+    for (int width : {1, 2, 8, 64}) {
+        for (int64_t rows : {0, 1, 2, 7, 1000}) {
+            std::vector<std::atomic<int>> hits((size_t)rows);
+            row_pool_run(rows, width, [&](int64_t i) { hits[(size_t)i].fetch_add(1); });
+            int bad = 0;
+            for (auto& h : hits) bad += h.load() != 1;
+            CHECK_EQ(bad, 0);
+        }
+    }
+}
+
+/* Under min_rows, or at width 1, the loop runs on the calling thread in order. */
+TEST(a_short_or_narrow_loop_runs_inline_in_order) {
+    const std::thread::id self = std::this_thread::get_id();
+    std::vector<int64_t> order;
+    bool elsewhere = false;
+    row_pool_run(31, 8, [&](int64_t i) {
+        order.push_back(i);
+        elsewhere = elsewhere || std::this_thread::get_id() != self;
+    }, 32);
+    CHECK(!elsewhere);
+    CHECK_EQ((int64_t)order.size(), (int64_t)31);
+    bool sorted = true;
+    for (size_t i = 0; i < order.size(); ++i) sorted = sorted && order[i] == (int64_t)i;
+    CHECK(sorted);
+    order.clear();
+    row_pool_run(100, 1, [&](int64_t i) { order.push_back(i); });
+    CHECK_EQ((int64_t)order.size(), (int64_t)100);
+}
+
+/* Callers on several threads at once each get all their rows, with workers shared between them,
+ * and a slow row in one loop does not hold up another caller's. */
+TEST(concurrent_callers_share_the_row_pool) {
+    if (row_pool_workers() == 0) return;
+    constexpr int kCallers = 6;
+    constexpr int64_t kRows = 4000;
+    std::vector<std::vector<std::atomic<int>>> hits(kCallers);
+    for (auto& h : hits) h = std::vector<std::atomic<int>>((size_t)kRows);
+    std::vector<std::thread> ts;
+    for (int c = 0; c < kCallers; ++c)
+        ts.emplace_back([&, c] {
+            for (int rep = 0; rep < 20; ++rep)
+                row_pool_run(kRows / 20, 8, [&](int64_t i) {
+                    hits[(size_t)c][(size_t)(rep * (kRows / 20) + i)].fetch_add(1);
+                });
+        });
+    for (auto& t : ts) t.join();
+    int bad = 0;
+    for (auto& h : hits)
+        for (auto& x : h) bad += x.load() != 1;
+    CHECK_EQ(bad, 0);
+
+    /* Rows spread over more than one thread when workers exist. */
+    std::mutex mu;
+    std::vector<std::thread::id> seen;
+    row_pool_run(256, 8, [&](int64_t) {
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        std::lock_guard<std::mutex> lk(mu);
+        if (std::find(seen.begin(), seen.end(), std::this_thread::get_id()) == seen.end())
+            seen.push_back(std::this_thread::get_id());
+    });
+    CHECK(seen.size() > 1);
 }
 
 RAD_TEST_MAIN()

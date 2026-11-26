@@ -5,7 +5,7 @@
 #include "../format/share.h"
 #include "rad_plugin.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cmath>
@@ -24,7 +24,7 @@ namespace lora {
 
 namespace {
 
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 
 std::string fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));
 std::string fmt(const char* f, ...) {
@@ -144,7 +144,7 @@ struct MapIndex {
 /* Is checkpoint tensor `src` an adapter target? A token model: its leaf is in the target list and
  * it is in the trunk. A generator: it is under a declared root, and its leaf is in the list or the
  * list is "*". */
-bool source_targeted(const Program& prog, const TargetSet& targets, const std::string& src) {
+bool source_hit(const Program& prog, const TargetSet& targets, const std::string& src) {
     std::string leaf;
     if (module_of(src, &leaf).empty()) return false;
     if (!gen_scope(prog)) return targets.count(leaf) && !excluded_source(src);
@@ -161,7 +161,7 @@ bool targeted_core(const Program& prog, const WeightInfo& w,
     if (excluded_weight(prog, w)) return false;
     for (const RadNameMap* m : maps)
         for (int k = 0; k < m->n_src && k < 8; ++k)
-            if (m->src[k] && source_targeted(prog, targets, m->src[k])) return true;
+            if (m->src[k] && source_hit(prog, targets, m->src[k])) return true;
     return false;
 }
 
@@ -505,7 +505,7 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
          * that is is not recorded. Usable only when exactly one alternative is targeted. */
         std::vector<std::string> hit;
         for (const std::string& x : srcs)
-            if (source_targeted(prog, targets, x)) hit.push_back(x);
+            if (source_hit(prog, targets, x)) hit.push_back(x);
         if (hit.size() != 1)
             return fail(err, RAD_E_UNSUPPORTED,
                         fmt("weight '%s' is one of %zu alternative checkpoint tensors and %zu of "
@@ -522,7 +522,7 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
         ss.module = module_of(x, &leaf);
         if (ss.module.empty()) ss.module = x;
         ss.module += piece[si];
-        ss.targeted = source_targeted(prog, targets, x);
+        ss.targeted = source_hit(prog, targets, x);
         if (ss.targeted) ss.slot = slot++;
         s.sources.push_back(ss);
     }
@@ -567,6 +567,10 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
 }  /* namespace */
 
 /* ================================================================== predicates */
+bool source_targeted(const Program& prog, const TargetSet& targets, const std::string& src) {
+    return source_hit(prog, targets, src);
+}
+
 bool weight_targeted(const Program& prog, rad_weight w, const TargetSet& targets) {
     if (targets.empty() || w == 0 || w >= prog.weights.size()) return false;
     /* A generator's fused GEMMs are kept: its scope is the plain GEMMs (build_sites). */
@@ -616,7 +620,13 @@ bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::s
             return no(fmt("%s reads K=%lld against a weight of %lld columns (a widened, rotated "
                           "input)", op.op.c_str(), k, (long long)w.decl.shape[1]));
     }
-    if (w.enc_known && w.enc.transform[0])
+    /* A quantised GEMM over a transformed weight is fed had_quant's rotated codes, so the adapter
+     * epilogue would multiply A against a transformed activation. A plain fp GEMM (gemm_nt,
+     * gemm_nt_bias) is fed what the architecture hands it: plain activations, with the kernel
+     * library's layout/relayout hooks presenting the planes in the plain basis at load (a plain
+     * kernel with no such hook is refused at declare by its own layout, RAD_E_DTYPE). A resolved
+     * plain GEMM over a transformed encoding is therefore basis-safe for the adapter epilogue. */
+    if ((gq || gqb) && w.enc_known && w.enc.transform[0])
         return no(fmt("weight '%s' is stored in the '%.*s' transform basis, so its GEMM is fed a "
                       "transformed activation", w.name.c_str(), (int)RAD_ENC_STR, w.enc.transform));
     return true;
@@ -631,6 +641,10 @@ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
     for (size_t i = 1; i < prog.ops.size(); ++i) {
         const OpInfo& op = prog.ops[i];
         if (op.weights.empty() || !op_live(op)) continue;
+        /* A prefetch only stages a weight's planes for the GEMMs that read them; the adapter's
+         * delta is applied at the site's expand op, so staging the base planes stays correct.
+         * A prefetch neither carries nor invalidates an adapter. */
+        if (op.op == "prefetch") continue;
         rad_weight b = 0;
         std::string why;
         const bool site = op_is_site(prog, op, &b, &why);
@@ -804,9 +818,18 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
     /* ---- the config */
     const std::string cfg_path = dir + "/adapter_config.json";
     std::string text;
-    if (!read_file(cfg_path, &text))
+    const int rst = read_text_file(cfg_path, text, kMaxContainerFile);
+    if (rst == RAD_E_FORMAT)
+        return fail(err, RAD_E_FORMAT,
+                    cfg_path + ": larger than the 256 MiB a container file may be");
+    if (rst != RAD_OK)
         return fail(err, RAD_E_IO, cfg_path + ": cannot read (a PEFT adapter directory has one)");
-    const ojson cfg = ojson::parse(text, nullptr, false);
+    /* Container-supplied like the generation config, so read with the container's bounds: a
+     * file past them is refused during the read, never grown into a tree to be walked. */
+    bool over = false, deep = false;
+    const ojson cfg = ojson::parse_container(text, &over, &deep);
+    if (over || deep)
+        return fail(err, RAD_E_FORMAT, cfg_path + ": " + ojson::bound_why(over, deep));
     if (cfg.is_discarded() || !cfg.is_object())
         return fail(err, RAD_E_FORMAT, cfg_path + ": not a JSON object");
     auto truthy = [&](const char* k) {

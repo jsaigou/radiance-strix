@@ -18,16 +18,27 @@ void enable_debug(bool enable) {
     g_jinja_debug = enable;
 }
 
+/* A block's statement results as one string value. A lone string result already is that
+ * value -- regathering it would copy (or move) its parts into a fresh string for nothing,
+ * and blocks with a single output statement are the common shape inside a message loop. */
+static value_string gather_array_result(const value_array & result) {
+    if (result->val_arr.size() == 1) {
+        if (auto s = std::dynamic_pointer_cast<value_string_t>(result->val_arr[0])) {
+            return s;
+        }
+    }
+    value_string str = mk_val<value_string>();
+    gather_string_parts_recursive(result, str);
+    return str;
+}
+
 static value_string exec_statements(const statements & stmts, context & ctx) {
     auto result = mk_val<value_array>();
     for (const auto & stmt : stmts) {
         JJ_DEBUG("Executing statement of type %s", stmt->type().c_str());
         result->push_back(stmt->execute(ctx));
     }
-    // convert to string parts
-    value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(result, str);
-    return str;
+    return gather_array_result(result);
 }
 
 static std::string get_line_col(const std::string & source, size_t pos) {
@@ -82,14 +93,17 @@ value statement::execute(context & ctx) {
 
 value identifier::execute_impl(context & ctx) {
     auto it = ctx.get_val(val);
-    auto builtins = global_builtins();
     if (!it->is_undefined()) {
         if (ctx.is_get_stats) {
             value_t::stats_t::mark_used(it);
         }
         JJ_DEBUG("Identifier '%s' found, type = %s", val.c_str(), it->type().c_str());
         return it;
-    } else if (builtins.find(val) != builtins.end()) {
+    }
+    // By reference, and only on the miss path: this used to copy the whole builtins map
+    // (every std::function in it) for every identifier evaluated.
+    const auto & builtins = global_builtins();
+    if (builtins.find(val) != builtins.end()) {
         JJ_DEBUG("Identifier '%s' found in builtins", val.c_str());
         return mk_val<value_func>(val, builtins.at(val));
     } else {
@@ -139,8 +153,8 @@ value binary_expression::execute_impl(context & ctx) {
             JJ_DEBUG("%s", "Workaround: treating null/undefined as empty string for string concatenation");
             string left_str  = is_left_null  ? string() : left_val->as_string();
             string right_str = is_right_null ? string() : right_val->as_string();
-            auto output = left_str.append(right_str);
-            res = mk_val<value_string>(std::move(output));
+            left_str.append(right_str);
+            res = mk_val<value_string>(std::move(left_str));
             return true;
         }
         return false;
@@ -245,7 +259,8 @@ value binary_expression::execute_impl(context & ctx) {
     if ((is_val<value_string>(left_val) || is_val<value_string>(right_val)) &&
             (op.value == "~" || op.value == "+")) {
         JJ_DEBUG("String concatenation with %s operator", op.value.c_str());
-        auto output = left_val->as_string().append(right_val->as_string());
+        string output = left_val->as_string();
+        output.append(right_val->as_string());
         auto res = mk_val<value_string>();
         res->val_str = std::move(output);
         return res;
@@ -262,8 +277,15 @@ value binary_expression::execute_impl(context & ctx) {
         if (repeat <= 0) {
             return res;
         }
+        // RADIANCE: sibling of the range() cap in value.cpp -- repetition is the same
+        // attacker-template OOM, one append per step. "x" * 4000000000, and chained
+        // repetitions that pass a 64 MiB product at any step, are refused the way range()
+        // is: the same exception class, so errors-as-values carries it across the seam.
+        if (str.length() != 0 && repeat > (64ll << 20) / (int64_t)str.length()) {
+            throw raised_exception("string repetition would produce more than 67108864 bytes");
+        }
         for (int64_t i = 0; i < repeat; ++i) {
-            res->val_str = res->val_str.append(str);
+            res->val_str.append(str);
         }
         return res;
     }
@@ -299,7 +321,7 @@ static value try_builtin_func(context & ctx, const std::string & name, value & i
         value_t::stats_t::mark_used(input);
         input->stats.ops.insert(name);
     }
-    auto builtins = input->get_builtins();
+    const auto & builtins = input->get_builtins();
     auto it = builtins.find(name);
     if (it != builtins.end()) {
         JJ_DEBUG("Binding built-in '%s'", name.c_str());
@@ -441,7 +463,7 @@ value unary_expression::execute_impl(context & ctx) {
 value if_statement::execute_impl(context & ctx) {
     value test_val = test->execute(ctx);
 
-    auto out = mk_val<value_array>();
+    auto out = mk_val<value_stmt_results>();
     if (test_val->as_bool()) {
         for (auto & stmt : body) {
             JJ_DEBUG("IF --> Executing THEN body, current block: %s", stmt->type().c_str());
@@ -453,10 +475,7 @@ value if_statement::execute_impl(context & ctx) {
             out->push_back(stmt->execute(ctx));
         }
     }
-    // convert to string parts
-    value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(out, str);
-    return str;
+    return out;
 }
 
 value for_statement::execute_impl(context & ctx) {
@@ -517,31 +536,36 @@ value for_statement::execute_impl(context & ctx) {
         }
     }
 
-    std::vector<std::function<void(context &)>> scope_update_fns;
-
-    std::vector<value> filtered_items;
-    for (size_t i = 0; i < items.size(); ++i) {
-        context loop_scope(scope);
-
-        value current = items[i];
-
-        std::function<void(context&)> scope_update_fn = [](context &) { /* no-op */};
+    // Bind the loop variable(s) for items[i] in a context. One lambda for the whole loop:
+    // this used to build a std::function per item (and a copied scope to test it on, selected
+    // or not), which made filtering cost more than the iterations it sets up.
+    auto apply_loop_var = [&](context & c, size_t i) {
         if (is_stmt<identifier>(loopvar)) {
             auto id = cast_stmt<identifier>(loopvar)->val;
-
-            if (is_val<value_object>(iterable_val)) {
-                // case example: {% for key in dict %}
-                current = items[i]->as_array()[0];
-                scope_update_fn = [id, &items, i](context & ctx) {
-                    ctx.set_val(id, items[i]->as_array()[0]);
-                };
-            } else {
-                // case example: {% for item in list %}
-                scope_update_fn = [id, &items, i](context & ctx) {
-                    ctx.set_val(id, items[i]);
-                };
+            // {% for key in dict %} binds the key, {% for item in list %} the item.
+            c.set_val(id, is_val<value_object>(iterable_val) ? items[i]->as_array()[0] : items[i]);
+        } else {
+            auto tuple = cast_stmt<tuple_literal>(loopvar);
+            auto & c_arr = items[i]->as_array();
+            for (size_t j = 0; j < tuple->val.size(); ++j) {
+                if (!is_stmt<identifier>(tuple->val[j])) {
+                    throw std::runtime_error("Cannot unpack non-identifier type: " + tuple->val[j]->type());
+                }
+                auto id = cast_stmt<identifier>(tuple->val[j])->val;
+                c.set_val(id, c_arr[j]);
             }
+        }
+    };
 
+    std::vector<value> filtered_items;
+    std::vector<size_t> filtered_idx;
+    for (size_t i = 0; i < items.size(); ++i) {
+        value current = items[i];
+
+        if (is_stmt<identifier>(loopvar)) {
+            if (is_val<value_object>(iterable_val)) {
+                current = items[i]->as_array()[0];
+            }
         } else if (is_stmt<tuple_literal>(loopvar)) {
             // case example: {% for key, value in dict %}
             auto tuple = cast_stmt<tuple_literal>(loopvar);
@@ -552,23 +576,13 @@ value for_statement::execute_impl(context & ctx) {
             if (tuple->val.size() != c_arr.size()) {
                 throw std::runtime_error(std::string("Too ") + (tuple->val.size() > c_arr.size() ? "few" : "many") + " items to unpack");
             }
-            scope_update_fn = [tuple, &items, i](context & ctx) {
-                auto & c_arr = items[i]->as_array();
-                for (size_t j = 0; j < tuple->val.size(); ++j) {
-                    if (!is_stmt<identifier>(tuple->val[j])) {
-                        throw std::runtime_error("Cannot unpack non-identifier type: " + tuple->val[j]->type());
-                    }
-                    auto id = cast_stmt<identifier>(tuple->val[j])->val;
-                    ctx.set_val(id, c_arr[j]);
-                }
-            };
-
         } else {
             throw std::runtime_error("Invalid loop variable(s): " + loopvar->type());
         }
 
         if (select_expr && test_expr) {
-            scope_update_fn(loop_scope);
+            context loop_scope(scope);
+            apply_loop_var(loop_scope, i);
             value test_val = test_expr->execute(loop_scope);
             if (!test_val->as_bool()) {
                 continue;
@@ -576,28 +590,45 @@ value for_statement::execute_impl(context & ctx) {
         }
         JJ_DEBUG("For loop: adding item type %s at index %zu", current->type().c_str(), i);
         filtered_items.push_back(current);
-        scope_update_fns.push_back(scope_update_fn);
+        filtered_idx.push_back(i);
     }
     JJ_DEBUG("For loop: %zu items after filtering", filtered_items.size());
 
-    auto result = mk_val<value_array>();
+    auto result = mk_val<value_stmt_results>();
+
+    // One loop object for the whole loop, its fields replaced per iteration (as in Jinja2,
+    // where `loop` is one context object whose counters move): a fresh object per iteration
+    // was nine hash nodes and a bucket array allocated to describe a counter.
+    value_object loop_obj;
+    if (!filtered_items.empty()) {
+        loop_obj = mk_val<value_object>();
+        loop_obj->has_builtins = false; // loop object has no builtins
+        loop_obj->insert_new("index", mk_val<value_int>(1));
+        loop_obj->insert_new("index0", mk_val<value_int>(0));
+        loop_obj->insert_new("revindex", mk_val<value_int>(filtered_items.size()));
+        loop_obj->insert_new("revindex0", mk_val<value_int>(filtered_items.size() - 1));
+        loop_obj->insert_new("first", mk_val<value_bool>(true));
+        loop_obj->insert_new("last", mk_val<value_bool>(filtered_items.size() == 1));
+        loop_obj->insert_new("length", mk_val<value_int>(filtered_items.size()));
+        loop_obj->insert_new("previtem", mk_val<value_undefined>("previtem"));
+        loop_obj->insert_new("nextitem", filtered_items.size() > 1 ? filtered_items[1] : mk_val<value_undefined>("nextitem"));
+    }
 
     bool noIteration = true;
     for (size_t i = 0; i < filtered_items.size(); i++) {
         JJ_DEBUG("For loop iteration %zu/%zu", i + 1, filtered_items.size());
-        value_object loop_obj = mk_val<value_object>();
-        loop_obj->has_builtins = false; // loop object has no builtins
-        loop_obj->insert("index", mk_val<value_int>(i + 1));
-        loop_obj->insert("index0", mk_val<value_int>(i));
-        loop_obj->insert("revindex", mk_val<value_int>(filtered_items.size() - i));
-        loop_obj->insert("revindex0", mk_val<value_int>(filtered_items.size() - i - 1));
-        loop_obj->insert("first", mk_val<value_bool>(i == 0));
-        loop_obj->insert("last", mk_val<value_bool>(i == filtered_items.size() - 1));
-        loop_obj->insert("length", mk_val<value_int>(filtered_items.size()));
-        loop_obj->insert("previtem", i > 0 ? filtered_items[i - 1] : mk_val<value_undefined>("previtem"));
-        loop_obj->insert("nextitem", i < filtered_items.size() - 1 ? filtered_items[i + 1] : mk_val<value_undefined>("nextitem"));
+        if (i > 0) {
+            loop_obj->at("index")     = mk_val<value_int>(i + 1);
+            loop_obj->at("index0")    = mk_val<value_int>(i);
+            loop_obj->at("revindex")  = mk_val<value_int>(filtered_items.size() - i);
+            loop_obj->at("revindex0") = mk_val<value_int>(filtered_items.size() - i - 1);
+            loop_obj->at("first")     = mk_val<value_bool>(false);
+            loop_obj->at("last")      = mk_val<value_bool>(i == filtered_items.size() - 1);
+            loop_obj->at("previtem")  = filtered_items[i - 1];
+            loop_obj->at("nextitem")  = i < filtered_items.size() - 1 ? filtered_items[i + 1] : mk_val<value_undefined>("nextitem");
+        }
         scope.set_val("loop", loop_obj);
-        scope_update_fns[i](scope);
+        apply_loop_var(scope, filtered_idx[i]);
         try {
             for (auto & stmt : body) {
                 value val = stmt->execute(scope);
@@ -619,10 +650,7 @@ value for_statement::execute_impl(context & ctx) {
         }
     }
 
-    // convert to string parts
-    value_string str = mk_val<value_string>();
-    gather_string_parts_recursive(result, str);
-    return str;
+    return result;
 }
 
 value set_statement::execute_impl(context & ctx) {
@@ -790,8 +818,7 @@ value member_expression::execute_impl(context & ctx) {
         if (!is_stmt<identifier>(this->property)) {
             throw std::runtime_error("Static member property must be an identifier");
         }
-        property = mk_val<value_string>(cast_stmt<identifier>(this->property)->val);
-        std::string prop = property->as_string().str();
+        const std::string & prop = cast_stmt<identifier>(this->property)->val;
         JJ_DEBUG("Member expression, object type %s, static property '%s'", object->type().c_str(), prop.c_str());
 
         // behavior of jinja2: obj having prop as a built-in function AND 'prop', as an object key,
@@ -803,6 +830,21 @@ value member_expression::execute_impl(context & ctx) {
         if (!is_val<value_undefined>(val)) {
             return val;
         }
+        if (is_val<value_object>(object)) {
+            // The common case (a message field): look the name up directly instead of
+            // allocating a key value and hashing it, then trying the builtins a second time.
+            value out = mk_val<value_undefined>("object_property");
+            out = object->at(prop, out);
+            if (ctx.is_get_stats && out && object) {
+                value prop_val = mk_val<value_string>(prop);
+                value_t::stats_t::mark_used(out);
+                value_t::stats_t::mark_used(object);
+                value_t::stats_t::mark_used(prop_val);
+                object->stats.ops.insert("object_access");
+            }
+            return out;
+        }
+        property = mk_val<value_string>(prop);
         // else, fallthrough to normal property access below
     }
 

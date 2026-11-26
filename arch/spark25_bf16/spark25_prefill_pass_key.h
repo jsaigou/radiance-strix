@@ -39,11 +39,13 @@ struct Request {
 #ifdef SPARK25_HAVE_PREFILL_SPLIT
 inline uint64_t pass_key(const Request& r) {
     if (r.enc) return 1;
-    if (r.draft_pass != 0) return 0;
-    /* Mixed and speculative passes can launch attention on sub-batches whose exact geometry
-     * is not represented by the whole-batch summary. */
-    if (r.phase == kPhaseMixed || r.n_spec > 0) return 0;
-    if (r.phase != kPhasePrefill) return 1;
+    /* A decode pass, a speculative verify or a draft included, issues every launch at the step's
+     * keyed context bound (RadArgs::kv_used_max_h), never the live maximum, so the core's key
+     * holds its geometry. */
+    if (r.phase == kPhaseDecode) return 1;
+    /* Mixed, drafting and speculative prefill passes can launch attention on sub-batches whose
+     * exact geometry is not represented by the whole-batch summary. */
+    if (r.phase == kPhaseMixed || r.draft_pass != 0 || r.n_spec > 0) return 0;
     if (r.head_dim != kHeadDim || r.gqa != kGqa || r.kv_heads <= 0 || !r.kv_group_found)
         return 0;
     /* For a singleton, these equalities prove the R4D q_len band and total_q used by its launch.

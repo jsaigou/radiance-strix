@@ -1,10 +1,11 @@
 #include "json-schema-to-grammar.h"
 #include "common.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <map>
 #include <regex>
 #include <sstream>
@@ -13,7 +14,7 @@
 #include <unordered_set>
 #include <vector>
 
-using json = nlohmann::ordered_json;
+using json = rad::Json;
 
 static std::string build_repetition(const std::string & item_rule, int min_items, int max_items, const std::string & separator_rule = "") {
     auto has_max = max_items != std::numeric_limits<int>::max();
@@ -589,7 +590,29 @@ private:
             auto s = ls.first;
             return is_literal ? "\"" + s + "\"" : s;
         };
+        int pw_nesting = 0;
+        bool pw_too_deep = false;
+        constexpr int kMaxPatternNesting = 64;
         std::function<literal_or_rule()> transform = [&]() -> literal_or_rule {
+            // RADIANCE: `client_pattern` is client data, and every nested `(` recurses this
+            // lambda once. A few tens of KB of '(' is an uncatchable stack overflow of the
+            // request worker -- the JSON depth and value bounds cannot help, because the
+            // brackets are string content, not JSON nesting. A pattern nesting past a depth
+            // no real one reaches is refused like any other unsupported syntax. Once only:
+            // every unwinding frame meets the same '(' again, and the error text travels.
+            if (++pw_nesting > kMaxPatternNesting) {
+                --pw_nesting;
+                if (!pw_too_deep) {
+                    _errors.push_back("Pattern nests groups more than " +
+                                      std::to_string(kMaxPatternNesting) + " deep");
+                    pw_too_deep = true;
+                }
+                return std::make_pair(std::string(), false);
+            }
+            struct Leave {
+                int& d;
+                ~Leave() { --d; }
+            } leave{ pw_nesting };
             size_t start = i;
             std::vector<literal_or_rule> seq;
 
@@ -1437,11 +1460,11 @@ common_schema_info::~common_schema_info() = default;
 common_schema_info::common_schema_info(common_schema_info &&) noexcept = default;
 common_schema_info & common_schema_info::operator=(common_schema_info &&) noexcept = default;
 
-void common_schema_info::resolve_refs(nlohmann::ordered_json & schema) {
+void common_schema_info::resolve_refs(rad::Json & schema) {
     impl_->resolve_refs(schema, "");
 }
 
-bool common_schema_info::unsatisfiable(const nlohmann::ordered_json & schema) const {
+bool common_schema_info::unsatisfiable(const rad::Json & schema) const {
     return common_schema_converter::is_unsatisfiable(schema);
 }
 
@@ -1449,7 +1472,7 @@ bool common_schema_info::unsatisfiable(const nlohmann::ordered_json & schema) co
 // Some models emit raw string values rather than JSON-encoded strings for string parameters.
 // If any branch of the schema (via oneOf, anyOf, $ref, etc.) permits a string, this returns
 // true, allowing callers to handle the value as a raw string for simplicity.
-bool common_schema_info::resolves_to_string(const nlohmann::ordered_json & schema) {
+bool common_schema_info::resolves_to_string(const rad::Json & schema) {
     std::unordered_set<std::string> visited_refs;
 
     std::function<bool(const json &)> check = [&](const json & s) -> bool {
@@ -1578,10 +1601,10 @@ std::string build_grammar(const std::function<void(const common_grammar_builder 
         /* .add_rule = */ [&](const std::string & name, const std::string & rule) {
             return converter._add_rule(name, rule);
         },
-        /* .add_schema = */ [&](const std::string & name, const nlohmann::ordered_json & schema) {
+        /* .add_schema = */ [&](const std::string & name, const rad::Json & schema) {
             return converter.visit(schema, name == "root" ? "" : name);
         },
-        /* .resolve_refs = */ [&](nlohmann::ordered_json & schema) {
+        /* .resolve_refs = */ [&](rad::Json & schema) {
             converter.resolve_refs(schema, "");
         }
     };

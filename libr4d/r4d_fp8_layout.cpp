@@ -39,6 +39,7 @@
 #include "r4d_fp8_lm.h"
 #include "r4d_hc_fp8.h"
 #include "r4d_enc.h"
+#include "r4d_hsimd.h"
 
 #include <algorithm>
 #include <cmath>
@@ -73,6 +74,15 @@ void frag_walk(long long N, long long K, Move move) {
                     r4d_fp8::frag_src(rt, ks, lane, t, 0, &row, &k);
                     move(at, row * K + k);
                 }
+}
+
+/* frag_walk's forward direction a 16-row tile at a time (r4d_hsimd, by CPU level): the load
+ * path of every block-FP8 and int8 GEMM weight. */
+void frag_tiles(const uint8_t* s, long long N, long long K, uint8_t* d) {
+    const long long ksuper = K / r4d_fp8::kSuperK;
+    for (long long rt = 0; rt < N / r4d_fp8::kFragRows; ++rt)
+        r4d_hsimd::fp8_frag_tile(s + rt * r4d_fp8::kFragRows * K, K, ksuper,
+                                 d + rt * r4d_fp8::kFragRows * K);
 }
 
 struct FGeom { long long N, K, sn, sk; };
@@ -158,70 +168,7 @@ bool fp8_block_enc(const RadEncoding* e) {
     return r4d_enc::affine(e, RAD_F8E4M3, RAD_BF16, R4D_FP8_BLOCK, R4D_FP8_BLOCK);
 }
 
-int fp8_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
-                   const int* sel, const RadTensor* pl, int n, RadLayout* out, bool frag) {
-    if (!out || !pl) return RAD_E_INVAL;
-    FGeom g;
-    const int rc = fgeom(p, n_p, &g);
-    if (rc != RAD_OK) return rc;
-    if (operand != FL_B && operand != FL_BSCALE) return RAD_E_UNSUPPORTED;
-    if (!fp8_block_enc(enc)) return RAD_E_DTYPE;
-    if (operand == FL_BSCALE) {
-        if (!r4d_enc::selects(enc, sel, n, "scale") || !r4d_enc::dims(pl[0], g.sn, g.sk))
-            return RAD_E_SHAPE;
-        return RAD_E_UNSUPPORTED;                      /* the checkpoint's own bf16 plane */
-    }
-    if (!r4d_enc::selects(enc, sel, n, "codes") || !r4d_enc::dims(pl[0], g.N, g.K))
-        return RAD_E_SHAPE;
-    if (!frag) return RAD_E_UNSUPPORTED;               /* row-major, as the matvec reads it */
-    if (g.K % R4D_FP8_SUPER_K || g.N % r4d_fp8::kFragRows) return RAD_E_SHAPE;
-    ffill(out, "r4d.fp8.w.frag64", RAD_F8E4M3, g.N, g.K, r4d_fp8::frag_bytes(g.N, g.K));
-    return RAD_OK;
-}
-
 }  /* namespace */
-
-extern "C" int r4d_rad_layout_fp8_block(const RadParam* p, int n_p, int operand,
-                                            const RadEncoding* enc, const int* sel,
-                                            const RadTensor* pl, int n, RadLayout* out) {
-    return fp8_enc_layout(p, n_p, operand, enc, sel, pl, n, out, true);
-}
-
-extern "C" int r4d_rad_layout_fp8_rowmajor(const RadParam* p, int n_p, int operand,
-                                               const RadEncoding* enc, const int* sel,
-                                               const RadTensor* pl, int n, RadLayout* out) {
-    return fp8_enc_layout(p, n_p, operand, enc, sel, pl, n, out, false);
-}
-
-extern "C" int r4d_rad_relayout_fp8_block(const RadParam* p, int n_p, int operand,
-                                          const RadEncoding* enc, const int* sel,
-                                          const RadTensor* pl, int n, void* dst,
-                                          int64_t dst_bytes) {
-    RadLayout L;
-    const int rc = fp8_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, true);
-    if (rc != RAD_OK) return rc;
-    if (dst_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
-    const uint8_t* s = (const uint8_t*)pl[0].data;
-    uint8_t* d = (uint8_t*)dst;
-    frag_walk(pl[0].shape[0], pl[0].shape[1],
-              [&](int64_t at, int64_t from) { std::memcpy(d + at, s + from, 8); });
-    return RAD_OK;
-}
-
-extern "C" int r4d_rad_unrelayout_fp8_block(const RadParam* p, int n_p, int operand,
-                                            const RadEncoding* enc, const int* sel,
-                                            const void* src, int64_t src_bytes,
-                                            const RadTensor* pl, int n) {
-    RadLayout L;
-    const int rc = fp8_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, true);
-    if (rc != RAD_OK) return rc;
-    if (src_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
-    const uint8_t* s = (const uint8_t*)src;
-    uint8_t* d = (uint8_t*)pl[0].data;
-    frag_walk(pl[0].shape[0], pl[0].shape[1],
-              [&](int64_t at, int64_t from) { std::memcpy(d + from, s + at, 8); });
-    return RAD_OK;
-}
 
 /* ---- the int8 twin: i8 codes in the same fragment order as E4M3, with a bf16 scale per row per
  * 128 K.
@@ -250,20 +197,49 @@ bool i8_codes(const RadEncoding* enc, const char* tr) {
     return r4d_enc::affine(enc, RAD_I8, RAD_BF16, 1, R4D_FP8_BLOCK, RAD_DT_INVALID, tr);
 }
 
+/* IQ8R: int8 codes rotated 128 wide, a u8 scale per (row, 256) under one bf16 scale a row
+ * (libquant's `codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128`). A weight
+ * element is code * scale * scale.1. */
+bool iq8r_codes(const RadEncoding* enc) {
+    if (!enc || !rad_enc_is(enc, "affine") || enc->n_planes != 3 ||
+        std::strncmp(enc->transform, "fwht128", RAD_ENC_STR) != 0)
+        return false;
+    if (enc->plane[0].dtype != RAD_I8 || enc->plane[0].block[1] != 1) return false;
+    const int s = rad_enc_find(enc, "scale"), s2 = rad_enc_find(enc, "scale.1");
+    return s >= 0 && enc->plane[s].dtype == RAD_U8 && enc->plane[s].kind == RAD_PLANE_TILED &&
+           enc->plane[s].block[0] == 1 && enc->plane[s].block[1] == R4D_I8_GROUP_WIDE &&
+           s2 >= 0 && enc->plane[s2].dtype == RAD_BF16 && enc->plane[s2].kind == RAD_PLANE_TILED &&
+           enc->plane[s2].block[0] == 1 && enc->plane[s2].block[1] == 0;
+}
+
+/* The scale group is 128, or 256 for IQ8R (the rotation stays 128 wide). The kernels take it as a
+ * template argument, so no other width has a layout. Either way the kernels read one bf16 scale
+ * per (row, group), tile-major: IQ8R's is the product of its two stored levels, rounded once. */
 int i8_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
                   const RadTensor* pl, int n, RadLayout* out) {
     if (!out || !pl) return RAD_E_INVAL;
     FGeom g;
-    const int rc = fgeom(p, n_p, &g);
-    if (rc != RAD_OK) return rc;
+    g.N = r4d_pgeti_or(p, n_p, "N", 0);
+    g.K = r4d_pgeti_or(p, n_p, "K", 0);
+    const long long group = r4d_pgeti_or(p, n_p, "group", R4D_FP8_BLOCK);
+    if (g.N <= 0 || g.K <= 0 || (group != R4D_FP8_BLOCK && group != R4D_I8_GROUP_WIDE))
+        return RAD_E_SHAPE;
+    g.sn = (g.N + R4D_FP8_BLOCK - 1) / R4D_FP8_BLOCK;
+    g.sk = (g.K + group - 1) / group;
     if (operand != FL_B && operand != FL_BSCALE) return RAD_E_UNSUPPORTED;
     const bool rot = i8_rotated(p, n_p);
-    if (!i8_codes(enc, rot ? "fwht128" : "")) return RAD_E_DTYPE;
+    const bool wide = group == R4D_I8_GROUP_WIDE;
+    if (wide ? !(rot && iq8r_codes(enc)) : !i8_codes(enc, rot ? "fwht128" : "")) return RAD_E_DTYPE;
     if (operand == FL_BSCALE) {
-        if (!r4d_enc::selects(enc, sel, n, "scale") || !r4d_enc::dims(pl[0], g.N, g.sk))
+        if (wide) {
+            if (!r4d_enc::selects(enc, sel, n, "scale", "scale.1") ||
+                !r4d_enc::dims(pl[0], g.N, g.sk) || !r4d_enc::dims(pl[1], g.N, 1))
+                return RAD_E_SHAPE;
+        } else if (!r4d_enc::selects(enc, sel, n, "scale") || !r4d_enc::dims(pl[0], g.N, g.sk)) {
             return RAD_E_SHAPE;
+        }
         if (g.N % r4d_fp8::kFragRows) return RAD_E_SHAPE;
-        ffill(out, "r4d.i8.s.t16", RAD_BF16, g.N, g.sk, g.N * g.sk * 2);
+        ffill(out, wide ? "r4d.iq8r.s.t16" : "r4d.i8.s.t16", RAD_BF16, g.N, g.sk, g.N * g.sk * 2);
         return RAD_OK;
     }
     if (!r4d_enc::selects(enc, sel, n, "codes") || !r4d_enc::dims(pl[0], g.N, g.K))
@@ -281,6 +257,25 @@ extern "C" int r4d_rad_layout_i8_block(const RadParam* p, int n_p, int operand,
     return i8_enc_layout(p, n_p, operand, enc, sel, pl, n, out);
 }
 
+/* The same int8 weight at one scale per (row, 128 of K), both planes row-major as stored: what
+ * the grouped expert GEMM reads, which stages a run's rows through LDS and gains nothing from a
+ * permutation. An expert then goes from the container or a host pool to the kernel unchanged. */
+extern "C" int r4d_rad_layout_i8_rowmajor(const RadParam* p, int n_p, int operand,
+                                          const RadEncoding* enc, const int* sel,
+                                          const RadTensor* pl, int n, RadLayout*) {
+    if (!pl) return RAD_E_INVAL;
+    FGeom g;
+    const int rc = fgeom(p, n_p, &g);
+    if (rc != RAD_OK) return rc;
+    if (operand != FL_B && operand != FL_BSCALE) return RAD_E_UNSUPPORTED;
+    if (!i8_codes(enc, i8_rotated(p, n_p) ? "fwht128" : "")) return RAD_E_DTYPE;
+    if (operand == FL_BSCALE
+            ? !r4d_enc::selects(enc, sel, n, "scale") || !r4d_enc::dims(pl[0], g.N, g.sk)
+            : !r4d_enc::selects(enc, sel, n, "codes") || !r4d_enc::dims(pl[0], g.N, g.K))
+        return RAD_E_SHAPE;
+    return RAD_E_UNSUPPORTED;                          /* the stored plane, as it is */
+}
+
 extern "C" int r4d_rad_relayout_i8_block(const RadParam* p, int n_p, int operand,
                                          const RadEncoding* enc, const int* sel,
                                          const RadTensor* pl, int n, void* dst,
@@ -291,17 +286,26 @@ extern "C" int r4d_rad_relayout_i8_block(const RadParam* p, int n_p, int operand
     if (dst_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
     if (operand == FL_BSCALE) {
         const long long N = pl[0].shape[0], nkb = pl[0].shape[1];
-        const uint16_t* s = (const uint16_t*)pl[0].data;
         uint16_t* d = (uint16_t*)dst;
+        if (n == 2) {
+            /* IQ8R: the two levels' product, the one bf16 the fold multiplies by. */
+            if (!pl[1].data) return RAD_E_SHAPE;
+            for (long long r = 0; r < N; ++r) {
+                const uint8_t* s1 = r4d_enc::row(pl[0], r);
+                const float s2 = rad_load_f32(pl[1].data, RAD_BF16, r);
+                for (long long kb = 0; kb < nkb; ++kb)
+                    rad_store_f32(d, RAD_BF16, ((r / 16) * nkb + kb) * 16 + r % 16,
+                                  (float)s1[kb] * s2);
+            }
+            return RAD_OK;
+        }
+        const uint16_t* s = (const uint16_t*)pl[0].data;
         for (long long r = 0; r < N; ++r)
             for (long long kb = 0; kb < nkb; ++kb)
                 d[((r / 16) * nkb + kb) * 16 + r % 16] = s[r * nkb + kb];
         return RAD_OK;
     }
-    const uint8_t* s = (const uint8_t*)pl[0].data;
-    uint8_t* d = (uint8_t*)dst;
-    frag_walk(pl[0].shape[0], pl[0].shape[1],
-              [&](int64_t at, int64_t from) { std::memcpy(d + at, s + from, 8); });
+    frag_tiles((const uint8_t*)pl[0].data, pl[0].shape[0], pl[0].shape[1], (uint8_t*)dst);
     return RAD_OK;
 }
 
@@ -314,6 +318,8 @@ extern "C" int r4d_rad_unrelayout_i8_block(const RadParam* p, int n_p, int opera
     if (rc != RAD_OK) return rc;
     if (src_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
     if (operand == FL_BSCALE) {
+        /* IQ8R's product does not come apart into its two stored levels. */
+        if (n == 2) return RAD_E_UNSUPPORTED;
         const long long N = pl[0].shape[0], nkb = pl[0].shape[1];
         const uint16_t* s = (const uint16_t*)src;
         uint16_t* d = (uint16_t*)pl[0].data;
@@ -360,55 +366,6 @@ int lm_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
 }
 }  /* namespace */
 
-extern "C" int r4d_rad_layout_fp8_logits(const RadParam* p, int n_p, int operand,
-                                             const RadEncoding* enc, const int* sel,
-                                             const RadTensor* pl, int n, RadLayout* out) {
-    return lm_enc_layout(p, n_p, operand, enc, sel, pl, n, out, nullptr);
-}
-
-extern "C" int r4d_rad_relayout_fp8_logits(const RadParam* p, int n_p, int operand,
-                                           const RadEncoding* enc, const int* sel,
-                                           const RadTensor* pl, int n, void* dst,
-                                           int64_t dst_bytes) {
-    RadLayout L;
-    FGeom g;
-    const int rc = lm_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g);
-    if (rc != RAD_OK) return rc;
-    if (dst_bytes != L.bytes || !pl[0].data || !pl[1].data) return RAD_E_SHAPE;
-    const long long stride = r4d_fp8::lm_row_bytes(g.K);
-    const uint8_t* codes = (const uint8_t*)pl[0].data;
-    const uint16_t* sc = (const uint16_t*)pl[1].data;
-    uint8_t* d = (uint8_t*)dst;
-    std::memset(d, 0, (size_t)dst_bytes);
-    for (long long r = 0; r < g.N; ++r) {
-        uint8_t* row = d + r * stride;
-        std::memcpy(row, codes + r * g.K, (size_t)g.K);
-        std::memcpy(row + g.K, sc + (r / R4D_FP8_BLOCK) * g.sk, (size_t)(2 * g.sk));
-    }
-    return RAD_OK;
-}
-
-extern "C" int r4d_rad_unrelayout_fp8_logits(const RadParam* p, int n_p, int operand,
-                                             const RadEncoding* enc, const int* sel,
-                                             const void* src, int64_t src_bytes,
-                                             const RadTensor* pl, int n) {
-    RadLayout L;
-    FGeom g;
-    const int rc = lm_enc_layout(p, n_p, operand, enc, sel, pl, n, &L, &g);
-    if (rc != RAD_OK) return rc;
-    if (src_bytes != L.bytes || !pl[0].data || !pl[1].data) return RAD_E_SHAPE;
-    const long long stride = r4d_fp8::lm_row_bytes(g.K);
-    const uint8_t* s = (const uint8_t*)src;
-    uint8_t* codes = (uint8_t*)pl[0].data;
-    uint16_t* sc = (uint16_t*)pl[1].data;
-    for (long long r = 0; r < g.N; ++r) {
-        std::memcpy(codes + r * g.K, s + r * stride, (size_t)g.K);
-        if (r % R4D_FP8_BLOCK == 0)
-            std::memcpy(sc + (r / R4D_FP8_BLOCK) * g.sk, s + r * stride + g.K, (size_t)(2 * g.sk));
-    }
-    return RAD_OK;
-}
-
 extern "C" int r4d_rad_layout_i8_logits(const RadParam* p, int n_p, int operand,
                                         const RadEncoding* enc, const int* sel,
                                         const RadTensor* pl, int n, RadLayout* out) {
@@ -428,12 +385,15 @@ extern "C" int r4d_rad_relayout_i8_logits(const RadParam* p, int n_p, int operan
     const uint8_t* codes = (const uint8_t*)pl[0].data;
     const uint16_t* sc = (const uint16_t*)pl[1].data;
     uint8_t* d = (uint8_t*)dst;
-    std::memset(d, 0, (size_t)dst_bytes);
+    /* Each row written once: its codes, its scales, then the padding cleared. */
+    const long long used = g.K + 2 * g.sk;
     for (long long r = 0; r < g.N; ++r) {
         uint8_t* row = d + r * stride;
         std::memcpy(row, codes + r * g.K, (size_t)g.K);
         std::memcpy(row + g.K, sc + r * g.sk, (size_t)(2 * g.sk));
+        if (stride > used) std::memset(row + used, 0, (size_t)(stride - used));
     }
+    if (dst_bytes > g.N * stride) std::memset(d + g.N * stride, 0, (size_t)(dst_bytes - g.N * stride));
     return RAD_OK;
 }
 
@@ -478,10 +438,13 @@ int hcrows_relayout(const HGeom& g, const RadTensor* pl, void* dst, int64_t dst_
     const uint8_t* codes = (const uint8_t*)pl[0].data;
     const float* sc = (const float*)pl[1].data;
     uint8_t* d = (uint8_t*)dst;
-    std::memset(d, 0, (size_t)dst_bytes);
+    /* Each row written once: its codes, its scales, then the padding cleared. */
+    const long long used = g.K + 4 * ng;
     for (long long r = 0; r < g.rows; ++r) {
-        std::memcpy(d + r * stride, codes + r * g.K, (size_t)g.K);
-        std::memcpy(d + r * stride + g.K, sc + r * ng, (size_t)(4 * ng));
+        uint8_t* row = d + r * stride;
+        std::memcpy(row, codes + r * g.K, (size_t)g.K);
+        std::memcpy(row + g.K, sc + r * ng, (size_t)(4 * ng));
+        if (stride > used) std::memset(row + used, 0, (size_t)(stride - used));
     }
     return RAD_OK;
 }

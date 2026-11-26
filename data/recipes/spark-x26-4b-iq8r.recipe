@@ -10,7 +10,7 @@
 # time -- RADIANCE_SPARK_CALIB_LAYERS=lo:hi, once per slice, same directory:
 #
 #   RADIANCE_CALIB_DIR=$CALIB RADIANCE_CALIB_TOKENS=65536 RADIANCE_SPARK_CALIB_LAYERS=0:12 \
-#     radiance --model spark-x2.6-4b-radiance-bf16.rad ...      # and drive prompts at max_tokens=1
+#     radiance --config bf16.yaml    # model: spark-x2.6-4b-radiance-bf16.rad; drive prompts at max_tokens=1
 #
 #   CALIB=$CALIB rad-convert <XHToken-Spark-X2.6-4B> --recipe data/recipes/spark-x26-4b-iq8r.recipe \
 #       --set quantization_config.quant_method=w8a8 --set quantization_config.fmt=fwht128 \

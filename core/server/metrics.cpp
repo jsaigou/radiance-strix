@@ -80,6 +80,7 @@ Metrics::Metrics(std::string model_name, int64_t max_model_len)
       h_tpot_(buckets_tpot()),
       h_e2e_(buckets_latency()),
       h_decode_(buckets_latency()),
+      h_queue_(buckets_latency()),
       h_prompt_tokens_(buckets_1_2_5(max_model_len > 0 ? max_model_len : 32768)),
       h_generation_tokens_(buckets_1_2_5(max_model_len > 0 ? max_model_len : 32768)),
       h_params_n_({1, 2, 5, 10, 20}),
@@ -98,9 +99,17 @@ static const char* reason_str(SuccessReason r) {
     }
 }
 
+void Metrics::set_cache_config(const std::string& dtype, int64_t block_size, bool prefix_caching,
+                               int64_t prefix_cache_mib) {
+    cache_labels_ = labels_.substr(0, labels_.size() - 1) + ",cache_dtype=\"" + esc_label(dtype) +
+                    "\",block_size=\"" + std::to_string(block_size) +
+                    "\",enable_prefix_caching=\"" + (prefix_caching ? "True" : "False") +
+                    "\",prefix_cache_mib=\"" + std::to_string(prefix_cache_mib) + "\"}";
+}
+
 void Metrics::observe_request(int64_t n_prompt, int64_t n_generated,
                               double ttft_s, double tpot_s, double e2e_s, double decode_s,
-                              int n_choices, int64_t max_tokens, SuccessReason r) {
+                              double queue_s, int n_choices, int64_t max_tokens, SuccessReason r) {
     c_prompt_tokens_.inc((double)n_prompt);
     c_generation_tokens_.inc((double)n_generated);
     c_success_[(size_t)r].inc();
@@ -116,6 +125,7 @@ void Metrics::observe_request(int64_t n_prompt, int64_t n_generated,
     if (tpot_s >= 0.0 && n_generated > 1) h_tpot_.observe(tpot_s);
     if (e2e_s >= 0.0) h_e2e_.observe(e2e_s);
     if (decode_s >= 0.0 && n_generated > 1) h_decode_.observe(decode_s);
+    if (queue_s >= 0.0) h_queue_.observe(queue_s);
 }
 
 void Metrics::observe_rejected()   { c_rejected_.inc(); }
@@ -144,6 +154,7 @@ void Metrics::sample(const SchedMetrics& m) {
     /* Nanoseconds in the scheduler, seconds on the wire, as engine_step_seconds_* use. */
     g_step_best_.set((double)m.step_ns_decode_best / 1e9);
     g_step_recent_.set((double)m.step_ns_decode_recent / 1e9);
+    g_mixed_step_target_cap_.set((double)m.mixed_step_target_prefill_cap);
     const int seen = std::max(0, std::min(m.draft_depth_seen, (int)MAX_DRAFT_POS));
     for (int j = 0; j < seen; ++j) {
         const int64_t r = m.draft_pos_reached[j];
@@ -174,6 +185,8 @@ void Metrics::sample(const SchedMetrics& m) {
     c_steps_ahead_.advance_to(m.steps_ahead);
     c_prefill_capped_.advance_to(m.prefill_chunks_capped);
     c_steps_held_.advance_to(m.steps_held);
+    c_mixed_step_target_steps_.advance_to(m.mixed_step_target_steps);
+    c_mixed_step_target_misses_.advance_to(m.mixed_step_target_misses);
     c_rows_unspec_.advance_to(m.decode_rows_unspeculated);
     c_step_secs_.advance_to((double)m.step_ns * 1e-9);
     c_step_secs_decode_.advance_to((double)m.step_ns_decode * 1e-9);
@@ -187,8 +200,13 @@ void Metrics::sample(const SchedMetrics& m) {
     c_lookup_held_.advance_to(m.lookup_held);
     c_lookup_held_drafts_.advance_to(m.lookup_held_drafts);
     c_lookup_held_hits_.advance_to(m.lookup_held_hits);
+    c_suffix_steps_.advance_to(m.suffix_steps);
+    c_suffix_rows_.advance_to(m.suffix_rows);
+    c_suffix_accepted_.advance_to(m.suffix_accepted);
+    c_suffix_held_ahead_.advance_to(m.suffix_held_ahead);
     c_attn_cached_.advance_to(m.attn_cached_tokens);
     c_linear_cached_.advance_to(m.linear_cached_tokens);
+    c_prefix_queries_.advance_to(m.prefix_queries);
     c_checkpoints_.advance_to(m.checkpoints_written);
     /* The cache's own cumulative counts, turned into deltas like the others. */
     c_prefix_evict_.advance_to(m.prefix_evictions);
@@ -305,6 +323,17 @@ std::string Metrics::render() const {
     w.out += '\n';
     w.gauge("vllm:gpu_prefix_cache_hit_rate",
             "GPU prefix cache block hit rate.", L, g_prefix_hit_.get());
+    /* The same as counters, which sum over time and across instances where the gauge cannot.
+     * Hits are the tokens a request did not compute again: on a hybrid model the checkpoint it
+     * resumed from bounds them, not the attention blocks found. */
+    w.counter("vllm:prefix_cache_queries_total",
+              "Prompt tokens of admitted requests, each looked up in the prefix cache.",
+              L, c_prefix_queries_.get());
+    w.counter("vllm:prefix_cache_hits_total",
+              "Prompt tokens served from the prefix cache instead of computed.",
+              L, c_linear_cached_.get());
+    if (!cache_labels_.empty())
+        w.gauge("vllm:cache_config_info", "The KV cache's settings, as labels.", cache_labels_, 1.0);
 
     /* ---------------- vLLM-compatible: counters ---------------- */
     w.counter("vllm:prompt_tokens_total",
@@ -341,6 +370,9 @@ std::string Metrics::render() const {
            "Histogram of end to end request latency in seconds.", L, h_e2e_);
     w.hist("vllm:request_decode_time_seconds",
            "Histogram of time spent in the decode phase, in seconds.", L, h_decode_);
+    w.hist("vllm:request_queue_time_seconds",
+           "Histogram of time a request waited before the scheduler admitted it, in seconds.",
+           L, h_queue_);
     w.hist("vllm:request_prompt_tokens",
            "Number of prefill tokens processed.", L, h_prompt_tokens_);
     w.hist("vllm:request_generation_tokens",
@@ -393,6 +425,16 @@ std::string Metrics::render() const {
     w.counter("radiance:engine_steps_held_total",
               "Decode-only steps run after a prefill chunk while other sequences decode "
               "(--prefill-interleave).", L, c_steps_held_.get());
+    w.counter("radiance:mixed_step_target_steps_total",
+              "Mixed prefill/decode steps observed by --mixed-step-target-ms.",
+              L, c_mixed_step_target_steps_.get());
+    w.counter("radiance:mixed_step_target_misses_total",
+              "Mixed steps whose completed service time exceeded --mixed-step-target-ms.",
+              L, c_mixed_step_target_misses_.get());
+    if (g_mixed_step_target_cap_.get() > 0)
+        w.gauge("radiance:mixed_step_target_prefill_cap",
+                "Current learned prefill-row cap used while decode sequences are active.",
+                L, g_mixed_step_target_cap_.get());
     w.counter("radiance:decode_rows_unspeculated_total",
               "Decode rows that took no draft, for any reason.",
               L, c_rows_unspec_.get());
@@ -436,6 +478,16 @@ std::string Metrics::render() const {
               "Of the held-back proposals scored against the text that followed, the drafts "
               "that came true: what verifying them would have accepted.",
               L, c_lookup_held_hits_.get());
+    w.counter("radiance:suffix_steps_total",
+              "Verify steps that carried a --draft-suffix chain of the sequence's own history.",
+              L, c_suffix_steps_.get());
+    w.counter("radiance:suffix_rows_total",
+              "Draft rows those suffix steps verified.", L, c_suffix_rows_.get());
+    w.counter("radiance:suffix_accepted_total",
+              "Of those rows, the drafts accepted.", L, c_suffix_accepted_.get());
+    w.counter("radiance:suffix_held_ahead_total",
+              "Decode steps not issued ahead of the previous commit because the sequence's "
+              "history ended in a recurring pattern (--draft-suffix).", L, c_suffix_held_ahead_.get());
 
     /* Decoupled prefix caching (spec §7.3). vllm:gpu_prefix_cache_hit_rate is the attention hit
      * rate, as in vLLM. The linear side hits at a different granularity (whole checkpoints, not

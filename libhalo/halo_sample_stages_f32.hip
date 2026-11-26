@@ -716,7 +716,7 @@ __global__ __launch_bounds__(kTopkThreads) void logprobs_kernel(
     __shared__ float red[kTopkWaves];
 
     const uint32_t m = blockIdx.x;
-    if (!(sp[m].flags & SP_LOGPROBS)) return;
+    if (sp && !(sp[m].flags & SP_LOGPROBS)) return;   /* no params: every row */
     const float* __restrict__ row = lg + (size_t)m * lg_ld;
     float* __restrict__ out = st + (size_t)m * st_ld;
     const uint32_t kk = k < n_vocab ? k : n_vocab;
@@ -1313,7 +1313,7 @@ static int halo_sample_argmax_f32(long lg, long tok, int M, int n_vocab, int lg_
 
 static int halo_sample_logprobs_f32(long lg, long params, long stats, int M, int n_vocab, int k,
                                    int lg_ld, int st_ld, int vocab_off, long stream) {
-    if (!lg || !params || !stats) return HALO_NO(RAD_E_INVAL);
+    if (!lg || !stats) return HALO_NO(RAD_E_INVAL);
     if (M <= 0 || n_vocab <= 0 || k <= 0) return HALO_NO(RAD_E_SHAPE);
     if ((uint32_t)k > kMaxLogprobs) return HALO_NO(RAD_E_SHAPE);
     if (!lg_ld) lg_ld = n_vocab;
@@ -1542,7 +1542,7 @@ extern "C" int halo_rad_sample_logprobs(const RadArgs* a, RadStream s) {
     long long M = 0, nv = 0, ld = 0;
     HALO_NEED(logits_of(a, &lg, &M, &nv, &ld));
     const RadTensor* pr = halo_opt(a, V_PARAMS);
-    HALO_NEED(params_ok(pr, M));
+    if (pr) HALO_NEED(params_ok(pr, M));
     const RadTensor* st = halo_opt(a, 2);
     if (!st) return HALO_NO(RAD_E_INVAL);
     HALO_NEED(dt_f32(st));

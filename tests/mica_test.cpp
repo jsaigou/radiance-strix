@@ -9,7 +9,7 @@
 #include "rad_test.h"
 #include "server/mica.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <cmath>
 #include <fstream>

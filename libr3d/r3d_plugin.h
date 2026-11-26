@@ -142,6 +142,7 @@ int r3d_rad_dequant         (const RadArgs* a, RadStream s);
 /* --- r3d_gemm_bf16_nt_m16.hip, r3d_gemm_f16_nt_m16.hip, r3d_gemm_fp8a16_nt_m1.hip --- */
 int r3d_rad_gemm_nt_bf16_m16 (const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_f16_m16  (const RadArgs* a, RadStream s);
+int r3d_rad_gemm_nt_f32     (const RadArgs* a, RadStream s);
 
 /* --- r3d_gemm_w4a16_nt_m64.hip: the 4-bit weight against an f16 activation at M <= 64. The
  * codes are read in the container's order; the layout and relayout hooks present the
@@ -184,10 +185,21 @@ int r3d_rad_gdn_gated_norm_hq_i8(const RadArgs* a, RadStream s);
 int r3d_rad_gdn_conv_prep(const RadArgs* a, RadStream s);
 int r3d_rad_gdn_conv_update(const RadArgs* a, RadStream s);
 
+/* --- r3d_ple_conv.hip: PLE's dilated depthwise convolution, its silu and the residual add that
+ * finishes the layer: one thread a channel, the conv window rewritten in the same launch.
+ * causal_conv1d is the same kernel with no activation, no residual and dilation one (LFM2's and
+ * LFM3's short convolution). */
+int r3d_rad_ple_conv(const RadArgs* a, RadStream s);
+int r3d_rad_causal_conv1d(const RadArgs* a, RadStream s);
+
 /* --- r3dh_gdn_recurrent_update.hip (libhalo's): the gated-delta-net recurrent state update at
  * decode against the paged state cache, in either state form (per_candidate or anchor). */
 extern "C" int r3dh_rad_gdn_recurrent_update(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s);
+
+/* --- r3d_kda_update.hip: GLM's per-channel KDA recurrence at decode and prefill, over the
+ * paged f32 state cache, with the speculative candidate snapshots. */
+int r3d_rad_kda_update(const RadArgs* a, RadStream s);
 
 /* --- r3d_expert_scale_bf16.hip: each routing weight times its expert's own scale, in place. */
 int r3d_rad_expert_scale_bf16(const RadArgs* a, RadStream s);
@@ -205,6 +217,10 @@ int r3d_rad_moe_gather(const RadArgs* a, RadStream s);
 int r3d_rad_moe_gather_inv(const RadArgs* a, RadStream s);
 int r3d_rad_router_topk_scatter(const RadArgs* a, RadStream s);
 int r3d_rad_router_sigmoid_topk(const RadArgs* a, RadStream s);
+int r3d_rad_router_sigmoid_group_topk(const RadArgs* a, RadStream s);
+int r3d_rad_mla_project(const RadArgs* a, RadStream s);
+int r3d_rad_mla_attn_paged(const RadArgs* a, RadStream s);
+int64_t r3d_rad_mla_attn_paged_scratch(const RadArgs* a);
 
 /* --- r3d_moe_gemm_q.hip: the grouped quantised GEMM (E4M3 x E4M3, the per-(row, grid) scale fold). */
 int r3d_rad_moe_gemm_q(const RadArgs* a, RadStream s);
@@ -274,7 +290,12 @@ int r3d_shape_scale           (const RadParam* p, int n_p, int operand, RadOpdDe
 int r3d_shape_fill            (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_rope            (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_kv_store        (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_kda_update      (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_embed_lookup    (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_gemm_nt_f32     (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_router_sigmoid_group_topk(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_mla_project     (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_mla_attn_paged  (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gather_rows     (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_scatter_rows    (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_quant_act_fp8   (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
@@ -378,6 +399,7 @@ int r3d_rad_gemm_nt_q_w4a8_m16(const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_q_w8a8_m16(const RadArgs* a, RadStream s);
 int r3d_shape_gemm_nt_q_w4a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gemm_nt_q_w8a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_gemm_nt_q_i8a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 
 /* The relayout writers for the three layout hooks, each delegating to rad_planes_relayout. The
  * loader converts a quantised weight into the joined operand the plan names, and only the row that
@@ -407,6 +429,7 @@ int r3d_rad_gemm_nt_bf16_tiled_alu(const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_bf16_tiled_wmma(const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_bf16_m64_wmma (const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_q_w8a8_m64   (const RadArgs* a, RadStream s);
+int r3d_rad_gemm_nt_q_i8a8       (const RadArgs* a, RadStream s);
 int r3d_shape_logits_gemm_bf16  (const RadParam*, int, int, RadOpdDesc*);
 
 /* --- r3d_model_bf16.hip: the fused MLP activation and the fused norm-quantiser --- */

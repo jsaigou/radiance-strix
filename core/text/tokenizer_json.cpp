@@ -13,7 +13,8 @@
 #include "text/tokenizer_regex.h"
 #include "text/gguf.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
+#include "rad_internal.h"
 
 #include <cstring>
 #include <fstream>
@@ -22,7 +23,7 @@
 
 namespace rad {
 
-using json = nlohmann::json;
+using json = Json;
 
 namespace {
 
@@ -388,11 +389,16 @@ int read_model(const json& m, VocabBuild& out, const char* origin, uint64_t id_l
             }
             max_id = std::max(max_id, id);
         }
+        /* Two texts on one id: the byte-greatest one holds it, whatever the file's order, as when
+         * the vocab was read through a key-sorted map. */
         out.tokens.assign((size_t)max_id + 1, std::string());
+        std::vector<bool> taken((size_t)max_id + 1, false);
         for (auto it = vocab->begin(); it != vocab->end(); ++it) {
             int32_t id = 0;
             read_id(it.value(), id_limit, &id);
-            out.tokens[(size_t)id] = it.key();
+            std::string& slot = out.tokens[(size_t)id];
+            if (!taken[(size_t)id] || slot < it.key()) slot = it.key();
+            taken[(size_t)id] = true;
         }
         out.types.assign(out.tokens.size(), (uint8_t)RAD_TT_NORMAL);
         return RAD_OK;
@@ -564,15 +570,24 @@ int read_added(const json& arr, VocabBuild& out, const char* origin, uint64_t id
  * elsewhere. */
 void read_config_json(const std::string& dir, VocabBuild& out) {
     const std::string path = dir + "tokenizer_config.json";
-    std::ifstream f(path);
-    if (!f) {
+    /* Container bytes: size-screened and parsed with the container's bounds, like every other
+     * file a checkpoint carries. (Streaming with operator>> meant an unbounded DOM.) */
+    std::string text;
+    const int rst = read_text_file(path, text, kMaxContainerFile);
+    if (rst == RAD_E_IO) {
         RAD_INFO("tokenizer: no %s; bos/eos ids and the chat template are unset", path.c_str());
         return;
     }
-    json c;
-    try { f >> c; }
-    catch (const std::exception& e) {
-        RAD_WARN("tokenizer: %s did not parse (%s); ids left unset", path.c_str(), e.what());
+    if (rst != RAD_OK) {
+        RAD_ERR("tokenizer: %s is larger than the 256 MiB a container file may be; ids left unset",
+                path.c_str());
+        return;
+    }
+    bool over = false, deep = false;
+    json c = json::parse_container(text, &over, &deep);
+    if (over || deep || c.is_discarded()) {
+        RAD_WARN("tokenizer: %s did not read as a bounded JSON document (%s); ids left unset",
+                 path.c_str(), json::bound_why(over, deep));
         return;
     }
     std::unordered_map<std::string, int32_t> id_of;
@@ -619,11 +634,15 @@ void read_config_json(const std::string& dir, VocabBuild& out) {
  * key, as in transformers. */
 void read_chat_template_file(const std::string& dir, VocabBuild& out) {
     const std::string path = dir + "chat_template.jinja";
-    std::ifstream f(path);
-    if (!f) return;
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    std::string t = ss.str();
+    std::string t;
+    const int rst = read_text_file(path, t, kMaxContainerFile);
+    if (rst == RAD_E_IO) return;
+    if (rst != RAD_OK) {
+        RAD_ERR("tokenizer: %s is larger than the 256 MiB a container file may be; template left "
+                "unset",
+                path.c_str());
+        return;
+    }
     while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
     if (t.empty()) return;
     RAD_INFO("tokenizer: chat template from %s (%zu bytes)%s", path.c_str(), t.size(),
@@ -765,11 +784,21 @@ int interpret_tokenizer_json(const json& j, uint64_t id_limit, const char* origi
 }  /* namespace */
 
 int parse_tokenizer_json_buf(std::string_view text, const char* origin, VocabBuild& out) {
-    json j;
-    try {
-        j = json::parse(text.begin(), text.end());
-    } catch (const std::exception& e) {
-        RAD_ERR("%s: not valid JSON: %s", origin, e.what());
+    /* A container-supplied file. It legitimately carries hundreds of thousands of FLAT values
+     * (a vocabulary, the merges), so it reads under the container's generous bounds rather than
+     * the wire's: a hostile one is refused during the read instead of becoming a tree whose
+     * walk or destruction overflows this process's stack. */
+    bool over = false, deep = false;
+    json j = json::parse_container(text, &over, &deep);
+    if (over || deep) {
+        RAD_ERR("%s: %s; a tokenizer file may not carry more than %lld values or nest more "
+                "than %d levels",
+                origin, json::bound_why(over, deep),
+                (long long)json::kContainerBudget, json::kContainerDepth);
+        return RAD_E_FORMAT;
+    }
+    if (j.is_discarded()) {
+        RAD_ERR("%s: not valid JSON", origin);
         return RAD_E_FORMAT;
     }
     out = VocabBuild{};
@@ -779,7 +808,7 @@ int parse_tokenizer_json_buf(std::string_view text, const char* origin, VocabBui
      * larger one, and the bound keeps the token table proportional to the input. */
     const uint64_t id_limit = text.size();
 
-    /* nlohmann throws on the first get<>() of a value with the wrong JSON type. The reader checks
+    /* Json throws on the first get<>() of a value with the wrong JSON type. The reader checks
      * the shapes that decide where things are written; this turns any other mismatch into a
      * format error instead of std::terminate. */
     try {
@@ -795,14 +824,16 @@ int parse_tokenizer_json_buf(std::string_view text, const char* origin, VocabBui
 
 int parse_tokenizer_json(const char* path, VocabBuild& out) {
     if (!path) return RAD_E_INVAL;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
+    std::string text;
+    const int rst = read_text_file(path, text, kMaxContainerFile);
+    if (rst == RAD_E_IO) {
         RAD_ERR("tokenizer: cannot open %s", path);
         return RAD_E_IO;
     }
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    const std::string text = ss.str();
+    if (rst != RAD_OK) {
+        RAD_ERR("tokenizer: %s is larger than the 256 MiB a container file may be", path);
+        return RAD_E_FORMAT;
+    }
 
     RAD_TRY(parse_tokenizer_json_buf(text, path, out));
 

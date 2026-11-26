@@ -261,66 +261,6 @@ AVX_KERNEL(gate_add) {
 /* gate_add (with `gated` 1), ln_mod and quant_act_fp8 in one pass over each row: the residual
  * rounded to x's dtype and stored, the norm to bf16, the codes as quant_act_fp8 writes them over
  * that bf16 row (avx_had.h: fp8_emit), and the bf16 row into `z` when bound. */
-AVX_KERNEL(ln_mod_quant_fp8) {
-    if (a->n_t < 8) return RAD_E_INVAL;
-    const RadTensor *Yv = rad_arg_in(a, 0), *G = rad_arg_in(a, 1), *S = &a->t[2], *cu = &a->t[3];
-    const RadTensor *X = &a->t[4], *Q = &a->t[5], *SC = &a->t[6], *Z = rad_arg_in(a, 7);
-    const int64_t n = p_int(a, "n", 0), grp = p_int(a, "group", 0);
-    const bool gated = p_int(a, "gated", 0) != 0;
-    const float eps = p_f32(a, "eps", 1e-6f);
-    if (n <= 0 || grp <= 0 || n % grp || (gated && (!Yv || !G))) return RAD_E_SHAPE;
-    const int64_t rows = rows_of(Q, n), n_seq = numel(cu) - 1, ngrp = n / grp;
-    if (rows <= 0 || n_seq <= 0 || rows_of(X, n) < rows || numel(SC) < rows * ngrp)
-        return RAD_E_SHAPE;
-    if (!S->data) return RAD_E_INVAL;
-    /* Both tables from one scratch_raw call: a second may reallocate the first. */
-    float* tabs = (float*)scratch_raw((size_t)(2 * n_seq * n + 32) * sizeof(float));
-    {
-        const int64_t s_rs = row_stride(S, n), s_cs = laststride(S);
-        const int64_t g_rs = gated ? row_stride(G, n) : 0, g_cs = gated ? laststride(G) : 0;
-        for (int64_t e = 0; e < n_seq; ++e)
-            for (int64_t i = 0; i < n; ++i) {
-                tabs[e * n + i] = narrow1(RAD_BF16, 1.0f + ldt(S, e * s_rs + i * s_cs));
-                if (gated)
-                    tabs[(n_seq + e) * n + i] =
-                        narrow1(X->dtype, sc_tanh(ldt(G, e * g_rs + i * g_cs)));
-            }
-    }
-    const float* gain = tabs;
-    const float* gate = tabs + n_seq * n;
-
-    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
-    for (int64_t r = 0; r < rows; ++r) {
-        float* buf = scratch_f32((size_t)(5 * n + 80));
-        float *xs = buf, *v = buf + n + 16, *o = v + n + 16, *codes = o + n + 16;
-        float* tmp = codes + n + 16;
-        const int64_t e = seq_of(cu, n_seq, r);
-        const float* xv = in_row(X, rowoff(X, r, n), n, xs);
-        if (gated) {
-            const float* yv = in_row(Yv, rowoff(Yv, r, n), n, codes);
-            const float* t = gate + e * n;
-            int64_t i = 0;
-            for (; i + VF_N <= n; i += VF_N)
-                vf_storeu(v + i, vf_mul(vf_loadu(t + i), vf_loadu(yv + i)));
-            for (; i < n; ++i) v[i] = t[i] * yv[i];
-            narrow_row(X->dtype, v, n, tmp);
-            add_rows(v, xv, n);
-            narrow_row(X->dtype, v, n, tmp);
-            out_row(X, rowoff(X, r, n), n, v);
-        } else {
-            std::memcpy(v, xv, (size_t)n * sizeof(float));
-        }
-        const float mean = row_sum(v, n) / (float)n;
-        const float rs = 1.0f / std::sqrt(dev_sumsq(v, mean, n) / (float)n + eps);
-        center_scale(v, mean, rs, o, n);
-        narrow_row(RAD_BF16, o, n, tmp);
-        mul_rows(o, gain + e * n, n);
-        narrow_row(RAD_BF16, o, n, tmp);
-        fp8_emit(o, codes, n, grp, Q, SC, Z, r);
-    }
-    return RAD_OK;
-}
-
 /* ------------------------------------------------------------------ rms_mod / rms_mod_quant_fp8 */
 /* Both forms: with `gated` the branch added through the gate row (no tanh) and the residual stored
  * in x's dtype; then n1 = rd(x rsqrt(mean(x^2) + eps)), n2 = rd(n1 w), m = rd(n2 rd(1 + scale)),
@@ -426,8 +366,6 @@ static int rms_mod_run(const RadArgs* a, bool quant) {
 }
 
 AVX_KERNEL(rms_mod) { return rms_mod_run(a, false); }
-AVX_KERNEL(rms_mod_quant_fp8) { return rms_mod_run(a, true); }
-
 /* ------------------------------------------------------------------ timestep_embed */
 /* y[m] = [cos(t' f_0) .. cos(t' f_{h-1}) | sin(t' f_0) .. sin(t' f_{h-1})] with libref's libm
  * calls: a pass embeds one row per entry, so this is a few thousand transcendentals. With
@@ -1268,6 +1206,7 @@ AVX_KERNEL(l2norm_chan) {
     if (rows <= 0 || rows_of(X, n) < rows) return RAD_E_SHAPE;
     const float sq = (float)std::sqrt((double)n);
     const uint32_t dt = Y->dtype;
+    const bool round_length = p_int(a, "round_length", 0) != 0;
     /* gamma read at linear offsets, as libref reads its [C, 1, 1(, 1)] weight. */
     float* gam = (float*)scratch_raw((size_t)(n + 16) * sizeof(float));
     for (int64_t c = 0; c < n; ++c) gam[c] = ld_elem(G->data, G->dtype, c);
@@ -1277,7 +1216,8 @@ AVX_KERNEL(l2norm_chan) {
         float* buf = scratch_f32((size_t)(3 * n + 48));
         float *xs = buf, *v = buf + n + 16, *tmp = v + n + 16;
         const float* x = in_row(X, rowoff(X, r, n), n, xs);
-        const float nrm = std::max(std::sqrt(row_sumsq(x, n)), 1e-12f);
+        const float clamped = std::max(std::sqrt(row_sumsq(x, n)), 1e-12f);
+        const float nrm = round_length ? narrow1(dt, clamped) : clamped;
         const vf vn = vf_set1(nrm), vq = vf_set1(sq);
         int64_t c = 0;
         for (; c + VF_N <= n; c += VF_N) vf_storeu(v + c, vf_div(vf_loadu(x + c), vn));

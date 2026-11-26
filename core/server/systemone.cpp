@@ -19,7 +19,7 @@
 #include "llama/src/unicode.h"
 #include "mm/processor.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cctype>
@@ -257,10 +257,37 @@ std::string py_json_dumps(const json& v) {
     return v.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
+namespace {
+
+/* The same tree with every object's members in byte order, which is code point order for
+ * UTF-8 keys: what Python's json.dumps(sort_keys=True) writes and the reference reads. This
+ * replaced a round trip through a sorted-key DOM. */
+json sorted_copy(const json& v) {
+    if (v.is_array()) {
+        json out = json::array();
+        for (const auto& e : v) out.push_back(sorted_copy(e));
+        return out;
+    }
+    if (v.is_object()) {
+        /* Members appended in sorted order rather than looked up by key: a lookup in an
+         * object is a scan, so filling by key made a large object quadratic. */
+        std::vector<std::pair<std::string, const json*>> order;
+        order.reserve(v.size());
+        for (auto it = v.begin(); it != v.end(); ++it) order.emplace_back(it.key(), &it.value());
+        std::sort(order.begin(), order.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        json::object_t out;
+        out.reserve(order.size());
+        for (auto& kv : order) out.emplace_back(std::move(kv.first), sorted_copy(*kv.second));
+        return json(std::move(out));
+    }
+    return v;
+}
+
+}  /* namespace */
+
 std::string py_json_compact_sorted(const json& v) {
-    /* nlohmann's unordered json keeps its keys sorted by bytes, which is code point order for
-     * UTF-8. */
-    return nlohmann::json::parse(v.dump()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    return sorted_copy(v).dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
 bool blank_text(const std::string& s) {

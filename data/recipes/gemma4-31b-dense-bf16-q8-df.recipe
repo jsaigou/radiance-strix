@@ -5,7 +5,7 @@
 #       --recipe data/recipes/gemma4-31b-dense-bf16-q8-df.recipe \
 #       --set quantization_config.quant_method=compressed-tensors -o gemma4-31b-dense-q8-df.rad
 #
-#   radiance serve gemma4-31b-dense-q8-df.rad --num-speculative-tokens auto ...
+#   served with `model: gemma4-31b-dense-q8-df.rad` and `num-speculative-tokens: auto`
 #
 # Q8_0 is int8 codes, symmetric, one f16 scale per block, the scale amax / 127: exactly `codes=i8
 # scale=f16 clamp=sym` and the default absmax rule. What differs is the block. GGML's is 32 values

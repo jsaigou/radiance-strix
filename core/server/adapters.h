@@ -31,13 +31,15 @@
 #include "text/tokenizer.h"
 #include "mm/processor.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <iterator>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 
 namespace rad {
 namespace server {
@@ -96,6 +98,7 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
      * rate has a different granularity (spec §7.3) and is reported separately, not averaged
      * in. */
     o.prefix_hit_rate = m.attn_hit_rate;
+    o.prefix_queries = m.prompt_tokens;
     o.prefix_evictions = m.prefix_evictions;
     /* What only the cache holds (SchedMetrics::prefix_held_tokens), clamped to the pool's
      * used figure: the two are counted at different moments in a step, and cached > used
@@ -124,6 +127,8 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.draft_refills = m.draft_refills;     o.draft_refill_tokens = m.draft_refill_tokens;
     o.lookup_proposals = m.lookup_proposals;     o.lookup_held = m.lookup_held;
     o.lookup_held_drafts = m.lookup_held_drafts; o.lookup_held_hits = m.lookup_held_hits;
+    o.suffix_steps = m.suffix_steps;             o.suffix_rows = m.suffix_rows;
+    o.suffix_accepted = m.suffix_accepted;       o.suffix_held_ahead = m.suffix_held_ahead;
     o.linear_hit_rate = m.linear_hit_rate;
     o.attn_cached_tokens = m.attn_cached_tokens;
     o.linear_cached_tokens = m.linear_cached_tokens;
@@ -149,10 +154,22 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.steps_ahead = m.steps_ahead;
     o.prefill_chunks_capped = m.prefill_chunks_capped;
     o.steps_held = m.steps_held;
+    o.mixed_step_target_steps = m.mixed_step_target_steps;
+    o.mixed_step_target_misses = m.mixed_step_target_misses;
+    o.mixed_step_target_prefill_cap = m.mixed_step_target_prefill_cap;
     o.decode_rows_unspeculated = m.decode_rows_unspeculated;
+    for (int i = 0; i < (int)std::size(m.loras) && i < (int)std::size(o.loras); ++i) {
+        o.loras[i].requests      = m.loras[i].requests;
+        o.loras[i].prompt_tokens = m.loras[i].prompt_tokens;
+        o.loras[i].output_tokens = m.loras[i].output_tokens;
+        o.loras[i].running       = m.loras[i].running;
+        if (m.loras[i].requests || m.loras[i].running) o.n_loras = i + 1;
+    }
     o.step_ns = m.step_ns;  o.step_ns_decode = m.step_ns_decode;
     o.step_ns_decode_best = m.step_ns_decode_best;
     o.step_ns_decode_recent = m.step_ns_decode_recent;
+    o.encode_items = m.encode_items;      o.encode_patches = m.encode_patches;
+    o.encode_ns = m.encode_ns;            o.encode_pending = m.encode_pending;
     return o;
 }
 
@@ -213,6 +230,13 @@ public:
 
     int64_t reset_prefix_cache() override { return s_->reset_prefix_cache(); }
 
+    /* The engine's LoRA slot names, indexed the same as ReqStat::lora_slot and the metrics'
+     * loras array. Wired by the engine beside the other callbacks. */
+    void set_lora_names(std::function<std::vector<std::string>()> f) { lora_names_ = std::move(f); }
+    std::vector<std::string> lora_names() const override {
+        return lora_names_ ? lora_names_() : std::vector<std::string>{};
+    }
+
     int release_session(const std::string& label, uint64_t id, int64_t keep_tokens,
                         SessionReleased* out) override {
         SessionRelease r;
@@ -259,12 +283,15 @@ public:
             occ->host_cap_bytes = held.host_cap_bytes;
         }
         const uint64_t now = rad_mono_ns();
+        const std::vector<std::string> lnames = lora_names();
         out->reserve(v.size());
         for (const IdleTiers::SessionInfo& s : v) {
             SessionStat o;
             o.id        = s.id;
             o.model     = s.model;
             o.label     = s.label;
+            o.lora      = s.last_lora_slot >= 0 && s.last_lora_slot < (int)lnames.size()
+                              ? lnames[(size_t)s.last_lora_slot] : std::string();
             o.n_tokens  = s.n_tokens;
             o.bytes     = s.bytes;
             o.idle_s    = now > s.last_used_ns  ? (double)(now - s.last_used_ns)  / 1e9 : 0.0;
@@ -285,6 +312,7 @@ public:
     int requests(std::vector<RequestStat>* out) const override {
         std::vector<Scheduler::ReqStat> raw(256);
         const int n = s_->observed_requests(raw.data(), (int)raw.size());
+        const std::vector<std::string> lnames = lora_names();
         out->clear();
         out->reserve((size_t)n);
         for (int i = 0; i < n; ++i) {
@@ -309,6 +337,8 @@ public:
             o.kv_tokens       = r.kv_tokens;
             o.n_draft         = r.n_draft;
             o.slot            = r.slot;
+            o.lora = r.lora_slot >= 0 && r.lora_slot < (int)lnames.size() ? lnames[(size_t)r.lora_slot]
+                                                                           : std::string();
             o.age_s           = r.age_s;
             o.ttft_s          = r.ttft_s;
             o.prefill_s       = r.prefill_s;
@@ -331,6 +361,7 @@ private:
     const IdleTiers*      tiers_ = nullptr;
     /* Ids start at 1: zero is the "no request" value the sink and the metrics use. */
     std::atomic<uint64_t> next_{1};
+    std::function<std::vector<std::string>()> lora_names_;
 };
 
 /* ================================================================== text */
@@ -520,12 +551,6 @@ public:
      * derive it from the template. A declaration the parser cannot run is refused at startup. */
     int init(const Vocab& v, const RadChatFormat* declared = nullptr,
              const std::string& plugin = std::string()) {
-        /* The spellings, resolved once. See ReplyOptions::terminators. */
-        terminators_.clear();
-        for (int32_t id : v.eog()) {
-            const std::string s = v.text(id);
-            if (!s.empty()) terminators_.push_back(s);
-        }
         const int st = t_.load_from_vocab(v);
         if (st < 0) return st;
 
@@ -563,11 +588,48 @@ public:
         RAD_INFO("chat: reply format %s", chat_format_describe(f).c_str());
         if (t_.caps().tools && !tool_refusal_.empty())
             RAD_WARN("chat: tool calls are refused for this model: %s", tool_refusal_.c_str());
+
+        /* The spellings, resolved once. See ReplyOptions::terminators. */
+        terminators_.clear();
+        for (int32_t id : v.eog()) {
+            const std::string s = v.text(id);
+            if (!s.empty()) terminators_.push_back(s);
+        }
         return RAD_OK;
+    }
+
+    /* The end-of-generation ids of `v` whose spelling is a marker of the reply format `v` is
+     * served with: `declared` (the architecture plugin's) or the one its template yields. A
+     * checkpoint can list its tool-call close in generation_config.json's eos ids; a turn ending
+     * there cannot write a second call or the text after one, and a reply quoting the tag is cut
+     * at it. The format says what the model writes as a call boundary, so the engine takes these
+     * ids out of the vocabulary's set at bring-up (Vocab::drop_named_eog), before the scheduler,
+     * the cards' step state, the grammar index and this bridge's terminators are built from it.
+     * Empty for a model without tool calls or a format that cannot be read. Logs nothing. */
+    static std::vector<int32_t> eog_call_markers(const Vocab& v, const RadChatFormat* declared) {
+        ChatFormat f;
+        std::string why, refused;
+        if (declared) {
+            if (chat_format_from_abi(declared, &f, &why) < 0 || chat_format_check(f, &why) < 0)
+                return {};
+        } else {
+            const std::string bos = v.bos() >= 0 ? v.text(v.bos()) : std::string();
+            const std::string eos = v.eos() >= 0 ? v.text(v.eos()) : std::string();
+            if (chat_format_from_template(v.chat_template(), bos, eos, &f, &refused, &why) < 0)
+                return {};
+        }
+        std::vector<int32_t> out;
+        if (!f.has_tools()) return out;
+        for (const std::string& m : chat_format_markers(f))
+            for (int32_t id : v.eog())
+                if (v.text(id) == m && std::find(out.begin(), out.end(), id) == out.end())
+                    out.push_back(id);
+        return out;
     }
 
     bool ready() const { return t_.ready() && fmt_ != nullptr; }
     bool supports_tools() const override { return t_.caps().tools; }
+    std::string tools_probe_error() const override { return t_.caps().probe_error; }
     bool supports_reasoning() const override { return t_.caps().preserve_reasoning; }
     std::string tool_refusal() const override { return tool_refusal_; }
     std::string source() const override { return t_.source(); }
@@ -628,12 +690,46 @@ public:
         out->preserved_tokens  = declared_ ? chat_format_markers(f) : p.preserved_tokens;
         out->grammar_triggers.clear();
 
+        /* The grammar and the parser below are pure functions of the tools, the schema, the
+         * generation prompt and the call options -- all fixed for this deployment's format --
+         * and building them walks every tool schema (measured ~0.4 ms for a dozen agent tools).
+         * An agent resends the same tools every turn, so a repeated build is a cache hit. The
+         * key is the tools' own dump plus length-prefixed fields; the dump is an order of
+         * magnitude cheaper than the build it gates. */
+        std::string built_key;
+        if (calls || doc) {
+            built_key = tools.dump();
+            auto field = [&built_key](const std::string& s) {
+                built_key += '\x1f';
+                built_key += std::to_string(s.size());
+                built_key += ':';
+                built_key += s;
+            };
+            field(opt.json_schema);
+            field(p.generation_prompt);
+            field(opt.tool_choice);
+            field(opt.tool_name);
+            field(opt.reasoning_format);
+            built_key += opt.parallel_tool_calls ? '\x01' : '\x00';
+            std::lock_guard<std::mutex> lk(built_mu_);
+            const auto it = built_.find(built_key);
+            if (it != built_.end()) {
+                const BuiltCall& b = it->second;
+                out->grammar           = b.grammar;
+                out->grammar_lazy      = b.grammar_lazy;
+                out->grammar_triggers  = b.triggers;
+                out->parser            = b.parser;
+                out->think_open        = b.think_open;
+                out->think_close       = b.think_close;
+                out->think_starts_open = b.think_starts_open;
+                return RAD_OK;
+            }
+        }
+
         if (calls || doc) {
             /* The grammar, and the words that trigger it, come from the reply format: the same
              * description the parser reads the reply back with. */
-            const nlohmann::ordered_json schema =
-                doc ? nlohmann::ordered_json::parse(opt.json_schema, nullptr, false)
-                    : nlohmann::ordered_json();
+            const Json schema = doc ? Json::parse(opt.json_schema, nullptr, false) : Json();
             ChatGrammarRequest gq;
             gq.tools               = calls ? &tools : nullptr;
             gq.json_schema         = doc && schema.is_object() ? &schema : nullptr;
@@ -678,6 +774,19 @@ public:
         out->think_close       = rm.close;
         out->think_starts_open = rm.starts_open;
         out->parser = std::make_shared<ReplyParserBridge>(std::move(rp));
+        if (!built_key.empty()) {
+            BuiltCall b;
+            b.grammar           = out->grammar;
+            b.grammar_lazy      = out->grammar_lazy;
+            b.triggers          = out->grammar_triggers;
+            b.parser            = out->parser;
+            b.think_open        = out->think_open;
+            b.think_close       = out->think_close;
+            b.think_starts_open = out->think_starts_open;
+            std::lock_guard<std::mutex> lk(built_mu_);
+            if (built_.size() >= 32) built_.clear();
+            built_.emplace(std::move(built_key), std::move(b));
+        }
         return RAD_OK;
     }
 
@@ -686,11 +795,23 @@ private:
      * kinds the way llama.cpp's common_grammar_trigger_type does. */
     static constexpr int kTriggerWord = 1;
 
+    /* What one (tools, schema, options) build produced; see apply(). */
+    struct BuiltCall {
+        std::string grammar;
+        bool grammar_lazy = false;
+        std::vector<SamplingParams::GrammarTrigger> triggers;
+        std::shared_ptr<IReplyParser> parser;
+        std::string think_open, think_close;
+        bool think_starts_open = false;
+    };
+
     ChatTemplate t_;
     std::vector<std::string> terminators_;
     std::shared_ptr<const ReplyFormat> fmt_;
     bool declared_ = false;
     std::string tool_refusal_;
+    mutable std::mutex built_mu_;
+    mutable std::unordered_map<std::string, BuiltCall> built_;
 };
 
 /* ================================================================== grammar
@@ -793,13 +914,13 @@ public:
         return p_->encoder_video(bytes, n, ratio, max_side, max_frames, out, why);
     }
 
-    int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
-                      std::vector<float>* out, std::string* why) override {
+    int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int32_t channels,
+                      int64_t max_samples, std::vector<float>* out, std::string* why) override {
         if (!p_ || !mm::decoder_available()) {
             if (why) *why = "no audio decoder is available";
             return RAD_E_UNSUPPORTED;
         }
-        return p_->encoder_audio(bytes, n, rate, max_samples, out, why);
+        return p_->encoder_audio(bytes, n, rate, channels, max_samples, out, why);
     }
 
     int32_t audio_rate() const override {

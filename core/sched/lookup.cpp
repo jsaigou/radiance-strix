@@ -8,7 +8,7 @@ namespace rad {
 void LookupGate::configure(int max_depth) {
     max_depth_ = max_depth < 0 ? 0 : (max_depth > RAD_SCHED_MAX_SPEC ? RAD_SCHED_MAX_SPEC : max_depth);
     alpha_ = 1.0 - std::exp2(-1.0 / kHalfLife);
-    for (int k = 0; k < kCostKeys; ++k) { cost_r_[k] = 0.0; cost_ms_[k] = 0.0; cost_n_[k] = 0; }
+    cost_.reset(kRowCost);
     proposed_ = held_ = held_drafts_ = held_hits_ = 0;
 }
 
@@ -100,46 +100,10 @@ bool LookupGate::pays(double gain, int k, int64_t rows, double tokens) const {
     return gain * t0 > tokens * (t1 - t0);
 }
 
-int LookupGate::cost_key(int64_t rows) {
-    if (rows < 1) rows = 1;
-    if (rows <= kCostExact) return (int)(rows - 1);
-    const int64_t k = kCostExact + (rows - kCostExact - 1) / kCostBand;
-    return (int)(k < kCostKeys ? k : kCostKeys - 1);
-}
+void LookupGate::step_time(int64_t rows, double ms) { cost_.sample(rows, ms); }
 
-void LookupGate::step_time(int64_t rows, double ms) {
-    if (rows < 1 || !(ms > 0.0) || !std::isfinite(ms)) return;
-    const int k = cost_key(rows);
-    double& m = cost_ms_[k];
-    double& r = cost_r_[k];
-    int64_t& n = cost_n_[k];
-    if (n >= kCostClipAfter && ms > kCostOutlier * m) ms = kCostOutlier * m;
-    const double w = std::fmax(1.0 - std::exp2(-1.0 / kCostHalfLife), 1.0 / (double)(n + 1));
-    m = n ? m + w * (ms - m) : ms;
-    r = n ? r + w * ((double)rows - r) : (double)rows;
-    ++n;
-}
+int64_t LookupGate::cost_samples(int64_t rows) const { return cost_.samples(rows); }
 
-int64_t LookupGate::cost_samples(int64_t rows) const { return cost_n_[cost_key(rows)]; }
-
-double LookupGate::step_cost(int64_t rows) const {
-    if (rows < 1) rows = 1;
-    const double R = (double)rows;
-    /* The timed keys either side, by the mean rows of their samples (monotone in the key). */
-    int lo = -1, hi = -1;
-    for (int k = 0; k < kCostKeys; ++k) {
-        if (cost_n_[k] <= 0) continue;
-        if (cost_r_[k] <= R) lo = k;
-        if (cost_r_[k] >= R && hi < 0) hi = k;
-    }
-    if (lo >= 0 && hi >= 0) {
-        const double r0 = cost_r_[lo], r1 = cost_r_[hi];
-        if (lo == hi || r1 <= r0) return cost_ms_[lo];
-        return cost_ms_[lo] + (cost_ms_[hi] - cost_ms_[lo]) * (R - r0) / (r1 - r0);
-    }
-    if (lo >= 0) return cost_ms_[lo] * prior(R) / prior(cost_r_[lo]);
-    if (hi >= 0) return cost_ms_[hi] * prior(R) / prior(cost_r_[hi]);
-    return prior(R);
-}
+double LookupGate::step_cost(int64_t rows) const { return cost_.cost(rows); }
 
 }  /* namespace rad */

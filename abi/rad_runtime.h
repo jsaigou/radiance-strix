@@ -344,7 +344,8 @@ typedef struct RadBatch {
      * (RadEncoderDecl::bidirectional): a picture's or a video frame's placeholders inside one
      * sequence's chunk. The pass attends them causally like every other row; the plugin attends a
      * run's rows again without the causal bound, over the keys before `bidi_used` (the position
-     * after the run's last token), in place of that result. The scheduler ends no chunk inside such
+     * after the run's last token, counted as the window group's seqused is: from the first
+     * position of its table), in place of that result. The scheduler ends no chunk inside such
      * a run, so its keys are this pass's or, after a prefix hit, the cache's; a run longer than any
      * step is cut where its chunk ends, and that chunk's rows see the run up to the cut.
      *
@@ -363,6 +364,18 @@ typedef struct RadBatch {
      * context state at the anchor (LiLiCorr) gathers it there; the query rows themselves sit past
      * that position. Null on every other pass. */
     const int32_t* anchor_rows;
+    /* ---- appended in ABI 43 (a checkpoint inside the step) */
+    /* A step of one prefill sequence (n_seq 1, no decode rows) whose linear-state checkpoint lies
+     * inside it rather than at its end: host, the rows before the checkpoint (its position less
+     * the sequence's context), 0 on every other step. Set only for a plugin that asked
+     * (RadArchProbe::ckpt_snap_ok). Such a plugin runs its recurrence over [0, ckpt_cut) and
+     * [ckpt_cut, n_tok) as two pieces -- each what a chunk of those rows computes -- and calls
+     * rad_ckpt_snap for each stateful layer between them, so the snapshot is the state a chunk
+     * ending at the checkpoint leaves, without a step of its own for the rows past it.
+     * `ckpt_cu` is [3] device: {0, ckpt_cut, n_tok}, a piece's cu_seqlens at +0 and +1; null when
+     * ckpt_cut is 0. */
+    int32_t        ckpt_cut;
+    const int32_t* ckpt_cu;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
@@ -625,6 +638,9 @@ typedef struct RadAudioGenBatch {
     const int32_t*  ref_cu_h;
     const int32_t*  ref_frame;
     const int32_t*  ref_frame_h;
+    /* ABI 40: PROMPT branch boundaries on the host, [n_seq + 1], including unequal
+     * reference-direction branches. Same rows as RadBatch::cu_seqlens on device. */
+    const int32_t*  prompt_cu_h;
 } RadAudioGenBatch;
 
 /* A window entry's flags on a WINDOW pass. FIRST is RAD_GEN_F_FIRST's bit and the others are clear
@@ -674,7 +690,9 @@ typedef struct RadVideoGenBatch {
     /* ---- VSTEP */
     int32_t         step;          /* from 0; the first draws the lane's noise */
     /* f32 [16]: the video's timestep, sigma and next sigma, then the soundtrack's; from [6] the
-     * res_multistep scalars of the video, then of the soundtrack (`sampler`, below). */
+     * res_multistep scalars of the video, then of the soundtrack (`sampler`, below).
+     * For UniPC, the timestep is Wan's unnormalised integer timestep as f32.
+     * Eight flow_unipc_step coefficients start at RAD_VIDEO_UNIPC_COEFF_OFFSET. */
     const float*    sched;
     const float*    pos;           /* f32 [3, n_tok]: RAD_VPOS_STEP */
     /* u32 [2, 2]: the video's noise seed and the soundtrack's, low word first (VSTEP, VUPSCALE and
@@ -721,12 +739,14 @@ typedef struct RadVideoGenBatch {
      * (k-diffusion's res_multistep at eta 0), which keeps the previous step's estimate. Its scalars
      * are sched[6..10] for the video and sched[11..15] for the soundtrack: sigma, r = next sigma /
      * sigma, the weights hb1 and hb2 of this step's estimate and the previous one, and the order,
-     * 1 where there is no previous estimate on the same grid. */
+     * 1 where there is no previous estimate on the same grid. RAD_SAMPLER_UNIPC uses
+     * the coefficients at RAD_VIDEO_UNIPC_COEFF_OFFSET and a three-plane history. */
     int32_t         sampler;
     /* VENCODE: f32 [enc_frames, enc_height, enc_width, 3] RGB in 0..255, the frames padded to
      * whole clips by repeating the last (rad_arch_encode_geom's entry 23). AENCODE: f32
      * [enc_channels, enc_n_samples], each channel padded with zeros to the hop (entry 0). Both:
-     * the pass's geometry as rad_arch_encode_geom gave it, i32 on the device, and the media's
+     * the pass's geometry as rad_arch_encode_geom gave it, i32 in pinned host memory also readable
+     * by device kernels (mixed-site encoders share it), and the media's
      * kind (RAD_ENC_*, below) and its number within the kind from 1. */
     const float*    enc_pixels;
     int32_t         enc_frames, enc_height, enc_width;
@@ -740,7 +760,8 @@ typedef struct RadVideoGenBatch {
      * height, latent width, latent frames, soundtrack latents} in presentation order and 3 a
      * keyframe {frame, latent frames, soundtrack latents}, then the prompt's vision pads: a count
      * and {first token, tokens} of each picture's run. A reference's kind is RAD_VREF_PICTURE,
-     * _AUDIO or _VIDEO; its slot is its encode pass's. */
+     * _AUDIO or _VIDEO; its slot is its encode pass's. A keyframe with soundtrack latents is the
+     * song guide (RAD_ENC_GUIDE), which has no picture: its latent frames are 0. */
     const int32_t*  ref_tab;
     /* VSTEP: i32, rad_arch_video_pack's `mod`: the boundaries of the modulation groups, then the
      * cell each reads; `seg_cu` then holds the segment boundaries. A request without references
@@ -748,7 +769,8 @@ typedef struct RadVideoGenBatch {
     const int32_t*  mod_cu;
 } RadVideoGenBatch;
 
-enum { RAD_SAMPLER_EULER = 0, RAD_SAMPLER_RES_MULTISTEP = 1 };
+enum { RAD_SAMPLER_EULER = 0, RAD_SAMPLER_RES_MULTISTEP = 1, RAD_SAMPLER_UNIPC = 2 };
+enum { RAD_VIDEO_UNIPC_COEFF_OFFSET = 6 };
 
 /* What a shape generator's pass carries beside the step batch's own fields (rad_builder.h,
  * RadShapeGenDecl, describes the passes). Every pass is one request's, in lane `lane`:
@@ -789,13 +811,14 @@ typedef struct RadShapeGenBatch {
 } RadShapeGenBatch;
 
 /* RadVideoGenBatch::enc_kind: the media an encode pass carries, numbered from 1 within a kind. A
- * keyframe is 1 for the first frame and 2 for the last. */
+ * keyframe is 1 for the first frame and 2 for the last. Additive; RAD_ABI_VERSION does not move. */
 enum {
     RAD_ENC_IMAGE = 1,      /* a reference picture; Vencode */
     RAD_ENC_VIDEO = 2,      /* a reference video; Vencode */
     RAD_ENC_VAUDIO = 3,     /* the soundtrack of reference video `enc_slot`; Aencode */
     RAD_ENC_AUDIO = 4,      /* a standalone soundtrack; Aencode */
-    RAD_ENC_KEYFRAME = 5    /* a first or last frame; Vencode */
+    RAD_ENC_KEYFRAME = 5,   /* a first or last frame; Vencode */
+    RAD_ENC_GUIDE = 6       /* a song guide, the soundtrack of a keyframe without a picture; Aencode */
 };
 
 /* RadVideoGenBatch::ref_tab: a reference's kind. */
@@ -921,6 +944,13 @@ int rad_lane_join(RadCtx* c, int from, int to);
  * the status it set, so a helper can `return rad_step_fail(...)`. */
 int rad_step_fail(RadCtx* c, const char* what);
 
+/* A step with a checkpoint inside it (RadBatch::ckpt_cut): copy layer `layer`'s state of the
+ * stateful KV group `group` -- the sequence's committed slot as the issue stands -- into the
+ * engine's checkpoint stage, on the current lane's stream. Called between the two pieces of the
+ * recurrence, once for every stateful group and layer the plugin holds. A no-op returning RAD_OK
+ * on a step with no checkpoint inside it, so a caller need not test. */
+int rad_ckpt_snap(RadCtx* c, rad_kvgroup group, int layer);
+
 /* ================================================================== run-phase queries */
 const RadBatch* rad_batch(RadCtx* c);
 /* The position of model layer `layer` among `group`'s bound layers, or -1 when this rank has no
@@ -936,6 +966,9 @@ int             rad_kv_stage_layer(RadCtx* c, rad_kvgroup group, const RadKVGrou
                                    int layer);
 int             rad_kv_stage_next(RadCtx* c, rad_kvgroup group, int layer);
 int             rad_rank(RadCtx* c);
+/* The instance's slot, rad_build_slot() of the declare that built it: what a plugin indexes its
+ * per-instance state by. */
+int             rad_slot(RadCtx* c);
 int             rad_world_size(RadCtx* c);
 /* Workgroups the current rank's card can run concurrently (HIP multiProcessorCount on RDNA;
  * 32 on the host backend or when the backend has no positive count). */

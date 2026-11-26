@@ -1,0 +1,106 @@
+# The fleet tp1.yaml serves, for one card: the server's configuration (docs/MULTIMODEL.md, 4).
+# An entry's name is the model id a request gives; its model is a file or a checkpoint
+# directory under /models, where the compose file mounts RADIANCE_MODELS.
+#
+#   RADIANCE_API_KEY=x radiance --config tp1.radiance.yaml --check
+#
+# parses and validates it and serves nothing (the key's variable has to be set).
+#
+# The containers are the README's (its Models table); delete the entries of those you do not
+# have.
+#
+# The models have one priority, so the one used least recently gives way to the one a request
+# asks for. A model that left the card comes back from host memory or from its container: a
+# second or two for the small ones, a few seconds for the 27B, Qwen-Image and MiniMax-Music3,
+# which each take most of the card while they are on it.
+#
+# Flash-Next on one card pins its expert pool in host memory, 42 GiB, and the fleet keeps
+# 8 GiB of the host free beside what it pins. On a 64 GB host that leaves no room for another
+# model's host copy or host tables, so Flash-Next is unloaded when another model loads and
+# takes 17 to 19 s to answer the next request for it, read from its container again (10 s
+# of that is the read of 65 GiB); the other models then come back from their containers
+# too. A host with 96 GB or more keeps both. Measured on one Radeon AI PRO R9700 (32 GB) and
+# 61 GB of host memory: three rounds of one request to each model, in changing order, all
+# answered.
+server:
+  host: "::"
+  port: 8000
+  api-key-env: RADIANCE_API_KEY
+memory:
+  gpu-headroom-mib: 160
+scheduler:
+  load-timeout: 600s
+models:
+  # Qwen3.8-Flash-Next (IQR-V4 experts, int8 trunk, draft head, vision). The routed experts that
+  # do not fit the card sit in a 42 GiB pinned host pool; the n-gram table is read from the model
+  # file. A prefill chunk and the checkpoint interval are 4096 tokens: a prefill step copies every
+  # pooled expert across the link once, and a longer step shares that copy among more tokens.
+  flashnext:
+    model: /models/qwen3.8-next-flash-iqr-v4.rad
+    tp: 1
+    max-num-seqs: 4
+    max-model-len: 200000
+    placement: expert_tiered
+    host-pool-mib: 43000
+    kv-cache-dtype: i8
+    prefix-cache-mib: 1024
+    num-speculative-tokens: 3
+    max-num-batched-tokens: 4096
+    checkpoint-interval: 4096
+  # Qwen3.8-27B IQ4R-L (IQR-V4, 4.9 bits a weight), DFlash2 drafter, vision.
+  qwen3.8-27b:
+    model: /models/qwen3.8-27b-iq4r-l-v4.rad
+    tp: 1
+    max-num-seqs: 8
+    max-model-len: 200000
+    kv-cache-dtype: i8
+  # MiniCPM5-2B IQ8R with its DSpark drafter.
+  minicpm5-2b:
+    model: /models/minicpm5-2b-iq8r.rad
+    tp: 1
+    max-num-seqs: 16
+    max-model-len: 131072
+    kv-cache-dtype: i8
+    max-num-batched-tokens: 512
+  # EmbeddingGemma 2 bf16: text, image, video and audio embeddings.
+  embeddinggemma2:
+    model: /models/embeddinggemma2-bf16.rad
+    tp: 1
+    max-num-seqs: 64
+    max-num-batched-tokens: 8192
+  # Nemotron 3.5 Rerank 8B BF16, the checkpoint directory as NVIDIA ships it: /rerank, /v1/rerank.
+  nemotron-rerank:
+    model: /models/Nemotron-3.5-Rerank-8B-BF16
+    tp: 1
+    max-model-len: 32768
+    max-num-batched-tokens: 32768
+  # Qwen3-ASR 1.7B bf16, the checkpoint directory as Qwen ships it: /v1/audio/transcriptions and
+  # live over /v1/realtime.
+  qwen3-asr:
+    model: /models/Qwen3-ASR-1.7B-hf
+    tp: 1
+    max-num-seqs: 16
+  # Breeze-TTS-2 bf16: /v1/audio/speech, whole, streamed or live.
+  breeze-tts2:
+    model: /models/breeze-tts2-bf16.rad
+    tp: 1
+  # LiquidAI d1-3B IQ8R, a decision model: /v1/systemone. Converted from the checkpoint with
+  # data/recipes/d1-3b-iq8r.recipe (docs/GUIDE.md, 5.13).
+  d1-3b:
+    model: /models/d1-3b-iq8r.rad
+    tp: 1
+  # Qwen-Image 2.1 IQ8R: /v1/images/generations and /v1/images/edits. A request holds two
+  # sequences of max-model-len tokens in the cache, which at the model's own 33600 is more than
+  # one card: 8192 tokens are pictures up to about 1.9 megapixels (1024x1024 is 4096 tokens).
+  qwen-image:
+    model: /models/qwen-image-2.1-iq8r.rad
+    tp: 1
+    max-model-len: 8192
+  # MiniMax-Music3 bf16: songs from lyrics and a description, /v1/audio/speech.
+  minimax-music3:
+    model: /models/minimax-music3-bf16.rad
+    tp: 1
+  # Hunyuan3D-2's shape model, bf16: a 3-D mesh from one picture, /generate.
+  hunyuan3d-2:
+    model: /models/hunyuan3d-2-bf16.rad
+    tp: 1

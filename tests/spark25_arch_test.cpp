@@ -380,6 +380,14 @@ TEST(spark_prefill_keys_match_live_r4d_split_grid) {
     r.used = 2048;
     CHECK_EQ(rad_prefill_splits_for_live(96, 48, 256, 256, 1, 4, 65536, 2048, 32), 5);
     CHECK(spark25_prefill_key::pass_key(r) != k4);
+    /* Decode, verify and draft passes issue at the keyed context bound, so they record; a
+     * drafter's rows in a prefill pass read the live maximum and do not. */
+    r.draft_pass = -1;
+    CHECK_EQ(spark25_prefill_key::pass_key(r), (uint64_t)0);
+    r.phase = RAD_PHASE_DECODE;
+    CHECK(spark25_prefill_key::pass_key(r) != 0);
+    r.draft_pass = 0; r.n_spec = 3;
+    CHECK(spark25_prefill_key::pass_key(r) != 0);
     r = {}; r.phase = RAD_PHASE_PREFILL; r.n_tok = r.max_q_len = 256; r.n_seq = 2;
     r.max_ctx = 65536; r.head_dim = 256; r.gqa = 4; r.kv_heads = 4;
     r.kv_group_found = 1; r.used = 1536; r.wgps = 32;

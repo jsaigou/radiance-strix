@@ -1,0 +1,42 @@
+# The fleet tp4.yaml serves, for four cards: the server's configuration (docs/MULTIMODEL.md, 4).
+# An entry's name is the model id a request gives; its model is a file or a checkpoint
+# directory under /models, where the compose file mounts RADIANCE_MODELS.
+#
+#   RADIANCE_API_KEY=x radiance --config tp4.radiance.yaml --check
+#
+# parses and validates it and serves nothing (the key's variable has to be set).
+#
+# GLM-5.3-Flash (IQR-V4 experts, IQ8R trunk, int8 latent cache) on all four cards. The routed
+# experts that do not fit the cards sit in a pinned host pool of 64 GiB in all, and the prefix
+# cache holds 32 GiB more. A prefix reaches past its attention cache only from a snapshot of the
+# linear-attention state, and 400 of them (141 MiB each over the four ranks) take 55 GiB more:
+# the host needs 151 GiB of memory free for the three, plus the runtime's own. On a replay of 32
+# conversations of 30k-token documents the 40 snapshots the server picks by default reused
+# 21% of the prompt tokens and 400 reused 76%. Measured on four Radeon AI PRO R9700 (32 GB
+# each): 64 tok/s decode, 130 tok/s over four streams, about 2550 tok/s prefill to 128k tokens.
+# It loads in about four minutes.
+server:
+  host: "::"
+  port: 8000
+  api-key-env: RADIANCE_API_KEY
+  # plugin/glm first: libr4d's bf16 mla_attn rows state no kv_dtype and would also match the int8
+  # latent cache's op, and selection takes the first library with a match.
+  kernels: glm,libr4d,libavx,libref
+memory:
+  gpu-headroom-mib: 96
+scheduler:
+  load-timeout: 1800s
+models:
+  glm-5.3-flash:
+    model: /models/glm53-flash-iqr-v4.rad
+    tp: 4
+    placement: expert_tiered
+    host-pool-mib: 65536
+    max-num-seqs: 4
+    max-model-len: 262144
+    max-num-batched-tokens: 2048
+    kv-cache-dtype: i8
+    num-speculative-tokens: 0
+    prefill-interleave: 4
+    prefix-cache-mib: 32768
+    checkpoint-slots: 400

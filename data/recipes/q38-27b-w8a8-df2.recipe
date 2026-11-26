@@ -20,10 +20,9 @@
 #   - The lm_head int8 too, unrotated (logits_gemm_i8): weight error 6.8e-3 against block fp8's
 #     2.6e-2. Against the bf16 model over 45K mostly-Go positions it halves the container's mean KL
 #     (0.00051 against 0.00090 with a block-fp8 head; Qwen's FP8 release 0.00404) and takes top-1
-#     agreement from 98.83% to 99.25%. A block-fp8 head is one override away:
-#         --quant 'output.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16'
+#     agreement from 98.83% to 99.25%.
 #
-# The drafter as q38-27b-fp8-df2.recipe makes it: its linears at MXFP4, and a 2-bit copy of the
+# The drafter: its linears at MXFP4, and a 2-bit copy of the
 # target's head (u2 with a u8 zero, least-squares clip search) whose top 32 the engine rescores
 # against the target's head.
 

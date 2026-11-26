@@ -453,6 +453,26 @@ static int gemm_ntq_impl(const RadArgs* a, bool bias_operand) {
     if (zg)
         return gemm_zp(*zg, A, as_, B, bs_, t_in(a, 5), Y, M, N, K, p_int(a, "group", 0), pb1,
                        pb2);
+    /* A scale in two levels, joined (ref_layout_gemm_q): an integer per (row, group) under a float
+     * a row. Their product in f32 is the scale the loop below reads. */
+    std::vector<float> two_level;
+    RadTensor bs_two;
+    if (is_joined(bs_)) {
+        const JPlane s1 = jplane(bs_, "scale"), s2 = jplane(bs_, "scale.1");
+        if (!s1 || !s2 || s1.dt != RAD_U8 || !float_scale_dt(s2.dt)) return RAD_E_DTYPE;
+        if (s1.rows != N || s1.cols <= 0 || s2.rows != N || s2.cols != 1) return RAD_E_SHAPE;
+        two_level.resize((size_t)(N * s1.cols));
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t g = 0; g < s1.cols; ++g)
+                two_level[(size_t)(n * s1.cols + g)] = s1.at(n, g) * s2.at(n, 0);
+        std::memset(&bs_two, 0, sizeof(bs_two));
+        bs_two.data = two_level.data();
+        bs_two.dtype = RAD_F32;
+        bs_two.rank = 2;
+        bs_two.shape[0] = N; bs_two.shape[1] = s1.cols;
+        bs_two.stride[0] = s1.cols; bs_two.stride[1] = 1;
+        bs_ = &bs_two;
+    }
     if (pb1 > 0 || pb2 > 0) {
         if (bias_operand || B->dtype != RAD_FP4E2M1 || A->rank < 2) return RAD_E_UNSUPPORTED;
         const int64_t e1 = pb1 > 0 ? std::min<int64_t>(pb1, N) : N;

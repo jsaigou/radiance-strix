@@ -127,6 +127,8 @@ struct RadBuilder {
     int64_t        drafter_short = 0;     /* rad_drafter_short_block */
     /* A tree drafter's parents buffer (rad_drafter_tree), 0 for a chain. */
     rad_buf        drafter_parents = 0;
+    /* The routing counts' table (rad_route_table), 0 when the plugin declared none. */
+    rad_buf        route_table = 0;
 
     /* The buffers named to rad_buf_concurrent: the ones a second lane touches. */
     std::vector<rad_buf> concurrent;
@@ -144,18 +146,26 @@ struct RadBuilder {
     std::string      generator_name;
 
     /* Adapter key names (rad_lora_root, rad_lora_alias): (native, spellings), and each alias as
-     * (native, from, to, from_lo, from_hi, to_lo). */
+     * (native, from, to, from_lo, from_hi, to_lo). Runtime targets (rad_lora_source_targeted):
+     * module leaf names, empty when no adapter is configured. */
     std::vector<std::pair<std::string, std::string>> lora_roots;
+    std::set<std::string> lora_targets;
     struct LoraAliasRec { std::string native, from, to; int64_t from_lo, from_hi, to_lo; };
     std::vector<LoraAliasRec> lora_aliases;
 
     /* What rad_weight_encoding answers: the first entry whose key the source name contains. Empty
      * means no model, so every weight is plain in its declared dtype. */
     std::vector<std::pair<std::string, RadEncoding>> encs;
+    std::map<std::string, std::vector<int64_t>> shapes;  /* optional unsharded shapes by exact name */
 
     const RecOp* op_of(rad_op h) const { return h ? &ops[h - 1] : nullptr; }
 };
 
+struct SnapRec {
+    size_t at;      /* issues before the call */
+    int    group;
+    int    layer;
+};
 struct StageRec {
     size_t issue = 0;   /* the issue count when the stage copy was issued */
     int    layer = -1;
@@ -179,6 +189,7 @@ struct RadCtx {
     bool                  stage_on = false;
     int                   stage_last = -1;
     std::vector<StageRec> stages;
+    std::vector<SnapRec>  snaps;     /* rad_ckpt_snap calls */
     /* kv_stage_next: after which issue index the next layer's copy was handed over. */
     std::vector<StageRec> stages_next;
 };
@@ -189,10 +200,24 @@ extern "C" rad_weight rad_decl_weight(RadBuilder* b, const char* name, const Rad
     return (rad_weight)b->weights.size();
 }
 
-extern "C" int rad_weight_encoding(RadBuilder* b, const char* source, RadEncoding* out, int64_t*,
-                                   uint32_t*) {
-    for (const auto& [key, e] : b->encs)
-        if (source && std::strstr(source, key.c_str())) { *out = e; return RAD_OK; }
+extern "C" int rad_weight_encoding(RadBuilder* b, const char* source, RadEncoding* out, int64_t* shape,
+                                   uint32_t* rank) {
+    for (const auto& [key, e] : b->encs) {
+        if (!source || !std::strstr(source, key.c_str())) continue;
+        *out = e;
+        if (shape || rank) {
+            const auto it = b->shapes.find(source);
+            if (it != b->shapes.end()) {
+                if (it->second.size() > RAD_MAX_RANK) return RAD_E_SHAPE;
+                if (shape) {
+                    std::fill_n(shape, RAD_MAX_RANK, 0);
+                    std::copy(it->second.begin(), it->second.end(), shape);
+                }
+                if (rank) *rank = (uint32_t)it->second.size();
+            }
+        }
+        return RAD_OK;
+    }
     return RAD_E_NOTFOUND;
 }
 extern "C" rad_buf rad_decl_buffer(RadBuilder* b, const char* name, const RadBufDecl* d) {
@@ -342,6 +367,40 @@ extern "C" int rad_lora_alias(RadBuilder* b, const char* native, const char* fro
     if (!b || !native || !from || !to) return RAD_E_INVAL;
     b->lora_aliases.push_back({ native, from, to, from_lo, from_hi, to_lo });
     return RAD_OK;
+}
+
+/* Mirrors lora::source_targeted. A token model matches the leaf and excludes towers, mtp, draft,
+ * embed_tokens and lm_head; "*" matches nothing there. A generator (a declared root) matches "*"
+ * or the leaf, and only under a root. */
+extern "C" int rad_lora_source_targeted(RadBuilder* b, const char* src) {
+    if (!b || !src || !*src || b->lora_targets.empty()) return 0;
+    const std::string s(src);
+    if (s.size() < 8 || s.compare(s.size() - 7, 7, ".weight") != 0) return 0;
+    const std::string mod = s.substr(0, s.size() - 7);
+    if (mod.empty()) return 0;
+    const size_t dot = mod.rfind('.');
+    const std::string leaf = dot == std::string::npos ? mod : mod.substr(dot + 1);
+    auto excluded = [&]() {
+        if (leaf == "embed_tokens" || leaf == "lm_head") return true;
+        static const char* tower[] = { "visual", "vision_tower", "vision_model", "audio_tower",
+                                        "audio_model", "embed_vision", "embed_audio",
+                                        "multi_modal_projector", "mm_projector" };
+        for (size_t at = 0; at < s.size();) {
+            size_t d = s.find('.', at);
+            if (d == std::string::npos) d = s.size();
+            const std::string c = s.substr(at, d - at);
+            if (at == 0 && (c == "mtp" || c == "draft")) return true;
+            for (const char* t : tower) if (c == t) return true;
+            if (d == s.size()) break;
+            at = d + 1;
+        }
+        return false;
+    };
+    if (b->lora_roots.empty()) return !excluded() && b->lora_targets.count(leaf) ? 1 : 0;
+    if (!b->lora_targets.count("*") && !b->lora_targets.count(leaf)) return 0;
+    for (const auto& r : b->lora_roots)
+        if (!r.first.empty() && s.compare(0, r.first.size(), r.first) == 0) return 1;
+    return 0;
 }
 
 /* Recorded: gemma4's prefill overlap names the buffers its second lane reduces in place. */
@@ -501,6 +560,13 @@ extern "C" int rad_lane_join(RadCtx* c, int from, int to) {
     c->joins.push_back({ c->issues.size(), from, to });
     return RAD_OK;
 }
+/* A checkpoint inside the step (RadBatch::ckpt_cut): recorded at its place in the issue stream,
+ * so a test can find the snapshot between the recurrence's two pieces. */
+extern "C" int rad_ckpt_snap(RadCtx* c, rad_kvgroup g, int layer) {
+    if (!c) return RAD_E_INVAL;
+    c->snaps.push_back(SnapRec{ c->issues.size(), (int)g, layer });
+    return RAD_OK;
+}
 /* No pool binding here, so a layer is at the index it names: the arch test uses layer 0 where it
  * checks the mirror offset. */
 extern "C" int rad_kv_layer_index(RadCtx* c, rad_kvgroup g, int layer) {
@@ -531,6 +597,8 @@ extern "C" int rad_step_fail(RadCtx* c, const char* what) {
 }
 extern "C" const RadBatch* rad_batch(RadCtx* c)      { return c->batch; }
 extern "C" int             rad_rank(RadCtx* c)       { return c->rank; }
+/* One engine: the slot is the rank (RadBuildCtx::slot_base zero). */
+extern "C" int             rad_slot(RadCtx* c)       { return c->rank; }
 extern "C" int             rad_world_size(RadCtx* c) { return c->world; }
 extern "C" int             rad_ctx_wgp_count(RadCtx*) { return 32; }
 /* The context itself, so a copy issued on the step's stream is recorded in it (rad_memcpy_async). */
@@ -539,6 +607,11 @@ extern "C" int             rad_stream_sync(RadStream s) { (void)s; return RAD_OK
 extern "C" int rad_route_report(RadCtx* c, int layer, const RadRouting* r) {
     (void)r;
     c->routed_layers.push_back(layer);
+    return RAD_OK;
+}
+extern "C" int rad_route_table(RadBuilder* b, rad_buf table) {
+    if (!b || table == 0) return RAD_E_INVAL;
+    b->route_table = table;
     return RAD_OK;
 }
 /* No card-side histogram here, so a router writes and reports its own buffer. */

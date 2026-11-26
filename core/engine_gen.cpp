@@ -51,9 +51,17 @@ int Engine::gen_loop() {
     while (!stopping_.load(std::memory_order_acquire)) {
         /* A round of the loop, idle or not: what lets a freed adapter slot cool (lora/slots.h). */
         lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
+        quiet_service();
+        /* A failed memory handoff can wake a parked generator. Do not let next() stage
+         * another pass against allocations whose ownership is still unresolved. */
+        if (memory_fence_status() < 0) return stop(memory_fence_status());
         const RadBatch* b = gen_->next(step);
         if (!b) {
             step_batch_.store(nullptr, std::memory_order_release);
+            if (hold_req_.load(std::memory_order_acquire)) {
+                hold_point();
+                continue;
+            }
             if (idle < 200) ++idle;
             std::this_thread::sleep_for(std::chrono::microseconds(idle * 50));
             continue;

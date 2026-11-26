@@ -11,7 +11,7 @@
  *
  * A strength not given is 1. */
 #pragma once
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <string>
 #include <utility>
@@ -22,7 +22,7 @@ namespace server {
 
 /* RAD_OK with the adapters in `out` (possibly none) and their tags removed from *prompt;
  * RAD_E_INVAL with `why` for a malformed entry. `field` receives the field the error is about. */
-int parse_loras(const nlohmann::json& body, std::string* prompt,
+int parse_loras(const Json& body, std::string* prompt,
                 std::vector<std::pair<std::string, double>>* out, std::string* field,
                 std::string* why);
 

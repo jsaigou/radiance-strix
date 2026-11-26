@@ -18,7 +18,6 @@
  * with a 60-second timeout and a named error.
  */
 
-#include "r4d_chain.h"
 #include "r4d_args.h"
 #include "r4d.h"
 #include "r4d_ar_shards.h"
@@ -29,6 +28,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <vector>
 #include <chrono>
@@ -76,22 +77,38 @@ struct Rendezvous {
     int  failed = 0;
 };
 
-Rendezvous g_rv;
+/* One rendezvous per tensor-parallel group. Several engines may run in one process
+ * (docs/MULTIMODEL.md), each with its own ranks 0..world-1, so the ranks that meet are the ranks of
+ * one group: the core names it in init's `tp_group` parameter (absent, the one group 0). Entries
+ * live for the process; a group's id is reused only by a later engine with the same ranks. */
+std::mutex                                       g_rv_mu;
+std::map<long long, std::unique_ptr<Rendezvous>> g_rvs;
+
+Rendezvous& rv_for(long long group) {
+    std::lock_guard<std::mutex> lk(g_rv_mu);
+    std::unique_ptr<Rendezvous>& r = g_rvs[group];
+    if (!r) r.reset(new Rendezvous());
+    return *r;
+}
 
 /* Sense-reversing barrier on a monotone epoch, so a rank that wakes and re-enters for the next
  * instance cannot be counted twice. The timeout is not recovery; it turns a startup deadlock into
  * a named error instead of a silent hang. */
-int rv_barrier(int world) {
-    std::unique_lock<std::mutex> lk(g_rv.m);
-    const int e = g_rv.epoch;
-    if (++g_rv.arrived == world) {
-        g_rv.arrived = 0;
-        g_rv.epoch++;
-        g_rv.cv.notify_all();
+int rv_barrier(Rendezvous& rv, int world) {
+    std::unique_lock<std::mutex> lk(rv.m);
+    const int e = rv.epoch;
+    if (++rv.arrived == world) {
+        rv.arrived = 0;
+        rv.epoch++;
+        rv.cv.notify_all();
         return RAD_OK;
     }
-    const bool ok = g_rv.cv.wait_for(lk, std::chrono::seconds(60),
-                                     [&] { return g_rv.epoch != e; });
+    const bool ok = rv.cv.wait_for(lk, std::chrono::seconds(60),
+                                   [&] { return rv.epoch != e; });
+    /* A rank that gave up takes its arrival back: a peer that failed before arriving would
+     * otherwise leave it counted, and the group's next engine (its id is reused) would be released
+     * one rank early. */
+    if (!ok) --rv.arrived;
     return ok ? RAD_OK : RAD_E_STATE;
 }
 
@@ -99,6 +116,7 @@ int rv_barrier(int world) {
  * ascending global rank with this rank removed (the order libr4d's wide entry points take). */
 struct ArInst {
     int  rank = 0, world = 0;
+    long long group = 0;      /* the tensor-parallel group it rendezvoused in (rv_for) */
     long my_scratch = 0, my_flags = 0, my_seq = 0, locpack = 0;
     /* A 2-rank host-mailbox instance's VRAM mirror of its slots, 0 otherwise (r4d_ar_seq.h). */
     long my_stage = 0;
@@ -183,18 +201,19 @@ long long ar8_pieces_for(const ArInst* in, long numel, long long asked) {
  * card's link, and after one barrier every rank derives the same weights from the same eight
  * entries. */
 int ar8_settle(ArInst* in, int rank, int world) {
+    Rendezvous& rv = rv_for(in->group);
     static std::once_flag said_links, said_unknown, said_set;
     const R4DAr8Settings set = ar8_settings();
     R4DArLink own;
     if (set.weights == R4D_AR8_WEIGHTS_AUTO && !ar8_own_link(&own)) own = R4DArLink();
     {
-        std::lock_guard<std::mutex> lk(g_rv.m);
-        g_rv.ar8_link[rank] = own;
+        std::lock_guard<std::mutex> lk(rv.m);
+        rv.ar8_link[rank] = own;
     }
-    const int rc = rv_barrier(world);
+    const int rc = rv_barrier(rv, world);
     if (rc != RAD_OK) return rc;
 
-    const R4DArLink* all = g_rv.ar8_link;
+    const R4DArLink* all = rv.ar8_link;
     in->pieces = set.pieces;
     in->weights_min = set.weights_min;
     in->pieces_min = set.pieces_min;
@@ -247,6 +266,10 @@ int ar8_settle(ArInst* in, int rank, int world) {
  * counter, padded to a cache line. */
 long kSeqWords(long nbw) { return 2L * nbw + 32; }
 
+/* Behind a flags allocation's flags and check words: a 2-rank instance's wake word
+ * (r4d_ar_link_wake, r4d_ar_seq.h), on a line of its own. */
+constexpr long kWakeBytes = 64;
+
 /* Build the world. `max_numel` is the largest message any launch on this instance carries.
  *
  * One sizing rule for the whole family: a slot holds a full message. The one-shots need exactly
@@ -258,11 +281,13 @@ long kSeqWords(long nbw) { return 2L * nbw + 32; }
  *
  * Cost: at a 4096-token chunk on a 5120-wide residual, 40 MiB a slot and 80 MiB for the pair. One
  * set serves every op with the same (rank, world, dtype, bound); see the cache below. */
-int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, int host) {
+int build(ArInst* in, long long group, int rank, int world, long long max_numel, int dtype_code,
+          int host) {
     if (world < 2 || world > R4D_MAX_RANKS) return RAD_E_SHAPE;
     if (rank < 0 || rank >= world) return RAD_E_INVAL;
     if (max_numel <= 0) return RAD_E_INVAL;
 
+    in->group = group;
     in->rank = rank;
     in->world = world;
     in->host = host;
@@ -270,6 +295,13 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     in->esize = r4d_ar_esize(dtype_code);
     in->max_numel = (long)max_numel;
     in->slot_bytes = align16((long)max_numel * in->esize);
+    /* A two-rank bf16 slot over P2P also holds the coded form of its largest message (the fused
+     * writes' coded push, r4d_ar_oneshot_2rank_exact.hip): 16.125 bytes a 16-byte word, 1/128
+     * more than the message. */
+    if (world == 2 && dtype_code == 0 && !host) {
+        const long coded = align16(r4d_ar_coded2_bytes(in->slot_bytes / 16));
+        if (coded > in->slot_bytes) in->slot_bytes = coded;
+    }
     in->slot16 = in->slot_bytes / 16;
     if (world == 8) {
         const int rc8 = ar8_settle(in, rank, world);
@@ -346,10 +378,10 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
         if (hipGetDevice(&dev) != hipSuccess) return RAD_E_DEVICE;
         if (host) {
             sc = r4d_ar_host_alloc((long)nslots * in->slot_bytes);
-            fl = r4d_ar_host_alloc((flag_words + 2L * maxb) * 4);
+            fl = r4d_ar_host_alloc((flag_words + 2L * maxb) * 4 + kWakeBytes);
         } else {
             sc = r4d_ar_ipc_alloc((long)nslots * in->slot_bytes, 1, handle, &hlen);
-            fl = r4d_ar_ipc_alloc((flag_words + 2L * maxb) * 4, 1, handle, &hlen);
+            fl = r4d_ar_ipc_alloc((flag_words + 2L * maxb) * 4 + kWakeBytes, 1, handle, &hlen);
         }
         sq = r4d_ar_ipc_alloc(kSeqWords(maxb) * 4, 0, handle, &hlen));
 
@@ -382,14 +414,15 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     in->my_stage   = stg;
     in->gate_ctr   = sq + 2L * maxb * 4;   /* the word after the sequence counters (r4d_ar_seq.h) */
 
+    Rendezvous& rv = rv_for(group);
     {
-        std::lock_guard<std::mutex> lk(g_rv.m);
-        g_rv.scratch[rank] = sc;
-        g_rv.flags[rank]   = fl;
-        g_rv.seq[rank]     = sq;
-        g_rv.dev[rank]     = dev;
+        std::lock_guard<std::mutex> lk(rv.m);
+        rv.scratch[rank] = sc;
+        rv.flags[rank]   = fl;
+        rv.seq[rank]     = sq;
+        rv.dev[rank]     = dev;
     }
-    int rc = rv_barrier(world);
+    int rc = rv_barrier(rv, world);
     if (rc != RAD_OK) return rc;
 
     /* Peer access is per context, so each rank enables its own, after the publish barrier where
@@ -400,17 +433,17 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     int j = 0;
     for (int r = 0; r < world; ++r) {
         if (r == rank) continue;
-        if (!g_rv.scratch[r] || !g_rv.flags[r]) return RAD_E_STATE;
-        in->peer_scratch[j] = g_rv.scratch[r];
-        in->peer_flags[j]   = g_rv.flags[r];
+        if (!rv.scratch[r] || !rv.flags[r]) return RAD_E_STATE;
+        in->peer_scratch[j] = rv.scratch[r];
+        in->peer_flags[j]   = rv.flags[r];
         ++j;
-        if (!host && g_rv.dev[r] != dev)
-            R4D_TRY("ar_ipc_enable_peer", r4d_ar_ipc_enable_peer((long)g_rv.dev[r]));
+        if (!host && rv.dev[r] != dev)
+            R4D_TRY("ar_ipc_enable_peer", r4d_ar_ipc_enable_peer((long)rv.dev[r]));
     }
 
     /* Second barrier: no rank may launch until every rank has enabled peer access, or the first
      * message would be pushed into a mapping the receiver has not opened. */
-    return rv_barrier(world);
+    return rv_barrier(rv, world);
 }
 
 /* ------------------------------------------------------------------ one world, shared
@@ -430,12 +463,13 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
  * The rendezvous stays symmetric because every rank declares the same graph in the same order:
  * the Nth all-reduce misses the cache on every rank or on none. */
 struct CacheKey {
+    long long group;          /* the tensor-parallel group: another engine's ranks never share */
     int       rank, world, dtype;
     long long numel;
     int       host;
     bool operator==(const CacheKey& o) const {
-        return rank == o.rank && world == o.world && dtype == o.dtype && numel == o.numel &&
-               host == o.host;
+        return group == o.group && rank == o.rank && world == o.world && dtype == o.dtype &&
+               numel == o.numel && host == o.host;
     }
 };
 
@@ -459,7 +493,7 @@ int acquire(const CacheKey& k, ArInst** out) {
      * rank has one declare thread, so no two builders race for one key. */
     ArInst* in = new (std::nothrow) ArInst();
     if (!in) return RAD_E_NOMEM;
-    int rc = build(in, k.rank, k.world, k.numel, k.dtype, k.host);
+    int rc = build(in, k.group, k.rank, k.world, k.numel, k.dtype, k.host);
     if (rc != RAD_OK) { delete in; return rc; }
     {
         std::lock_guard<std::mutex> lk(g_cache_mu);
@@ -515,7 +549,8 @@ static int ar_init(const RadParam* p, int n_p, int rank, int world, int host, vo
     if (numel <= 0) return RAD_E_INVAL;
 
     ArInst* in = nullptr;
-    int rc = acquire(CacheKey{ rank, world, dt, numel, host }, &in);
+    const long long group = pgeti_hi(p, n_p, "tp_group", 0);
+    int rc = acquire(CacheKey{ group, rank, world, dt, numel, host }, &in);
     if (rc != RAD_OK) return rc;
     *out = in;
     return RAD_OK;
@@ -542,7 +577,8 @@ static int ar_mn_acquire(const RadParam* p, int n_p, int rank, int world, int ho
     if (M <= 0 || K <= 0) return RAD_E_INVAL;
 
     ArInst* in = nullptr;
-    int rc = acquire(CacheKey{ rank, world, 0 /* bf16 */, M * K, host }, &in);
+    const long long group = pgeti_hi(p, n_p, "tp_group", 0);
+    int rc = acquire(CacheKey{ group, rank, world, 0 /* bf16 */, M * K, host }, &in);
     if (rc != RAD_OK) return rc;
     *out = in;
     return RAD_OK;
@@ -886,7 +922,7 @@ extern "C" int r4d_rad_ar_oneshot_2rank_exact(const RadArgs* a, RadStream s) {
                                    c.in->peer_flags[0], c.in->my_flags, c.in->my_seq,
                                    c.in->slot16, c.inp, c.out, c.numel, c.in->dtype,
                                    (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                                   c.in->my_stage));
+                                   c.in->my_stage, ar_chain(a, c.numel)));
     return RAD_OK;
 }
 
@@ -905,6 +941,51 @@ enum { R4D_AR_WHT6_NB_CAP = 48 };
  * many resident blocks of half the size is 5-9% faster per call, while 96 or 192 blocks of 1024
  * do not help. */
 enum { R4D_AR_WHT6_FUSED_THREADS = 512 };
+
+/* The two-rank fused writes' coded push (r4d_ar_hc_write_coded_kernel: ~12.1 bits a bf16 value
+ * instead of 16, the same bytes out) from this message size. Coding costs each block its encode and
+ * the peer's decode and saves a quarter of the bytes, so it pays where a message's time is the
+ * link's. On 2x R9700 (PCIe 4.0 P2P), rows of 2560 with four streams, N x [producer, reduction]
+ * chained on both cards, coded against plain time a reduction, each at its grid below (the gather
+ * form in brackets):
+ *
+ *     20 KiB  1.48 (1.48)    240 KiB  1.01 (1.04)    960 KiB  0.89 (0.75)      5 MiB  0.84 (0.82)
+ *     65 KiB  1.14 (1.11)    320 KiB  0.97 (0.99)   1.25 MiB  0.86 (0.71)     10 MiB  0.82 (0.82)
+ *    120 KiB  1.11 (1.08)    480 KiB  0.92 (0.95)    2.5 MiB  0.83 (0.84)   11.7 MiB  0.84 (0.84)
+ *    160 KiB  1.05 (1.05)    640 KiB  0.89 (0.89)
+ *
+ * (20 KiB is the register form's step, 3.7 us against 5.5; 10 MiB a 2048-row chunk's, 533 us
+ * against 436 and 627 against 513), and the same crossing with the link idle 100 us between
+ * reductions, as in a decode step. The forms meet near 280 KiB, so the floor sits at 512 KiB,
+ * where coding has begun to pay: a prefill chunk from 103 rows of 2560 is coded, and a decode or
+ * verify step of eight streams (48 rows, 240 KiB) is not. A message that does not code at all
+ * (every group raw) costs 14% more than plain at 240 KiB, 7% at 640 KiB and 1% at 10 MiB;
+ * Qwen3.8-Flash-Next's prefill sends 0.8% (the mixers) and 0.02% (the experts) of its words raw,
+ * 12.16 and 12.13 bits a value.
+ *
+ * `coded` (0 or 1), a launch parameter no declaration carries, pins one launch: r4d_selftest's
+ * arms. */
+enum { R4D_AR_CODED_MIN_BYTES = 512 * 1024 };
+
+/* The coded form's grid. Its blocks code and decode in waves of 32 words, so it runs 1024 threads
+ * a block whatever the row's tuned `nthreads` (at 512 a 10 MiB reduction takes 536 us against 435),
+ * and with a quarter of the bytes off the link the memory behind it shows: up to 48 blocks instead
+ * of 24 (the gather form at 2048 rows 559 us at 24 blocks and 513 at 48, at 192 rows 53 and 42;
+ * 3% slower at 384 to 512 rows, nothing else). Part of the table's 0.75 and 0.71 is that grid: the
+ * plain gather at 192 rows takes 59 us at 24 blocks and 49 at 48, where coding alone gives 0.87. */
+enum { R4D_AR_CODED_NB_CAP = 48, R4D_AR_CODED_THREADS = 1024 };
+
+static long long ar_coded_min_bytes() { return (long long)R4D_AR_CODED_MIN_BYTES; }
+
+/* Whether a fused write of `words16` 16-byte words takes the coded push: asked for (the floor, or
+ * the launch's `coded`) and fitting the form (r4d_ar_coded2_ok; the gather's launcher adds its
+ * table's bound). Both ranks decide from the same M and n. */
+static long ar_coded(const RadArgs* a, const ArInst* in, long words16) {
+    if (in->host || !r4d_ar_coded2_ok(words16, in->slot16, in->my_stage)) return 0;
+    const long long pin = r4d_geti_or(a, "coded", -1);
+    if (pin >= 0) return pin != 0;
+    return (long long)words16 * 16 >= ar_coded_min_bytes();
+}
 
 extern "C" int r4d_rad_ar_oneshot_2rank_wht6(const RadArgs* a, RadStream s) {
     ArCall c;
@@ -929,7 +1010,7 @@ extern "C" int r4d_rad_ar_oneshot_2rank_wht6(const RadArgs* a, RadStream s) {
                                        c.in->peer_flags[0], c.in->my_flags, c.in->my_seq,
                                        c.in->slot16, c.inp, c.out, c.numel, c.in->dtype,
                                        (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                                       c.in->my_stage));
+                                       c.in->my_stage, ar_chain(a, c.numel)));
         return RAD_OK;
     }
 
@@ -1317,7 +1398,7 @@ extern "C" int r4d_rad_ar_ln_had_quant_i8(const RadArgs* a, RadStream s) {
  * size above --tp-wire-min-kb), and both ranks decide on the same T. A wire-6 chunk that would
  * straddle a row is refused as a shape. */
 /* `hi8`: ar_rmsnorm_had_quant_i8g, the same with had_quant_act_i8g's quantiser on the norm's pass
- * (int8 codes, K whole 128s, no post-norm). */
+ * (int8 codes, K whole scale groups of 128 or IQ8R's 256, no post-norm). */
 static int rad_ar_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
     if (!in) return RAD_E_STATE;
@@ -1349,9 +1430,10 @@ static int rad_ar_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
     /* A row must be whole 16B words, since a block pushes its rows as words. */
     if (K % 8) return RAD_E_SHAPE;
 
-    const long long grp = r4d_quant_act_fp8_group();
+    const long long g0 = r4d_quant_act_fp8_group();
+    const long long grp = r4d_geti_or(a, "group", g0);
+    if (grp != g0 && !(hi8 && grp == R4D_I8_GROUP_WIDE)) return RAD_E_SHAPE;
     const long long nkb = (K + grp - 1) / grp;
-    if (r4d_geti_or(a, "group", grp) != grp) return RAD_E_SHAPE;
     if (hi8 && K % grp) return RAD_E_SHAPE;
     if (r4d_numel(w) != K) return RAD_E_SHAPE;
     if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return RAD_E_DTYPE;
@@ -1422,7 +1504,8 @@ static int rad_ar_rmsnorm_quant(const RadArgs* a, RadStream s, bool hi8) {
               r4d_addr(sc), (int)M, (int)K, eps, wadd, w_f32,
               (int)rp, (int)yp, (int)qp, (int)sp,
               (long)(uintptr_t)s, nblocks, nthreads, cfgv.drain, cfgv.acq, wire,
-              in->locpack, in->slot_bytes / 2, in->my_stage)
+              in->locpack, in->slot_bytes / 2, in->my_stage, (int)grp,
+              r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0)
         : r4d_ar_rmsnorm_quant_fp8(
               in->peer_scratch[0], in->my_scratch,
               in->peer_flags[0], in->my_flags, in->my_seq,
@@ -1440,6 +1523,56 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
 
 extern "C" int r4d_rad_ar_rmsnorm_had_quant_i8g(const RadArgs* a, RadStream s) {
     return rad_ar_rmsnorm_quant(a, s, true);
+}
+
+/* ar_rmsnorm: ar_rmsnorm_quant_fp8 without the quantiser, for a block whose linears read the bf16
+ * norm output (arch/common's bf16 blocks). Its operands are that op's minus `q` and `scale`, with
+ * `y` required; the exact wire only. The checks, the block count and the norm's width are
+ * rad_ar_rmsnorm_quant's, for the same reasons. */
+enum { AN_X = 0, AN_RESID, AN_W, AN_Y };
+
+extern "C" int r4d_rad_ar_rmsnorm(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 2) return RAD_E_SHAPE;
+
+    const RadTensor* x  = r4d_opt(a, AN_X);
+    const RadTensor* rs = r4d_opt(a, AN_RESID);
+    const RadTensor* w  = r4d_opt(a, AN_W);
+    const RadTensor* y  = r4d_opt(a, AN_Y);
+    if (!x || !w || !y) return RAD_E_INVAL;
+    if (!r4d_contig(w)) return RAD_E_STRIDE;
+    if (x->rank != 2 || y->rank != 2) return RAD_E_SHAPE;
+    const long long M = x->shape[0], K = x->shape[1];
+    if (M < 1 || K < 1) return RAD_E_SHAPE;
+    if (M * K > in->max_numel) return RAD_E_SHAPE;
+    if (K % 8) return RAD_E_SHAPE;
+    if (r4d_numel(w) != K) return RAD_E_SHAPE;
+    if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return RAD_E_DTYPE;
+    if (y->shape[0] != M || y->shape[1] != K) return RAD_E_SHAPE;
+    if (rs && (rs->rank != 2 || rs->shape[0] != M || rs->shape[1] != K)) return RAD_E_SHAPE;
+    const long long xp = r4d_row_pitch(x), yp = r4d_row_pitch(y);
+    const long long rp = rs ? r4d_row_pitch(rs) : 0;
+    if (xp < 0 || yp < 0 || rp < 0) return RAD_E_STRIDE;
+    if (xp != K) return RAD_E_STRIDE;
+    if (r4d_geti_or(a, "wire", 0) != 0) return RAD_E_UNSUPPORTED;
+
+    R4dArCfg cfgv;
+    r4d_cfg_ar(a, &cfgv);
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : (int)M;
+    if (nblocks > (int)M) nblocks = (int)M;
+    constexpr int kNbCap = 256;
+    if (nblocks > kNbCap) nblocks = kNbCap;
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+    if (nblocks < 1) nblocks = 1;
+
+    const int e = r4d_ar_rmsnorm_bf16(
+        in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags, in->my_seq,
+        in->slot16, r4d_addr(x), rs ? r4d_addr(rs) : 0, r4d_addr(w), r4d_addr(y), (int)M, (int)K,
+        (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0), w->dtype == RAD_F32,
+        (int)rp, (int)yp, (long)(uintptr_t)s, nblocks, 0, cfgv.drain, cfgv.acq, in->my_stage,
+        r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0);
+    return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
 /* The all-reduce and the sandwich-norm junction after it, int8 out: exact `all_reduce` of `x`, then
@@ -1510,7 +1643,7 @@ static int rad_ar_rmsnorm_quant_i8(const RadArgs* a, RadStream s, bool grp) {
         v.sl ? (v.sl->dtype == RAD_F32) : 0, r4d_addr(v.ob), r4d_addr(v.q), r4d_addr(v.sc), (int)M,
         (int)K, (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0),
         v.w->dtype == RAD_F32, (int)v.rp, (int)v.yp, (long)(uintptr_t)s, nblocks, cfgv.drain,
-        cfgv.acq, grp ? 1 : 0, in->my_stage);
+        cfgv.acq, grp ? 1 : 0, in->my_stage, r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
@@ -1705,7 +1838,9 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
         if (rc != 0) return RAD_E_SHAPE;
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
-    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, in->nb_cap);
+    const long coded = ar_coded(a, in, words16);
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks
+                                   : nb_for(words16, coded ? R4D_AR_CODED_NB_CAP : in->nb_cap);
     if (nblocks > in->max_blocks) nblocks = in->max_blocks;
 
     const long gate = link_gate(a), early = in->host ? 0L : gate;
@@ -1714,10 +1849,10 @@ extern "C" int r4d_rad_ar_gather_hc_write(const RadArgs* a, RadStream s) {
         in->slot16, r4d_addr(y), r4d_addr(inj), r4d_addr(h), (long)M, (long)n, (long)hc,
         (long)irow, (long)hrow, r4d_addr(ye), r4d_addr(ew), r4d_addr(so),
         sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L, (long)ye_ld, (long)ew_ld, (long)sh_ld,
-        (long)sg_ld, (long)top_k, (long)sig, (long)(uintptr_t)s, nblocks, cfgv.nthreads,
+        (long)sg_ld, (long)top_k, (long)sig, (long)(uintptr_t)s, nblocks,
+        coded ? R4D_AR_CODED_THREADS : cfgv.nthreads,
         cfgv.drain, cfgv.acq, has_inv ? (long)(uintptr_t)a->scratch : 0L, early,
-        early ? in->gate_ctr : 0L, in->my_stage,
-        r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(M) ? 1L : 0L);
+        early ? in->gate_ctr : 0L, in->my_stage, (long)r4d_geti_or(a, "chain", 0), coded);
     if (rc != 0) return RAD_E_SHAPE;
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
@@ -1837,7 +1972,9 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
         if (rc != 0) return RAD_E_SHAPE;
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
-    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, in->nb_cap);
+    const long coded = ar_coded(a, in, words16);
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks
+                                   : nb_for(words16, coded ? R4D_AR_CODED_NB_CAP : in->nb_cap);
     if (nblocks > in->max_blocks) nblocks = in->max_blocks;
 
     const long gate = link_gate(a), early = in->host ? 0L : gate;
@@ -1845,9 +1982,9 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
         r4d_ar_hc_write(in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags,
                         in->my_seq, in->slot16, r4d_addr(y), r4d_addr(inj), r4d_addr(h),
                         (long)M, (long)n, (long)hc, (long)irow, (long)hrow, (long)(uintptr_t)s,
-                        nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq, early,
-                        early ? in->gate_ctr : 0L, in->my_stage,
-                        r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(M) ? 1L : 0L));
+                        nblocks, coded ? R4D_AR_CODED_THREADS : cfgv.nthreads, cfgv.drain,
+                        cfgv.acq, early, early ? in->gate_ctr : 0L, in->my_stage,
+                        (long)r4d_geti_or(a, "chain", 0), coded));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 

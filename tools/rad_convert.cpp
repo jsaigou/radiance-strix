@@ -15,6 +15,7 @@
  * are reported.
  */
 #include "iface.h"
+#include "convert_work_queue.h"
 #include "format/checkpoint.h"
 #include "format/encoding.h"
 #include "format/imatrix.h"
@@ -27,7 +28,7 @@
 #include "rad_quant.h"
 
 #include <dlfcn.h>
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <sys/stat.h>
 
@@ -50,6 +51,13 @@
 #include <unordered_set>
 
 using namespace rad;
+
+namespace rad {
+int rad_add_gemma4_vision(const std::string& base_path, const std::string& input,
+                         const std::string& config_dir, const std::string& out,
+                         const std::string& home, const std::vector<std::string>& hierarchy,
+                         bool plan_only);
+}
 
 namespace {
 
@@ -85,7 +93,7 @@ int clef_metadata(const std::string& in, const std::string& config_dir, const Ch
                 "checkpoint (or under --config)", path.c_str());
         return -1;
     }
-    nlohmann::json c;
+    Json c;
     try { f >> c; } catch (const std::exception& e) {
         RAD_ERR("%s: %s", path.c_str(), e.what());
         return -1;
@@ -164,7 +172,7 @@ int laya_metadata(const std::string& in, const std::string& config_dir, MetaOwn&
             dir = slash == std::string::npos ? "." : in.substr(0, slash);
         }
     }
-    auto read_json = [](const std::string& path, nlohmann::json* j) {
+    auto read_json = [](const std::string& path, Json* j) {
         std::ifstream f(path);
         if (!f) { RAD_ERR("%s: a Laya checkpoint carries it; cannot read it", path.c_str()); return -1; }
         try { f >> *j; } catch (const std::exception& e) {
@@ -182,7 +190,7 @@ int laya_metadata(const std::string& in, const std::string& config_dir, MetaOwn&
         if (enc.keys[i] != "model_type" && enc.keys[i] != "architectures") meta.set(enc.keys[i], enc.vals[i]);
     meta.m = enc.m;
 
-    nlohmann::json rl;
+    Json rl;
     if (read_json(dir + "/rl_agent_config.json", &rl) < 0) return -1;
     const std::pair<const char*, long long> counts[] = { { "max_len", 1 }, { "head_max_len", 1 },
                                                          { "head_layers", 0 } };
@@ -201,7 +209,7 @@ int laya_metadata(const std::string& in, const std::string& config_dir, MetaOwn&
     auto num = [](double v) { char s[32]; std::snprintf(s, sizeof s, "%.9g", v); return std::string(s); };
     std::string temps = "1 1 1";
     if (rl.contains("temperature")) {
-        const nlohmann::json& t = rl["temperature"];
+        const Json& t = rl["temperature"];
         if (!t.is_array() || t.size() != 3 || !t[0].is_number() || !t[1].is_number() || !t[2].is_number()) {
             RAD_ERR("%s/rl_agent_config.json: `temperature` is not three numbers (choice, score, "
                     "noul)", dir.c_str());
@@ -218,10 +226,10 @@ int laya_metadata(const std::string& in, const std::string& config_dir, MetaOwn&
     /* The special tokens by name (tokenizer_config.json), their ids from tokenizer.json. */
     const std::string tdir = dir + "/tokenizer";
     if (tokjson->empty()) *tokjson = tdir + "/tokenizer.json";
-    nlohmann::json tc, tj;
+    Json tc, tj;
     if (read_json(tdir + "/tokenizer_config.json", &tc) < 0 || read_json(*tokjson, &tj) < 0) return -1;
     for (const char* which : { "cls_token", "sep_token", "mask_token" }) {
-        const nlohmann::json* v = tc.contains(which) ? &tc[which] : nullptr;
+        const Json* v = tc.contains(which) ? &tc[which] : nullptr;
         if (v && v->is_object() && v->contains("content")) v = &(*v)["content"];
         if (!v || !v->is_string()) {
             RAD_ERR("%s/tokenizer_config.json: no `%s`", tdir.c_str(), which);
@@ -347,8 +355,8 @@ void usage() {
         "                       the engine. Default: the checkpoint's training context\n"
         "      --draft-model DIR  a drafter that ships as its own repository (DFlash2), merged\n"
         "                       under `draft.`\n"
-        "      --kv-cache-dtype T  bf16 | fp8, the cache width declare is run at. Default: the\n"
-        "                       first of bf16, fp8 at which every op resolves -- the container\n"
+        "      --kv-cache-dtype T  bf16 | i8, the cache width declare is run at. Default: the\n"
+        "                       first of bf16, i8 at which every op resolves -- the container\n"
         "                       is the same at either, so this only picks the kernels it checks\n"
         "      --max-spec N     the max_spec declare is run at (default 4, or the block a\n"
         "                       drafter states; a number given here is used as given); 0\n"
@@ -357,6 +365,12 @@ void usage() {
         "                       the first is searched first). A weight\n"
         "                       it holds with the same encoding, quantiser, options and shape is\n"
         "                       copied from it instead of quantised again\n"
+        "      --add-vision BASE.rad   add a Gemma 4 MoE vision tower to a text-only container.\n"
+        "                       Input is the vision safetensors with its source config. Copy all\n"
+        "                       base weight planes, vocab and metadata to a new output.\n"
+        "                       Supports --config, --home, --kernels and --plan-only.\n"
+        "      --reuse-only     with --reuse, refuse any weight not found with matching encoding,\n"
+        "                       quantiser, options, shape and expert slot; no fresh conversion\n"
         "      --changed FILE   with --reuse: checkpoint tensors (one name a line) that differ from\n"
         "                       the checkpoint the --reuse container was converted from. Every\n"
         "                       weight that reads one is converted; the rest are copied\n"
@@ -374,15 +388,31 @@ void usage() {
         "                       every target; several targets mean the module is their concate-\n"
         "                       nation (a fused qkv), and the adapter's rows split along them\n"
         "                       in the order listed\n"
-        "      --in-place       with --reuse: EXTEND that container instead of writing a new one.\n"
+        "      --in-place       with --reuse: EXTEND that container (the first --reuse; further\n"
+        "                       ones only supply planes) instead of writing a new one.\n"
         "                       Its weights stay where they are; new ones are written past its\n"
         "                       end and the header last. Refused when a weight it holds would\n"
-        "                       change or a new weight is an expert. <file>.pre-append keeps the\n"
-        "                       old header and length\n"
+        "                       change or a new weight is an expert of a layer it holds experts\n"
+        "                       of. <file>.pre-append keeps the old header and length\n"
+        "      --replace GLOB   with --in-place: a weight the glob matches that the container\n"
+        "                       holds under another encoding or rule is written again past its\n"
+        "                       end, and the old planes stay behind as unreachable bytes until\n"
+        "                       the container is converted to a new file (repeatable). A\n"
+        "                       layer's other experts move with one that is written again,\n"
+        "                       their planes copied\n"
+        "      --defer GLOB     leave every weight the glob matches out of this container, for\n"
+        "                       a later --in-place run to add (repeatable). With --in-place a\n"
+        "                       weight the container already holds stays. The container loads\n"
+        "                       once no weight is left out, so a checkpoint larger than the disk\n"
+        "                       converts a layer at a time: the first run defers the layers\n"
+        "                       whose tensors are not there yet, each later run adds some\n"
         "      --gpus LIST      the cards (HIP device numbers, comma separated) the quantisers\n"
         "                       may run on, and large weights then run two at a time. A\n"
         "                       quantiser writes the same bytes on a card as on the host; with\n"
         "                       no quantiser plugin that has a device path, refused\n"
+        "      --gpu-workers N  with --gpus, reserve N OpenMP workers for trellis GPTQ jobs;\n"
+        "                       other workers process CPU jobs, either side can steal. N must\n"
+        "                       be less than OMP_NUM_THREADS and at most the cards in --gpus. Default: one shared queue\n"
         "      --plan-only      declare, plan every weight's encoding, print the plan, and stop\n"
 "      --plan-json F    write the plan as JSON: per weight its sources, encoding, bytes,\n"
 "                       exactness class and provenance (also with a real conversion)\n"
@@ -430,15 +460,18 @@ int main(int argc, char** argv) {
     int      report_n = 20;
     bool     verbose = false, plan_only = false, list_quant = false, plan_sha = false;
     std::string plan_json;
-    std::string reuse_path, changed_path;
+    std::string reuse_path, changed_path, vision_base;
     std::vector<std::string> reuse_more;   /* --reuse given again: more containers to copy from */
+    std::vector<std::string> defer;        /* --defer: globs of the weights this run leaves out */
+    std::vector<std::string> replace;      /* --replace: globs of the weights --in-place may rewrite */
     std::vector<std::string> lora_paths;
     double      lora_strength = 1.0;
     std::string lora_map;
-    bool        in_place = false;
+    bool        in_place = false, reuse_only = false;
     int         kv_dtype = RAD_DT_INVALID;
     std::vector<std::pair<std::string, std::string>> set_kv;
     std::vector<int> gpus;           /* --gpus: the cards the quantisers may run on */
+    int gpu_workers = 0;             /* 0: the original shared OpenMP job queue */
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -478,6 +511,14 @@ int main(int argc, char** argv) {
         else if (a == "--max-spec")  { max_spec = (int)num("--max-spec", 0, INT32_MAX);
                                        max_spec_given = true; }
         else if (a == "--draft-model") draft_dir = next("--draft-model");
+        else if (a == "--add-vision") {
+            const char* path = next("--add-vision");
+            if (!*path || !vision_base.empty()) {
+                RAD_ERR("--add-vision takes one nonempty base container path");
+                return 2;
+            }
+            vision_base = path;
+        }
         else if (a == "--plan-only") plan_only = true;
         else if (a == "--plan-json") plan_json = next("--plan-json");
         else if (a == "--plan-sha256") plan_sha = true;
@@ -487,6 +528,7 @@ int main(int argc, char** argv) {
             if (reuse_path.empty()) reuse_path = r;
             else reuse_more.push_back(r);
         }
+        else if (a == "--reuse-only") reuse_only = true;
         else if (a == "--changed")   changed_path = next("--changed");
         else if (a == "--lora")      lora_paths.push_back(next("--lora"));
         else if (a == "--lora-strength") {
@@ -501,16 +543,19 @@ int main(int argc, char** argv) {
         }
         else if (a == "--lora-map")  lora_map = next("--lora-map");
         else if (a == "--in-place")  in_place = true;
+        else if (a == "--defer")     defer.push_back(next("--defer"));
+        else if (a == "--replace")   replace.push_back(next("--replace"));
         else if (a == "--gpus") {
             for (const std::string& d : rad_split_list(next("--gpus")))
                 gpus.push_back((int)rad_flag_int("rad-convert", "--gpus", d.c_str(), 0, 1023));
         }
+        else if (a == "--gpu-workers") gpu_workers = (int)num("--gpu-workers", 1, 1023);
         else if (a == "--kv-cache-dtype") {
             const std::string v = next("--kv-cache-dtype");
-            if (v == "fp8")       kv_dtype = RAD_F8E4M3;
+            if (v == "i8")        kv_dtype = RAD_I8;
             else if (v == "bf16") kv_dtype = RAD_BF16;
             else { std::fprintf(stderr, "rad-convert: --kv-cache-dtype takes bf16 "
-                                                         "or fp8, not '%s'\n", v.c_str());
+                                                         "or i8, not '%s'\n", v.c_str());
                                     return 2; }
         }
         else if (a == "-v" || a == "--verbose") { verbose = true; log_set_level(Log::Debug); }
@@ -520,6 +565,24 @@ int main(int argc, char** argv) {
             return 2;
         } else if (in.empty()) in = a;
         else { std::fprintf(stderr, "rad-convert: more than one input given\n"); return 2; }
+    }
+
+    if (!vision_base.empty()) {
+        if (in.empty() || out.empty() || in_place || list_quant || !reuse_path.empty() || reuse_only ||
+            !recipe_files.empty() || !quant_flags.empty() || !set_kv.empty() ||
+            !arch_override.empty() || !tokjson.empty() || !tokjson2.empty() || !chat_tmpl.empty() ||
+            !add_files.empty() || !draft_dir.empty() || !imat_path.empty() || !lora_paths.empty() ||
+            !lora_map.empty() || lora_strength != 1.0 || !changed_path.empty() || !gpus.empty() ||
+            max_tok_given || max_ctx != 0 || max_spec_given || kv_dtype != RAD_DT_INVALID ||
+            report_n != 20) {
+            RAD_ERR("--add-vision needs an input, a new -o path, and only its supported options "
+                    "(see --help)");
+            return 2;
+        }
+        const int rc = rad_add_gemma4_vision(vision_base, in, config_dir, out, home, hierarchy,
+                                             plan_only);
+        if (rc < 0) RAD_ERR("--add-vision: %s", rad_strerror(rc));
+        return rc < 0 ? 1 : 0;
     }
 
     /* ---------------------------------------------------------------- --list-quantizers */
@@ -556,6 +619,36 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    {
+        std::unordered_set<int> listed;
+        for (int g : gpus)
+            if (!listed.insert(g).second) {
+                std::fprintf(stderr, "rad-convert: --gpus lists card %d more than once\n", g);
+                return 2;
+            }
+    }
+    if (gpu_workers) {
+        if (gpus.empty()) {
+            std::fprintf(stderr, "rad-convert: --gpu-workers needs --gpus\n"); return 2;
+        }
+        if ((size_t)gpu_workers > gpus.size()) {
+            std::fprintf(stderr, "rad-convert: --gpu-workers %d exceeds the %zu card(s) in --gpus\n",
+                         gpu_workers, gpus.size());
+            return 2;
+        }
+#ifdef _OPENMP
+        if (gpu_workers >= omp_get_max_threads()) {
+            std::fprintf(stderr, "rad-convert: --gpu-workers must leave at least one of the %d "
+                                 "OpenMP workers for host jobs\n", omp_get_max_threads());
+            return 2;
+        }
+#else
+        std::fprintf(stderr, "rad-convert: --gpu-workers needs an OpenMP build\n"); return 2;
+#endif
+    }
+    if (reuse_only && (reuse_path.empty() || in_place)) {
+        std::fprintf(stderr, "rad-convert: --reuse-only needs --reuse without --in-place\n"); return 2;
+    }
     if (!changed_path.empty() && (reuse_path.empty() || in_place)) {
         std::fprintf(stderr, "rad-convert: --changed says which weights not to copy from the "
                              "container --reuse names, and needs --reuse without --in-place (a "
@@ -578,6 +671,11 @@ int main(int argc, char** argv) {
             return 2;
         }
         if (out.empty()) out = reuse_path;
+    }
+    if (!replace.empty() && !in_place) {
+        std::fprintf(stderr, "rad-convert: --replace names weights --in-place writes again; a "
+                             "conversion to a new file writes every changed weight anyway\n");
+        return 2;
     }
     if (in.empty() || out.empty()) { usage(); return 2; }
     /* The output is opened with O_TRUNC, so it must not be the --reuse container unless
@@ -671,12 +769,10 @@ int main(int argc, char** argv) {
     RadFile reuse;
     if (!reuse_path.empty() && reuse.open(reuse_path.c_str()) != RAD_OK) return 1;
     /* Further --reuse containers supply only weights the first lacks or holds converted otherwise:
-     * a container assembled from several converts (a mixed-precision recipe). */
+     * a container assembled from several converts (a mixed-precision recipe). With --in-place the
+     * first is the container extended and the others supply the planes of weights written past
+     * its end. */
     std::deque<RadFile> reuse_extra;
-    if (!reuse_more.empty() && in_place) {
-        std::fprintf(stderr, "rad-convert: --in-place extends one container; give --reuse once\n");
-        return 2;
-    }
     for (const std::string& r : reuse_more) {
         reuse_extra.emplace_back();
         if (reuse_extra.back().open(r.c_str()) != RAD_OK) return 1;
@@ -934,12 +1030,12 @@ int main(int argc, char** argv) {
         return n;
     };
     /* The KV cache width is a serve-time choice the container does not record; only the kernels
-     * differ (an fp8-cache attention may have no bf16 form). Without --kv-cache-dtype, check
+     * differ (an int8-cache attention may have no bf16 form). Without --kv-cache-dtype, check
      * against the first width at which every op resolves, else report the one with fewest holes. */
     const std::vector<int> widths = kv_dtype != RAD_DT_INVALID
                                         ? std::vector<int>{ kv_dtype }
-                                        : std::vector<int>{ RAD_BF16, RAD_F8E4M3 };
-    auto width_name = [](int dt) { return dt == RAD_F8E4M3 ? "fp8" : "bf16"; };
+                                        : std::vector<int>{ RAD_BF16, RAD_I8 };
+    auto width_name = [](int dt) { return dt == RAD_I8 ? "i8" : "bf16"; };
     Program prog;
     size_t dead = 0;
     for (size_t k = 0; k < widths.size(); ++k) {
@@ -1172,15 +1268,14 @@ int main(int argc, char** argv) {
                      humanb(rr.bytes).c_str(), rr.src.c_str(), rr.enc.c_str(), rr.cls.c_str());
     }
     if (!plan_json.empty()) {
-        nlohmann::json J;
+        Json J;
         J["tool"] = "rad-convert plan";
         J["source"] = ck.path();
         J["arch"] = meta.m.arch_id;
         J["quant"] = meta.quant;
         J["plugin"] = plugins.arch_plugin;
         J["recipe"] = recipe.text();
-        nlohmann::json arr = nlohmann::json::array();
-        std::vector<nlohmann::json> rec(plan.size());
+        Json arr = Json::array();
         std::vector<std::string> sha(plan.size());
         if (plan_sha) {
             RAD_INFO("--plan-sha256: hashing the dequantised f32 values of %zu weight(s) ...", plan.size());
@@ -1203,16 +1298,16 @@ int main(int argc, char** argv) {
         }
         for (size_t i = 0; i < plan.size(); ++i) {
             const Logical& L = *plan[i];
-            nlohmann::json j;
+            Json j;
             j["name"] = L.src.name;
             j["shape"] = std::vector<int64_t>(L.src.shape, L.src.shape + L.src.rank);
-            nlohmann::json srcs = nlohmann::json::array();
+            Json srcs = Json::array();
             for (const SrcTensor* p : L.src.pieces)
                 srcs.push_back({ { "tensor", p->name },
                                  { "type", p->rad_dtype != RAD_DT_INVALID ? rad_dtype_name(p->rad_dtype)
                                            : gguf_dtype(p->ggml) ? gguf_dtype(p->ggml)->name : "?" },
                                  { "bytes", p->bytes } });
-            if (srcs.size() > 8) { srcs = nlohmann::json::array({ srcs[0], "... " + std::to_string(srcs.size()) + " pieces" }); }
+            if (srcs.size() > 8) { srcs = Json::array({ srcs[0], "... " + std::to_string(srcs.size()) + " pieces" }); }
             j["sources"] = srcs;
             j["encoding"] = enc_name(L.enc);
             j["bytes"] = plan_bytes(&L);
@@ -1326,10 +1421,13 @@ int main(int argc, char** argv) {
     };
     std::vector<Job> jobs;
     jobs.reserve(plan.size());
-    int64_t reused_inplace = 0, n_inplace = 0, n_changed = 0;
+    int64_t reused_inplace = 0, n_inplace = 0, n_changed = 0, n_deferred = 0;
+    std::vector<int64_t> defer_hits(defer.size(), 0);
+    std::vector<int64_t> replace_hits(replace.size(), 0);
+    int64_t n_replaced = 0, replaced_dead = 0;
 
-    for (Logical* Lp : plan) {
-        Logical& L = *Lp;
+    /* What the writer is told of a logical weight. */
+    auto weight_of = [](const Logical& L) {
         RadWriter::Weight ww;
         ww.name = L.src.name;
         const RecipeRule* rr = L.rule ? L.rule->rule : L.import_rule;
@@ -1341,9 +1439,55 @@ int main(int argc, char** argv) {
         ww.layer = L.layer;
         ww.expert = L.expert;
         ww.slot = L.slot;
+        return ww;
+    };
+    /* Whether container R holds `ww` as entry `e` with the planes this run would write: the same
+     * encoding, quantiser, options and shape, and for an expert the same place in its layer. */
+    auto held_same = [](const RadFile& R, const RadFileEntry& e, const RadWriter::Weight& ww) {
+        const bool expert = ww.expert >= 0 || e.expert >= 0;
+        bool same = rad_enc_equal(&R.encoding(e), &ww.enc) && ww.quantizer == R.str(e.quantizer) &&
+                    ww.options == R.str(e.options) && e.rank == ww.rank &&
+                    (!expert || (e.layer == ww.layer && e.expert == ww.expert &&
+                                 e.slot == ww.slot));
+        for (uint32_t i = 0; same && i < RAD_MAX_RANK; ++i)
+            if (e.shape[i] != ww.shape[i]) same = false;
+        return same;
+    };
+    auto replace_names = [&](const std::string& name) {
+        for (const std::string& g : replace)
+            if (recipe_glob(g.c_str(), name.c_str())) return true;
+        return false;
+    };
+    /* The layers whose experts --replace writes again: a layer's experts sit at one stride, so the
+     * ones whose rule did not change move with the ones whose did, their planes copied. */
+    std::unordered_set<int32_t> moved_layers;
+    if (in_place && !replace.empty())
+        for (const Logical* Lp : plan) {
+            if (Lp->expert < 0) continue;
+            const RadWriter::Weight ww = weight_of(*Lp);
+            const RadFileEntry* re = reuse.find(ww.name);
+            if (re && !held_same(reuse, *re, ww) && replace_names(ww.name))
+                moved_layers.insert(ww.layer);
+        }
+    int64_t n_moved = 0, moved_bytes = 0;
+    /* Written past the end of an --in-place container from another --reuse container's planes. */
+    int64_t n_from_other = 0, other_bytes = 0;
+
+    for (Logical* Lp : plan) {
+        Logical& L = *Lp;
+        RadWriter::Weight ww = weight_of(L);
         int64_t plane_total = 0;
         for (int k = 0; k < L.enc.n_planes; ++k)
             plane_total += rad_enc_plane_bytes(&L.enc.plane[k], L.src.rows, L.src.cols);
+
+        /* --- Deferred: left for a later --in-place run, unless the container being extended holds
+         * it already. Its checkpoint tensors are not read. */
+        {
+            bool hit = false;
+            for (size_t d = 0; d < defer.size(); ++d)
+                if (recipe_glob(defer[d].c_str(), ww.name.c_str())) { ++defer_hits[d]; hit = true; }
+            if (hit && !(in_place && reuse.find(ww.name))) { ++n_deferred; continue; }
+        }
 
         /* --- Reused: the same encoding, quantiser, options and shape in the --reuse container give
          * the same planes, assuming the same checkpoint (the operator's responsibility; neither
@@ -1359,50 +1503,79 @@ int main(int argc, char** argv) {
             /* The movement group is the declaration's either way (add_weight and add_existing
              * record ww's), so a plugin that regroups a weight still reuses its planes; only an
              * expert's layer, index and slot say where its planes sit in a stride table. */
-            const bool expert = ww.expert >= 0 || re->expert >= 0;
-            bool same = rad_enc_equal(&reuse.encoding(*re), &ww.enc) &&
-                        ww.quantizer == reuse.str(re->quantizer) &&
-                        ww.options == reuse.str(re->options) && re->rank == ww.rank &&
-                        (!expert || (re->layer == ww.layer && re->expert == ww.expert &&
-                                     re->slot == ww.slot));
-            for (uint32_t i = 0; same && i < RAD_MAX_RANK; ++i)
-                if (re->shape[i] != ww.shape[i]) same = false;
+            const bool same = held_same(reuse, *re, ww);
             if (in_place) {
-                if (!same) {
+                /* --replace: the weight is written again past the end and the old planes are
+                 * left behind. Every glob that matches counts, as --defer's do. */
+                bool rep = false;
+                for (size_t d = 0; d < replace.size(); ++d)
+                    if (recipe_glob(replace[d].c_str(), ww.name.c_str())) {
+                        ++replace_hits[d];
+                        rep = true;
+                    }
+                if (!same && !rep) {
                     RAD_ERR("--in-place: '%s' is in %s as %s by '%s %s', and this run would write "
-                            "it as %s by '%s %s'. A weight cannot be replaced in place; convert "
-                            "to a new file.", ww.name.c_str(), reuse_path.c_str(),
+                            "it as %s by '%s %s'. Name it with --replace to write it again past "
+                            "the end, or convert to a new file.", ww.name.c_str(),
+                            reuse_path.c_str(),
                             enc_name(reuse.encoding(*re)).c_str(), reuse.str(re->quantizer),
                             reuse.str(re->options), enc_name(ww.enc).c_str(),
                             ww.quantizer.c_str(), ww.options.c_str());
                     w.abort();
                     return 1;
                 }
-                if (w.add_existing(ww, reuse, *re) < 0) { w.abort(); return 1; }
-                reused_inplace += (int64_t)re->bytes;
-                ++n_inplace;
-                continue;
+                /* An unchanged expert of a layer that is written again goes with it: the same
+                 * planes, copied past the end (the job below reads them from the container). */
+                const bool moved = same && ww.expert >= 0 && moved_layers.count(ww.layer) != 0;
+                if (same && !moved) {
+                    if (w.add_existing(ww, reuse, *re) < 0) { w.abort(); return 1; }
+                    reused_inplace += (int64_t)re->bytes;
+                    ++n_inplace;
+                    continue;
+                }
+                if (moved) { ++n_moved; moved_bytes += (int64_t)re->bytes; }
+                else ++n_replaced;
+                replaced_dead += (int64_t)re->bytes;
             }
-            if (!same) re = nullptr;
+            re = same ? re : nullptr;
         }
         RadFile* rf = re ? &reuse : nullptr;
         for (size_t x = 0; !re && !reads_changed && x < reuse_extra.size(); ++x) {
             RadFile& R = reuse_extra[x];
             const RadFileEntry* e = R.find(ww.name);
             if (!e) continue;
-            const bool expert = ww.expert >= 0 || e->expert >= 0;
-            bool same = rad_enc_equal(&R.encoding(*e), &ww.enc) && ww.quantizer == R.str(e->quantizer) &&
-                        ww.options == R.str(e->options) && e->rank == ww.rank &&
-                        (!expert || (e->layer == ww.layer && e->expert == ww.expert &&
-                                     e->slot == ww.slot));
-            for (uint32_t i = 0; same && i < RAD_MAX_RANK; ++i)
-                if (e->shape[i] != ww.shape[i]) same = false;
-            if (same) { re = e; rf = &R; }
+            if (held_same(R, *e, ww)) {
+                re = e;
+                rf = &R;
+                if (in_place) { ++n_from_other; other_bytes += (int64_t)e->bytes; }
+            }
+        }
+        if (reuse_only && !re) {
+            RAD_ERR("--reuse-only: no matching source for '%s'; refusing fresh conversion",
+                    ww.name.c_str());
+            w.abort();
+            return 1;
         }
         const int64_t idx = w.add_weight(ww);
         if (idx < 0) { w.abort(); return 1; }
         jobs.push_back(Job{ Lp, idx, re, rf, plane_total });
     }
+    /* A --replace glob no weight of the container matches is a typo too. */
+    for (size_t d = 0; d < replace.size(); ++d)
+        if (!replace_hits[d]) {
+            RAD_ERR("--replace %s matches no weight %s holds", replace[d].c_str(),
+                    reuse_path.c_str());
+            w.abort();
+            return 1;
+        }
+    /* A --defer glob no weight matches is a typo; refuse it. */
+    for (size_t d = 0; d < defer.size(); ++d)
+        if (!defer_hits[d]) {
+            RAD_ERR("--defer %s matches no weight of this conversion", defer[d].c_str());
+            w.abort();
+            return 1;
+        }
+
     /* A --changed name no weight reads is a typo or an unconverted tensor; refuse it. */
     if (!changed.empty()) {
         std::vector<std::string> unread;
@@ -1685,13 +1858,28 @@ int main(int argc, char** argv) {
     }
     std::atomic<int> failed{RAD_OK};
     const auto t0 = std::chrono::steady_clock::now();
+    std::vector<size_t> device_small, host_small;
+    if (gpu_workers) for (size_t i : small) {
+        const Job& j = jobs[i];
+        const bool device = !j.re && j.L->rule && j.L->rule->q &&
+                            std::strcmp(j.L->rule->q->name, "gptq") == 0 &&
+                            rad_enc_is(&j.L->enc, "trellis");
+        (device ? device_small : host_small).push_back(i);
+    }
+    if (gpu_workers && !device_small.empty()) {
+        RAD_INFO("gpu pipeline: %zu trellis job(s), %zu other job(s), %d preferred device worker(s)",
+                 device_small.size(), host_small.size(), gpu_workers);
+        failed.store(convert_run_queues(device_small, host_small, gpu_workers,
+                                        [&](size_t i) { return run_job(jobs[i]); }));
+    } else {
 #pragma omp parallel for schedule(dynamic, 1)
-    for (size_t i = 0; i < small.size(); ++i) {
-        if (failed.load(std::memory_order_relaxed) != RAD_OK) continue;
-        const int st = run_job(jobs[small[i]]);
-        if (st < 0) {
-            int ok = RAD_OK;
-            failed.compare_exchange_strong(ok, st);
+        for (size_t i = 0; i < small.size(); ++i) {
+            if (failed.load(std::memory_order_relaxed) != RAD_OK) continue;
+            const int st = run_job(jobs[small[i]]);
+            if (st < 0) {
+                int ok = RAD_OK;
+                failed.compare_exchange_strong(ok, st);
+            }
         }
     }
     {
@@ -1730,14 +1918,29 @@ int main(int argc, char** argv) {
     RAD_INFO("wrote %s: %lld weight(s), %s of weights, %u vocab token(s)", out.c_str(),
              (long long)w.weight_count(), humanb(written.load()).c_str(),
              (unsigned)vb.tokens.size());
-    if (in_place)
+    if (in_place) {
         RAD_INFO("--in-place: %lld weight(s), %s, kept where they were in %s; %lld added past "
-                 "its end", (long long)n_reused.load(), humanb(reused.load()).c_str(),
-                 reuse_path.c_str(), (long long)(w.weight_count() - n_reused.load()));
+                 "its end", (long long)(n_reused.load() - n_moved - n_from_other),
+                 humanb(reused.load() - moved_bytes - other_bytes).c_str(), reuse_path.c_str(),
+                 (long long)(w.weight_count() - n_reused.load() + n_moved + n_from_other));
+        if (n_from_other)
+            RAD_INFO("--in-place: %lld of the added weight(s), %s, are another --reuse "
+                     "container's planes", (long long)n_from_other, humanb(other_bytes).c_str());
+        if (n_replaced)
+            RAD_INFO("--replace: %lld of the added weight(s) replace one the container held and "
+                     "%lld unchanged expert(s) of their layers moved with them, planes copied; "
+                     "%s of old planes are unreachable until it is converted to a new file "
+                     "(rad-info --unreferenced lists them)",
+                     (long long)n_replaced, (long long)n_moved, humanb(replaced_dead).c_str());
+    }
     else if (reuse.is_open())
         RAD_INFO("--reuse: %lld weight(s), %s, copied from %s; the other %lld were written",
                  (long long)n_reused.load(), humanb(reused.load()).c_str(), reuse_path.c_str(),
                  (long long)(w.weight_count() - n_reused.load()));
+
+    if (n_deferred)
+        RAD_WARN("--defer: %lld weight(s) left out. The container does not load until --in-place "
+                 "runs have added them", (long long)n_deferred);
 
     std::vector<const Logical*> measured;
     for (const Logical* L : plan) if (L->err >= 0) measured.push_back(L);

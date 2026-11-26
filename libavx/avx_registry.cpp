@@ -53,6 +53,9 @@
 
 /* ---- elementwise and norms ---------------------------------------------------------------- */
 /* rmsnorm_add has no `mult`: no fused residual-norm site uses a scaled branch. */
+static const RadParamSpec pL2Clip[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_F64("threshold"),
+                                       P_STR("dtype"), P_F64O("floor"), P_F64O("alpha") };
+static const RadOperandSpec oL2Clip[] = { OPD("x"), WGT_O("w"), OPD_O("positions"), OUT("y") };
 static const RadParamSpec pRmsnormAdd[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
                                           P_F64O("wadd") };
 static const RadParamSpec pRmsnorm[]   = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
@@ -121,6 +124,11 @@ static const RadParamSpec pCausalConv[]   = { P_INT("M"), P_INT("n"), P_INT("wid
 static const RadOperandSpec oCausalConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
                                               OPD_O("cache_idx"), OPD_O("has_init"),
                                               OPD_O("num_accepted"), OUT("y") };
+static const RadParamSpec pSconvRes[]    = { P_INT("M"), P_INT("n"), P_INT("width"), P_INT("heads"),
+                                              P_STR("dtype") };
+static const RadOperandSpec oSconvRes[]  = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
+                                              OPD_O("dyn"), OPD_O("cache_idx"), OPD_O("has_init"),
+                                              OPD_O("num_accepted"), OUT("y") };
 
 static const RadParamSpec pHcWrite[]   = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
@@ -144,9 +152,20 @@ static const RadParamSpec pLayernorm[]   = { P_INT("M"), P_INT("n"), P_F64("eps"
 static const RadOperandSpec oLayernorm[] = { OPD("x"), WGT("w"), WGT_O("b"), OUT("y") };
 static const RadParamSpec pGridEmbed[]   = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype") };
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
+static const RadParamSpec pWindowOrder[] = { P_INT("M"), P_INT("window") };
+static const RadOperandSpec oWindowOrder[] = { OPD("crd"), OPD_O("cu"), OUT("idx"), OUT("inv"),
+                                               OUT("pos"), OUT("cuw") };
 static const RadParamSpec pGridEmbedCpe[]   = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
                                                 P_INTO("n_prefix") };
 static const RadOperandSpec oGridEmbedCpe[] = { INOUT("x"), WGT("table"), OPD("coord"), WGT_O("prefix") };
+/* SiTU over a fused gate_up (avx_elementwise.cpp). */
+static const RadParamSpec pSituMul[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("gate_cap"),
+                                         P_F64O("up_cap") };
+/* Block attention residuals (avx_attn_res.cpp; libref/ref_attn_res.cpp has the contract). */
+static const RadParamSpec pAttnResMix[] = { P_INT("M"), P_INT("n"), P_INT("n_state"),
+                                            P_INT("n_query"), P_STR("dtype"), P_F64("eps") };
+static const RadOperandSpec oAttnResMix[] = { OPD_O("states"), OPD("cur"), OPD_O("addend"),
+                                              WGT("query"), WGT_O("w"), OUT("y") };
 /* LiLiCorr's correlator (avx_lili.cpp; libref/ref_lili.cpp has the contracts). */
 static const RadParamSpec pLiliCand[] = { P_INT("M"), P_INT("k"), P_INT("world"), P_INT("steps"),
                                           P_INT("n"), P_STR("dtype"), P_F64O("eps"),
@@ -284,7 +303,12 @@ static const RadOperandSpec oRmsHadQuant[] = { OPD("x"), INOUT_O("residual"), WG
                                                OUT("q"), OUT("scale"), OUT_O("out_bf16") };
 
 static const RadParamSpec pGatedQuant[]   = { P_INT("M"), P_INT("n"), P_INT("group"),
-                                              P_STR("dtype"), P_STRO("act"), P_INTO("mode") };
+                                              P_STR("dtype"), P_STRO("act"), P_INTO("mode"),
+                                              P_F64O("gate_cap"), P_F64O("up_cap") };
+/* gated_quant_i8: the same parameters with `group` optional (default 128); libref's table matches. */
+static const RadParamSpec pGatedQuantI8[] = { P_INT("M"), P_INT("n"), P_INTO("group"), P_STR("dtype"),
+                                              P_STRO("act"), P_INTO("mode"), P_F64O("gate_cap"),
+                                              P_F64O("up_cap") };
 static const RadOperandSpec oGatedQuant[] = { OPD("a"), OPD_O("b"), OUT("q"), OUT("scale") };
 
 /* `a_scale` is optional: a "bf16" activation has none. */
@@ -293,6 +317,9 @@ static const RadOperandSpec oGram[] = { OPD("a"), OPD_O("a_scale"), INOUT("h") }
 static const RadParamSpec pDequant[]   = { P_INT("M"), P_INT("n"), P_INT("group"),
                                            P_STR("dtype") };
 static const RadOperandSpec oDequant[] = { OPD("q"), OPD("scale"), OUT("y") };
+static const RadParamSpec pDequantW4[] = { P_INT("N"), P_INT("K"), P_INT("group"), P_STR("dtype"),
+                                           P_INT("twos") };
+static const RadOperandSpec oDequantW4[] = { WGT("wq"), WGT("ws"), OUT("y") };
 
 /* ---- gemm --------------------------------------------------------------------------------- */
 static const RadParamSpec pGemm[]       = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype") };
@@ -348,6 +375,18 @@ static const RadOperandSpec oAttnPagedTree[] = {
 static const RadOperandSpec oAttnPagedSink[] = {
     OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
     OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), WGT("sinks"), OUT("out")
+};
+/* Inkling 2's attention: attn_paged's parameters and operands with the bias (r, rel_proj) and the
+ * per-row sinks before `out` (libref's ref_registry.cpp has the contract). */
+static const RadParamSpec pAttnPagedRel[] = {
+    P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"), P_INTD("block_size"), P_INT("causal"),
+    P_INT("window"), P_STR("q_dtype"), P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"),
+    P_INTO("n_head"), P_INTO("max_seqs"), P_INTO("prefill_fp8"), P_INT("d_rel"), P_INT("extent")
+};
+static const RadOperandSpec oAttnPagedRel[] = {
+    OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
+    OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"),
+    OPD("r"), WGT("rel_proj"), OPD("sink"), OUT("out")
 };
 static const RadConstraint cPagedBlock[] = { RAD_CGE("block_size", 1) };
 
@@ -522,22 +561,25 @@ static const RadOperandSpec oMoeGemm[] = { OPD("a"), WTAB("w"), OPD("sorted_tok"
 static const RadParamSpec pMoeGemmQ[]   = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
                                             P_INT("top_k"), P_INT("group"), P_STR("a_order"),
                                             P_STR("dtype"), P_INTO("N_odd"), P_INTO("K_odd"),
-                                            P_INTO("parts") };
+                                            P_INTO("parts"), P_INTO("a_group") };
 static const RadOperandSpec oMoeGemmQ[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"), WTAB("w_scale"),
                                             OPD("sorted_tok"), OPD("expert_offset"),
-                                            WTAB("w_odd"), WTAB("w_odd_scale"), OUT("y") };
+                                            WTAB("w_odd"), WTAB("w_odd_scale"), OUT("y"),
+                                            OPD_O("split") };
 /* The same over four classes by expert number mod 4, `w_q` class q at [N_q, K_q], as in libref
  * and libr4d. */
 static const RadParamSpec pMoeGemmQMod4[]   = { P_INT("M"), P_INT("N"), P_INT("K"),
                                                 P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
                                                 P_STR("a_order"), P_STR("dtype"), P_INTO("N_1"),
                                                 P_INTO("K_1"), P_INTO("N_2"), P_INTO("K_2"),
-                                                P_INTO("N_3"), P_INTO("K_3"), P_INTO("parts") };
+                                                P_INTO("N_3"), P_INTO("K_3"), P_INTO("parts"),
+                                                P_INTO("a_group") };
 static const RadOperandSpec oMoeGemmQMod4[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"),
                                                 WTAB("w_scale"), OPD("sorted_tok"),
                                                 OPD("expert_offset"), WTAB("w_1"),
                                                 WTAB("w_1_scale"), WTAB("w_2"), WTAB("w_2_scale"),
-                                                WTAB("w_3"), WTAB("w_3_scale"), OUT("y") };
+                                                WTAB("w_3"), WTAB("w_3_scale"), OUT("y"),
+                                                OPD_O("split") };
 
 /* With `shared` and `shared_gate`, the shared expert is folded in: y = narrow(shared * act(gate))
  * + narrow(gathered), the unfused pair's roundings. `act` is sigmoid or none, as in scale_rows,
@@ -696,7 +738,9 @@ static const RadParamSpec pConvNhwc[] = { P_INT("M"), P_INT("cin"), P_INT("cout"
 static const RadOperandSpec oConvNhwc[] = { OPD("x"), WGT("w"), WGT("b"), OUT("y") };
 static const RadParamSpec pIm2col[] = { P_INT("M"), P_INT("cin"), P_INT("k"), P_INT("stride"),
                                         P_STR("pad"), P_INT("up"), P_STR("dtype") };
-static const RadParamSpec pL2Norm[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
+static const RadParamSpec pL2Norm[] = {
+    P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype"), P_INTO("round_length"),
+};
 static const RadOperandSpec oL2Norm[] = { OPD("x"), WGT("gamma"), OUT("y") };
 static const RadParamSpec pSpaceDepth[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("ft"),
                                             P_STR("dtype") };
@@ -855,6 +899,8 @@ static const RadParamSpec pVqEncode[] = { P_INT("M"), P_INT("n"), P_INT("dim"), 
                                           P_STR("dtype") };
 static const RadOperandSpec oVqEncode[] = { INOUT("x"), WGT("in_w"), WGT("in_b"), WGT("cb"),
                                             WGT("out_w"), WGT("out_b"), OUT("codes") };
+static const RadParamSpec pVqEuclidean[] = { P_INT("M"), P_INT("n"), P_INT("bins"), P_STR("dtype") };
+static const RadOperandSpec oVqEuclidean[] = { INOUT("x"), WGT("cb"), OUT("codes") };
 static const RadParamSpec pFrameMix[] = { P_INT("M"), P_INT("n_embd"), P_INT("L"), P_INT("stride"),
                                           P_INTO("rep"), P_STR("dtype") };
 static const RadOperandSpec oFrameMix[] = { OPD("hid"), WGT("logits"), WGT("scale"), OPD("lane"),
@@ -979,6 +1025,8 @@ static const RadOpSchema kSchemas[] = {
 { "rmsnorm", ARR(pRmsnorm), ARR(oRmsnorm),
   "y = x * rsqrt(mean(x^2) + eps) * (w + wadd); the sum of squares is a four-accumulator vector "
   "reduction, in a different order from libref's." },
+{ "l2_clip", ARR(pL2Clip), ARR(oL2Clip),
+  "per-group L2 clip with an optional scale and a position tau: libref's l2_clip." },
 { "rmsnorm_p", ARR(pLayernorm), ARR(oUnary),
   "y = x * rsqrt(mean(x^2) + eps): rmsnorm with no gain, summed as rmsnorm sums." },
 { "rmsnorm_add", ARR(pRmsnormAdd), ARR(oRmsnormAdd),
@@ -997,7 +1045,8 @@ static const RadOpSchema kSchemas[] = {
 { "ssd_update", ARR(pSsdUpdate), ARR(oSsdUpdate), "Mamba-2 scalar-decay state update with candidate-state rollback, per_candidate or anchor." },
 { "hc_read", ARR(pHcRead), ARR(oHcRead),
   "The read half of a gated residual: grouped norm, low-rank gate, stream mix, and optionally the "
-  "block-scaled fp8 form of x and its Hadamard-rotated twin. See docs/OPS.md for the three facts "
+  "block-scaled fp8 form of x and its Hadamard-rotated twin, each int8 into an int8 buffer. See "
+  "docs/OPS.md for the three facts "
   "a second implementation has to match (the mix is a MEAN, there is a separate / hc inside each "
   "gate argument, and hc_write adds into the UNNORMED h). `mix` names the matrices' stored "
   "format; a host kernel reads them as the dense tensors it is handed." },
@@ -1011,8 +1060,21 @@ static const RadOpSchema kSchemas[] = {
 { "layernorm", ARR(pLayernorm), ARR(oLayernorm), "layer norm with gain and optional bias." },
 { "grid_embed", ARR(pGridEmbed), ARR(oGridEmbed),
   "x += a side x side position table resampled bilinearly to the row's grid." },
+{ "grid_embed_pad", ARR(pGridEmbed), ARR(oGridEmbed),
+  "x += the table resampled half-pixel bilinear (align_corners=False) with zero-padded taps: a "
+  "tap off the table contributes nothing rather than reading an edge (Muse's)." },
+{ "window_order", ARR(pWindowOrder), ARR(oWindowOrder),
+  "The window-attention permutation of one pass from its coordinate planes: idx/inv the "
+  "permutation and its inverse, pos the swapped one-offset rope positions, cuw the cumulative "
+  "window boundaries; window <= 0 is the identity." },
 { "grid_embed_aa", ARR(pGridEmbed), ARR(oGridEmbed),
   "x += the table resampled as torch's antialiased half-pixel bilinear, SigLIP2's." },
+{ "situ_mul", ARR(pSituMul), ARR(oGateUp),
+  "SiTU over a fused gate_up, gate first: gcap * tanh(g / gcap) * sigmoid(g) * ucap * tanh(u / "
+  "ucap); a cap of 0 is no softcap on that side." },
+{ "attn_res_mix", ARR(pAttnResMix), ARR(oAttnResMix),
+  "Block attention residuals: a softmax over depth of rms-normed states, cur + addend, per query; "
+  "optionally rms-normed and gained by w. states may be absent at n_state 0." },
 { "lili_cand", ARR(pLiliCand), ARR(oLiliCand),
   "LiLiCorr's candidates from the ranks' sample_logprobs rows, their rank features through "
   "layernorm, the up projection and silu, and the lattice rows' additive part." },
@@ -1104,6 +1166,9 @@ static const RadOpSchema kSchemas[] = {
   "ple_conv with a per-channel bias inside the silu (Mamba-2's conv1d)." },
 { "causal_conv1d", ARR(pCausalConv), ARR(oCausalConv),
   "depthwise causal conv with ple_conv's window, no activation and no residual (LFM2)." },
+{ "sconv_res", ARR(pSconvRes), ARR(oSconvRes),
+  "depthwise causal conv with its input as the residual and optional input-dependent taps, "
+  "scaled by 1/sqrt(m*k+1) (Inkling 2's short convolution)." },
 { "ngram_ids", ARR(pNgramIds), ARR(oNgramIds), "hashed n-gram row ids for PLE." },
 { "gather_rows", ARR(pMnD), ARR(oGather), "y[i,:] = x[idx[i],:]." },
 { "scatter_rows", ARR(pMnD), ARR(oScatterRows),
@@ -1119,21 +1184,11 @@ static const RadOpSchema kSchemas[] = {
   "symmetric int8, one f32 scale per `group` contiguous elements, row-major." },
 { "quant_act_fp8", ARR(pQuant), ARR(oQuantFp8), "symmetric block-scaled E4M3 quantiser." },
 { "quant_cols_fp8", ARR(pQuantCols), ARR(oQuantCols), "E4M3 with one scale per column." },
-{ "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
-  "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser. No normalisation: "
-  "the 1/group is folded into the stored weight scale at convert (docs/OPS.md)." },
 { "had_quant_act_i8g", ARR(pQuant), ARR(oQuantFp8),
   "width-`group` Hadamard, then quant_act_i8g's symmetric int8 per group. No normalisation: the "
   "1/group is the i8a8h weight's stored scale (docs/OPS.md)." },
 { "gram_accum", ARR(pGram), ARR(oGram),
   "h += x^T x over a dequantised E4M3 activation. `h` is [n, n] and INOUT." },
-{ "givens_dense_quant", ARR(pGivensDense), ARR(oGivensDense),
-  "ParoQuant's activation quantiser with the rotation as a dense per-group matrix: y = T (x / "
-  "rscale) for each of `parts` rotated copies, then the block-scaled quantiser `out` names "
-  "(\"i8\": amax / 127, round to nearest; \"fp8\": E4M3, amax / 448)." },
-{ "givens_rotate", ARR(pGivensRotate), ARR(oGivensRotate),
-  "ParoQuant's rotation without a quantiser: x / rscale rotated by `stages` rounds of Givens "
-  "pairs, `parts` copies side by side, in y's own dtype." },
 { "had_quant_act_i8", ARR(pQuant), ARR(oHadQuant),
   "Walsh-Hadamard rotation at width `group`, then symmetric int8 with ONE scale per row carrying "
   "the 1/sqrt(group)." },
@@ -1141,7 +1196,12 @@ static const RadOpSchema kSchemas[] = {
   "RMS norm, optional residual add, rotation and int8 in one pass." },
 { "gated_had_quant_i8", ARR(pGatedQuant), ARR(oGatedQuant),
   "gated product, rotation and int8 in one pass." },
+{ "gated_quant_i8", ARR(pGatedQuantI8), ARR(oGatedQuant),
+  "gated_had_quant_i8 without the rotation: per-group int8 with one f32 scale per group." },
 { "dequant", ARR(pDequant), ARR(oDequant), "group-scaled dequantisation." },
+{ "dequant_w4", ARR(pDequantW4), ARR(oDequantW4),
+  "Packed int4 weight to row-major bf16. Each 32-bit word holds 8 codes; the scale is "
+  "f16 in the low 16 bits, the zero point -(1024+zero) as f16 in the high 16 bits." },
 { "rmsnorm_quant_fp8", ARR(pRmsQuantFp8), ARR(oRmsQuantFp8),
   "RMS norm with an optional residual add, then the E4M3 quantiser, in one pass. The add is "
   "stored before the variance reads it, and the codes are taken over the bf16-narrowed row that "
@@ -1184,6 +1244,10 @@ static const RadOpSchema kSchemas[] = {
 { "attn_paged_sink", ARR(pAttnPaged), ARR(oAttnPagedSink),
   "attn_paged with `sinks` [n_head] f32, one logit a query head beside the keys in the softmax's "
   "maximum and denominator, with no value." },
+{ "attn_paged_rel", ARR(pAttnPagedRel), ARR(oAttnPagedRel),
+  "attn_paged with a relative-position bias and a sink logit per query row and head. The bias of "
+  "key j is r[i,h] . rel_proj[:, d] at d = pos_i - pos_j for 0 <= d < extent, else 0; it joins "
+  "the score unscaled. The sink joins the softmax's maximum and denominator with no value." },
 { "attn_dense", ARR(pAttnDense), ARR(oAttnDense),
   "dense varlen attention over cu_seqlens; a non-causal window may reach further right "
   "(`window_right`)." },
@@ -1290,9 +1354,6 @@ static const RadOpSchema kSchemas[] = {
 { "all_reduce", ARR(pAllReduce), ARR(oAllReduce),
   "sum across ranks, f32, ascending rank order." },
 { "all_gather", ARR(pAllGather), ARR(oAllGather), "gather every rank's shard." },
-{ "ln_mod_quant_fp8", ARR(pLnModQ), ARR(oLnModQ),
-  "gate_add (with `gated` 1), ln_mod and quant_act_fp8 in one pass, each value rounded as its own "
-  "store would round it; z written when bound." },
 { "ln_mod", ARR(pLnMod), ARR(oLnMod),
   "y = bf16(bf16(LN(x)) * bf16(1 + s[seq])): a gainless layer norm and the row's entry's "
   "modulation row of `s` ([n_seq, >= n] at its own pitch)." },
@@ -1357,8 +1418,6 @@ static const RadOpSchema kSchemas[] = {
 { "rms_mod", ARR(pRmsMod), ARR(oRmsMod),
   "the gated residual (no tanh), then an RMS norm with a gain times bf16(1 + scale row) plus the "
   "shift row, `s` holding [shift | scale]; libref's roundings." },
-{ "rms_mod_quant_fp8", ARR(pRmsModQ), ARR(oRmsModQ),
-  "rms_mod with its norm chain in bf16, then the E4M3 codes and scales of that row." },
 { "flow_x0_step", ARR(pMnD), ARR(oFlowX0),
   "x = r x + (1 - r)(x + (1 - t) v), r = sigma_next / sigma, each step one f32 rounding, bit for "
   "bit libref's." },
@@ -1467,6 +1526,10 @@ static const RadOpSchema kSchemas[] = {
 { "vq_encode", ARR(pVqEncode), ARR(oVqEncode),
   "one residual vector quantiser step: the code of greatest cosine with in_w x + in_b, then "
   "x -= out_w cb[code] + out_b; libref's arithmetic in another summation order." },
+{ "vq_euclidean", ARR(pVqEuclidean), ARR(oVqEuclidean),
+  "the nearest Euclidean centroid (the lower index on a tie): its code written and the centroid "
+  "subtracted from x, libref's arithmetic." },
+{ "elu", ARR(pMnD), ARR(oUnary), "y = x >= 0 ? x : expm1(x), alpha 1." },
 { "frame_mix_store", ARR(pFrameMix), ARR(oFrameMix),
   "a frame's softmax-weighted mix of hidden planes, stored into its lane, bit for bit libref's." },
 { "end_status", ARR(pEndStatus), ARR(oEndStatus),
@@ -1549,10 +1612,6 @@ static const RadOpSchema kSchemas[] = {
   "rmsnorm, for rows a model declares in thousands (the head norms over head_dim)." },
 { "rope_rows", ARR(pRope), ARR(oRope),
   "rope, for a model that wants the per-(token, pair) angles form at prefill row counts." },
-{ "gemm_nt_q_short", ARR(pGemmQ), ARR(oGemmQ),
-  "gemm_nt_q, for the short-prompt split rule's rows." },
-{ "gemm_nt_q_gated_wide", ARR(pGemmQGated), ARR(oGemmQGated),
-  "gemm_nt_q_gated at any M." },
 };
 
 /* ================================================================== the kernel table
@@ -1579,32 +1638,38 @@ static const RadOpSchema kSchemas[] = {
  * stored joined (abi/rad_planes.h); a view of one plane is stored as it is. The selections
  * accepted are libref's (libref/ref_moe.cpp: cb_check), so a weight libref refuses at declare is
  * refused here too, and both libraries store the same bytes under one tag. */
-/* What a codebook `dtype` stores: code width and dtype, the scale's group and dtype, whether the
- * scale view carries a second level, the table's dtype (0 for an implicit one), and whether the
- * activation is rotated (fwht128). */
-struct CbForm { int bits; int64_t group; uint32_t sdt; bool level; uint32_t cdt; uint32_t tdt;
-                bool rot; };
+/* What a codebook `dtype` stores: code width, the scale's group and dtype, whether the scale view
+ * carries a second level, whether the codes are one plain e2m1 plane read as a u4 codebook (NVFP4,
+ * which is not joined), the codes' dtype, the table's dtype (0 for an implicit one) and whether
+ * the activation is rotated (fwht128). */
+struct CbForm { int bits; int64_t group; uint32_t sdt; bool level; bool fp4 = false;
+                uint32_t cdt; uint32_t tdt; bool rot; };
 static CbForm cb_form(const RadParam* p, int n_p) {
     const RadParam* d = rad_param_find(p, n_p, "dtype");
     const char* s = d && d->kind == RAD_P_STR ? d->sval : nullptr;
-    if (s && !std::strcmp(s, "w4nla8h"))   return CbForm{ 4, 128, RAD_BF16, false, RAD_U4, RAD_F32, true };
-    if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true, RAD_U4, RAD_F32, true };
-    if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true, RAD_U4, RAD_F32, true };
-    if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true, RAD_U5, RAD_F32, true };
+    /* NVFP4's codes are one plain e2m1 plane (no join), so only its scale view is checked here. */
+    if (s && !std::strcmp(s, "nvfp4a8i8")) return CbForm{ 4, 16, RAD_F8E4M3, true, true, RAD_FP4E2M1, 0, false };
+    if (s && !std::strcmp(s, "w4nla8h"))   return CbForm{ 4, 128, RAD_BF16, false, false, RAD_U4, RAD_F32, true };
+    if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true, false, RAD_U4, RAD_F32, true };
+    if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true, false, RAD_U4, RAD_F32, true };
+    if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true, false, RAD_U5, RAD_F32, true };
+    /* The same stored experts under their names against an int8 activation. */
+    if (s && !std::strcmp(s, "w4nl64a8i8h")) return CbForm{ 4, 64, RAD_F8E4M3, true, false, RAD_U4, RAD_F32, true };
+    if (s && !std::strcmp(s, "w4nl32a8i8h")) return CbForm{ 4, 32, RAD_F8E4M3, true, false, RAD_U4, RAD_F32, true };
     /* The unrotated GGUF forms: IQ4_NL joins an i8 table; Q5_0 and Q2_0 have implicit ones and
      * are stored as single planes. All three carry f16 scales and bf16 activations. */
-    if (s && !std::strcmp(s, "iq4nl32a16")) return CbForm{ 4, 32, RAD_F16, false, RAD_U4, RAD_I8, false };
-    if (s && !std::strcmp(s, "q50a16"))     return CbForm{ 5, 32, RAD_F16, false, RAD_I5, 0,      false };
-    if (s && !std::strcmp(s, "q20a16"))     return CbForm{ 2, 64, RAD_F16, false, RAD_U2, 0,      false };
-    return CbForm{ 0, 0, 0, false, 0, 0, false };
+    if (s && !std::strcmp(s, "iq4nl32a16")) return CbForm{ 4, 32, RAD_F16, false, false, RAD_U4, RAD_I8, false };
+    if (s && !std::strcmp(s, "q50a16"))     return CbForm{ 5, 32, RAD_F16, false, false, RAD_I5, 0,      false };
+    if (s && !std::strcmp(s, "q20a16"))     return CbForm{ 2, 64, RAD_F16, false, false, RAD_U2, 0,      false };
+    return CbForm{ 0, 0, 0, false, false, 0, 0, false };
 }
 static int cb_check(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                     const int* sel, int n_planes) {
     const CbForm f = cb_form(p, n_p);
     const bool codes = operand == 2 || operand == 6 || operand == 8 || operand == 10;
     const bool scale = operand == 3 || operand == 7 || operand == 9 || operand == 11;
-    const bool rot = enc && (f.rot ? std::strcmp(enc->transform, "fwht128") == 0
-                                    : enc->transform[0] == 0);
+    const bool rot = enc && (f.fp4 || (f.rot ? std::strcmp(enc->transform, "fwht128") == 0
+                                             : enc->transform[0] == 0));
     if (!f.bits || (!codes && !scale) || !enc || !sel || n_planes < 1 || !rot)
         return RAD_E_DTYPE;
     for (int i = 0; i < n_planes; ++i)
@@ -1684,6 +1749,8 @@ static const RadKernelInfo kKernels[] = {
 SIMPLE("avx_rmsnorm", "rmsnorm", "norm", "root-mean-square norm with a gain", DT_FLOAT, L(rmsnorm)),
 SIMPLE("avx_rmsnorm_p", "rmsnorm_p", "norm", "weightless RMS norm (no gain)", DT_FLOAT,
        L(rmsnorm_p)),
+SIMPLE("avx_l2_clip", "l2_clip", "elem", "per-group L2 clip with a scale and a position tau",
+       DT_FLOAT, L(l2_clip)),
 SIMPLE("avx_rmsnorm_add", "rmsnorm_add", "norm", "residual add then RMS norm", DT_FLOAT,
        L(rmsnorm_add)),
 SIMPLE("avx_hc_enter", "hc_enter", "norm", "gated residual entry: hc copies of x", DT_FLOAT,
@@ -1712,12 +1779,23 @@ SIMPLE("avx_layernorm", "layernorm", "norm", "layer norm with gain and bias", DT
        L(layernorm)),
 SIMPLE("avx_grid_embed", "grid_embed", "elem",
        "bilinear resample of a learned position grid, added in", DT_FLOAT, L(grid_embed)),
+SIMPLE("avx_grid_embed_pad", "grid_embed_pad", "elem",
+       "half-pixel bilinear resample of a position grid, zero-padded taps, added in", DT_FLOAT,
+       L(grid_embed_pad)),
+SIMPLE("avx_window_order", "window_order", "elem",
+       "the window-attention permutation of one pass, from its coordinates", DT_ANY,
+       L(window_order)),
 SIMPLE("avx_grid_embed_aa", "grid_embed_aa", "elem",
        "antialiased half-pixel bilinear resample of a position grid, added in", DT_FLOAT,
        L(grid_embed_aa)),
 SIMPLE("avx_grid_embed_cpe", "grid_embed_cpe", "elem",
        "half-pixel bilinear resample of a position grid onto a square, cropped, added in", DT_FLOAT,
        L(grid_embed_cpe)),
+SIMPLE("avx_situ_mul", "situ_mul", "elem", "SiTU gated product over a fused gate_up", DT_FLOAT,
+       L(situ_mul)),
+SIMPLE("avx_attn_res_mix", "attn_res_mix", "norm",
+       "block attention residuals: a depth softmax over rms-normed states", DT_FLOAT,
+       L(attn_res_mix)),
 SIMPLE("avx_lili_cand", "lili_cand", "draft", "LiLiCorr candidates and their features", DT_FLOAT,
        L(lili_cand)),
 SIMPLE("avx_lili_attn", "lili_attn", "draft", "LiLiCorr lattice attention with slot biases",
@@ -1804,6 +1882,9 @@ SIMPLE("avx_ple_conv_bias", "ple_conv_bias", "norm",
        L(ple_conv_bias)),
 SIMPLE("avx_causal_conv1d", "causal_conv1d", "conv", "depthwise causal conv, no activation",
        DT_FLOAT, L(causal_conv1d)),
+SIMPLE("avx_sconv_res", "sconv_res", "conv",
+       "depthwise causal conv with its residual and optional input-dependent taps", DT_FLOAT,
+       L(sconv_res)),
 SIMPLE("avx_cast", "cast", "elem", "dtype conversion", DT_ANY, L(cast)),
 SIMPLE("avx_softmax", "softmax", "elem", "row-wise softmax", DT_FLOAT, L(softmax)),
 SIMPLE("avx_scale_rows", "scale_rows", "elem", "one scalar per row, broadcast across the row",
@@ -1822,21 +1903,10 @@ SIMPLE("avx_quant_act_fp8", "quant_act_fp8", "quant", "symmetric block-scaled E4
        "float in, fp8_e4m3 out, f32 scale", L(quant_act_fp8)),
 SIMPLE("avx_quant_cols_fp8", "quant_cols_fp8", "quant", "E4M3 with one scale per column",
        "float in, fp8_e4m3 out, f32 scale", L(quant_cols_fp8)),
-SIMPLE("avx_had_quant_act_fp8", "had_quant_act_fp8", "quant",
-       "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser",
-       "float in, fp8_e4m3 out, f32 scale per group; n a multiple of group",
-       L(had_quant_act_fp8)),
 SIMPLE("avx_had_quant_act_i8g", "had_quant_act_i8g", "quant",
        "width-`group` Hadamard, then the symmetric int8 quantiser, one scale per group",
        "float in, i8 out, f32 scale per group; n a multiple of group",
        L(had_quant_act_i8g)),
-SIMPLE("avx_givens_rotate", "givens_rotate", "quant",
-       "channel scale and Givens rotations per part, in the output's dtype",
-       "float in, float out; int32 pairs, f32 angles and channel scales", L(givens_rotate)),
-SIMPLE("avx_givens_dense_quant", "givens_dense_quant", "quant",
-       "the rotation as a dense per-group matrix, then the block-scaled int8 or E4M3 quantiser",
-       "float in, int8 or fp8_e4m3 out, f32 scale per group; f16 matrices and f32 channel scales",
-       L(givens_dense_quant)),
 SIMPLE("avx_gram_accum", "gram_accum", "quant",
        "h += x^T x over a dequantised E4M3 activation, or a plain bf16 one",
        "fp8_e4m3 plus an f32 scale per group, or bf16 with no scale, in; an f32 [n][n] "
@@ -1848,7 +1918,12 @@ SIMPLE("avx_rmsnorm_had_quant_i8", "rmsnorm_had_quant_i8", "quant",
 SIMPLE("avx_gated_had_quant_i8", "gated_had_quant_i8", "quant",
        "gated product, rotation and int8 in one pass", "float in, i8 out, f32 scale",
        L(gated_had_quant_i8)),
+SIMPLE("avx_gated_quant_i8", "gated_quant_i8", "quant",
+       "gated product and grouped int8 in one pass", "float in, i8 out, f32 scale per group",
+       L(gated_quant_i8)),
 SIMPLE("avx_dequant", "dequant", "quant", "group-scaled dequantisation", DT_ANY, L(dequant)),
+SIMPLE("avx_dequant_w4", "dequant_w4", "quant", "packed int4 weight to row-major bf16", DT_ANY,
+       L(dequant_w4)),
 SIMPLE("avx_rmsnorm_quant_fp8", "rmsnorm_quant_fp8", "quant",
        "RMS norm, optional residual add, and the E4M3 quantiser in one pass",
        "float in, fp8_e4m3 out, f32 scale, bf16 out_bf16", L(rmsnorm_quant_fp8)),
@@ -1895,6 +1970,10 @@ ROW("avx_attn_paged_sink", "attn_paged_sink", "attn",
     "paged causal / sliding-window attention with a sink logit a head, any query length",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; f32 sinks",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(attn_paged_sink)),
+ROW("avx_attn_paged_rel", "attn_paged_rel", "attn",
+    "paged causal / sliding-window attention with a relative-position bias and a sink logit per row",
+    "any q and out dtype; bf16, f32 or int8 kv cache with optional per-(seq,head) descales",
+    cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(attn_paged_rel)),
 SIMPLE("avx_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_seqlens", DT_FLOAT,
        L(attn_dense)),
 SIMPLE("avx_attn_cross", "attn_cross", "attn",
@@ -2006,9 +2085,6 @@ SIMPLE("avx_mix_rows", "mix_rows", "elem", "a weighted sum of k consecutive rows
        L(mix_rows)),
 SIMPLE("avx_chan_stats", "chan_stats", "elem", "per-channel statistics held as weights",
        DT_FLOAT, L(chan_stats)),
-SIMPLE("avx_ln_mod_quant_fp8", "ln_mod_quant_fp8", "norm",
-       "gated residual, adaptive norm and the E4M3 quantiser in one pass",
-       "float in, fp8_e4m3 out, f32 scale, bf16 z", L(ln_mod_quant_fp8)),
 SIMPLE("avx_timestep_embed", "timestep_embed", "elem", "sinusoidal timestep embedding", DT_FLOAT,
        L(timestep_embed)),
 SIMPLE("avx_gather_rows2", "gather_rows2", "elem", "rows from two sources by a signed index",
@@ -2048,9 +2124,6 @@ SIMPLE("avx_attn_prefix_self", "attn_prefix_self", "attn",
 SIMPLE("avx_rms_mod", "rms_mod", "norm",
        "gated residual, RMS norm with a gain times (1 + scale row) plus a shift row", DT_FLOAT,
        L(rms_mod)),
-SIMPLE("avx_rms_mod_quant_fp8", "rms_mod_quant_fp8", "norm",
-       "gated residual, modulated RMS norm and the E4M3 quantiser in one pass", DT_FLOAT,
-       L(rms_mod_quant_fp8)),
 SIMPLE("avx_flow_x0_step", "flow_x0_step", "elem", "a sampler step toward the clean estimate",
        DT_FLOAT, L(flow_x0_step)),
 SIMPLE("avx_flow_res_multistep", "flow_res_multistep", "elem",
@@ -2125,6 +2198,9 @@ SIMPLE("avx_rvq_embed", "rvq_embed", "elem", "a frame's embedding from its resid
        DT_FLOAT, L(rvq_embed)),
 SIMPLE("avx_vq_encode", "vq_encode", "elem",
        "a residual quantiser's step: the nearest code by cosine", DT_FLOAT, L(vq_encode)),
+SIMPLE("avx_vq_euclidean", "vq_euclidean", "elem",
+       "a residual quantiser's step: the nearest centroid by distance", DT_FLOAT, L(vq_euclidean)),
+SIMPLE("avx_elu", "elu", "elem", "ELU, alpha 1", DT_FLOAT, L(elu)),
 SIMPLE("avx_frame_mix_store", "frame_mix_store", "elem",
        "a frame's conditioning row into its lane", DT_FLOAT, L(frame_mix_store)),
 SIMPLE("avx_end_status", "end_status", "elem", "a frame's status from its first pick", DT_ANY,
@@ -2224,12 +2300,6 @@ SIMPLE("avx_dflash_tree", "dflash_tree", "draft",
 SIMPLE("avx_rmsnorm_rows", "rmsnorm_rows", "norm", "rmsnorm under its row-form name", DT_FLOAT,
        L(rmsnorm)),
 SIMPLE("avx_rope_rows", "rope_rows", "attn", "rope under its row-form name", DT_FLOAT, L(rope)),
-ROWL("avx_gemm_nt_q_short", "gemm_nt_q_short", "gemm", "gemm_nt_q under its row-form name",
-     "as avx_gemm_nt_q", L(gemm_nt_q), avx_layout_gemm_q),
-SIMPLE("avx_gemm_nt_q_gated_wide", "gemm_nt_q_gated_wide", "gemm",
-       "gemm_nt_q_gated under its row-form name",
-       "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; fp8_e4m3 out, f32 scale",
-       L(gemm_nt_q_gated)),
 };
 
 /* ================================================================== plugin exports */

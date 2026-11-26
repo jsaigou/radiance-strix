@@ -37,6 +37,7 @@ struct Engine::Rank {
     Program   program;          /* declare runs once per rank: dimensions are already divided */
     /* Runtime LoRA: this rank's sites (core/lora/lora.h), the loader's map from an adapter's
      * modules to this rank's slot bytes. Empty with LoRA off. */
+    std::map<rad_weight, std::vector<uint16_t>> lora_base_weights;
     std::vector<lora::Site> lora_sites;
     Plan      plan;
     Pools     pools;
@@ -72,6 +73,9 @@ struct Engine::Rank {
     /* Where the prefill stager's ring is at the span's shared level, from the arena's base; -1
      * without that level. */
     int64_t                 arena_low_off = -1;
+    /* Expert flex (docs/MULTIMODEL.md §6.7): address space for the slab slots the fleet may lend,
+     * one slot for every expert in the pinned pool, backed from the top as the loan grows. */
+    VMem                    xflex;
     /* Prefill stager (core/place/stager.h): copies the next routed layer's pooled experts into the
      * top of this rank's arena while a full-plan step runs the layer before. */
     PrefillStager stager;
@@ -109,5 +113,6 @@ struct TierPump {
  * loop dumps after a trunk step, and each drafter after its own passes, since a drafter's buffers
  * still hold the previous step's values when the step loop dumps. */
 void dump_buffers(Ctx& ctx, int step, const char* phase = "");
+
 
 }  /* namespace rad */

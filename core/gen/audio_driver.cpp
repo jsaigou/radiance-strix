@@ -292,7 +292,10 @@ int AudioDriver::submit(std::unique_ptr<AudioRequest> r, std::string* why) {
     if (r->cfg != 0.0f && !(r->cfg >= 1.0f)) return no("guidance_scale must be >= 1");
     /* References: the clips the declaration allows, each a whole number of frames, and a frame
      * for every row that names one. */
-    if (!r->ref_cu.empty() || !r->ref_frame.empty() || !r->ref_audio.empty()) {
+    if (!r->ref_cu.empty() || !r->ref_frame.empty() || !r->ref_audio.empty() ||
+        !r->neg_ref_frame.empty()) {
+        if (nb_ == 2 && r->cfg != 0.0f && r->cfg != 1.0f && r->neg_ref_frame.empty())
+            return no("voice cloning requires guidance_scale 1; reference CFG is not served");
         const int64_t n_ref = (int64_t)r->ref_cu.size() - 1, hop = d.ref_hop;
         bool ok = d.ref_max > 0 && n_ref >= 1 && n_ref <= d.ref_max && r->ref_cu[0] == 0 &&
                   r->ref_cu.back() == (int64_t)r->ref_audio.size() &&
@@ -303,6 +306,10 @@ int AudioDriver::submit(std::unique_ptr<AudioRequest> r, std::string* why) {
         const int64_t frames = ok ? r->ref_cu.back() / hop : 0;
         for (int64_t t = 0; ok && t < T; ++t)
             ok = r->ref_frame[(size_t)t] >= -1 && r->ref_frame[(size_t)t] < frames;
+        if (ok && !r->neg_ref_frame.empty()) {
+            ok = nb_ == 2 && neg_own_ && (int64_t)r->neg_ref_frame.size() == Tn;
+            for (int32_t f : r->neg_ref_frame) ok = ok && f >= -1 && f < frames;
+        }
         if (!ok)
             return no(d.ref_max > 0 ? "the references do not fit this model: at most " +
                                           std::to_string(d.ref_max) + " clips of whole frames, " +
@@ -405,7 +412,13 @@ int AudioDriver::admit_locked() {
                     if (kv_->has_sequence(j.seq[b])) kv_->free_sequence(j.seq[b]);
                     j.seq[b] = 0;
                 }
-            break;
+            /* With nothing running to free blocks, waiting would never end. */
+            bool running = false;
+            for (const auto& o : jobs_) running = running || o->admitted;
+            if (running) break;
+            fail_locked(j, RAD_E_FULL, "the KV cache cannot hold this piece, and nothing is running "
+                                       "that would free it; ask for a shorter piece");
+            continue;
         }
         j.have_kv = true;
         j.lane = free_lanes_.back();
@@ -701,12 +714,24 @@ const RadBatch* AudioDriver::build_prompt(Job& j, int step) {
     if (n_ref > 0) {
         std::memcpy(hptr<float>(R_RAUD), q.ref_audio.data(), q.ref_audio.size() * 4);
         std::memcpy(hptr<int32_t>(R_RCU), q.ref_cu.data(), q.ref_cu.size() * 4);
-        std::memcpy(hptr<int32_t>(R_RFRM), q.ref_frame.data() + p0, (size_t)cb[0] * 4);
         reg_[R_RAUD].used = (int64_t)q.ref_audio.size() * 4;
         reg_[R_RCU].used = (int64_t)q.ref_cu.size() * 4;
-        reg_[R_RFRM].used = cb[0] * 4;
         h_rcu_ = q.ref_cu;
         h_rfrm_.assign(q.ref_frame.begin() + p0, q.ref_frame.begin() + p0 + cb[0]);
+        /* At guidance 1 the driver runs the conditional prompt in both branches. Its audio
+         * rows must be duplicated too, not silently turned into text in the second branch. */
+        if (nb_ > 1) {
+            if (j.cfg == 1.0f)
+                h_rfrm_.insert(h_rfrm_.end(), q.ref_frame.begin() + p0,
+                               q.ref_frame.begin() + p0 + cb[1]);
+            else if (!q.neg_ref_frame.empty())
+                h_rfrm_.insert(h_rfrm_.end(), q.neg_ref_frame.begin() + p0,
+                               q.neg_ref_frame.begin() + p0 + cb[1]);
+            else
+                h_rfrm_.resize((size_t)rows, -1);
+        }
+        std::memcpy(hptr<int32_t>(R_RFRM), h_rfrm_.data(), h_rfrm_.size() * 4);
+        reg_[R_RFRM].used = (int64_t)h_rfrm_.size() * 4;
     }
     if (upload() < 0) return nullptr;
     base_batches(rows, nb_, (int32_t)cmax, (int32_t)(p0 + cmax), step, true, pitch);
@@ -715,6 +740,7 @@ const RadBatch* AudioDriver::build_prompt(Job& j, int step) {
     for (size_t r = 0; r < ranks_.size(); ++r) {
         out_[r].gen = RAD_GEN_PASS_PROMPT;
         RadAudioGenBatch& A = aout_[r];
+        A.prompt_cu_h = cu;
         A.n_lane = 1;
         A.lane_h = h_lane_.data();
         A.last_h = h_last_.data();

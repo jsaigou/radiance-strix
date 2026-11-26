@@ -714,9 +714,6 @@ __global__ __launch_bounds__(kDenseThreads) R4D_WAVES(lm_waves(MT, FKB)) void r4
 #undef R4D_LMW_PARAMS
 }  // namespace
 
-extern "C" int r4d_gemm_fp8a16_nt_m1_block(void) { return (int)kBlock; }
-extern "C" int r4d_gemm_fp8a16_nt_m1_max_m(void) { return (int)kMaxMt; }
-
 // C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T for M <= kMaxMt, one weight read for all M rows.
 //
 //   a    [M][K]                     bf16, `a_ld` elements a row (0 = K)
@@ -983,10 +980,6 @@ static int rad_logits_gemm_8(const RadArgs* a, RadStream s, bool i8) {
                (int)x_ld, (int)y_ld, (int)stride, (long)(uintptr_t)s, ch) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
-extern "C" int r4d_rad_logits_gemm_fp8(const RadArgs* a, RadStream s) {
-    return rad_logits_gemm_8(a, s, false);
-}
-
 /* The int8 head: the same operands and stored row, i8 codes (r4d_rad_layout_i8_logits). */
 extern "C" int r4d_rad_logits_gemm_i8(const RadArgs* a, RadStream s) {
     return rad_logits_gemm_8(a, s, true);
@@ -1030,28 +1023,3 @@ extern "C" int r4d_rad_logits_gemm_iqr(const RadArgs* a, RadStream s) {
 // The shared operand reader is r4d_fp8_args.h; see libr4d/r4d_args.h.
 /* ================================================================== the fp8 GEMMs */
 
-extern "C" int r4d_rad_gemm_fp8a16_m1(const RadArgs* a, RadStream s) {
-    Fp8Ops g;
-    int rc = fp8_ops(a, &g, 0);
-    if (rc != RAD_OK) return rc;
-    if (g.M > r4d_gemm_fp8a16_nt_m1_max_m()) return R4D_NO(RAD_E_SHAPE);
-    /* This kernel reads bf16 directly; refuse an activation scale rather than silently drop it. */
-    if (g.ascale) return R4D_NO(RAD_E_INVAL);
-    /* M = 1 keeps the one-row kernel (its own RB tuning; every non-speculative decode step), so a
-     * deployment that never speculates runs exactly that arithmetic. Above one row, the multi-row
-     * form reads the weight once for all M rows. */
-    if (g.M == 1) {
-        R4dMvCfg mv;
-        r4d_cfg_mv(a, &mv);
-        const int e = r4d_gemm_fp8a16_nt_m1(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.bscale),
-                                            r4d_addr(g.y), (int)g.M, (int)g.K, (int)g.N,
-                                            (int)g.w_ld, (int)g.sw_ld, mv.rb, (long)(uintptr_t)s);
-        return e == 0 ? RAD_OK : RAD_E_SHAPE;
-    }
-    /* `c_ld` is 0 because fp8_ops has already refused any output whose row pitch is not N. */
-    const int e = r4d_gemm_fp8a16_nt_mt(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.bscale),
-                                        r4d_addr(g.y), (int)g.M, (int)g.K, (int)g.N,
-                                        (int)g.a_ld, 0, (int)g.w_ld, (int)g.sw_ld,
-                                        (long)(uintptr_t)s);
-    return e == 0 ? RAD_OK : RAD_E_SHAPE;
-}

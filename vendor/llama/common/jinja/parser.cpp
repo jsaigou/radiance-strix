@@ -27,6 +27,30 @@ class parser {
 public:
     parser(const std::vector<token> & t, const std::string & src) : tokens(t), source(src) {}
 
+    // RADIANCE: a container's template is server-side attacker data, and both descent families
+    // recursed without a bound -- every '(' (or '['/'{') re-entered parse_expression through a
+    // chain of precedence functions, and every nested {% if %}/{% for %} re-entered parse_any.
+    // A few tens of KB of brackets was an uncatchable stack overflow of whoever parsed: the
+    // capability probe, or the worker taking the first render. 128 units is far past any human
+    // template; the throw is the same parser_exception a malformed template already raises,
+    // which the chat loader catches as a clean refusal of that template.
+    static constexpr int k_max_nesting = 128;
+
+private:
+    int nesting = 0;
+
+public:
+    struct nest_guard {
+        int& n;
+        explicit nest_guard(int& n) : n(n) {
+            if (++n > k_max_nesting) {
+                --n;
+                throw std::runtime_error("Template nests deeper than 128 levels");
+            }
+        }
+        ~nest_guard() { --n; }
+    };
+
     program parse() {
         statements body;
         while (current < tokens.size()) {
@@ -94,6 +118,7 @@ private:
     }
 
     statement_ptr parse_any() {
+        nest_guard nest{ nesting };
         size_t start_pos = current;
         switch (peek().t) {
             case token::comment:
@@ -254,6 +279,10 @@ private:
             size_t pos0 = current;
             ++current; // consume {%
             ++current; // consume 'elif'
+            // RADIANCE: an elif is an if nested in the alternate, parsed by this function calling
+            // itself and executed and destroyed the same way, so a chain counts against the
+            // nesting cap like any other descent.
+            nest_guard nest{ nesting };
             alternate.push_back(parse_if_statement(pos0)); // nested If
         } else if (is_statement({"else"})) {
             ++current; // consume {%
@@ -325,6 +354,7 @@ private:
     }
 
     statement_ptr parse_expression() {
+        nest_guard nest{ nesting };
         // Choose parse function with lowest precedence
         return parse_if_expression();
     }

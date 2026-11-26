@@ -48,7 +48,7 @@ void usage() {
         "      --max-seqs N   the max_seqs declare is run at (default 256)\n"
         "      --tp N         tensor-parallel width to declare at (default 1). The shapes a\n"
         "                     sharded deployment runs are not the shapes tp=1 runs.\n"
-        "      --kv-cache-dtype T  bf16 (default) or fp8 -- attention bands are gated on it.\n"
+        "      --kv-cache-dtype T  bf16 (default) or i8 -- attention bands are gated on it.\n"
         "                     Declare what the served engine runs, or the tune rows will not\n"
         "                     match the bands it selects.\n"
         "      --tp-wire MODE exact (default) or wht6 -- selects the all-reduce family.\n"
@@ -333,7 +333,7 @@ int main(int argc, char** argv) {
     int64_t  max_tok = 8192;
     int64_t  max_seqs = 256;
     int      tp = 1, spec = -1;          /* -1 = the container's own drafter depth */
-    int      kv_dtype = RAD_DT_INVALID;  /* RAD_F8E4M3 = the engine's --kv-cache-dtype fp8 */
+    int      kv_dtype = RAD_DT_INVALID;  /* RAD_I8 = the engine's --kv-cache-dtype i8 */
     int      wire_lossy = 0;             /* the engine's --tp-wire wht6 */
     int64_t  wire_min_kb = 128;          /* the engine's --tp-wire-min-kb */
     bool     dry = false, verbose = false;
@@ -361,10 +361,10 @@ int main(int argc, char** argv) {
         else if (a == "--tp")      tp   = (int)num("--tp", 1, INT32_MAX);
         else if (a == "--kv-cache-dtype") {
             const char* v = next("--kv-cache-dtype");
-            if (!std::strcmp(v, "fp8"))      kv_dtype = RAD_F8E4M3;
+            if (!std::strcmp(v, "i8"))       kv_dtype = RAD_I8;
             else if (!std::strcmp(v, "bf16")) kv_dtype = RAD_DT_INVALID;
             else { std::fprintf(stderr, "rad-tune: --kv-cache-dtype: '%s' is not one of "
-                                "bf16, fp8 (the tuner tunes the bands it declares; other "
+                                "bf16, i8 (the tuner tunes the bands it declares; other "
                                 "encodings are the engine's)\n", v); return 2; }
         }
         else if (a == "--tp-wire") {

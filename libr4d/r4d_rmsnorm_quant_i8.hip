@@ -346,7 +346,9 @@ __device__ __forceinline__ unsigned int arq8_load_acq(const unsigned int* p) {
     return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, bool GRP = false>
+// CH `r4dchain`: the chained form (r4d_chain.h); no block returns early.
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, bool GRP = false,
+          class CH = R4dUnchained>
 __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
     uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
@@ -354,6 +356,7 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
     int4* peer_base, const int4* my_base, unsigned int* peer_flags, unsigned int* my_flags,
     unsigned int* seq_ctrs, int M, uint32_t n, float eps, float wadd, uint32_t r_ld, uint32_t y_ld,
     int slot_stride16, int drain, int acq, unsigned int nbw, long stage) {
+    if (CH::on) r4d_chain_wait();
     extern __shared__ uint16_t ybuf[];
     __shared__ float l1[THR / kWave], l2[THR / kWave], lm[THR / kWave];
     __shared__ unsigned int s_seq, s_slot;
@@ -420,6 +423,7 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
             wadd, s1, ybuf, l2, lm);
         __syncthreads();   /* the planes and ybuf are re-used by the next row this block owns */
     }
+    if (CH::on) r4d_chain_done();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -881,7 +885,7 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_sp_kernel(R4D_ARQ8S_P
 }
 template <uint32_t EPT, uint32_t THR, int WS>
 __global__ __launch_bounds__(THR) void r4dchain_ar_rmsnorm_quant_i8_sp(R4D_ARQ8S_PARAMS) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     ar_rmsnorm_quant_i8_sp_body<EPT, THR, WS>(R4D_ARQ8S_ARGS);
     r4d_chain_done();
 }
@@ -1009,13 +1013,14 @@ extern "C" int r4d_rad_rmsnorm_quant_i8g(const RadArgs* a, RadStream stream) {
 // double-buffered scratch, the per-block flags and the device-resident sequence counters -- and the
 // rest is the junction's. `x` is the message and takes no pitch; `nblocks` is clamped to M (a block
 // owns whole rows). `grp` takes quant_act_i8g's grid (ar_rmsnorm_quant_i8g): `s` is [M][n / 128]
-// and n a multiple of 128. Returns 0, or a negative code for a shape it does not serve.
+// and n a multiple of 128. `chain` takes the chained form (r4d_chain.h), which the launch has at
+// the decode width of 1024 threads. Returns 0, or a negative code for a shape it does not serve.
 extern "C" int r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long peer_flags,
                                        long my_flags, long seq_ctrs, long slot_stride16,
                                        long x, long res, long w, long wp, long sc, int sc_f32,
                                        long y, long q, long s, int M, int n, float eps, float wadd,
                                        int w_f32, int r_ld, int y_ld, long stream, int nblocks,
-                                       int drain, int acq, int grp, long stage) {
+                                       int drain, int acq, int grp, long stage, int chain) {
     if (!x || !w || !q || !s) return -1;
     if (!peer_scratch || !my_scratch || !peer_flags || !my_flags || !seq_ctrs) return -1;
     if (M <= 0 || n <= 0) return -2;
@@ -1030,8 +1035,8 @@ extern "C" int r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long 
     if (nb > nbw) nb = nbw;
     const int thr = r4d_act_threads(M, n);
     const size_t lds = (size_t)n * sizeof(uint16_t);
-#define R4D_ARQ8_T(WF, RS, PO, SC, T, G)                                                          \
-    hipLaunchKernelGGL((ar_rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T, G>), dim3((uint32_t)nb),    \
+#define R4D_ARQ8_T(WF, RS, PO, SC, T, G, CH)                                                      \
+    hipLaunchKernelGGL((ar_rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T, G, CH>), dim3((uint32_t)nb), \
                        dim3(T), lds, (hipStream_t)stream, (uint16_t*)x, (uint16_t*)res,          \
                        (const void*)w, (const void*)wp, (const void*)sc, (uint32_t)sc_f32,       \
                        (signed char*)q, (float*)s, (uint16_t*)y, (int4*)peer_scratch,            \
@@ -1040,9 +1045,10 @@ extern "C" int r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long 
                        wadd, (uint32_t)r_ld, (uint32_t)y_ld, (int)slot_stride16, drain, acq,      \
                        (unsigned)nbw, stage)
 #define R4D_ARQ8(WF, RS, PO, SC, G)                                                               \
-    do { if (thr == 1024)     R4D_ARQ8_T(WF, RS, PO, SC, 1024, G);                                \
-         else if (thr == 512) R4D_ARQ8_T(WF, RS, PO, SC, 512, G);                                 \
-         else                 R4D_ARQ8_T(WF, RS, PO, SC, 256, G); } while (0)
+    do { if (thr == 1024 && chain) R4D_ARQ8_T(WF, RS, PO, SC, 1024, G, r4dchain);                 \
+         else if (thr == 1024) R4D_ARQ8_T(WF, RS, PO, SC, 1024, G, R4dUnchained);                 \
+         else if (thr == 512) R4D_ARQ8_T(WF, RS, PO, SC, 512, G, R4dUnchained);                   \
+         else                 R4D_ARQ8_T(WF, RS, PO, SC, 256, G, R4dUnchained); } while (0)
 #define R4D_ARQ8_W(WF, G)                                                                         \
     do { if (!res)            R4D_ARQ8(WF, false, false, false, G);                               \
          else if (!wp && !sc) R4D_ARQ8(WF, true, false, false, G);                                \

@@ -311,6 +311,60 @@ TEST(a_cloning_model_takes_references_as_clips_and_transcripts_in_its_prompt) {
 }
 
 /* ================================================================== the response */
+TEST(breeze_cloning_uses_one_reference_and_direction_is_opt_in) {
+    if (!mm::decoder_available()) { SKIP("audio decoder unavailable"); return; }
+    Speech s;
+    auto& info = s.gen.inf;
+    info.max_prompt = 512;
+    info.tmpl_plain = "<bos>[S0]{input}";
+    info.tmpl = "<bos>[S0]<ins_bos>{instructions}<ins_eos>{input}";
+    info.neg_tmpl = info.tmpl_plain;
+    info.tmpl_ref = "{references}<bos>[S0]{input}";
+    info.ref_item = "<bos>[S0]{text}{audio}<|audio_eos|>";
+    info.ref_rate = 24000;
+    info.ref_hop = 1920;
+    info.ref_max_samples = 240000;
+    info.ref_max = 1;
+    info.branches = 2;
+    info.default_steps = 0;
+    const std::string wav = wav_of(std::vector<int16_t>(2000, 1000), 24000);
+    const std::string audio = base64_encode((const uint8_t*)wav.data(), wav.size());
+    const json ref = {{"audio", audio}, {"text", "reference words"}};
+    json body = {{"input", "new words"}, {"references", json::array({ref})}, {"guidance_scale", 1}};
+    CHECK_EQ(s.post(body).status, 200);
+    const auto& q = s.last();
+    CHECK_EQ(q.ref_audio.size(), (size_t)3840);
+    CHECK_EQ(q.ref_cu.size(), (size_t)2);
+    CHECK_EQ(std::count_if(q.ref_frame.begin(), q.ref_frame.end(), [](int v) { return v >= 0; }), 2);
+    CHECK_EQ(q.ref_frame.size(), q.tokens.size());
+    CHECK_EQ(q.cfg, 1.0f);
+    body["guidance_scale"] = 4;
+    CHECK_EQ(s.refused(body), std::string("guidance_scale"));
+    body["guidance_scale"] = 1;
+    body["instructions"] = "a different voice";
+    CHECK_EQ(s.refused(body), std::string("instructions"));
+    info.tmpl_ref_instruct = "{references}<bos>[S0]<ins_bos>{instructions}<ins_eos>{input}";
+    info.neg_tmpl_ref = info.tmpl_ref;
+    body["guidance_scale"] = 4;
+    CHECK_EQ(s.post(body).status, 200);
+    const auto& directed = s.last();
+    CHECK_EQ(directed.cfg, 4.0f);
+    CHECK_EQ(directed.neg_ref_frame.size(), directed.neg_tokens.size());
+    CHECK_EQ(std::count(directed.ref_frame.begin(), directed.ref_frame.end(), 0), 1);
+    CHECK_EQ(std::count(directed.neg_ref_frame.begin(), directed.neg_ref_frame.end(), 0), 1);
+    CHECK(directed.tokens.size() > directed.neg_tokens.size());
+    const auto text_of = [](const std::vector<int32_t>& ids) {
+        std::string text; for (int32_t i : ids) if (i) text.push_back((char)i); return text;
+    };
+    CHECK(has(text_of(directed.tokens), "<ins_bos>a different voice<ins_eos>new words"));
+    CHECK(!has(text_of(directed.neg_tokens), "a different voice"));
+    CHECK(has(text_of(directed.neg_tokens), "reference words"));
+    body.erase("instructions");
+    body["references"].push_back(ref);
+    CHECK_EQ(s.refused(body), std::string("references"));
+    body["references"] = json::array({{{"audio", audio}, {"text", " "}}});
+    CHECK_EQ(s.refused(body), std::string("references[0].text"));
+}
 
 /* The whole piece: the windows in order whatever order they were played in, as a WAV whose header
  * states the rate, channels and length, or as the same samples raw. */

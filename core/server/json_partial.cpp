@@ -1,4 +1,5 @@
 #include "json_partial.h"
+#include "util/simd.h"
 
 namespace rad {
 namespace server {
@@ -182,6 +183,10 @@ bool json_quote_append(std::string& out, std::string_view s) {
     const unsigned char* e = p + s.size();
     const unsigned char* run = p;     /* [run, p) is verified and goes out as it is */
     while (p < e) {
+        /* Ordinary bytes go out as they are: jump over them a vector at a time to the next
+         * byte that needs an escape or UTF-8 validation. */
+        p += simd::first_json_special((const char*)p, (size_t)(e - p));
+        if (p >= e) break;
         const unsigned char c = *p;
         if (c >= 0x80) {
             /* Sequence length and the allowed range of the second byte, which rejects overlong

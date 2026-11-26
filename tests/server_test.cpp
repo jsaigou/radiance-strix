@@ -720,6 +720,9 @@ TEST(the_ways_of_turning_thinking_off_all_reach_the_template) {
              R"({"messages":[{"role":"user","content":"hi"}],
                  "chat_template_kwargs":{"enable_thinking":false}})",
              R"({"messages":[{"role":"user","content":"hi"}],"enable_thinking":false})",
+             R"({"messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":false}})",
+             R"({"messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"none"}})",
+             R"({"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}})",
              R"({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"})" }) {
         Fixture f;
         CHECK_EQ(f.post("/v1/chat/completions", body).status, 200);
@@ -730,6 +733,41 @@ TEST(the_ways_of_turning_thinking_off_all_reach_the_template) {
     CHECK_EQ(f.post("/v1/chat/completions",
                     R"({"messages":[{"role":"user","content":"hi"}]})").status, 200);
     CHECK(f.tmpl.last_opt.enable_thinking);
+}
+
+/* The grouped spellings, and the switches that are refused by name instead of dropped.
+ * OpenRouter's `reasoning` object carries the flat fields; asking to keep the reasoning
+ * out of the reply, or to merge it into it, is never served silently as the opposite. */
+TEST(the_grouped_reasoning_spellings_reach_the_template_or_are_refused) {
+    Fixture f;
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    R"({"messages":[{"role":"user","content":"hi"}],
+                        "reasoning":{"effort":"high"}})").status, 200);
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"),
+             std::string("\"high\""));
+    /* A flat spelling named with the grouped one wins, as with the other spellings. */
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    R"({"messages":[{"role":"user","content":"hi"}],
+                        "reasoning":{"effort":"high"},"reasoning_effort":"low"})").status, 200);
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"),
+             std::string("\"low\""));
+    struct Case { const char* extra; const char* param; };
+    for (const Case& c : { Case{ R"("reasoning":{"exclude":true})", "reasoning.exclude" },
+                           Case{ R"("include_reasoning":false)", "include_reasoning" },
+                           Case{ R"("separate_reasoning":false)", "separate_reasoning" },
+                           Case{ R"("reasoning":true)", "reasoning" },
+                           Case{ R"("thinking":{"type":"sideways"})", "thinking.type" } }) {
+        HttpResponse r = f.post("/v1/chat/completions",
+                                std::string(R"({"messages":[{"role":"user","content":"hi"}],)") +
+                                    c.extra + "}");
+        CHECK_EQ(r.status, 400);
+        CHECK_EQ(json::parse(r.body)["error"]["param"].get<std::string>(), std::string(c.param));
+    }
+    /* At the values this server's replies already have, both switches are accepted. */
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    R"({"messages":[{"role":"user","content":"hi"}],
+                        "include_reasoning":true,"separate_reasoning":true})").status, 200);
+    f.sched.join_all();
 }
 
 /* ================================================================== deployment defaults
@@ -1602,6 +1640,8 @@ TEST(a_reply_ending_inside_a_call_keeps_its_reasoning_and_earlier_calls) {
     const json c = json::parse(r.body)["choices"][0];
     CHECK_EQ(c["finish_reason"].get<std::string>(), std::string("stop"));
     CHECK_EQ(c["message"]["reasoning_content"].get<std::string>(), std::string("Look first.\n"));
+    /* The same text under vLLM's name for it, so either reader keeps it. */
+    CHECK_EQ(c["message"]["reasoning"].get<std::string>(), std::string("Look first.\n"));
     CHECK_EQ(c["message"]["content"].get<std::string>(), "Checking.\n" + open);
     REQUIRE(c["message"].contains("tool_calls") && c["message"]["tool_calls"].size() == 1);
     CHECK_EQ(c["message"]["tool_calls"][0]["function"]["arguments"].get<std::string>(),
@@ -1611,7 +1651,7 @@ TEST(a_reply_ending_inside_a_call_keeps_its_reasoning_and_earlier_calls) {
     HttpResponse s = f.post("/v1/chat/completions", body + R"(,"stream":true})");
     CHECK_EQ(s.status, 200);
     int bad = 0;
-    std::string reasoning, finish;
+    std::string reasoning, reasoning_alias, finish;
     std::vector<std::string> args;
     for (const std::string& p : sse_payloads(drain(s), &bad)) {
         if (p == "[DONE]") continue;
@@ -1621,6 +1661,7 @@ TEST(a_reply_ending_inside_a_call_keeps_its_reasoning_and_earlier_calls) {
         if (!ch["finish_reason"].is_null()) finish = ch["finish_reason"].get<std::string>();
         const json& d = ch["delta"];
         if (d.contains("reasoning_content")) reasoning += d["reasoning_content"].get<std::string>();
+        if (d.contains("reasoning")) reasoning_alias += d["reasoning"].get<std::string>();
         if (!d.contains("tool_calls")) continue;
         const size_t k = d["tool_calls"][0]["index"].get<size_t>();
         if (k >= args.size()) args.resize(k + 1);
@@ -1630,6 +1671,7 @@ TEST(a_reply_ending_inside_a_call_keeps_its_reasoning_and_earlier_calls) {
     CHECK_EQ(bad, 0);
     CHECK_EQ(finish, std::string("stop"));
     CHECK_EQ(reasoning, std::string("Look first.\n"));
+    CHECK_EQ(reasoning_alias, reasoning);
     REQUIRE(!args.empty());
     CHECK_EQ(args[0], std::string("{\"command\":\"ls\"}"));
 }
@@ -1878,10 +1920,24 @@ TEST(a_thinking_budget_reaches_the_engine_or_is_refused_by_name) {
         CHECK(f.sched.last_sp.reasoning.starts_open);
     }
 
+    /* The grouped spellings carry the same budget. */
+    for (const char* extra : { R"("reasoning":{"max_tokens":7})",
+                               R"("thinking":{"type":"enabled","budget_tokens":7})" }) {
+        HttpResponse r = f.post("/v1/chat/completions",
+                                std::string(R"({"messages":[{"role":"user","content":"hi"}],)") +
+                                    extra + "}");
+        CHECK_EQ(r.status, 200);
+        f.sched.join_all();
+        std::lock_guard<std::mutex> lk(f.sched.mu);
+        CHECK_EQ(f.sched.last_sp.thinking_budget, 7);
+    }
+
     struct Case { const char* extra; const char* param; };
     for (const Case& c : { Case{ R"("thinking_token_budget":3,"thinking_budget":4)",
                                  "thinking_budget" },
-                           Case{ R"("thinking_budget":"3")", "thinking_budget" } }) {
+                           Case{ R"("thinking_budget":"3")", "thinking_budget" },
+                           Case{ R"("thinking_token_budget":3,"reasoning":{"max_tokens":4})",
+                                 "reasoning.max_tokens" } }) {
         HttpResponse r = f.post("/v1/chat/completions",
                                 std::string(R"({"messages":[{"role":"user","content":"hi"}],)") +
                                     c.extra + "}");
@@ -2195,6 +2251,41 @@ TEST(a_dropped_stream_cancels_at_the_scheduler) {
 
     /* The cancel must stop the worker, not merely be recorded; otherwise this join hangs for the
      * fake's full twenty-second hold. */
+    f.sched.join_all();
+}
+
+/* A model leaving its cards ends its streams even when the engine has stopped answering: the
+ * response's lease is what keeps the server alive, so a stream that waits for the engine keeps a
+ * park or an unload waiting, and a server freed under it faults at the client's hang-up. */
+TEST(ending_streams_ends_a_stream_the_engine_no_longer_feeds) {
+    Fixture f;
+    f.sched.reply = "abcdefgh";
+    f.sched.hang = true;          /* never finishes on its own */
+
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/chat/completions";
+    q.body = R"({"messages":[{"role":"user","content":"hi"}],"stream":true})";
+    q.closed = [] { return false; };
+
+    HttpResponse r = f.srv->router().dispatch(q);
+    CHECK_EQ(r.status, 200);
+    CHECK(r.streaming());
+    for (int i = 0; i < 4; ++i) { std::string c; r.next(c); }
+    CHECK_EQ(f.srv->in_flight(), 1LL);
+
+    f.srv->end_streams(true);
+    std::string last;
+    const bool more = r.next(last);
+    CHECK(!more);
+    /* Not a silent end: the client sees why, and the stream still closes the OpenAI way. */
+    CHECK(last.find("leaving its cards") != std::string::npos);
+    CHECK(last.find("[DONE]") != std::string::npos);
+    r.on_close(true);
+
+    CHECK(f.sched.saw_cancel());
+    CHECK_EQ(f.srv->in_flight(), 0LL);
+    f.srv->end_streams(false);
     f.sched.join_all();
 }
 
@@ -2524,6 +2615,24 @@ TEST(the_steps_a_prefill_interleave_held_are_counted) {
     CHECK(it != d.samples.end() && it->second == 6.0);
 }
 
+TEST(the_mixed_step_target_controller_is_observable) {
+    Metrics m("m", 1024);
+    server::SchedMetrics s;
+    s.mixed_step_target_steps = 9;
+    s.mixed_step_target_misses = 2;
+    s.mixed_step_target_prefill_cap = 384;
+    m.sample(s);
+    PromDoc d = parse_prom(m.render());
+    CHECK_EQ((int)d.errors.size(), 0);
+    CHECK_EQ(d.type["radiance:mixed_step_target_steps_total"], std::string("counter"));
+    CHECK_EQ(d.type["radiance:mixed_step_target_misses_total"], std::string("counter"));
+    CHECK_EQ(d.type["radiance:mixed_step_target_prefill_cap"], std::string("gauge"));
+    const auto cap = d.samples.find(
+        "radiance:mixed_step_target_prefill_cap{model_name=\"m\",engine=\"0\"}");
+    CHECK(cap != d.samples.end());
+    if (cap != d.samples.end()) CHECK_NEAR(cap->second, 384.0, 1e-9);
+}
+
 /* Each draft position's acceptances are a counter next to its reach. At a fixed depth position
  * j+1's reach is j's acceptances, but an adaptive window can end at j with j taken, so a ratio
  * over a window needs both. Here two verifies end at position 1 with it accepted. */
@@ -2583,6 +2692,20 @@ TEST(the_adaptive_draft_window_is_exposed_only_while_it_is_on) {
     CHECK_NEAR(value("radiance:draft_verify_depth_total" + L + ",depth=\"2\"}"), 7.0, 1e-9);
     CHECK_NEAR(value("radiance:draft_verify_depth_total" + L + ",depth=\"5\"}"), 3.0, 1e-9);
     CHECK_NEAR(value("radiance:draft_verify_depth_total" + L + ",depth=\"6\"}"), -1.0, 1e-9);
+}
+
+/* The front matches /v1/models/ID itself and hands the request on with the path rewritten: an
+ * alias becomes the model's name, `base:adapter` the adapter's. The model's router reads the id its
+ * own route captured, not the front's, so the request still carries the front's capture here. */
+TEST(a_request_handed_on_reads_the_capture_of_the_route_that_matched_it) {
+    Fixture f;
+    HttpRequest q;
+    q.method = "GET";
+    q.path = "/v1/models/test-model";
+    q.params["id"] = "an-alias";
+    const HttpResponse r = f.srv->router().dispatch(q);
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(json::parse(r.body).value("id", std::string()), std::string("test-model"));
 }
 
 TEST(models_and_health_answer) {
@@ -2787,6 +2910,36 @@ TEST(the_models_root_path_follows_the_key) {
              std::string("/models/m.rad"));
 }
 
+/* The predicate every keyless "loopback only" guard reads -- hoisted so the fleet's front applies
+ * the very rule the engine's routes do (fleet.cpp: the admin/fleet guard). The three legs:
+ * loopback socket, no foreign Origin, a Host that names this box. */
+TEST(local_operator_reads_all_three_legs) {
+    const std::vector<std::string> pinned = {"box.example"};
+    auto ask = [&](const char* peer, const char* host, const char* origin,
+                  const char* bind) {
+        HttpRequest q;
+        q.peer = q.raw_peer = peer;
+        if (host) q.headers["Host"] = host;
+        if (origin) q.headers["Origin"] = origin;
+        return local_operator(q, bind, pinned);
+    };
+    /* The machine dialling itself: loopback socket, loopback Host. */
+    CHECK(ask("127.0.0.1:50122", "localhost:8000", nullptr, "0.0.0.0"));
+    /* A pinned --allow-host name and a concrete --host bind answer for the box. */
+    CHECK(ask("127.0.0.1:50122", "box.example:8000", nullptr, "0.0.0.0"));
+    CHECK(ask("127.0.0.1:50122", "10.3.1.5", nullptr, "10.3.1.5"));
+    /* The rebinding page: same-origin with itself, so no Origin leg fires -- the Host leg is
+     * what refuses it. */
+    CHECK(!ask("127.0.0.1:50122", "evil.test:8000", "http://evil.test:8000", "0.0.0.0"));
+    /* The localhost proxy: every remote client arrives on a loopback socket carrying the
+     * public Host, and no leg names that name. */
+    CHECK(!ask("127.0.0.1:50122", "public.example:8000", nullptr, "0.0.0.0"));
+    /* A foreign Origin never rides a loopback socket into a guard, whatever the Host says. */
+    CHECK(!ask("127.0.0.1:50122", "localhost:8000", "http://evil.test", "0.0.0.0"));
+    /* A remote socket is no operator, however it names itself. */
+    CHECK(!ask("192.168.1.20:50122", "localhost:8000", nullptr, "0.0.0.0"));
+}
+
 TEST(the_model_entry_and_server_info_report_the_same_capabilities) {
     Fixture f;
     const json info = json::parse(f.get("/server_info").body)["capabilities"];
@@ -2838,10 +2991,10 @@ TEST(a_stable_prefix_never_cuts_a_code_point_or_an_escape) {
     CHECK_EQ((long long)json_stable_prefix("x\\u0041"), 7LL);
 }
 
-/* A string literal is written exactly as nlohmann writes it and refused exactly where nlohmann
+/* A string literal is written exactly as Json::dump writes it and refused exactly where it
  * refuses: every byte value alone and after each lead byte, and random strings drawn from the
  * deciding bytes (controls, quote and backslash, DEL, continuation and lead bytes). */
-TEST(a_quoted_string_is_what_nlohmann_writes) {
+TEST(a_quoted_string_is_what_the_dom_writes) {
     auto agree = [](const std::string& s) {
         std::string got = "x";
         const bool ok = json_quote_append(got, s);
@@ -2849,7 +3002,7 @@ TEST(a_quoted_string_is_what_nlohmann_writes) {
         bool refused = false;
         try {
             want = "x" + json(s).dump();
-        } catch (const nlohmann::json::type_error&) {
+        } catch (const Json::exception&) {
             refused = true;
         }
         CHECK_EQ(ok, !refused);
@@ -3390,6 +3543,46 @@ TEST(llama_server_spellings_reach_the_engine) {
     CHECK_EQ(post(R"(,"max_tokens":-1)").status, 200);
     { std::lock_guard<std::mutex> lk(f.sched.mu); CHECK(f.sched.last_max_tokens != 32); }
     CHECK_EQ(post(R"(,"max_tokens":0)").status, 400);
+
+    /* The other spellings that echo back from /props and cross-API clients. */
+    CHECK_EQ(post(R"(,"typ_p":0.8,"max_completion_tokens":6)").status, 200);
+    {
+        std::lock_guard<std::mutex> lk(f.sched.mu);
+        CHECK_NEAR(f.sched.last_sp.typical_p, 0.8, 1e-6);
+        CHECK_EQ(f.sched.last_max_tokens, 6);
+    }
+    CHECK_EQ(post(R"(,"typical_p":0.8,"typ_p":0.9)").status, 400);
+    CHECK_EQ(post(R"(,"max_tokens":5,"max_completion_tokens":5)").status, 200);
+    CHECK_EQ(post(R"(,"max_tokens":4,"max_completion_tokens":5)").status, 400);
+    CHECK_EQ(post(R"(,"max_output_tokens":7)").status, 200);
+    { std::lock_guard<std::mutex> lk(f.sched.mu); CHECK_EQ(f.sched.last_max_tokens, 7); }
+    CHECK_EQ(post(R"(,"max_new_tokens":8)").status, 200);
+    { std::lock_guard<std::mutex> lk(f.sched.mu); CHECK_EQ(f.sched.last_max_tokens, 8); }
+    CHECK_EQ(post(R"(,"no_repeat_ngram_size":35,"no_repeat_ngram_window_size":128)").status, 200);
+    {
+        std::lock_guard<std::mutex> lk(f.sched.mu);
+        CHECK_EQ(f.sched.last_sp.ngram_ban_n, 35);
+        CHECK_EQ(f.sched.last_sp.ngram_window, 128);
+    }
+    CHECK_EQ(post(R"(,"ngram_ban_n":35,"no_repeat_ngram_size":36)").status, 400);
+}
+
+/* OpenRouter asks for the usage chunk at the top level; continuous stats, which would put
+ * usage on every chunk, are refused by name rather than answered with only the last. */
+TEST(openrouters_usage_ask_gets_the_final_usage_chunk) {
+    Fixture f;
+    HttpResponse r = f.post("/v1/chat/completions",
+                            R"({"messages":[{"role":"user","content":"hi"}],"stream":true,
+                                "usage":{"include":true}})");
+    CHECK_EQ(r.status, 200);
+    CHECK(has(drain(r), "\"usage\""));
+    HttpResponse bad = f.post("/v1/chat/completions",
+                              R"({"messages":[{"role":"user","content":"hi"}],"stream":true,
+                                  "stream_options":{"continuous_usage_stats":true}})");
+    CHECK_EQ(bad.status, 400);
+    CHECK_EQ(json::parse(bad.body)["error"]["param"].get<std::string>(),
+             std::string("stream_options.continuous_usage_stats"));
+    f.sched.join_all();
 }
 
 /* `samplers`: a stage left out is off, temperature after the cuts sets temp_last, and an order the
@@ -3481,6 +3674,17 @@ TEST(older_and_llama_server_chat_spellings_reach_the_template) {
                     R"({"messages":[{"role":"user","content":"hi"}],"json_schema":{"type":"object"}})")
                  .status, 200);
     CHECK_EQ(f.tmpl.last_opt.json_schema, std::string(R"({"type":"object"})"));
+
+    /* A Responses-flat tool and choice, and text parts under their Responses names, are
+     * folded into the Chat spellings rather than refused. */
+    CHECK_EQ(f.post("/v1/chat/completions",
+                    R"({"messages":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],
+                        "tools":[{"type":"function","name":"f","parameters":{"type":"object"}}],
+                        "tool_choice":{"type":"function","name":"f"}})").status, 200);
+    CHECK_EQ(f.tmpl.last_n_tools, 1);
+    CHECK_EQ(f.tmpl.last_opt.tool_choice, std::string("required"));
+    CHECK_EQ(f.tmpl.last_opt.tool_name, std::string("f"));
+    CHECK(has(f.tmpl.last_prompt, "hi"));
     f.sched.join_all();
 }
 
@@ -3566,7 +3770,8 @@ TEST(an_anthropic_request_becomes_the_chat_request_it_means) {
         "tool_choice":{"type":"any","disable_parallel_tool_use":true},
         "messages":[
           {"role":"user","content":"weather?"},
-          {"role":"assistant","content":[{"type":"text","text":"Looking."},
+          {"role":"assistant","content":[{"type":"thinking","thinking":"Check Paris."},
+                                         {"type":"text","text":"Looking."},
                                          {"type":"tool_use","id":"t1","name":"get","input":{"c":"P"}}]},
           {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"sun"},
                                     {"type":"text","text":"thanks"}]}]})",
@@ -3575,6 +3780,7 @@ TEST(an_anthropic_request_becomes_the_chat_request_it_means) {
     CHECK_EQ(c["messages"][0].value("role", ""), std::string("system"));
     CHECK(has(c["messages"][0].value("content", ""), "cch=fffff;"));
     CHECK(has(c["messages"][0].value("content", ""), "Be terse."));
+    CHECK_EQ(c["messages"][2].value("reasoning_content", ""), std::string("Check Paris."));
     CHECK_EQ(c["messages"][2]["tool_calls"][0]["function"].value("arguments", ""),
              std::string(R"({"c":"P"})"));
     CHECK_EQ(c["messages"][3].value("role", ""), std::string("tool"));        /* result first */
@@ -3947,7 +4153,7 @@ TEST(a_mid_conversation_system_message_keeps_the_roles_alternating) {
         ApiError e;
         if (anthropic_to_chat(body, lim, &chat, &label, &e) < 0) return -1000;
         ChatPrompt p;
-        const int st = t.apply(json::parse(chat)["messages"], json::array(), ChatOptions(), &p);
+        const int st = t.apply(json::parse(chat)["messages"], Json::array(), ChatOptions(), &p);
         if (st < 0) fprintf(stderr, "    %s\n", p.error.c_str());
         *prompt = p.prompt;
         return st;
@@ -4338,6 +4544,15 @@ TEST(a_responses_request_becomes_the_chat_request_it_means) {
     CHECK_EQ(c["response_format"].value("type", ""), std::string("json_schema"));
     CHECK(!c.contains("input") && !c.contains("text") && !c.contains("instructions"));
     CHECK_EQ(json::parse(echo).value("instructions", ""), std::string("Be terse."));
+
+    /* A Responses field and its Chat spelling passed through in one body: the endpoint's
+     * own spelling is the one the request was made in, and it wins. */
+    CHECK_OK(responses_to_chat(
+        R"({"input":"x","max_tokens":5,"max_output_tokens":7,
+            "reasoning_effort":"high","reasoning":{"effort":"low"}})",
+        lim, &chat, &echo, &e));
+    CHECK_EQ(json::parse(chat).value("max_tokens", 0), 7);
+    CHECK_EQ(json::parse(chat).value("reasoning_effort", ""), std::string("low"));
 
     CHECK(responses_to_chat(R"({"input":"x","previous_response_id":"resp_1"})", lim, &chat,
                             &echo, &e) < 0);
@@ -4842,6 +5057,106 @@ int status_with(Fixture& f, const std::string& ep, const std::string& key, const
 
 }  /* namespace */
 
+/* --control-vector-variant: the variant's name runs the vector whatever the default, the model's
+ * own name keeps the default, an explicit false beside the variant's name is refused as the
+ * contradiction it is, and the name is listed as a child of the model the way an adapter is. */
+TEST(the_control_vector_variant_runs_with_the_vector_and_is_listed) {
+    Fixture f(Fixture::Tweak{ [](ServerOptions& o, Deps& d) {
+        o.control_vector_variant = "uncensored";
+        d.control_vector.available   = [] { return true; };
+        d.control_vector.get_default = [] { return false; };
+    } });
+    HttpResponse r = f.post("/v1/chat/completions",
+                            R"({"model":"uncensored","messages":[{"role":"user","content":"hi"}],
+                                "max_tokens":4})");
+    if (r.streaming()) drain(r);
+    f.sched.join_all();
+    CHECK_EQ(r.status, 200);
+    CHECK(f.sched.last_sp.use_control_vector);
+
+    /* The model's own name runs the default, off here. */
+    HttpResponse r2 = f.post("/v1/chat/completions",
+                             R"({"model":"test-model","messages":[{"role":"user","content":"hi"}],
+                                 "max_tokens":4})");
+    if (r2.streaming()) drain(r2);
+    f.sched.join_all();
+    CHECK_EQ(r2.status, 200);
+    CHECK(!f.sched.last_sp.use_control_vector);
+
+    /* The variant's name with an explicit true is the same request; with false it asks for both. */
+    HttpResponse r3 = f.post("/v1/chat/completions",
+                             R"({"model":"uncensored","messages":[{"role":"user","content":"hi"}],
+                                 "max_tokens":4,"control_vector":true})");
+    if (r3.streaming()) drain(r3);
+    f.sched.join_all();
+    CHECK_EQ(r3.status, 200);
+    CHECK(f.sched.last_sp.use_control_vector);
+    HttpResponse r4 = f.post("/v1/chat/completions",
+                             R"({"model":"uncensored","messages":[{"role":"user","content":"hi"}],
+                                 "max_tokens":4,"control_vector":false})");
+    if (r4.streaming()) drain(r4);
+    f.sched.join_all();
+    CHECK_EQ(r4.status, 400);
+    CHECK(r4.body.find("control_vector") != std::string::npos);
+    CHECK(r4.body.find("uncensored") != std::string::npos);
+
+    /* Listed as a child of the model, and readable on its own. */
+    const json all = json::parse(f.get("/v1/models").body);
+    bool listed = false;
+    for (const json& m : all["data"])
+        if (m.value("id", std::string()) == "uncensored") {
+            listed = true;
+            CHECK_EQ(m.value("parent", std::string()), std::string("test-model"));
+        }
+    CHECK(listed);
+    const HttpResponse one = f.get("/v1/models/uncensored");
+    CHECK_EQ(one.status, 200);
+    CHECK_EQ(json::parse(one.body).value("id", std::string()), std::string("uncensored"));
+}
+
+/* With adapters enabled, every name but the model's own must be a loaded adapter. The variant is a
+ * name of the model, so it reaches the base without an adapter lookup, and no adapter may be
+ * loaded under it: `base:name` would then mean two things. */
+TEST(the_control_vector_variant_is_not_an_adapter) {
+    int lookups = 0;
+    Fixture f(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
+        o.control_vector_variant = "uncensored";
+        o.lora_acquire = [&](const std::string&, int32_t*, uint64_t*, std::shared_ptr<void>*) {
+            ++lookups;
+            return (int)RAD_E_NOTFOUND;
+        };
+        o.lora_names = [] { return std::vector<std::string>{}; };
+        o.lora_load = [](const std::string&, const std::string&, std::string*) {
+            return (int)RAD_OK;
+        };
+        o.lora_unload = [](const std::string&, std::string*, int*) { return (int)RAD_OK; };
+        d.control_vector.available   = [] { return true; };
+        d.control_vector.get_default = [] { return false; };
+    } });
+    HttpResponse r = f.post("/v1/chat/completions",
+                            R"({"model":"uncensored","messages":[{"role":"user","content":"hi"}],
+                                "max_tokens":4})");
+    if (r.streaming()) drain(r);
+    f.sched.join_all();
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(lookups, 0);
+    CHECK(f.sched.last_sp.use_control_vector);
+
+    /* Any other name still goes to the adapters, which do not know it. */
+    HttpResponse r2 = f.post("/v1/chat/completions",
+                             R"({"model":"other","messages":[{"role":"user","content":"hi"}],
+                                 "max_tokens":4})");
+    if (r2.streaming()) drain(r2);
+    f.sched.join_all();
+    CHECK_EQ(r2.status, 404);
+    CHECK_EQ(lookups, 1);
+
+    const HttpResponse l = f.post("/v1/load_lora_adapter",
+                                  R"({"lora_name":"uncensored","lora_path":"/adapters/u"})");
+    CHECK_EQ(l.status, 400);
+    CHECK(l.body.find("control-vector variant") != std::string::npos);
+}
+
 /* The control vector: absent, the deployment's default applies; an explicit `true` on a
  * deployment with no vector is refused by name (serving the stock model while the client believes
  * otherwise would be a silent lie), and on one with a vector it reaches the engine's request. */
@@ -5023,6 +5338,8 @@ TEST(every_request_key_is_served_refused_or_ignored_as_its_list_says) {
         { "grammar_lazy",        { false, true } },
         { "grammar_triggers",    { json::array(), json::parse(R"([{"type":1,"value":"x"}])") } },
         { "preserved_tokens",    { json::array(), json::parse(R"(["<x>"])") } },
+        { "include_reasoning",   { true, false } },
+        { "separate_reasoning",  { true, false } },
     };
     /* Where a guarded key is the endpoint's own field and served. */
     auto served_on = [](const std::string& key, const std::string& ep) {
@@ -5065,10 +5382,14 @@ TEST(every_request_key_is_served_refused_or_ignored_as_its_list_says) {
     const std::map<std::string, Valid> valid = {
         { "model", { "m", none } }, { "stream", { true, none } },
         { "stream_options", { json::parse(R"({"include_usage":true})"), json::parse(R"({"stream":true})") } },
+        { "usage", { json::parse(R"({"include":true})"), json::parse(R"({"stream":true})") } },
         { "n", { 2, none } }, { "seed", { 1, none } }, { "stop", { json::parse(R"(["zz"])"), none } },
-        { "max_tokens", { 4, none } }, { "n_predict", { 4, none } }, { "temperature", { 0.5, none } },
+        { "max_tokens", { 4, none } }, { "max_output_tokens", { 4, none } },
+        { "max_new_tokens", { 4, none } }, { "n_predict", { 4, none } },
+        { "temperature", { 0.5, none } },
         { "top_p", { 0.9, none } }, { "top_k", { 5, none } }, { "min_p", { 0.1, none } },
-        { "typical_p", { 0.9, none } }, { "presence_penalty", { 0.1, none } },
+        { "typical_p", { 0.9, none } }, { "typ_p", { 0.9, none } },
+        { "presence_penalty", { 0.1, none } },
         { "frequency_penalty", { 0.1, none } }, { "repetition_penalty", { 1.1, none } },
         { "repeat_penalty", { 1.1, none } }, { "repeat_last_n", { 32, none } },
         { "xtc_probability", { 0.1, none } }, { "xtc_threshold", { 0.2, none } },
@@ -5085,6 +5406,8 @@ TEST(every_request_key_is_served_refused_or_ignored_as_its_list_says) {
         { "ngram_ban_n", { 35, none } }, { "ngram_window", { 128, none } },
         { "ngram_whitelist", { json::parse(R"([4,5])"), none } },
         { "no_repeat_ngram_whitelist", { json::parse(R"([4,5])"), none } },
+        { "no_repeat_ngram_size", { 35, none } },
+        { "no_repeat_ngram_window_size", { 128, none } },
         { "images_config", { "gundam", none } },
         { "messages", { json::parse(R"([{"role":"user","content":"yo"}])"), none } },
         { "tools", { json::parse(R"([{"type":"function","function":{"name":"f"}}])"), none } },
@@ -5094,7 +5417,10 @@ TEST(every_request_key_is_served_refused_or_ignored_as_its_list_says) {
         { "parallel_tool_calls", { false, none } }, { "add_generation_prompt", { true, none } },
         { "max_completion_tokens", { 4, none } },
         { "chat_template_kwargs", { json::parse(R"({"x":"y"})"), none } },
-        { "reasoning_effort", { "low", none } }, { "enable_thinking", { false, none } },
+        { "reasoning_effort", { "low", none } },
+        { "reasoning", { json::parse(R"({"effort":"low"})"), none } },
+        { "thinking", { json::parse(R"({"type":"adaptive"})"), none } },
+        { "enable_thinking", { false, none } },
         { "preserve_thinking", { true, none } }, { "thinking_token_budget", { -1, none } },
         { "thinking_budget", { -1, none } }, { "thinking_budget_tokens", { -1, none } },
         { "reasoning_budget_tokens", { -1, none } }, { "reasoning_format", { "none", none } },
@@ -5498,6 +5824,12 @@ TEST(an_embedding_inputs_bos_moves_its_media_by_one) {
         {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]})", d, lim, &r, &e));
     REQUIRE(r.prompts.size() == 1 && r.prompts[0].media);
     CHECK(r.prompts[0].tokens == std::vector<int32_t>({ 1, 'a', 'b', 9001, 9002 }));
+    /* A text part under its Responses name embeds as the same text. */
+    OaiRequest r2;
+    CHECK_OK(parse_embeddings_request(R"({"input":[{"type":"input_text","text":"ab"}]})", d, lim,
+                                      &r2, &e));
+    REQUIRE(r2.prompts.size() == 1);
+    CHECK(r2.prompts[0].tokens == std::vector<int32_t>({ 1, 'a', 'b' }));
     REQUIRE(r.prompts[0].media->items.size() == 1);
     CHECK_EQ(r.prompts[0].media->items[0].tok, 3);
 }

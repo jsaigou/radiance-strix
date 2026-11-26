@@ -1,0 +1,32 @@
+# flint-bf16-q4.recipe -- Flint as flint-q4.rad: the 19.72 GiB container.
+#
+# 4-bit attention projections and routed experts; INT8 dense layers, shared expert and output
+# head; BF16 router, norms and embedding. Attention tolerates U4; the dense and shared MLPs do
+# not, so they stay INT8.
+#
+#   rad-convert <flint checkpoint> --add data/flint-zero-bias.safetensors \
+#       --recipe data/recipes/flint-bf16-q4.recipe \
+#       --chat-template data/flint-chat-template.jinja \
+#       -o flint-q4.rad
+#
+# Serve:
+#   radiance --model flint-q4.rad --max-model-len 262144            # one card
+#   radiance --model flint-q4.rad --tp 2 --max-model-len 262144     # two cards
+
+blk.*.attn_q.weight                  rtn  codes=u4 zero=u8 group=128 scale=f16
+blk.*.attn_k.weight                  rtn  codes=u4 zero=u8 group=128 scale=f16
+blk.*.attn_v.weight                  rtn  codes=u4 zero=u8 group=128 scale=f16
+blk.*.attn_output.weight             rtn  codes=u4 zero=u8 group=128 scale=f16
+
+blk.*.ffn_gate_up_shexp.weight       rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.*.ffn_down_shexp.weight          rtn  codes=i8 group=128 scale=bf16 clamp=sym
+
+blk.0.ffn_gate_up.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.0.ffn_down.weight                rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.1.ffn_gate_up.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.1.ffn_down.weight                rtn  codes=i8 group=128 scale=bf16 clamp=sym
+
+blk.*.ffn_gate_up_exps.*.weight      rtn  codes=i4 group=128 scale=bf16
+blk.*.ffn_down_exps.*.weight         rtn  codes=i4 group=128 scale=bf16
+
+output.weight                        rtn  codes=i8 group=128 scale=bf16 clamp=sym

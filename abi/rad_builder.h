@@ -56,35 +56,27 @@ double      rad_meta_getf(const RadModelMeta* m, const char* key, double dflt);
 const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* dflt);
 
 /* ================================================================== build context */
-/* RadBuildCtx::kv_quant. A layout groups each head's dims by 32 with an f16 scale per group, the
- * group's absmax over the largest code. A token's row in a head, at head_dim HD (a multiple of 32):
+/* A paged cache group's dtype says how a token's row in a head is laid out, at head_dim HD:
  *
- *   RAD_KVQ_V4 (fp8_v4), 25 * HD / 16 bytes:
- *     [0, HD)            K, E4M3 as the fp8 cache stores it
- *     [HD, 3HD/2)        V's int4 codes, dim d in the nibble at bit 4 * (d % 2) of byte d / 2
- *     [3HD/2, 25HD/16)   V's scales (absmax / 7)
- *   RAD_KVQ_K6V4 (k6_v4), 22 * HD / 16 bytes:
- *     [0, HD/2)          K's low four bits, as V's codes above
- *     [HD/2, 3HD/4)      K's high two bits, a 4-byte word per 16 dims whose byte j holds dims 2j
- *                        and 2j+1 in bits 0-3 and dims 8+2j and 9+2j in bits 4-7
- *     [3HD/4, 5HD/4)     V's int4 codes
- *     [5HD/4, 21HD/16)   K's scales (absmax / 31)
- *     [21HD/16, 22HD/16) V's scales (absmax / 7)
- *
- * Codes are two's complement (int4 -7..7, int6 -31..31). The group is declared at RAD_F8E4M3 with
- * head_dim the row's bytes / 2 so the core sizes pages from it; only the layout's kernels read
- * it. */
-enum {
-    RAD_KVQ_NONE = 0,
-    RAD_KVQ_V4   = 1,
-    RAD_KVQ_K6V4 = 2
-};
+ *   RAD_BF16, 4 * HD bytes: K then V, as the model computes them.
+ *   RAD_I8, 2 * HD + 4 bytes: K and V as int8 codes with one f16 scale each per (token, head):
+ *     [0, HD)            K's int8 codes (two's complement, -127..127)
+ *     [HD, 2HD)          V's int8 codes
+ *     [2HD, 2HD + 2)     K's scale (the head's absmax / 127)
+ *     [2HD + 2, 2HD + 4) V's scale (absmax / 127)
+ *   The plugin declares HD; the core adds the scales' bytes (rad_kv_row_elems). */
 
-/* The products of the prefill attention a deployment accepts in e4m3 (RadBuildCtx::
- * attn_prefill_fp8, `attn_paged`'s `prefill_fp8`): bits, so both is 3. */
+/* Elements of a token's row in one head of a paged group declared at `dtype` and `head_dim`: K
+ * then V, and under the int8 cache the two f16 scales after them. */
+static inline int64_t rad_kv_row_elems(uint32_t dtype, int64_t head_dim) {
+    return 2 * head_dim + (dtype == RAD_I8 ? 4 : 0);
+}
+
+/* RadArchProbe::chain_pays. */
 enum {
-    RAD_ATTN_FP8_QK = 1,   /* Q.K^T, the query rounded to e4m3 after the softmax scale */
-    RAD_ATTN_FP8_PV = 2    /* P.V, the probabilities rounded to e4m3 */
+    RAD_CHAIN_NONE   = 0,
+    RAD_CHAIN_SPEC   = 1,   /* with a drafter decoding speculatively */
+    RAD_CHAIN_ALWAYS = 2    /* with or without one */
 };
 
 typedef struct RadBuildCtx {
@@ -111,17 +103,16 @@ typedef struct RadBuildCtx {
     int64_t  tp_wire_min_bytes;
 
 
-    /* The KV cache dtype, a deployment choice rather than a property of the checkpoint: fp8
-     * weights may want a bf16 cache and vice versa.
+    /* The KV cache dtype, a deployment choice rather than a property of the checkpoint.
      *
      * RAD_DT_INVALID (the zero-initialised default) means the plugin's default, bf16 for every
-     * architecture in this tree. RAD_F8E4M3 is the only other implemented value: the fp8kv
-     * attention family is band-gated on it, and the store side writes E4M3 with per-(sequence,
-     * head) descales. `kv_quant` below narrows the trunk's attention cache further.
+     * architecture in this tree. RAD_I8 is the other value every paged attention serves, the
+     * int8 cache above: the attention kernels band on it and the store writes each token's codes
+     * and scales. RAD_F8E4M3 reaches only a plugin whose probe sets RadArchProbe::kv_fp8_ok.
      *
      * An ABI field rather than an environment variable because it changes what the model
      * computes, so it must have one visible answer: --kv-cache-dtype. */
-    int      kv_dtype;        /* RAD_DT_INVALID = the plugin's default (bf16); or RAD_F8E4M3 */
+    int      kv_dtype;        /* RAD_DT_INVALID = the plugin's default (bf16); RAD_I8; RAD_F8E4M3 */
     int      is_draft;        /* this builder scope is a drafter (spec §10) */
     const char* scope;        /* "", "draft", "vision", "audio" -- prefixes declared names */
 
@@ -171,25 +162,6 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int64_t  max_mixed_tok;
-
-    /* A narrower layout of the trunk's attention cache under kv_dtype RAD_F8E4M3, from
-     * --kv-cache-dtype fp8_v4 or k6_v4: a RAD_KVQ_* (below). The engine sets it only for a plugin
-     * whose probe has the layout's bit in RadArchProbe::kv_quant_ok and refuses the flag
-     * otherwise, so no plugin sees it that would store plain E4M3 instead. A drafter's cache stays
-     * E4M3.
-     *
-     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
-    int      kv_quant;
-
-    /* ---- appended in ABI 26 (fp8 prefill attention) */
-    /* RAD_ATTN_FP8_* bits from --attn-prefill-fp8: the attention products the deployment accepts
-     * in e4m3 rather than exactly. 0 (the zero-initialised default) is exact. A plugin passes a
-     * nonzero value on as `attn_paged`'s `prefill_fp8` (docs/OPS.md) and omits the parameter at
-     * 0, so an exact declare is unchanged. The engine refuses to start when no resolved kernel
-     * takes it, so a plugin that ignores the field is refused rather than silently exact.
-     *
-     * Zero-defaulted and in the padding after kv_quant, so no other field moves. */
-    int      attn_prefill_fp8;
 
     /* ---- appended in ABI 30 (KV streaming) */
     /* --kv-resident in tokens, 0 when nothing streams: the ring a streamed group carves is this in
@@ -301,7 +273,31 @@ typedef struct RadBuildCtx {
      * drive has to be stored whole, so a plugin that can lay its routed experts out either way
      * keeps them whole for this; 0 leaves it free to split them across the ranks by width. */
     int      expert_file_tier;
+
+    /* ---- appended in ABI 38 (several engines in one process) */
+    /* The first of this engine's slots. Each engine in the process holds a contiguous block of
+     * slots, one per rank, so an instance's slot, `slot_base + rank` (rad_build_slot), is unique
+     * among the ranks of every engine alive, where `rank` is unique only within one engine. A
+     * plugin keeps per-instance state (handles, geometry, its step's view of the model) indexed by
+     * the slot, and reads it back in step() with rad_slot(). Zero, the default, makes the slot the
+     * rank: one engine in a process, or a test driving a plugin alone. Two engines may serve the
+     * same plugin at once only when it says so (rad_arch_multi_instance). */
+    int      slot_base;
+
+    /* ---- appended in ABI 42 (--prefill-span-pass step) */
+    /* Nonzero: where the plugin runs a step wider than max_mixed_tok serially (it pipelines no
+     * part of it), its routed block may take the whole step in one pass rather than one pass a
+     * checkpoint interval, and size the planes that hold a row per (token, expert slot) for
+     * max_tok rows. 0, the zero-initialised default, keeps the interval-tall passes. A plugin
+     * without such a pass ignores it. */
+    int      span_pass_step;
 } RadBuildCtx;
+
+/* The most instances (engine ranks) one process holds at once; every slot is below it. */
+#define RAD_MAX_SLOTS 32
+
+/* The declaring instance's slot (see RadBuildCtx::slot_base). */
+static inline int rad_build_slot(const RadBuildCtx* c) { return c->slot_base + c->rank; }
 
 /* ================================================================== control vectors */
 /* A direction per layer, in the shape llama.cpp's `--cvec-mode project` applies it:
@@ -761,16 +757,19 @@ int rad_declare_plugin_words(RadBuilder* b, int64_t max_words);
  * The kind is a drive shape, not a model. SERIAL runs `depth` dependent passes, each embedding the
  * last one's proposal, so tokens arrive one at a time and a pass that declines ends the chain
  * (MTP, EAGLE, Medusa-serial). BLOCK runs a context pass, then one pass that fills every drafted
- * position at once (DFlash2 and other block-diffusion drafters).
+ * position at once (DFlash2 and other block-diffusion drafters). HISTORY runs just the serial
+ * history pass (draft_pass < 0, every hidden row, n_draft_out = 0) to collect calibration
+ * inputs. It is for --calib-corpus with max_spec = 0; it declares and produces no proposals.
  *
  * `proposal` is the buffer a pass writes its token ids into; 0 means the sampler's token buffer,
  * which suits a head whose logits go through the ordinary sampler chain.
  *
  * Declaring no drafter is the normal case; the scheduler's prompt-lookup drafter still runs. */
 typedef enum {
-    RAD_DRAFT_NONE   = 0,
-    RAD_DRAFT_SERIAL = 1,   /* `depth` dependent passes, one proposal each */
-    RAD_DRAFT_BLOCK  = 2,   /* a context pass, then one pass that fills the whole block */
+    RAD_DRAFT_NONE    = 0,
+    RAD_DRAFT_SERIAL  = 1,   /* `depth` dependent passes, one proposal each */
+    RAD_DRAFT_BLOCK   = 2,   /* a context pass, then one pass that fills the whole block */
+    RAD_DRAFT_HISTORY = 3,   /* calibration-only serial history pass, depth zero */
 } RadDraftKind;
 
 typedef struct RadDrafterDecl {
@@ -851,6 +850,23 @@ int rad_drafter_shared_kv(RadBuilder* b, int pos_offset);
  * rejected ones at slot -1); and the step is issued ahead, behind which the block driver queues
  * the drafter's passes (the KL mode drafts nothing, so trees do not apply there). */
 int rad_drafter_tree(RadBuilder* b, rad_buf parents);
+
+/* The model's routing counts live in `table`: an i32 RAD_BUF_PERSIST device buffer of at least
+ * [layers, n_expert], one row per layer that reports (rad_route_report's `layer`, so a head past
+ * the trunk counts) and n_expert the model's expert count. Each layer's router writes its counts
+ * into its own row and the report names that row as RadRouting::expert_count; the core takes it
+ * in place and copies the pass's rows to the host once, at the end of the pass. Without a table
+ * the core keeps the rows itself and a report costs one copy dispatch per routed layer on the
+ * compute stream, since a plugin cannot bind the core's rows as operands of a recorded pass. A
+ * report naming any other buffer is still copied, into the layer's row of the table.
+ *
+ * A row per layer also means a consumer that reads a layer's counts later in stream order (the
+ * file stager, at the layer's first expert op) reads that layer's, which one buffer shared by
+ * every layer does not guarantee once a later layer's router has run.
+ *
+ * Called at most once. The row count is checked when a context binds, where the reporting layers
+ * are known. Additive export; RAD_ABI_VERSION does not move. */
+int rad_route_table(RadBuilder* b, rad_buf table);
 
 /* Whether this engine's launches chain (RadKernelChainFn, abi/rad_abi.h): the core's decision, on
  * the AQL backend only, which keeps a completion counter per queue, where the model's plugin
@@ -1150,6 +1166,14 @@ int rad_lora_root(RadBuilder* b, const char* native, const char* spellings);
 int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const char* to,
                    int64_t from_lo, int64_t from_hi, int64_t to_lo);
 
+/* Is checkpoint tensor `src` a runtime-LoRA target of this build? 1 when an adapter configured
+ * for this startup targets it, 0 otherwise (no adapter, a different module, a tower, the drafter,
+ * or a generator source outside a declared root). The same predicate as lora::source_targeted:
+ * the leaf of a `.weight` name. A plugin asks before the weight exists, and sets a LoRA-only
+ * declaration (the plain bf16 view of a rotated int8 trunk weight) only on 1. Null or an empty
+ * name is 0. Additive export; RAD_ABI_VERSION does not move. */
+int rad_lora_source_targeted(RadBuilder* b, const char* src);
+
 /* ================================================================== the audio generator */
 /* A program that makes audio from text: an autoregressive language model writes the piece frame by
  * frame, with classifier-free guidance (each request runs a conditional and an unconditional
@@ -1277,13 +1301,22 @@ typedef struct RadAudioGenDecl {
      * prepare() has limited to those a caller may write), and so is the text after it. A clip is
      * mono f32 in [-1, 1] at `ref_rate`, right-padded with zeros to a whole number of `ref_hop`
      * samples, each `ref_hop` samples one frame; a request's clips hold at most `ref_max_samples`
-     * samples together. NULL `tmpl_ref`: references are refused. */
+     * samples together. With two branches, references require default_cfg 1 and a plain
+     * neg_tmpl: guidance 1 repeats the conditional prompt and frame map in both branches.
+     * Reference direction is opt-in through the templates appended below. NULL `tmpl_ref`:
+     * references are refused. */
     const char* tmpl_ref;
     const char* ref_item;
     int64_t     ref_rate;
     int64_t     ref_hop;
     int64_t     ref_max_samples;
     int32_t     ref_max;
+    /* ABI 40: reference-plus-instructions uses tmpl_ref_instruct ({references},
+     * {instructions}, {input} once each). Its guidance baseline is neg_tmpl_ref
+     * ({references}, {input}, no instructions). Both branches retain the same clips;
+     * their text lengths and reference-frame maps may differ. NULL: direction refused. */
+    const char* tmpl_ref_instruct;
+    const char* neg_tmpl_ref;
 } RadAudioGenDecl;
 
 int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d);
@@ -1313,8 +1346,9 @@ int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d);
  * Geometry. A video of n chunks has `frames_per_chunk n + frames_tail` frames at
  * `fps_num / fps_den` a second and `latents_per_chunk n + latents_tail` latent frames, each of
  * (height / latent_scale) x (width / latent_scale) latents of `latent_channels`; the denoiser
- * reads them in `patch` x `patch` patches. Chunk c of n is `frames_per_chunk` frames, the last
- * `frames_per_chunk + frames_tail`. A side is a multiple of `size_multiple` pixels, at least
+ * reads them in `patch` x `patch` patches. A positive `frames_tail` adds frames to the last
+ * chunk. A negative `frames_tail` trims the first chunk, which must still emit at least one
+ * frame. Every other chunk has `frames_per_chunk` frames. A side is a multiple of `size_multiple` pixels, at least
  * `min_side`, the area at most `max_area`, and the long side over the short at most `max_aspect`.
  * The soundtrack has round(frames / fps * audio_rate) latents a channel, each
  * `sample_rate / audio_rate` samples.
@@ -1368,6 +1402,9 @@ enum { RAD_GEN_PASS_VCOND = 8, RAD_GEN_PASS_VSTEP = 9, RAD_GEN_PASS_ADECODE = 10
        RAD_GEN_PASS_VDECODE = 11, RAD_GEN_PASS_VUPSCALE = 12,
        RAD_GEN_PASS_VENCODE = 13, RAD_GEN_PASS_AENCODE = 14 };
 
+enum { RAD_VIDEO_SCHEDULE_UNIPC = 2 };
+enum { RAD_VIDEO_GUIDANCE_FULL = 1, RAD_VIDEO_GUIDANCE_CFG = 2 };
+
 typedef struct RadVideoGenDecl {
     const char* name;             /* "minimax-h3" -- the served model id and messages */
 
@@ -1386,7 +1423,7 @@ typedef struct RadVideoGenDecl {
     /* The size and length a request that names none is made at. */
     int64_t     default_width, default_height, default_chunks;
 
-    /* The soundtrack. */
+    /* The soundtrack. All four fields are zero for a video-only model. */
     int64_t     sample_rate, audio_rate, audio_channels, audio_latent_channels;
 
     /* The sampler (above). */
@@ -1396,7 +1433,7 @@ typedef struct RadVideoGenDecl {
     /* `max_lanes` requests may hold state at once. `frames_out` is [>= the frames of the largest
      * chunk, height, width, 3] u8 on the device, the frames a VDECODE pass made, row-major RGB;
      * `audio_out` is [>= the samples of the longest soundtrack, audio_channels] f32, interleaved,
-     * what an ADECODE pass made. */
+     * what an ADECODE pass made. Set audio_out to RAD_NULL_HANDLE for video-only models. */
     int64_t     max_lanes;
     rad_buf     frames_out;
     rad_buf     audio_out;
@@ -1422,7 +1459,11 @@ typedef struct RadVideoGenDecl {
      * `base_seq` (`base_shift`) to `max_seq` (`max_shift`); then, with `shift_terminal` > 0,
      * stretched so the last is shift_terminal; and a closing 0. A trained schedule (n_rungs > 0)
      * is the rungs taken to f32 and a closing 0, with default_steps and max_steps both n_rungs.
-     * Both modalities step the same sigmas; shift_video and shift_audio are unused. */
+     * Both modalities step the same sigmas; shift_video and shift_audio are unused.
+     * RAD_VIDEO_SCHEDULE_UNIPC: Wan's shifted 1000-step flow training grid and
+     * order-two UniPC BH2 update, with integer model timesteps. The request
+     * names the number of evaluations. Only video, with no trained rungs or
+     * latent upscaler. shift_video supplies the default shift. */
     int32_t       sched_kind;
     int32_t       dyn_shift;
     double        base_shift, max_shift;
@@ -1437,11 +1478,12 @@ typedef struct RadVideoGenDecl {
     /* The text rows of every VSTEP pass, whatever the prompt's length (0: the prompt's tokens):
      * a model whose text encoder writes a fixed number of rows. */
     int64_t       step_text_rows;
-    /* Guidance terms (RadVideoGenBatch::guidance_h) when `guidance` is 1: the defaults a request
+    /* Guidance terms (RadVideoGenBatch::guidance_h) when `guidance` is nonzero: the defaults a request
      * that names none gets, the video's scale, spatio-temporal scale, modality scale and rescale,
      * then the soundtrack's four. A request whose video or soundtrack scale is not 1 is guided
      * against a negative prompt: its own, else `default_negative` (null: ""). The VCOND pass then
-     * carries both prompts, the positive first (two cu_seqlens entries). */
+     * carries both prompts, the positive first (two cu_seqlens entries).
+     * RAD_VIDEO_GUIDANCE_CFG accepts only the video and soundtrack CFG scales and negative prompt. */
     int32_t       guidance;
     double        guidance_default[8];
     const char*   default_negative;
@@ -1611,6 +1653,13 @@ const char* rad_arch_quant(void);
  * move. */
 int rad_arch_serves_imports(void);
 
+/* Nonzero when every piece of per-instance state the plugin keeps is indexed by
+ * rad_build_slot() / rad_slot(), so several engines in one process may run it at once
+ * (docs/MULTIMODEL.md §3.3). Optional: absent or zero, the core runs the plugin for one engine at
+ * a time and refuses a second engine on it by name. arch/common/rad_arch.h writes it with
+ * RAD_ARCH_MULTI_INSTANCE(). */
+int rad_arch_multi_instance(void);
+
 /* What the plugin can say before it declares anything. Optional: a plugin that does not export
  * it answers zero to everything, each field's default.
  *
@@ -1670,17 +1719,18 @@ typedef struct RadArchProbe {
      * `gen_rows` (its largest pass: a step's packed sequence at the largest size and length). It
      * keeps no KV. */
     int32_t gen_video;
-    /* The RadBuildCtx::kv_quant layouts the plugin serves for this model, bit 1 << RAD_KVQ_*:
-     * libr4d has their rows for its attention geometry. A layout whose bit is clear is refused at
-     * startup with the plugin named. */
-    int32_t kv_quant_ok;
+    /* Nonzero when the plugin serves an E4M3 cache for this model (--kv-cache-dtype fp8,
+     * RadBuildCtx::kv_dtype RAD_F8E4M3): GLM-5.3's latent attention. The engine refuses the flag
+     * for a plugin that leaves it zero, naming the int8 cache every paged attention serves. */
+    int32_t kv_fp8_ok;
 
     /* ---- appended in ABI 26 (chained launches, control vectors) */
-    /* Nonzero when this plugin measured its speculative step faster with chained launches
-     * (RadKernelChainFn: a dependent kernel waits in its own prologue rather than behind the
-     * queue's barrier bit). With a drafter decoding speculatively on the AQL backend, the core
-     * then takes them. Zero keeps them off: plain decode measured slower chained, and a plugin
-     * that never measured them asks for nothing. */
+    /* How this plugin measured chained launches (RadKernelChainFn: a dependent kernel waits in its
+     * own prologue rather than behind the queue's barrier bit), a RAD_CHAIN_*. SPEC: its
+     * speculative step is faster with them, and the core takes them on the AQL backend while a
+     * drafter decodes speculatively. ALWAYS: its plain decode is faster too, and the core takes
+     * them with or without a drafter. Zero keeps them off: some models' plain decode measured
+     * slower chained, and a plugin that never measured them asks for nothing. */
     int32_t chain_pays;
     /* ---- appended in ABI 30 (KV streaming) */
     /* Nonzero when the architecture can stream a KV group between host memory and a VRAM ring: its
@@ -1723,6 +1773,14 @@ typedef struct RadArchProbe {
      * `gen_rows` (its largest pass: a step's two branches, or a query pass's points). It keeps no
      * KV. */
     int32_t gen_shape;
+
+    /* ---- appended in ABI 43 (a checkpoint inside the step), in the tail padding behind gen_shape */
+    /* Nonzero when the plugin serves RadBatch::ckpt_cut: a step of one prefill sequence whose
+     * checkpoint lies inside it runs its recurrence in two pieces and snapshots between them
+     * (rad_ckpt_snap). The scheduler then takes a prompt's tail snapshot inside its last chunk
+     * rather than ending the chunk there and running the rows past it as a step of their own.
+     * Zero keeps that step. */
+    int32_t ckpt_snap_ok;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);
@@ -1852,6 +1910,13 @@ typedef struct RadChatFormat {
      * decides how its value is read, whatever the schema says; the grammar writes the one the
      * schema calls for. NULL: the schema alone types a value. */
     const char* arg_json_value_prefix;
+
+    /* A header the model writes first when it answers without reasoning, in place of
+     * reasoning_open: the reply then starts with this literal, which is dropped, and the rest is
+     * content. A reply that starts with anything else, or with only part of it, is read as
+     * written. When the model does reason, its header after the block is reasoning_close's.
+     * NULL or "": the reply starts with its content. */
+    const char* content_open;
 } RadChatFormat;
 
 /* Return the format, or NULL for "derive it from the chat template". Called once at startup. */
@@ -1967,7 +2032,9 @@ void        rad_arch_step(struct RadCtx* c, const struct RadBatch* batch);
 /* Optional. Return a stable fingerprint of actual dispatch geometry whose grid depends on live
  * per-group seqused values. `kv_used_max_h[g]` is the host maximum for batch->kv[g], and
  * rad_ctx_wgp_count(c) supplies the device's WGP count. Return 0 when exact geometry is unknown;
- * that pass runs live and is not recorded. */
+ * that pass runs live and is not recorded. Only prefill and mixed launches read the live maximum:
+ * in a decode, verify or draft pass every launch reads the step's keyed context bound
+ * (RadArgs::kv_used_max_h), so such a pass needs no geometry here and returns nonzero. */
 uint64_t    rad_arch_pass_key(struct RadCtx* c, const struct RadBatch* batch,
                               const int32_t* kv_used_max_h);
 

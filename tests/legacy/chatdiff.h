@@ -14,7 +14,7 @@
 
 struct RadChatFormat;
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <map>
 #include <memory>
@@ -25,7 +25,7 @@ struct RadChatFormat;
 namespace rad {
 namespace chatdiff {
 
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 
 /* A model: where its template is and how its vocabulary spells the tokens a template reads. */
 struct Model {

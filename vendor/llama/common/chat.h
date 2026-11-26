@@ -8,16 +8,17 @@
 #include "jinja/runtime.h"
 #include "jinja/caps.h"
 
-#include "nlohmann/json_fwd.hpp"
+#include "util/json.h"
 
 #include <chrono>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 using chat_template_caps = jinja::caps;
-using json = nlohmann::ordered_json;
+using json = rad::Json;
 
 struct common_chat_templates;
 
@@ -29,10 +30,13 @@ struct common_chat_tool_call {
     std::string name;
     std::string arguments;
     std::string id;
+    /* Arguments that arrived already parsed (an object in the request), carried as JSON so
+     * the render path neither dumps them to a string here nor parses that string back when a
+     * template reads them as a mapping. When set, `arguments` stays empty and this is the
+     * value common_chat_msgs_to_json_oaicompat emits. */
+    std::shared_ptr<const rad::Json> arguments_json;
 
-    bool operator==(const common_chat_tool_call & other) const {
-        return name == other.name && arguments == other.arguments && id == other.id;
-    }
+    bool operator==(const common_chat_tool_call & other) const;
 };
 
 struct common_chat_msg_content_part {
@@ -87,7 +91,7 @@ struct common_chat_msg {
     std::string                               tool_name;
     std::string                               tool_call_id;
 
-    nlohmann::ordered_json to_json_oaicompat(bool concat_typed_text = false) const;
+    rad::Json to_json_oaicompat(bool concat_typed_text = false) const;
 
     std::string render_content(const std::string & delimiter = "\n\n") const;
 
@@ -289,19 +293,20 @@ common_chat_tool_choice common_chat_tool_choice_parse_oaicompat(const std::strin
 bool common_chat_templates_support_enable_thinking(const common_chat_templates * chat_templates);
 
 // Parses a JSON array of messages in OpenAI's chat completion API format.
-std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const nlohmann::ordered_json & messages);
+std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const rad::Json & messages);
 
-std::vector<common_chat_tool> common_chat_tools_parse_oaicompat(const nlohmann::ordered_json & tools);
+std::vector<common_chat_tool> common_chat_tools_parse_oaicompat(const rad::Json & tools);
 
-common_chat_continuation common_chat_continuation_parse(const nlohmann::ordered_json & value);
+common_chat_continuation common_chat_continuation_parse(const rad::Json & value);
 
 // DEPRECATED: only used in tests
-nlohmann::ordered_json common_chat_msgs_to_json_oaicompat(const std::vector<common_chat_msg> & msgs, bool concat_typed_text = false);
+rad::Json common_chat_msgs_to_json_oaicompat(const std::vector<common_chat_msg> & msgs, bool concat_typed_text = false);
 
-nlohmann::ordered_json common_chat_tools_to_json_oaicompat(const std::vector<common_chat_tool> & tools);
+rad::Json common_chat_tools_to_json_oaicompat(const std::vector<common_chat_tool> & tools);
 
 // get template caps, useful for reporting to server /props endpoint
 std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_templates * chat_templates);
+std::string common_chat_templates_get_probe_error(const common_chat_templates * chat_templates);
 
 std::string common_chat_template_direct_apply(
     const common_chat_template & tmpl,
@@ -310,6 +315,14 @@ std::string common_chat_template_direct_apply(
 std::string common_chat_template_generation_prompt(
     const common_chat_template &          tmpl,
     const autoparser::generation_params & inputs);
+
+// As above, with the caller's own direct_apply of `inputs` in hand: it is one of the two
+// renders the generation prompt is diffed from, so the other is the only one still needed
+// (and a repeat request whose generation prompt proved message-independent needs neither).
+std::string common_chat_template_generation_prompt_with_rendered(
+    const common_chat_template &          tmpl,
+    const autoparser::generation_params & inputs,
+    const std::string &                   rendered_prompt);
 
 std::optional<common_chat_params> common_chat_try_specialized_template(
         const common_chat_template &          tmpl,

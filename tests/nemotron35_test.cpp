@@ -9,12 +9,12 @@
 #include "server/nemotron35.h"
 #include "server/oai.h"
 #include "text/tokenizer.h"
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 #include <dlfcn.h>
 #include <fstream>
 #include <stdexcept>
 
-using json = nlohmann::json;
+using json = rad::Json;
 
 namespace {
 std::vector<const char*> host_libraries() {
@@ -1418,7 +1418,8 @@ TEST(nemotron35_reranker_parser_matches_the_native_pair_template_and_context_bou
     rad::server::OaiLimits lim;
     lim.max_ctx = 32768;
     lim.allow_image = true;
-    for (const auto& c : golden("nemotron35_rerank.json")["http"]) {
+    const json golden_http = golden("nemotron35_rerank.json")["http"];
+    for (const auto& c : golden_http) {
         json doc = c["document"];
         if (!c["image"].is_null()) {
             json parts = json::array();

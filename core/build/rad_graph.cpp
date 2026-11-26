@@ -16,7 +16,7 @@
 
 #include "startup.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <atomic>
@@ -27,7 +27,7 @@
 namespace rad {
 
 /* ordered_json keeps keys in insertion order rather than alphabetical. */
-using json = nlohmann::ordered_json;
+using json = Json;
 
 namespace {
 
@@ -253,7 +253,10 @@ std::string dump_graph_str(const Program& p, const std::vector<std::string>* err
     }
 
     /* ---------------------------------------------------------------- the drafter (spec §10) */
-    if (p.drafter.kind != RAD_DRAFT_NONE) {
+    if (p.drafter.kind == RAD_DRAFT_HISTORY) {
+        s += fmt("---- drafter: '%s', RAD_DRAFT_HISTORY -- calibration pass, no proposals\n\n",
+                 p.drafter_name.c_str());
+    } else if (p.drafter.kind != RAD_DRAFT_NONE) {
         const bool blk = p.drafter.kind == RAD_DRAFT_BLOCK;
         s += fmt("---- drafter: '%s', %s, %d token(s) a step\n",
                  p.drafter_name.c_str(),
@@ -564,8 +567,8 @@ static json weight_json(const WeightInfo& w) {
     return j;
 }
 
-std::string dump_graph_json(const Program& p) {
-    Registry& reg = rad_tools_registry();
+std::string dump_graph_json(const Program& p, Registry* r) {
+    Registry& reg = r ? *r : rad_tools_registry();
     json root;
     json meta;
     meta["arch"]     = p.meta.arch_id ? p.meta.arch_id : "";
@@ -729,7 +732,8 @@ std::string dump_graph_json(const Program& p) {
     if (p.drafter.kind != RAD_DRAFT_NONE) {
         json d;
         d["name"]  = p.drafter_name;
-        d["kind"]  = p.drafter.kind == RAD_DRAFT_BLOCK ? "block" : "serial";
+        d["kind"]  = p.drafter.kind == RAD_DRAFT_HISTORY ? "history"
+                   : p.drafter.kind == RAD_DRAFT_BLOCK ? "block" : "serial";
         d["depth"] = p.drafter.depth;
         if (p.drafter.kind == RAD_DRAFT_BLOCK) {
             d["window"] = p.drafter.window;

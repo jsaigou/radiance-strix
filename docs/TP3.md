@@ -50,13 +50,13 @@ its weights pool, up to all of its weights resident.
 - The token count, the carve, the loan and the attention ranks' pools are unchanged.
 - Other placements keep the common split (under `auto` a fully resident rank would choose
   all_vram while its peers spill).
-- `--deterministic` and a device without virtual memory management re-split like any other: the
+- `deterministic: true` and a device without virtual memory management re-split like any other: the
   cache does not lend there, and the bytes the rank never pages are as much its experts' as under a
   lending cache.
 - The condition is the cost, not the world: a rank is re-split only when its cache costs less per
   token than the most expensive rank's, which at TP2 and TP4 no rank does. A rank that qualifies
   but keeps the common split gives the reason on its `kv: rank N's cache costs ...` line.
-- The pinned host pool is not re-split: every rank allocates its whole `--host-pool-mib`, and a
+- The pinned host pool is not re-split: every rank allocates its whole share of `host-pool-mib`, and a
   re-split rank whose weights all fit on the card logs that its pinned host pool holds no weights.
 
 The log line on the third rank:
@@ -114,7 +114,7 @@ Load check: the relayout pool refuses to finish when any staged weight was never
 nothing wrote holds whatever the card had there: zeros on a card whose driver wipes freed memory,
 garbage after a reset ("VRAM is lost"). To expose such a read on any card:
 
-    RADIANCE_DEBUG_POISON_ALLOC=255 radiance --model stock.rad --tp 3 ...
+    RADIANCE_DEBUG_POISON_ALLOC=255 radiance --config radiance.yaml    # model: stock.rad, tp: 3
 
 This fills every fresh device allocation with 0xFF (NaN in every float width) before it is handed
 out; the serve must answer exactly as without it. `RADIANCE_DEBUG_POISON_RANGE=lo:hi` narrows the
@@ -122,20 +122,35 @@ fill to a range of a thread's allocation ordinals, for bisecting (`core/device/d
 
 ## 4. Serving
 
+```yaml
+# radiance.yaml
+memory:
+  gpu-headroom-mib: 96
+models:
+  qwen3.8-next-flash:
+    model: qwen3.8-next-flash-iqr-v4.rad
+    tp: 3
+    tp-wire: exact
+    max-num-seqs: 8
+    max-model-len: 262144
+    placement: expert_tiered
+    host-pool-mib: 24576
+    kv-cache-dtype: i8
+    num-speculative-tokens: 3
+    max-num-batched-tokens: 2048
+```
+
 ```sh
-radiance --model qwen3.8-next-flash-fp8-iq4r-moe.rad --tp 3 --tp-wire exact --max-num-seqs 8 \
-    --max-model-len 262144 --placement expert_tiered --host-pool-mib 8192 \
-    --gpu-headroom-mib 96 --kv-cache-dtype fp8 \
-    --num-speculative-tokens 3 --max-num-batched-tokens 2048
+radiance --config radiance.yaml
 ```
 
 At three ranks the exact all-reduce is the one-shot up to 1 MiB per message (every decode step) and
 the two-shot above it (every prefill chunk). The two-shot is reduce-scatter + all-gather and sends
 4/3 of the message per rank instead of twice it. A message rarely divides into thirds (a
 2048-wide bf16 row is 256 16-byte words), so the first `words % 3` shards take one word more. Both
-fold in fp32 in ascending rank order, so the switch between them changes no bits. `--tp-wire wht6`
+fold in fp32 in ascending rank order, so the switch between them changes no bits. `tp-wire: wht6`
 at three ranks is the tiered-int8 wire over the same uneven two-shot for messages from
-`--tp-wire-min-kb` up, and the exact one-shot below.
+`tp-wire-min-kb` up, and the exact one-shot below.
 
 Startup logs the geometry:
 
@@ -143,7 +158,7 @@ Startup logs the geometry:
 radiance: world_size = 3 over n_head_kv = 2: attention on 2 rank(s), rank(s) 2..2 carry no attention and take the delta net's remainder first
 ```
 
-Each rank's delta-net share is a note in its declared graph; `--debug-graph` and the dashboard's
+Each rank's delta-net share is a note in its declared graph; `debug-graph: true` and the dashboard's
 graph view show rank 0's:
 
 ```
@@ -158,7 +173,7 @@ attention-zero rank still ran its projections on zero weights, and the extra del
 rank 0. Hot = 1 / 4 / 8 streams, 8K prompt, 1K generated, aggregate tok/s; crowd = 4 streams at
 100K context, per stream; HumanEval 164 and a 200-question GSM8K subset at temperature 0:
 
-| container | `--tp` | hot c1 / c4 / c8 | crowd | HE | GSM8K |
+| container | `tp` | hot c1 / c4 / c8 | crowd | HE | GSM8K |
 |---|---|---|---|---|---|
 | unpadded | 3 | 191 / 309 / 353 | 42.7 | 0.878 | 0.925 |
 | unpadded, the same file | 2 | 177 / 308 / 377 | 33.8 | 0.884 | 0.915 |

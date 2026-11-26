@@ -13,8 +13,7 @@
 #
 # The rest of the pipeline directory (model_index.json, scheduler/, text_encoder/, tokenizer/, vae/,
 # transformer/config.json) is the release's: Raw and Turbo ship identical parts but for
-# model_index.json, whose `is_distilled` selects Turbo's sampling (8 steps, no guidance). A finetune
-# stored as plain fp8 converts with data/recipes/krea-2-fp8-unscaled.recipe.
+# model_index.json, whose `is_distilled` selects Turbo's sampling (8 steps, no guidance).
 #
 # Needs only python3; the data is copied, never decoded.
 import json

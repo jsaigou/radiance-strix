@@ -1,0 +1,20 @@
+# Ling-3.0-tiny on the 8 GiB gfx1102: the 128 experts of each MoE layer at 4 bits (the
+# moe_gemm_w4a8 form, i4 with bf16 scales per 128 of K, ~3.6 GiB over 23 layers), everything
+# else bf16 (dense layer 0, the KDA and MLA projections, the shared expert, embed and output:
+# ~1.7 GiB). The source is the IQ4_NL GGUF; libquant's ggml port decodes it for the re-quant.
+blk.*.ffn_gate_up_exps.*.weight rtn codes=i4 group=128 scale=bf16
+blk.*.ffn_down_exps.*.weight    rtn codes=i4 group=128 scale=bf16
+# The shared blocks declare their gains and router correction as f32 planes (A_log and
+# dt_bias ship f32 in the checkpoint), so they keep the f32 form the plugin reads; the
+# catch-all below takes only what is left.
+blk.*.attn_norm.weight          cast dtype=f32
+blk.*.attn_q_a_norm.weight        cast dtype=f32
+blk.*.attn_kv_a_norm.weight       cast dtype=f32
+blk.*.ffn_norm.weight           cast dtype=f32
+blk.*.ssm_norm.weight           cast dtype=f32
+blk.*.ssm_a                     cast dtype=f32
+blk.*.ssm_dt_bias               cast dtype=f32
+blk.*.glm_router.weight         cast dtype=f32
+blk.*.glm_router.correction     cast dtype=f32
+output_norm.weight              cast dtype=f32
+* cast dtype=bf16

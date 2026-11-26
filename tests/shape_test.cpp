@@ -9,6 +9,8 @@ using namespace sched_fake;
 #include "gen/shape_driver.h"
 #include "rad_plugin.h"
 
+#include <random>
+#include "util/simd.h"
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -459,6 +461,292 @@ TEST(a_field_without_a_surface_ends_after_its_first_level) {
     gen::ShapeMesh m;
     gen::shape_mesh(t->take_field(&res), res, 1.0, 0.0, &m);
     CHECK(m.f.empty());
+}
+
+/* ================================================================== bitmap kernels vs per point */
+/* The per-point forms shape_refine and shape_mesh had before they classified rows with
+ * simd::level_bits_f32, with the case table they were built on, kept as the reference the
+ * bitmap forms must match exactly. */
+namespace {
+
+/* A 3 x 3 x 3 dilation of an n^3 mask (zero outside), as separable maxima along each axis. */
+void ref_dilate(std::vector<uint8_t>& m, int64_t n) {
+    std::vector<uint8_t> t(m.size());
+    /* One axis: each voxel ORs its two neighbours along it, where they exist. Along the
+     * contiguous axis a line of n voxels at a time; along the others whole rows of `stride`
+     * voxels, each with the rows either side of it. */
+    auto pass = [&](const std::vector<uint8_t>& src, std::vector<uint8_t>& dst, int64_t stride) {
+        const uint8_t* s = src.data();
+        uint8_t* d = dst.data();
+        const int64_t total = (int64_t)src.size(), plane = n * stride;
+        for (int64_t base = 0; base < total; base += plane) {
+            if (stride == 1) {
+                simd::or_adjacent_u8(d + base, s + base, (size_t)n);
+                continue;
+            }
+            for (int64_t c = 0; c < n; ++c) {
+                const uint8_t* a = s + base + c * stride;
+                simd::or3_u8(d + base + c * stride, a, c > 0 ? a - stride : nullptr,
+                             c + 1 < n ? a + stride : nullptr, (size_t)stride);
+            }
+        }
+    };
+    pass(m, t, 1);
+    pass(t, m, n);
+    pass(m, t, n * n);
+    m.swap(t);
+}
+
+
+std::vector<uint32_t> ref_refine(const std::vector<float>& prev, int32_t rp, int32_t r,
+                                   double level, bool last) {
+    const int64_t np = (int64_t)rp + 1, n = (int64_t)r + 1;
+    std::vector<uint8_t> near((size_t)(np * np * np), 0);
+    auto sgn = [](float v) { return (v > 0.0f) - (v < 0.0f); };
+    const float lv = (float)level;
+    for (int64_t i = 0; i < np; ++i)
+        for (int64_t j = 0; j < np; ++j)
+            for (int64_t k = 0; k < np; ++k) {
+                const int64_t p = (i * np + j) * np + k;
+                const float raw = prev[(size_t)p];
+                if (std::isnan(raw)) continue;
+                const float v = raw - lv;
+                const int s = sgn(v);
+                bool cross = std::fabs(v) < 0.95f;
+                const int64_t nb[6][3] = { { i - 1, j, k }, { i + 1, j, k }, { i, j - 1, k },
+                                           { i, j + 1, k }, { i, j, k - 1 }, { i, j, k + 1 } };
+                for (int q = 0; q < 6 && !cross; ++q) {
+                    const int64_t a = nb[q][0], b = nb[q][1], c = nb[q][2];
+                    /* Outside the grid the reference replicates the border, and a neighbour not
+                     * sampled stands in as the point itself: neither crosses. */
+                    if (a < 0 || a >= np || b < 0 || b >= np || c < 0 || c >= np) continue;
+                    const float u = prev[(size_t)((a * np + b) * np + c)];
+                    if (std::isnan(u)) continue;
+                    cross = sgn(u - lv) != s;
+                }
+                near[(size_t)p] = cross;
+            }
+    if (!last) ref_dilate(near, np);
+    std::vector<uint8_t> mark((size_t)(n * n * n), 0);
+    auto up = [&](int64_t c) { return (c * r + rp / 2) / rp; };
+    for (int64_t i = 0; i < np; ++i)
+        for (int64_t j = 0; j < np; ++j)
+            for (int64_t k = 0; k < np; ++k)
+                if (near[(size_t)((i * np + j) * np + k)])
+                    mark[(size_t)((up(i) * n + up(j)) * n + up(k))] = 1;
+    ref_dilate(mark, n);
+    if (last) ref_dilate(mark, n);
+    std::vector<uint32_t> pts;
+    for (int64_t p = 0; p < (int64_t)mark.size(); ++p)
+        if (mark[(size_t)p]) pts.push_back((uint32_t)p);
+    return pts;
+}
+
+
+/* Corner c of a cube is at (c & 1, c >> 1 & 1, c >> 2 & 1) along the grid's (i, j, k). Edge e is
+ * along axis e / 4 from corner kEdge[e][0] to kEdge[e][1]. */
+struct McRef {
+    int32_t edge[12][2];
+    /* Each case's triangles as edge triples, -1 ended. */
+    int8_t  tri[256][31];
+};
+
+McRef build_ref_tables() {
+    McRef T{};
+    int ne = 0;
+    for (int a = 0; a < 3; ++a)
+        for (int c = 0; c < 8; ++c)
+            if (!(c >> a & 1)) { T.edge[ne][0] = c; T.edge[ne][1] = c | (1 << a); ++ne; }
+    auto edge_of = [&](int c0, int c1) {
+        for (int e = 0; e < 12; ++e)
+            if ((T.edge[e][0] == c0 && T.edge[e][1] == c1) ||
+                (T.edge[e][0] == c1 && T.edge[e][1] == c0))
+                return e;
+        return -1;
+    };
+    auto pos = [](int c, double* p) { p[0] = c & 1; p[1] = c >> 1 & 1; p[2] = c >> 2 & 1; };
+    for (int m = 0; m < 256; ++m) {
+        for (int i = 0; i < 31; ++i) T.tri[m][i] = -1;
+        if (m == 0 || m == 255) continue;
+        auto in = [&](int c) { return (m >> c & 1) != 0; };
+        /* Each face's segments between its crossing edges. A face with all four edges crossing
+         * (its inside corners diagonal) separates the inside corners, the rule both cubes that
+         * share the face apply, so the surface has no cracks. */
+        std::vector<std::array<int, 2>> seg;
+        for (int a = 0; a < 3; ++a)
+            for (int s = 0; s < 2; ++s) {
+                const int u = (a + 1) % 3, v = (a + 2) % 3;
+                const int base = s << a;
+                const int cyc[4] = { base, base | (1 << u), base | (1 << u) | (1 << v),
+                                     base | (1 << v) };
+                int fe[4];
+                bool cr[4];
+                int ncr = 0;
+                for (int q = 0; q < 4; ++q) {
+                    fe[q] = edge_of(cyc[q], cyc[(q + 1) % 4]);
+                    cr[q] = in(cyc[q]) != in(cyc[(q + 1) % 4]);
+                    ncr += cr[q];
+                }
+                if (ncr == 2) {
+                    int a0 = -1, a1 = -1;
+                    for (int q = 0; q < 4; ++q) {
+                        if (!cr[q]) continue;
+                        if (a0 < 0) a0 = fe[q]; else a1 = fe[q];
+                    }
+                    seg.push_back({ a0, a1 });
+                } else if (ncr == 4) {
+                    for (int q = 0; q < 4; ++q)
+                        if (in(cyc[q])) seg.push_back({ fe[(q + 3) % 4], fe[q] });
+                }
+            }
+        /* The segments close into loops; each crossing edge is in exactly two. */
+        std::vector<bool> used(seg.size(), false);
+        int nt = 0;
+        for (size_t s0 = 0; s0 < seg.size(); ++s0) {
+            if (used[s0]) continue;
+            std::vector<int> loop = { seg[s0][0], seg[s0][1] };
+            used[s0] = true;
+            for (bool grew = true; grew;) {
+                grew = false;
+                for (size_t q = 0; q < seg.size(); ++q) {
+                    if (used[q]) continue;
+                    const int tail = loop.back();
+                    int nx = -1;
+                    if (seg[q][0] == tail) nx = seg[q][1];
+                    else if (seg[q][1] == tail) nx = seg[q][0];
+                    if (nx < 0) continue;
+                    used[q] = true;
+                    grew = true;
+                    if (nx != loop.front()) loop.push_back(nx);
+                }
+            }
+            /* Orientation: the loop's normal (Newell's, over the edges' midpoints) points from the
+             * inside corners to the outside ones. */
+            double nrm[3] = { 0, 0, 0 }, out[3] = { 0, 0, 0 };
+            std::vector<std::array<double, 3>> mid;
+            for (int e : loop) {
+                double p0[3], p1[3];
+                pos(T.edge[e][0], p0);
+                pos(T.edge[e][1], p1);
+                mid.push_back({ (p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2, (p0[2] + p1[2]) / 2 });
+                const double sg = in(T.edge[e][0]) ? 1.0 : -1.0;
+                for (int d = 0; d < 3; ++d) out[d] += sg * (p1[d] - p0[d]);
+            }
+            for (size_t q = 0; q < mid.size(); ++q) {
+                const auto& c = mid[q];
+                const auto& d = mid[(q + 1) % mid.size()];
+                nrm[0] += (c[1] - d[1]) * (c[2] + d[2]);
+                nrm[1] += (c[2] - d[2]) * (c[0] + d[0]);
+                nrm[2] += (c[0] - d[0]) * (c[1] + d[1]);
+            }
+            if (nrm[0] * out[0] + nrm[1] * out[1] + nrm[2] * out[2] < 0)
+                std::reverse(loop.begin(), loop.end());
+            for (size_t q = 1; q + 1 < loop.size() && nt < 10; ++q) {
+                T.tri[m][3 * nt] = (int8_t)loop[0];
+                T.tri[m][3 * nt + 1] = (int8_t)loop[q];
+                T.tri[m][3 * nt + 2] = (int8_t)loop[q + 1];
+                ++nt;
+            }
+        }
+    }
+    return T;
+}
+
+const McRef& mc_ref() {
+    static const McRef t = build_ref_tables();
+    return t;
+}
+
+void ref_mesh(const std::vector<float>& field, int32_t r, double bounds, double level,
+                gen::ShapeMesh* out) {
+    out->v.clear();
+    out->f.clear();
+    const McRef& T = mc_ref();
+    const int64_t n = (int64_t)r + 1, nn = n * n;
+    const float lv = (float)level;
+    const double sc = 2.0 * bounds / (double)n;
+    /* An edge's vertex by its first grid point: the x edges between planes i and i + 1, and the
+     * y and z edges of planes i and i + 1. */
+    std::vector<int32_t> ex((size_t)nn), ey[2], ez[2];
+    for (int p = 0; p < 2; ++p) { ey[p].assign((size_t)nn, -1); ez[p].assign((size_t)nn, -1); }
+    auto value = [&](int64_t i, int64_t j, int64_t k) {
+        return field[(size_t)((i * n + j) * n + k)];
+    };
+    for (int64_t i = 0; i + 1 < n; ++i) {
+        std::fill(ex.begin(), ex.end(), -1);
+        if (i > 0) {
+            std::swap(ey[0], ey[1]);
+            std::swap(ez[0], ez[1]);
+            std::fill(ey[1].begin(), ey[1].end(), -1);
+            std::fill(ez[1].begin(), ez[1].end(), -1);
+        }
+        for (int64_t j = 0; j + 1 < n; ++j)
+            for (int64_t k = 0; k + 1 < n; ++k) {
+                float v[8];
+                bool skip = false;
+                int m = 0;
+                for (int c = 0; c < 8 && !skip; ++c) {
+                    v[c] = value(i + (c & 1), j + (c >> 1 & 1), k + (c >> 2 & 1));
+                    if (std::isnan(v[c])) skip = true;
+                    else if (v[c] > lv) m |= 1 << c;
+                }
+                if (skip || m == 0 || m == 255) continue;
+                for (int t = 0; t < 30 && T.tri[m][t] >= 0; ++t) {
+                    const int e = T.tri[m][t];
+                    const int c0 = T.edge[e][0], c1 = T.edge[e][1], a = e / 4;
+                    const int64_t bi = c0 & 1, bj = c0 >> 1 & 1, bk = c0 >> 2 & 1;
+                    int32_t* slot = a == 0 ? &ex[(size_t)((j + bj) * n + k + bk)]
+                                  : a == 1 ? &ey[bi][(size_t)(j * n + k + bk)]
+                                           : &ez[bi][(size_t)((j + bj) * n + k)];
+                    if (*slot < 0) {
+                        const float t0 = v[c0], t1 = v[c1];
+                        const float f = t1 != t0 ? (lv - t0) / (t1 - t0) : 0.5f;
+                        float g[3] = { (float)(i + bi), (float)(j + bj), (float)(k + bk) };
+                        g[a] += f;
+                        *slot = (int32_t)(out->v.size() / 3);
+                        for (int d = 0; d < 3; ++d) out->v.push_back((float)(g[d] * sc - bounds));
+                    }
+                    out->f.push_back((uint32_t)*slot);
+                }
+            }
+    }
+}
+
+
+/* A field with NaNs, values exactly at the level, and a surface crossing everywhere. */
+std::vector<float> rough_field(int64_t n, std::mt19937& rng) {
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    std::vector<float> f((size_t)(n * n * n));
+    for (auto& x : f) {
+        const float y = u(rng);
+        x = y > 0.97f ? std::nanf("") : y > 0.9f ? 0.0f : y * 1.5f;
+    }
+    return f;
+}
+
+}  /* namespace */
+
+TEST(shape_mesh_and_refine_match_the_per_point_forms_at_every_simd_level) {
+    std::mt19937 rng(20261107);
+    const int top = simd::detect_level();
+    for (int lvl = 0; lvl <= top; ++lvl) {
+        simd::force_level(lvl);
+        for (int32_t r : { 1, 2, 5, 31, 62, 63, 64, 65, 66, 90 }) {
+            const int64_t n = (int64_t)r + 1;
+            const std::vector<float> f = rough_field(n, rng);
+            gen::ShapeMesh got, want;
+            gen::shape_mesh(f, r, 1.0, 0.0, &got);
+            ref_mesh(f, r, 1.0, 0.0, &want);
+            CHECK(got.f == want.f);
+            CHECK(got.v == want.v);
+            for (bool last : { false, true }) {
+                const int32_t rf = r * 2;
+                CHECK(gen::shape_refine(f, r, rf, 0.0, last) == ref_refine(f, r, rf, 0.0, last));
+                CHECK(gen::shape_refine(f, r, rf, 0.3, last) == ref_refine(f, r, rf, 0.3, last));
+            }
+        }
+    }
+    simd::force_level(top);
 }
 
 RAD_TEST_MAIN()

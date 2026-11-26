@@ -1,24 +1,52 @@
-/* bailing_hybrid -- Ling-3.0-flash and its fine-tunes (`model_type: bailing_hybrid`,
- * BailingMoeV3ForCausalLM), from the bf16 checkpoint, the routed experts as a recipe stores them
- * (data/recipes/ling3-w4a8-rtn.recipe, ling3-w4a8-gptq.recipe).
+/* bailing_hybrid -- Ling-3.0-flash, Ling-3.0-tiny and their fine-tunes (`model_type:
+ * bailing_hybrid`, BailingMoeV3ForCausalLM), from the bf16 checkpoint, the routed experts as a
+ * recipe stores them (data/recipes/ling3-w4a8-rtn.recipe, ling3-w4a8-gptq.recipe), an IQ8R trunk
+ * with rotated int8 experts (data/recipes/ling-3.0-tiny-iq8r.recipe; below), and the tiny
+ * family's GGUF releases (arch/bailing_hybrid_gguf and kin: IQ4_NL, Q8_0, Q4_K_M, Q5_K_M, Q6_K,
+ * the iq4 release's codes through data/recipes/ling-3.0-tiny-iq4.recipe).
  *
  * ============================== WHAT IT SERVES ==============================
  *
- *   layers        42 in groups of six: five Kimi delta attention (KDA) layers, then one dense
- *                 latent attention (MLA) layer, so layers 5, 11, ..., 41 are MLA
- *   KDA           32 heads of 128, separate q/k/v projections each with its own causal
- *                 convolution, a full-rank per-channel forget gate (`f_proj`) and output gate
- *                 (`g_proj`), lower bound -5
- *   MLA           no query LoRA, a 512-wide latent and a 64-wide rotary part (interleaved pairs),
- *                 heads of 128 + 64, values of 128, a sigmoid gate per head
- *   feed-forward  layers 0-1 dense (6144); from layer 2, 512 experts of 768 at top-8 under
- *                 group-limited sigmoid routing (8 groups, 4 kept, a correction bias, x2.5), an
- *                 ungated shared expert, and a SwiGLU clipped after the SiLU in the last layers
- *                 (`expert_swiglu_limit_list`, `share_expert_swiglu_limit_list`, as vLLM and
- *                 SGLang serve it; HF's reference ignores it)
+ *   layers        flash: 42 in groups of six -- five Kimi delta attention (KDA) layers, then one
+ *                 dense latent attention (MLA) layer, so layers 5, 11, ..., 41 are MLA.
+ *                 tiny: 24 in groups of four, MLA at 3, 7, ..., 23.
+ *   KDA           flash: 32 heads of 128; tiny: 16. Separate q/k/v projections each with its own
+ *                 causal convolution, a full-rank per-channel forget gate (`f_proj`) and output
+ *                 gate (`g_proj`), lower bound -5
+ *   MLA           a 512-wide latent and a 64-wide rotary part (interleaved pairs), heads of
+ *                 128 + 64, values of 128, a sigmoid gate per head. flash has no query LoRA;
+ *                 tiny projects through one: q_a and its norm feed q_b, whose rows serve the
+ *                 two query parts.
+ *   feed-forward  flash: layers 0-1 dense (6144); from layer 2, 512 experts of 768 at top-8.
+ *                 tiny: layer 0 dense (4608); from layer 1, 128 experts of 512 at top-8. Both
+ *                 under group-limited sigmoid routing (8 groups, 4 kept, a correction bias,
+ *                 x2.5), an ungated shared expert, and a SwiGLU clipped after the SiLU in the
+ *                 last layers (`expert_swiglu_limit_list`, `share_expert_swiglu_limit_list`, as
+ *                 vLLM and SGLang serve it; HF's reference ignores it)
  *
  * The KDA core is GLM-5.3's (KdaState), the router GLM-5.3's with groups (GlmRouter), the
  * feed-forward MoeFP8. The KDA and MLA blocks around them are in this file.
+ *
+ * ============================== THE TRUNK'S FORM ==============================
+ *
+ * Read from layer 0's fused q|k|v before any activation buffer is declared. Two forms:
+ *
+ *   - a rotated int8 trunk (data/recipes/ling-3.0-tiny-iq8r.recipe: IQ8R, int8 codes rotated by
+ *     a 128-wide Hadamard under a u8 scale a (row, 256 of K) and a bf16 one a row): the block
+ *     norms write rmsnorm_had_quant_i8g's codes at the trunk's group, read by every KDA
+ *     projection, the shared expert's gate/up and the routed gate/up; the KDA core's gated norm
+ *     and the MLA's expanded values are quantised by had_quant_act_i8g for their out projections;
+ *     the dense and shared gated products write gated_had_quant_i8g's codes (the shared one at
+ *     the group its own down weight is stored at), and the routed arm is int8 at one scale a 128
+ *     (MoeFP8::a8), so the rotated int8 experts read those codes at i8a8h. Where no loaded
+ *     library serves the rotating norm, each linear quantises the norm's bf16 output itself and
+ *     the routed experts read a rotated copy written once a layer. The linears the recipe keeps
+ *     bf16 (the KDA beta, the MLA's low-rank q and kv and its head gate) read the norm's bf16
+ *     output in either case. A clamped SwiGLU (flash's last layers) writes the bf16 product,
+ *     which had_quant_act_i8g quantises: one launch more than the unclamped gated product.
+ *   - any other (bf16, the four-bit experts of ling3-w4a8-rtn and ling-3.0-tiny-iq4, the GGUF
+ *     releases): the norms write E4M3 codes, each linear reads the bf16 plane or quantises it
+ *     itself, and four-bit experts read the E4M3 pair (rotated ones a rotated copy of it).
  *
  * ============================== THE LATENT ATTENTION ==============================
  *
@@ -55,10 +83,19 @@ using namespace rad::arch;
 struct Shape {
     int64_t n_embd = 0, n_layer = 0, heads = 0, head_dim = 0, nope = 0, rope = 0, v_dim = 0,
             latent = 0, experts = 0, top_k = 0, groups = 0, topk_groups = 0, ff_exp = 0,
-            ff_shared = 0, ff_dense = 0, dense_layers = 0, group_size = 0, conv = 0;
+            ff_shared = 0, ff_dense = 0, dense_layers = 0, group_size = 0, conv = 0, q_lora = 0;
     double lower = -5, route_scale = 1;
+    bool gguf = false;   /* the checkpoint spells its tensors blk. and ssm. names (the release GGUF) */
     std::vector<double> lim_exp, lim_shared;
 };
+
+/* A projection's checkpoint name: config.json's spelling under the layer prefix `pre`
+ * (`model.layers.%d.attention`) for the safetensors, the blk./ssm. spelling with the layer as %d
+ * for the release GGUF. */
+static const char* ck_name(Names& nm, const Shape& sh, int l, const char* pre, const char* hf,
+                           const char* gg) {
+    return sh.gguf ? nm.ckpt(gg, l) : nm.ckpt(hf, pre);
+}
 
 /* A KDA layer: the q/k/v, beta, forget and output-gate projections into KdaState, then o_proj and
  * its all-reduce. */
@@ -76,40 +113,63 @@ struct LingKda {
     QuantFP8 out_quant{};
     rad_op op_ar = 0;
 
+    /* Maps layer l's fused q|k|v and reads its stored form (LinearFP8::probe); declare() then does
+     * not map it again. The model learns from it whether the trunk is rotated int8 before it
+     * declares any activation buffer. */
+    int probe_qkv(RadBuilder* b, Names& nm, const Geom& geom, const Shape& sh, int l,
+                  const char* pre) {
+        return qkv.probe(b, nm, geom, nm.f("blk.%d.attn_qkv", l),
+                         { ck_name(nm, sh, l, pre, "%s.q_proj.weight", "blk.%d.attn_q.weight"),
+                           ck_name(nm, sh, l, pre, "%s.k_proj.weight", "blk.%d.attn_k.weight"),
+                           ck_name(nm, sh, l, pre, "%s.v_proj.weight", "blk.%d.attn_v.weight") });
+    }
+
     int declare(RadBuilder* b, Names& nm, const Geom& geom, const Shape& sh, int l,
                 const Wire& wire, const char* pre, rad_kvgroup state, rad_kvgroup history) {
         g = geom;
         w = wire;
         const int64_t heads = sh.heads / g.world, width = heads * sh.head_dim;
         const auto grp = grp_layer(l);
+        /* One name a projection, the checkpoint's spelling (ck_name). */
+        auto ck = [&](const char* hf, const char* gg) -> const char* {
+            return ck_name(nm, sh, l, pre, hf, gg);
+        };
         RAD_ARCH_TRY(qkv.declare(b, nm, g, nm.f("blk.%d.attn_qkv", l), 3 * width, g.n_embd,
                                  RAD_SHARD_ROW, grp,
-                                 { nm.ckpt("%s.q_proj.weight", pre), nm.ckpt("%s.k_proj.weight", pre),
-                                   nm.ckpt("%s.v_proj.weight", pre) },
+                                 { ck("%s.q_proj.weight", "blk.%d.attn_q.weight"),
+                                   ck("%s.k_proj.weight", "blk.%d.attn_k.weight"),
+                                   ck("%s.v_proj.weight", "blk.%d.attn_v.weight") },
                                  w.input, w.core.qkv, 0, { width, width, width }));
         RAD_ARCH_TRY(beta.declare(b, nm, g, nm.f("blk.%d.attn_beta", l), heads, g.n_embd,
-                                  RAD_SHARD_ROW, grp, { nm.ckpt("%s.b_proj.weight", pre) },
+                                  RAD_SHARD_ROW, grp, { ck("%s.b_proj.weight", "blk.%d.ssm_beta.weight") },
                                   w.input, w.core.beta));
         RAD_ARCH_TRY(forget.declare(b, nm, g, nm.f("blk.%d.attn_forget", l), width, g.n_embd,
-                                    RAD_SHARD_ROW, grp, { nm.ckpt("%s.f_proj.weight", pre) },
+                                    RAD_SHARD_ROW, grp, { ck("%s.f_proj.weight", "blk.%d.ssm_f_a.weight") },
                                     w.input, w.core.a));
         RAD_ARCH_TRY(gate.declare(b, nm, g, nm.f("blk.%d.attn_gate", l), width, g.n_embd,
-                                  RAD_SHARD_ROW, grp, { nm.ckpt("%s.g_proj.weight", pre) },
+                                  RAD_SHARD_ROW, grp, { ck("%s.g_proj.weight", "blk.%d.ssm_g_a.weight") },
                                   w.input, w.core.gate));
         KdaState::Config kc;
         kc.heads = heads;
         kc.dim = sh.head_dim;
         kc.width = sh.conv;
         kc.lower = sh.lower;
-        KdaState::Src ks{ nm.ckpt("%s.q_conv1d.weight", pre), nm.ckpt("%s.k_conv1d.weight", pre),
-                          nm.ckpt("%s.v_conv1d.weight", pre), nm.ckpt("%s.A_log", pre),
-                          nm.ckpt("%s.dt_bias", pre),         nm.ckpt("%s.o_norm.weight", pre) };
+        KdaState::Src ks{ ck("%s.q_conv1d.weight", "blk.%d.ssm_conv1d_q.weight"),
+                          ck("%s.k_conv1d.weight", "blk.%d.ssm_conv1d_k.weight"),
+                          ck("%s.v_conv1d.weight", "blk.%d.ssm_conv1d_v.weight"),
+                          ck("%s.A_log", "blk.%d.ssm_a_raw"),
+                          ck("%s.dt_bias", "blk.%d.ssm_dt.bias"),
+                          ck("%s.o_norm.weight", "blk.%d.ssm_norm.weight") };
         RAD_ARCH_TRY(core.declare(b, nm, g, l, state, history, kc, w.core, ks));
         const char* on = nm.f("blk.%d.attn_output", l);
-        RAD_ARCH_TRY(output.probe(b, nm, g, on, { nm.ckpt("%s.o_proj.weight", pre) }));
-        if (!output.reads_x) RAD_ARCH_TRY(out_quant.declare(b, g, w.core_out, width));
+        RAD_ARCH_TRY(output.probe(b, nm, g, on, { ck("%s.o_proj.weight", "blk.%d.attn_output.weight") }));
+        /* The out projection's input codes: on a rotated int8 trunk (ActFP8::q8_fed) an int8 out
+         * projection reads had_quant_act_i8g's, written here; otherwise a quantiser runs only for
+         * a weight that does not read the bf16 plane. */
+        if (w.core_out.q8_fed ? output.probed_i8 : !output.reads_x)
+            RAD_ARCH_TRY(out_quant.declare(b, g, w.core_out, width));
         RAD_ARCH_TRY(output.declare(b, nm, g, on, g.n_embd, width, RAD_SHARD_COL, grp,
-                                    { nm.ckpt("%s.o_proj.weight", pre) }, w.core_out, w.out));
+                                    { ck("%s.o_proj.weight", "blk.%d.attn_output.weight") }, w.core_out, w.out));
         op_ar = GlmTp::reduce(b, g, w.out);
         return g.world > 1 && !op_ar ? RAD_E_INVAL : RAD_OK;
     }
@@ -131,6 +191,8 @@ struct LingKda {
 struct LingMla {
     struct Wire {
         ActFP8 input{};
+        ActFP8 qa{};          /* [T, q_lora], the tiny query LoRA's normed latent (the trunk's,
+                                   projected through q_a, for the parts' GEMMs) */
         rad_buf q_rope = 0;   /* [T, heads * rope] */
         rad_buf q_nope = 0;   /* [T, heads * nope] */
         rad_buf row = 0;      /* [T, latent + rope], the cache row */
@@ -146,11 +208,11 @@ struct LingMla {
     int layer = 0;
     int64_t heads = 0, qw = 0, cw = 0;
     rad_kvgroup kv = 0;
-    LinearFP8 q_rope_proj{}, q_nope_proj{}, kv_a{}, g_proj{}, output{};
-    QuantFP8 value_quant{};
-    rad_weight kv_gain = 0, kv_b = 0;
-    rad_op op_kv_norm = 0, op_q_rope = 0, op_k_rope = 0, op_store = 0, op_absorb = 0, op_attn = 0,
-           op_expand = 0, op_ar = 0;
+    LinearFP8 q_a_proj{}, q_rope_proj{}, q_nope_proj{}, kv_a{}, g_proj{}, output{};
+    QuantFP8 value_quant{}, qa_quant{};
+    rad_weight kv_gain = 0, qa_gain = 0, kv_b = 0;
+    rad_op op_qa_norm = 0, op_kv_norm = 0, op_q_rope = 0, op_k_rope = 0, op_store = 0,
+           op_absorb = 0, op_attn = 0, op_expand = 0, op_ar = 0;
     int64_t block = 0;
 
     static constexpr int64_t kBlock = 16;
@@ -169,7 +231,17 @@ struct LingMla {
         RAD_ARCH_TRY(rad_bind_layer_kv(b, l, kv));
         /* One row map a part, a piece a head: [h * (nope + rope) + off, + width). Successive ROWS
          * maps for one name extend it in call order (rad_builder.h), eight pieces a map. */
-        const char* qsrc = nm.ckpt("%s.q_proj.weight", pre);
+        /* flash projects the query from the trunk; tiny runs it through a LoRA first (q_a, its
+         * norm, then q_b), and the parts' rows come off q_b against the normed latent. */
+        const int64_t qk = s.q_lora ? s.q_lora : g.n_embd;
+        const ActFP8& qin = s.q_lora ? w.qa : w.input;
+        auto ck = [&](const char* hf, const char* gg) -> const char* {
+            /* The safetensors names are the layer prefix plus the projection (`pre`, `model.layers.%d`);
+             * the release GGUF spells them blk./ssm. with the layer as %d. */
+            return s.gguf ? nm.ckpt(gg, l) : nm.ckpt(hf, pre);
+        };
+        const char* qsrc = s.q_lora ? ck("%s.q_b_proj.weight", "blk.%d.attn_q_b.weight")
+                                    : ck("%s.q_proj.weight", "blk.%d.attn_q.weight");
         auto part = [&](const char* name, int64_t off, int64_t width) -> int {
             for (int64_t h0 = 0; h0 < s.heads; h0 += 8) {
                 RadNameMap m = map_base(name, RAD_MAP_ROWS);
@@ -183,18 +255,49 @@ struct LingMla {
             }
             return RAD_OK;
         };
-        RAD_ARCH_TRY(part(nm.f("blk.%d.attn_q_rope.weight", l), s.nope, s.rope));
-        RAD_ARCH_TRY(part(nm.f("blk.%d.attn_q_nope.weight", l), 0, s.nope));
+        if (s.gguf) {
+            /* The reader split the quantised q_b into plain blocks a row map cannot see. */
+            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_q_rope.weight", l),
+                                  nm.ckpt("blk.%d.attn_q_b_rope.weight", l)));
+            RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.attn_q_nope.weight", l),
+                                  nm.ckpt("blk.%d.attn_q_b_nope.weight", l)));
+        } else {
+            RAD_ARCH_TRY(part(nm.f("blk.%d.attn_q_rope.weight", l), s.nope, s.rope));
+            RAD_ARCH_TRY(part(nm.f("blk.%d.attn_q_nope.weight", l), 0, s.nope));
+        }
+        if (s.q_lora) {
+            RAD_ARCH_TRY(q_a_proj.declare(b, nm, g, nm.f("blk.%d.attn_q_a", l), s.q_lora, g.n_embd,
+                                          RAD_SHARD_NONE, grp,
+                                          { ck("%s.q_a_proj.weight", "blk.%d.attn_q_a.weight") }, w.input, w.qa.x));
+            const char* an = nm.f("blk.%d.attn_q_a_norm.weight", l);
+            RAD_ARCH_TRY(map_copy(b, an, ck("%s.q_a_layernorm.weight", "blk.%d.attn_q_a_norm.weight")));
+            qa_gain = decl_w(b, an, RAD_F32, { s.q_lora }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
+                             grp);
+            if (!qa_gain) return RAD_E_INVAL;
+            op_qa_norm = rw(b,
+                            RAD_OP(b, "rmsnorm",
+                                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", s.q_lora),
+                                              RAD_F64("eps", g.eps), RAD_STR("dtype", "bf16")),
+                                   RAD_WEIGHTS(qa_gain)),
+                            { w.qa.x }, { w.qa.x });
+            if (!op_qa_norm) return RAD_E_INVAL;
+        }
         q_rope_proj.mapped = q_nope_proj.mapped = true;
         RAD_ARCH_TRY(q_rope_proj.declare(b, nm, g, nm.f("blk.%d.attn_q_rope", l), heads * s.rope,
-                                         g.n_embd, RAD_SHARD_ROW, grp, { qsrc }, w.input, w.q_rope));
+                                         qk, RAD_SHARD_ROW, grp, { qsrc }, qin, w.q_rope));
         RAD_ARCH_TRY(q_nope_proj.declare(b, nm, g, nm.f("blk.%d.attn_q_nope", l), heads * s.nope,
-                                         g.n_embd, RAD_SHARD_ROW, grp, { qsrc }, w.input, w.q_nope));
+                                         qk, RAD_SHARD_ROW, grp, { qsrc }, qin, w.q_nope));
+        /* On a rotated int8 trunk the LoRA's latent carries an int8 pair that a part stored int8
+         * quantises itself (LinearFP8's own had_quant_act_i8g) and no E4M3 pair, so no quantiser
+         * runs here. */
+        if (s.q_lora && !q_nope_proj.reads_x && !w.qa.q8)
+            RAD_ARCH_TRY(qa_quant.declare(b, g, w.qa, s.q_lora));
         RAD_ARCH_TRY(kv_a.declare(b, nm, g, nm.f("blk.%d.attn_kv_a", l), cw, g.n_embd,
-                                  RAD_SHARD_NONE, grp, { nm.ckpt("%s.kv_a_proj_with_mqa.weight", pre) },
+                                  RAD_SHARD_NONE, grp,
+                                  { ck("%s.kv_a_proj_with_mqa.weight", "blk.%d.attn_kv_a_mqa.weight") },
                                   w.input, w.row));
         const char* kn = nm.f("blk.%d.attn_kv_a_norm.weight", l);
-        RAD_ARCH_TRY(map_copy(b, kn, nm.ckpt("%s.kv_a_layernorm.weight", pre)));
+        RAD_ARCH_TRY(map_copy(b, kn, ck("%s.kv_a_layernorm.weight", "blk.%d.attn_kv_a_norm.weight")));
         kv_gain = decl_w(b, kn, RAD_F32, { s.latent }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
         if (!kv_gain) return RAD_E_INVAL;
         op_kv_norm = rw(b,
@@ -217,7 +320,8 @@ struct LingMla {
                              RAD_NOWEIGHTS),
                       { w.row }, {});
         const char* bn = nm.f("blk.%d.attn_kv_b.weight", l);
-        RAD_ARCH_TRY(map_copy(b, bn, nm.ckpt("%s.kv_b_proj.weight", pre)));
+        /* The GGUF keeps k_b and v_b head-last; the reader fuses them into this name. */
+        RAD_ARCH_TRY(map_copy(b, bn, ck("%s.kv_b_proj.weight", "blk.%d.attn_kv_b.weight")));
         kv_b = decl_w(b, bn, RAD_BF16, { heads * (s.nope + s.v_dim), s.latent }, RAD_ACCESS_PER_TOKEN,
                       RAD_SHARD_ROW, grp);
         if (!op_kv_norm || !op_q_rope || !op_k_rope || !op_store || !kv_b) return RAD_E_INVAL;
@@ -229,7 +333,8 @@ struct LingMla {
                               RAD_WEIGHTS(kv_b)),
                        { w.q_nope }, { w.q_lat });
         RAD_ARCH_TRY(g_proj.declare(b, nm, g, nm.f("blk.%d.attn_head_gate", l), heads, g.n_embd,
-                                    RAD_SHARD_ROW, grp, { nm.ckpt("%s.g_proj.weight", pre) },
+                                    RAD_SHARD_ROW, grp,
+                                    { ck("%s.g_proj.weight", "blk.%d.attn_gate.weight") },
                                     w.input, w.gate));
         op_attn = rw(b,
                      RAD_OP(b, "mla_attn_paged",
@@ -255,10 +360,12 @@ struct LingMla {
             return RAD_E_INVAL;
         }
         const char* on = nm.f("blk.%d.attn_output", l);
-        RAD_ARCH_TRY(output.probe(b, nm, g, on, { nm.ckpt("%s.dense.weight", pre) }));
-        if (!output.reads_x) RAD_ARCH_TRY(value_quant.declare(b, g, w.value, heads * s.v_dim));
+        RAD_ARCH_TRY(output.probe(b, nm, g, on, { ck("%s.dense.weight", "blk.%d.attn_output.weight") }));
+        /* As the KDA out projection's input (LingKda::declare). */
+        if (w.value.q8_fed ? output.probed_i8 : !output.reads_x)
+            RAD_ARCH_TRY(value_quant.declare(b, g, w.value, heads * s.v_dim));
         RAD_ARCH_TRY(output.declare(b, nm, g, on, g.n_embd, heads * s.v_dim, RAD_SHARD_COL, grp,
-                                    { nm.ckpt("%s.dense.weight", pre) }, w.value, w.out));
+                                    { ck("%s.dense.weight", "blk.%d.attn_output.weight") }, w.value, w.out));
         op_ar = GlmTp::reduce(b, g, w.out);
         return g.world > 1 && !op_ar ? RAD_E_INVAL : RAD_OK;
     }
@@ -271,8 +378,14 @@ struct LingMla {
         }
         const int64_t T = batch->n_tok, S = batch->n_seq;
         const RadOperand pos = praw(batch->positions, RAD_I32, T);
-        q_rope_proj.step(c, w.input, w.q_rope, T);
-        q_nope_proj.step(c, w.input, w.q_nope, T);
+        const ActFP8& qin = s.q_lora ? w.qa : w.input;
+        if (s.q_lora) {
+            q_a_proj.step(c, w.input, w.qa.x, T);
+            RAD_ISSUE_N(c, op_qa_norm, T, brows(w.qa.x, T), RAD_W(qa_gain), brows(w.qa.x, T));
+            qa_quant.step(c, T);
+        }
+        q_rope_proj.step(c, qin, w.q_rope, T);
+        q_nope_proj.step(c, qin, w.q_nope, T);
         kv_a.step(c, w.input, w.row, T);
         g_proj.step(c, w.input, w.gate, T);
         RAD_ISSUE_N(c, op_kv_norm, T, bcol(w.row, 0, s.latent, T), RAD_W(kv_gain),
@@ -308,6 +421,11 @@ struct Model {
     Names nm{};
     Geom g{};
     Shape s{};
+    /* Whether layer 0's probe found a rotated-int8 trunk, and its activation scale group: see
+     * rad_fp8.h's trunk_rotation. `norm_fed`: the block norms write those codes themselves
+     * (rmsnorm_had_quant_i8g is served). */
+    bool trunk_rot = false, norm_fed = false;
+    int64_t trunk_g8 = RAD_FP8_BLOCK;
     std::vector<Layer> layers;
     rad_kvgroup latent = 0, state = 0, conv = 0;
     rad_buf x = 0, y = 0, final_hidden = 0, logit_input = 0, logits = 0;
@@ -324,7 +442,7 @@ struct Model {
     Layer draft{};
 };
 
-static Model g_model[MAX_RANKS];
+static Model g_model[MAX_SLOTS];
 
 static int64_t cfg(const RadModelMeta* m, const char* key, int64_t fallback) {
     return rad_meta_geti(m, key, fallback);
@@ -370,6 +488,8 @@ static int read_shape(const RadModelMeta* meta, Shape& s) {
     s.dense_layers = cfg(meta, "first_k_dense_replace", 0);
     s.group_size = cfg(meta, "layer_group_size", 0);
     s.conv = cfg(meta, "short_conv_kernel_size", 0);
+    s.q_lora = cfg(meta, "q_lora_rank", 0);
+    s.gguf = cfg(meta, "gguf_source", 0) != 0;
     s.lower = rad_meta_getf(meta, "kda_lower_bound", 0.0);
     s.route_scale = rad_meta_getf(meta, "routed_scaling_factor", 0.0);
     s.lim_exp = cfg_list(meta, "expert_swiglu_limit_list");
@@ -382,7 +502,11 @@ static int read_shape(const RadModelMeta* meta, Shape& s) {
         { "qk_nope_head_dim == v_head_dim (mla_project's head)", s.nope > 0 && s.nope == s.v_dim },
         { "an even qk_rope_head_dim", s.rope > 0 && !(s.rope & 1) },
         { "an even kv_lora_rank + qk_rope_head_dim", s.latent > 0 && !((s.latent + s.rope) & 1) },
-        { "q_lora_rank null", cfg(meta, "q_lora_rank", 0) == 0 },
+        { "q_lora_rank null, or 256 for the tiny family's query LoRA",
+          s.q_lora == 0 || s.q_lora == 256 },
+        { "the tiny family's query LoRA in a GGUF release (the reader splits its quantised q_b; "
+          "a full-rank attn_q has no GGUF path)",
+          !s.gguf || s.q_lora != 0 },
         { "no_kda_lora", cfg(meta, "no_kda_lora", 0) != 0 },
         { "kda_safe_gate", cfg(meta, "kda_safe_gate", 1) != 0 },
         { "a negative kda_lower_bound", s.lower < 0 && std::isfinite(s.lower) },
@@ -423,18 +547,38 @@ static void slice_of(int64_t blocks, int world, int rank, int first, int64_t* lo
 
 /* ============================== The trunk's buffers ============================== */
 
+/* The activation code pairs follow the trunk's form (the file's head comment). On a rotated int8
+ * trunk every pair is int8 at the trunk's group and is declared before the wires are copied, so
+ * each block sees whether its producer writes the codes (ActFP8::q8_fed): the norms where
+ * `norm_fed`, the out projections' quantisers always, the gated products where gated_had_quant_i8g
+ * is served (ActFP8::declare_pair). A producer whose rotating form is not served keeps an E4M3 pair
+ * that no linear reads, and each int8 linear then quantises the bf16 plane itself. */
 static int buffers(RadBuilder* b, Model& m) {
     auto& g = m.g;
     auto& s = m.s;
     auto& nm = m.nm;
     const int64_t T = g.max_tok, E = g.n_embd, H = s.heads / g.world, W = H * s.head_dim;
+    const bool rot = m.trunk_rot;
+    const int64_t g8 = m.trunk_g8;
     auto bf = [&](const char* n, std::initializer_list<int64_t> shape) {
         return decl_b(b, nm.f("%s", n), RAD_BF16, shape);
+    };
+    /* A rotated int8 trunk's pair on `a`, written by its producer (`fed`) or by each int8 linear
+     * reading it. */
+    auto i8_pair = [&](ActFP8& a, const char* n, int64_t width, bool fed) -> int {
+        RAD_ARCH_TRY(a.declare_qs(b, nm, g, n, width, 0, true, false, g8));
+        a.q8_fed = a.q8_rot = fed;
+        return RAD_OK;
     };
     m.x = bf("residual", { T, E });
     m.y = bf("attn_delta", { T, E });
     m.act.x = bf("normed", { T, E });
-    RAD_ARCH_TRY(m.act.declare_qs(b, nm, g, "normed", E));
+    if (rot) {
+        RAD_ARCH_TRY(m.act.declare_qs(b, nm, g, "normed", E, 0, true, !m.norm_fed, g8));
+        m.act.q8_fed = m.act.q8_rot = m.norm_fed;
+    } else {
+        RAD_ARCH_TRY(m.act.declare_qs(b, nm, g, "normed", E));
+    }
     m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, E }, RAD_BUF_PERSIST);
     m.logit_input = bf("logit_input", { g.max_logit_rows, E });
     m.logits = decl_b(b, nm.f("logits"), RAD_F32, { g.max_logit_rows, g.n_vocab });
@@ -450,7 +594,10 @@ static int buffers(RadBuilder* b, Model& m) {
     kw.core.gate = bf("kda_gate", { T, W });
     kw.core.out = bf("kda_out", { T, W });
     kw.core_out.x = kw.core.out;
-    RAD_ARCH_TRY(kw.core_out.declare_qs(b, nm, g, "kda_out", W));
+    if (rot)
+        RAD_ARCH_TRY(i8_pair(kw.core_out, "kda_out", W, true));
+    else
+        RAD_ARCH_TRY(kw.core_out.declare_qs(b, nm, g, "kda_out", W));
 
     auto& aw = m.aw;
     aw.input = m.act;
@@ -461,19 +608,35 @@ static int buffers(RadBuilder* b, Model& m) {
     aw.q_lat = bf("mla_q_latent", { T, H * s.latent });
     aw.gate = bf("mla_gate", { T, H });
     aw.attn = bf("mla_attn_latent", { T, H * s.latent });
+    if (s.q_lora) {
+        aw.qa.x = bf("mla_q_a", { T, s.q_lora });
+        if (rot)
+            RAD_ARCH_TRY(i8_pair(aw.qa, "mla_q_a", s.q_lora, false));
+        else
+            RAD_ARCH_TRY(aw.qa.declare_qs(b, nm, g, "mla_q_a", s.q_lora));
+    }
     aw.value.x = bf("mla_value", { T, H * s.v_dim });
-    RAD_ARCH_TRY(aw.value.declare_qs(b, nm, g, "mla_value", H * s.v_dim));
+    if (rot)
+        RAD_ARCH_TRY(i8_pair(aw.value, "mla_value", H * s.v_dim, true));
+    else
+        RAD_ARCH_TRY(aw.value.declare_qs(b, nm, g, "mla_value", H * s.v_dim));
 
     auto& dw = m.dw;
     dw.x = m.x;
     dw.h = m.act;
     dw.gate_up = bf("dense_gate_up", { T, 2 * g.n_ff });
     dw.ffn.x = bf("dense_ff", { T, g.n_ff });
-    RAD_ARCH_TRY(dw.ffn.declare_qs(b, nm, g, "dense_ff", g.n_ff));
+    if (rot)
+        RAD_ARCH_TRY(dw.ffn.declare_pair(b, nm, g, "dense_ff", g.n_ff, 0, true, g8,
+                                         "gated_had_quant_i8g"));
+    else
+        RAD_ARCH_TRY(dw.ffn.declare_qs(b, nm, g, "dense_ff", g.n_ff));
     return RAD_OK;
 }
 
-static int moe_buffers(RadBuilder* b, Model& m, const MoeFP8::Config& mc) {
+/* `shared_g8`: on a rotated int8 trunk, the scale group of the shared expert's stored down weight,
+ * which its input codes take. */
+static int moe_buffers(RadBuilder* b, Model& m, const MoeFP8::Config& mc, int64_t shared_g8) {
     auto& g = m.g;
     auto& nm = m.nm;
     const int64_t T = g.max_tok, E = g.n_embd, F = mc.n_ff_exp, k = mc.top_k;
@@ -491,9 +654,25 @@ static int moe_buffers(RadBuilder* b, Model& m, const MoeFP8::Config& mc) {
     mw.sorted = decl_b(b, nm.f("expert_sorted"), RAD_I32, { T * k });
     mw.egu = bf("expert_gate_up", { T * k, 2 * F });
     mw.eff.x = bf("expert_ff", { T * k, F });
-    RAD_ARCH_TRY(mw.eff.declare_qs(b, nm, g, "expert_ff", F, T * k));
+    if (m.trunk_rot) {
+        /* The routed arm of a rotated trunk is int8 throughout: the gated product's rotated codes
+         * at one scale a 128 of K, which the grouped GEMM's int8 rows read (MoeFP8::a8). */
+        RAD_ARCH_TRY(mw.eff.declare_qs(b, nm, g, "expert_ff", F, T * k, true, false,
+                                       RAD_FP8_BLOCK));
+        mw.eff.q8_fed = mw.eff.q8_rot = true;
+    } else {
+        RAD_ARCH_TRY(mw.eff.declare_qs(b, nm, g, "expert_ff", F, T * k));
+    }
     mw.edn = bf("expert_down", { T * k, E });
-    if (mc.expert_rot) {
+    if (m.trunk_rot) {
+        /* The routed gate_up reads the norm's own codes where it writes them, else a rotated int8
+         * copy of the block input that MoeFP8 writes once a layer (Wire::hr). */
+        if (!m.norm_fed) {
+            RAD_ARCH_TRY(mw.hr.declare_qs(b, nm, g, "normed_rot", E, 0, true, false,
+                                          RAD_FP8_BLOCK));
+            mw.hr.q8_fed = mw.hr.q8_rot = true;
+        }
+    } else if (mc.expert_rot) {
         mw.hr.q = decl_b(b, nm.f("normed_rot.q"), RAD_F8E4M3, { T, E });
         mw.hr.s = decl_b(b, nm.f("normed_rot.s"), RAD_F32, { T, E / RAD_FP8_BLOCK });
         if (!mw.hr.q || !mw.hr.s) return RAD_E_INVAL;
@@ -501,7 +680,11 @@ static int moe_buffers(RadBuilder* b, Model& m, const MoeFP8::Config& mc) {
     if (mc.n_ff_shared > 0) {
         mw.sgu = bf("shared_gate_up", { T, 2 * mc.n_ff_shared });
         mw.sff.x = bf("shared_ff", { T, mc.n_ff_shared });
-        RAD_ARCH_TRY(mw.sff.declare_qs(b, nm, g, "shared_ff", mc.n_ff_shared));
+        if (m.trunk_rot)
+            RAD_ARCH_TRY(mw.sff.declare_pair(b, nm, g, "shared_ff", mc.n_ff_shared, 0, true,
+                                             shared_g8, "gated_had_quant_i8g"));
+        else
+            RAD_ARCH_TRY(mw.sff.declare_qs(b, nm, g, "shared_ff", mc.n_ff_shared));
         mw.sout = bf("shared_out", { T, E });
         mw.sgate = bf("shared_one", { T, 1 });
     }
@@ -511,13 +694,14 @@ static int moe_buffers(RadBuilder* b, Model& m, const MoeFP8::Config& mc) {
 /* ============================== declare ============================== */
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
-    if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
+    if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS ||
+        rad_build_slot(ctx) >= MAX_SLOTS)
         return RAD_E_INVAL;
     const int world = ctx->world_size ? ctx->world_size : 1;
     /* A sizing declare writes scratch: the step reads g_model, filled by the real declare at the
      * real max_tok (RadBuildCtx::shape_probe). */
     static thread_local Model probe_model;
-    Model& m = ctx->shape_probe ? probe_model : g_model[ctx->rank];
+    Model& m = ctx->shape_probe ? probe_model : g_model[rad_build_slot(ctx)];
     m = Model{};
     m.nm = Names(ctx->scope);
     auto& g = m.g;
@@ -613,11 +797,23 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         ms.cfg = mc;
         ms.cfg.swiglu_limit = limit_at(s.lim_exp, l);
         ms.cfg.shared_swiglu_limit = limit_at(s.lim_shared, l);
-        ms.norm = nm.ckpt("%s.post_attention_layernorm.weight", pre);
-        ms.router = nm.ckpt("%s.mlp.gate.weight", pre);
-        ms.router_bias = nm.ckpt("%s.mlp.gate.expert_bias", pre);
-        ms.experts = nm.ckpt("%s.mlp.experts", pre);
-        ms.shared = nm.ckpt("%s.mlp.shared_experts", pre);
+        ms.norm = s.gguf ? nm.ckpt("blk.%d.ffn_norm.weight", l)
+                         : nm.ckpt("%s.post_attention_layernorm.weight", pre);
+        ms.router = s.gguf ? nm.ckpt("blk.%d.ffn_gate_inp.weight", l)
+                           : nm.ckpt("%s.mlp.gate.weight", pre);
+        ms.router_bias = s.gguf ? nm.ckpt("blk.%d.exp_probs_b.bias", l)
+                                : nm.ckpt("%s.mlp.gate.expert_bias", pre);
+        if (s.gguf) {
+            /* The release GGUF stacks the experts expert-last, the block's split-stacked
+             * source slicing one expert off each: [E, ff, emb] gate and up, [E, emb, ff] down. */
+            ms.experts_gate = nm.ckpt("blk.%d.ffn_gate_exps.weight", l);
+            ms.experts_up   = nm.ckpt("blk.%d.ffn_up_exps.weight", l);
+            ms.experts_down = nm.ckpt("blk.%d.ffn_down_exps.weight", l);
+        } else {
+            ms.experts = nm.ckpt("%s.mlp.experts", pre);
+        }
+        ms.shared = s.gguf ? nm.ckpt("blk.%d.mlp.shared_experts", l)
+                           : nm.ckpt("%s.mlp.shared_experts", pre);
         RAD_ARCH_TRY(MoeFP8::probe(b, nm, l, ms, &ms.cfg));
         if (ms.cfg.expert_rot) mc.expert_rot = 1;
         if (ms.cfg.expert_bf16) mc.expert_bf16 = 1;
@@ -644,8 +840,57 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                  g.rank, (long long)mc.expert_base, (long long)(mc.expert_base + per),
                  (long long)s.experts);
     }
+
+    /* ---- the trunk's stored form, read from layer 0's fused q|k|v through that layer's own
+     * LinearFP8 (layer 0 is KDA: the last of each group of `layer_group_size` > 1 is MLA). The
+     * activations below carry rotated int8 codes only for a rotated trunk. */
+    m.layers.resize((size_t)s.n_layer);
+    RAD_ARCH_TRY(m.layers[0].kda.probe_qkv(b, nm, g, s, 0,
+                                           nm.ckpt("%s.attention", nm.ckpt("model.layers.%d", 0))));
+    {
+        RadEncoding enc{};
+        m.trunk_rot = weight_enc(b, nm.f("blk.0.attn_qkv.weight"), &enc) &&
+                      trunk_rotation(enc, &m.trunk_g8);
+    }
+    int64_t shared_g8 = m.trunk_g8;
+    if (m.trunk_rot) {
+        /* The routed experts read the trunk's rotated int8 codes (MoeFP8::a8), which only a
+         * rotated expert meets. A clamped layer clamps, then quantises (GateQuantFP8). */
+        for (int l = (int)s.dense_layers; l < (int)s.n_layer + (mtp ? 1 : 0); ++l) {
+            const MoeFP8::Config& c = msrc[(size_t)l].cfg;
+            if (c.expert_bf16 || !c.expert_rot) {
+                fprintf(stderr, "radiance: bailing_hybrid: the trunk is rotated int8 and layer %d's "
+                                "routed experts are %s; a rotated trunk's experts read its int8 codes "
+                                "and are stored rotated (data/recipes/ling-3.0-tiny-iq8r.recipe)\n",
+                        l, c.expert_bf16 ? "plain bf16" : "unrotated");
+                return RAD_E_UNSUPPORTED;
+            }
+        }
+        m.norm_fed = rad_op_declared(b, "rmsnorm_had_quant_i8g") != 0;
+        /* The shared expert's down projection is a trunk linear whose input codes take the group
+         * its own weight is stored at, read from the first routed layer's through that layer's
+         * own LinearFP8 (which MoeFP8 then does not map again). */
+        const int lm = (int)s.dense_layers;
+        if (lm < (int)s.n_layer && mc.n_ff_shared > 0) {
+            LinearFP8& sd = m.layers[(size_t)lm].moe.sh_down;
+            RAD_ARCH_TRY(sd.probe(b, nm, g, nm.f("blk.%d.ffn_down_shexp", lm),
+                                  { nm.ckpt("%s.down_proj.weight", msrc[(size_t)lm].shared) }));
+            if (sd.probed_i8) shared_g8 = sd.probed_g8;
+        }
+    } else {
+        for (int l = (int)s.dense_layers; l < (int)s.n_layer + (mtp ? 1 : 0); ++l) {
+            const MoeFP8::Config& c = msrc[(size_t)l].cfg;
+            if (c.expert_i8 || c.expert_iqr) {
+                fprintf(stderr, "radiance: bailing_hybrid: layer %d's routed experts are rotated "
+                                "int8 and the trunk is not; they read the trunk's rotated int8 codes, "
+                                "so convert the trunk with them "
+                                "(data/recipes/ling-3.0-tiny-iq8r.recipe)\n", l);
+                return RAD_E_UNSUPPORTED;
+            }
+        }
+    }
     RAD_ARCH_TRY(buffers(b, m));
-    RAD_ARCH_TRY(moe_buffers(b, m, mc));
+    RAD_ARCH_TRY(moe_buffers(b, m, mc, shared_g8));
 
     /* ---- the caches: the MLA layers' latent rows, the KDA layers' state and convolution
      * history. */
@@ -673,9 +918,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
 
     /* ---- the embedding, the layers, the final norm and the head. */
-    RAD_ARCH_TRY(map_copy(b, nm.f("token_embd.weight"), nm.ckpt("model.word_embeddings.weight")));
-    RAD_ARCH_TRY(map_copy(b, nm.f("output.weight"), nm.ckpt("lm_head.weight")));
-    RAD_ARCH_TRY(map_copy(b, nm.f("output_norm.weight"), nm.ckpt("model.norm.weight")));
+    /* The release GGUF already spells the head tensors under the container's names; the first
+     * source the container holds wins. */
+    RAD_ARCH_TRY(map_copy_alt(b, nm.f("token_embd.weight"), nm.ckpt("model.word_embeddings.weight"),
+                              nm.ckpt("token_embd.weight")));
+    RAD_ARCH_TRY(map_copy_alt(b, nm.f("output.weight"), nm.ckpt("lm_head.weight"),
+                              nm.ckpt("output.weight")));
+    RAD_ARCH_TRY(map_copy_alt(b, nm.f("output_norm.weight"), nm.ckpt("model.norm.weight"),
+                              nm.ckpt("output_norm.weight")));
     m.token = decl_w(b, nm.f("token_embd.weight"), RAD_BF16, { g.n_vocab, g.n_embd },
                      RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
     m.head = decl_w(b, nm.f("output.weight"), RAD_BF16, { g.n_vocab, g.n_embd }, RAD_ACCESS_VOCAB,
@@ -698,7 +948,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         lay.dense = l < s.dense_layers;
         const char* pre = nm.ckpt("model.layers.%d", l);
         const char* nn = nm.f("blk.%d.attn_norm.weight", l);
-        RAD_ARCH_TRY(map_copy(b, nn, nm.ckpt("%s.input_layernorm.weight", pre)));
+        RAD_ARCH_TRY(map_copy(b, nn, s.gguf ? nm.ckpt("blk.%d.attn_norm.weight", l)
+                                           : nm.ckpt("%s.input_layernorm.weight", pre)));
         lay.gain = decl_w(b, nn, RAD_F32, { g.n_embd }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
                           grp_layer(l));
         RAD_ARCH_TRY(lay.norm.declare(b, g, lay.gain, m.x, m.act, g.n_embd));
@@ -718,10 +969,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         { m.x, m.y }, { m.x });
         if (!lay.op_add) return RAD_E_INVAL;
         if (lay.dense) {
-            MlpFP8::Src ds{ nm.ckpt("%s.post_attention_layernorm.weight", pre),
-                            nm.ckpt("%s.mlp.gate_proj.weight", pre),
-                            nm.ckpt("%s.mlp.up_proj.weight", pre),
-                            nm.ckpt("%s.mlp.down_proj.weight", pre) };
+            MlpFP8::Src ds{ s.gguf ? nm.ckpt("blk.%d.ffn_norm.weight", l)
+                                   : nm.ckpt("%s.post_attention_layernorm.weight", pre),
+                           s.gguf ? nm.ckpt("blk.%d.ffn_gate.weight", l)
+                                  : nm.ckpt("%s.mlp.gate_proj.weight", pre),
+                           s.gguf ? nm.ckpt("blk.%d.ffn_up.weight", l)
+                                  : nm.ckpt("%s.mlp.up_proj.weight", pre),
+                           s.gguf ? nm.ckpt("blk.%d.ffn_down.weight", l)
+                                  : nm.ckpt("%s.mlp.down_proj.weight", pre) };
             RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, l, m.dw, ds));
         } else {
             RAD_ARCH_TRY(lay.moe.declare(b, nm, g, l, m.mw, msrc[(size_t)l]));
@@ -779,10 +1034,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     rad_note(b,
              "Ling-3.0 (bailing_hybrid): TP%d, %lld layers, %lld KDA + %lld dense MLA, %lld experts "
-             "top-%lld in %lld groups (%lld kept), MTP %s",
+             "top-%lld in %lld groups (%lld kept), MTP %s, %s trunk",
              world, (long long)s.n_layer, (long long)(s.n_layer - s.n_layer / s.group_size),
              (long long)(s.n_layer / s.group_size), (long long)s.experts, (long long)s.top_k,
-             (long long)s.groups, (long long)s.topk_groups, m.have_mtp ? "enabled" : "not declared");
+             (long long)s.groups, (long long)s.topk_groups, m.have_mtp ? "enabled" : "not declared",
+             !m.trunk_rot ? "unrotated"
+             : m.trunk_g8 == RAD_I8_GROUP_WIDE ? "IQ8R (rotated int8)" : "rotated int8");
     return RAD_OK;
 }
 
@@ -831,7 +1088,7 @@ static void draft_pass(RadCtx* c, Model& m, const RadBatch* batch) {
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
-    Model& m = g_model[rad_rank(c)];
+    Model& m = g_model[rad_slot(c)];
     const int64_t T = batch->n_tok, E = m.g.n_embd;
     if (batch->enc) {
         rad_step_fail(c, "bailing_hybrid serves text");
@@ -878,8 +1135,36 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
 
 }  /* namespace bailing_hybrid */
 
+/* The GGUF release wrappers (arch/bailing_hybrid_gguf* and kin) define these to their file's
+ * `general.file_type` and plugin name and include the file; the base plugin keeps the empty
+ * quant. The name is spelled by a macro, not by RAD_ARCH_PLUGIN's stringifier: a macro argument
+ * that reaches `#` expands as written, and a wrapper that only renames the namespace would ship
+ * five plugins all called "bailing_hybrid". */
+#ifndef BAILING_HYBRID_QUANT
+#define BAILING_HYBRID_QUANT ""
+#endif
+#ifndef BAILING_HYBRID_PLUGIN
+#define BAILING_HYBRID_PLUGIN "bailing_hybrid"
+#endif
+
 #ifndef RAD_ARCH_NO_EXPORTS
 RAD_ARCH_PROBE(bailing_hybrid)
-RAD_ARCH_PLUGIN(bailing_hybrid, "bailinghybrid", "", "0.1.0",
-                "Ling-3.0 (bailing_hybrid): KDA and dense latent attention, group-routed experts")
+/* Every per-instance state above is indexed by slot (rad_build_slot / rad_slot). */
+RAD_ARCH_MULTI_INSTANCE()
+extern "C" const char* rad_arch_id(void) { return "bailinghybrid"; }
+extern "C" const char* rad_arch_quant(void) { return BAILING_HYBRID_QUANT; }
+extern "C" int rad_arch_declare(RadBuilder* b, const RadModelMeta* m, const RadBuildCtx* c) {
+    return bailing_hybrid::declare(b, m, c);
+}
+extern "C" void rad_arch_step(struct RadCtx* c, const struct RadBatch* batch) {
+    bailing_hybrid::step(c, batch);
+}
+extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+extern "C" uint64_t rad_plugin_abi_layout(void) { return rad_abi_layout(); }
+extern "C" const RadPluginInfo* rad_plugin_info(void) {
+    static const RadPluginInfo info = {
+        RAD_PLUGIN_ARCH, BAILING_HYBRID_PLUGIN, "0.1.0",
+        "Ling-3.0 (bailing_hybrid): KDA and dense latent attention, group-routed experts", "" };
+    return &info;
+}
 #endif

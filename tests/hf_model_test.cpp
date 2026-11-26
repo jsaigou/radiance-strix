@@ -312,6 +312,49 @@ TEST(a_listing_naming_a_path_outside_the_destination_is_refused) {
     CHECK(has(err, "does not land inside the destination"));
 }
 
+/* `#` and `?` end the URL's path: curl requests the stripped object instead. A listing that
+ * spells out a truncated name with the truncated object's size and oid passes every check
+ * afterwards -- the bytes arrive under a name nobody asked for, and the manifest certifies the
+ * directory complete. Refused as an escaping name is. */
+const char* kFragmentListing =
+    "#!/bin/sh\n"
+    "for a in \"$@\"; do case \"$a\" in *api/models*)\n"
+    "  printf '[{\"type\":\"file\",\"path\":\"model.bin#x\",\"size\":1},"
+    "{\"type\":\"file\",\"path\":\"kept.bin\",\"size\":1}]'; exit 0;; esac; done\n"
+    "exit 22\n";
+
+TEST(a_listing_name_that_curl_would_truncate_is_refused_whole) {
+    NEED_ARTIFACT(hfget_beside_this_binary());
+    if (!on_path("jq")) SKIP("no jq on PATH, which hfget.sh needs");
+    TempDir root;
+    REQUIRE(!root.path.empty());
+    FakeCurl curl(kFragmentListing);
+    const std::string cmd = "sh '" + hfget_beside_this_binary() +
+                            "' radiance-test-owner/radiance-test-model '" + root.path +
+                            "' >/dev/null 2>&1";
+    CHECK(std::system(cmd.c_str()) != 0);
+    CHECK(!fs::exists(root.path + "/model.bin#x"));
+    CHECK(!fs::exists(root.path + "/model.bin"));        /* curl would have fetched this one */
+    CHECK(!fs::exists(root.path + "/kept.bin"));         /* the whole listing is refused */
+    CHECK(!fs::exists(root.path + "/.hfget-manifest"));
+}
+
+/* The per-file child re-screens its name without waiting for the parent: a trailing `..` (the
+ * parent's regex caught it, the child's old case did not) and curl's own path terminators must
+ * fail there too, before any request or any write. */
+TEST(the_child_screen_refuses_trailing_dotdot_and_curl_terminator_names) {
+    NEED_ARTIFACT(hfget_beside_this_binary());
+    TempDir root;
+    REQUIRE(!root.path.empty());
+    for (const char* name : {"model.bin#x", "model.bin?y", "sub/.."}) {
+        const std::string cmd =
+            "HFGET_CHILD=1 HFGET_DEST='" + root.path + "' sh '" + hfget_beside_this_binary() +
+            "' \"$(printf '5\\t\\t" + std::string(name) + "')\" >/dev/null 2>&1";
+        CHECK(std::system(cmd.c_str()) != 0);
+    }
+    CHECK(fs::is_empty(root.path));
+}
+
 /* An LFS file's oid is the hub's claim about its bytes; the download is kept only once those
  * bytes hash to it -- the size check alone would take a swapped file of the same length, and a
  * spliced resume at any length the hub likes. A mismatch deletes the file and fails the run;

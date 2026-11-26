@@ -183,6 +183,32 @@ __device__ __forceinline__ float r4d_wave_sum(float v) {
     return v;
 }
 
+// Sixteen values a lane, each summed over the wave: after a level's exchange both lanes of a pair
+// hold the same sums, so one keeps the first half of them and the other the second, and the next
+// level adds half as many. 47 instructions where sixteen r4d_wave_sum take 96; lane l ends with the
+// wave's sum of value red16_row(l). The levels run from offset 1 up, so a sum's rounding differs
+// from r4d_wave_sum's.
+// `x` where `c`, else `y`, by value: a conditional over two elements of one array is an lvalue, which
+// the compiler turns into one indexed read and then into a compare and select per element.
+__device__ __forceinline__ float r4d_pick(bool c, float x, float y) { return c ? x : y; }
+__device__ __forceinline__ float red16(float (&a)[16], uint32_t lane) {
+    const bool l1 = lane & 1u, l2 = lane & 2u, l4 = lane & 4u, l8 = lane & 8u;
+    float b[8], c[4], d[2];
+#pragma unroll
+    for (uint32_t q = 0; q < 16; ++q) a[q] = r4d_dpp_xor_add<0x161>(a[q]);
+#pragma unroll
+    for (uint32_t j = 0; j < 8; ++j) b[j] = r4d_dpp_xor_add<0x162>(r4d_pick(l1, a[8 + j], a[j]));
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) c[j] = r4d_dpp_xor_add<0x164>(r4d_pick(l2, b[4 + j], b[j]));
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) d[j] = r4d_dpp_xor_add<0x168>(r4d_pick(l4, c[2 + j], c[j]));
+    const float v = r4d_pick(l8, d[1], d[0]);
+    return v + swap16(v);
+}
+__device__ __forceinline__ uint32_t red16_row(uint32_t lane) {
+    return (lane & 1u) << 3 | (lane & 2u) << 1 | (lane & 4u) >> 1 | (lane & 8u) >> 3;
+}
+
 // The same butterfly over a group of W lanes (W a power of two up to the wave): the exchanges of
 // `for (o = W / 2; o; o >>= 1) v = op(v, __shfl_xor(v, o))`, in its order, so bit-identical to
 // that loop.

@@ -1,4 +1,5 @@
 /* pools.cpp -- see pools.h. */
+#include <algorithm>
 #include "mem/pools.h"
 
 #include <cstdlib>
@@ -216,7 +217,8 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
      * expert plane can promote into, so the split follows actual demand. There is no fixed-pool
      * option: it would hold every block whether used or not while experts stream over the link.
      * Without virtual memory management init_elastic() allocates the range whole. */
-    if ((s = kv_.init_elastic("vram_kv", kv, RAD_MEM_DEVICE, device)) < 0) st = s;
+    if ((s = kv_.init_elastic("vram_kv", std::max(kv, cfg.kv_reserve), RAD_MEM_DEVICE, device)) < 0)
+        st = s;
     /* Mapped, not merely pinned. The host pool holds the mover's staging buffers and O_DIRECT
      * landing zone, and the zero-copy execution site (spec §5.1), where kernels read weights over
      * the link and so need a kernel-addressable base: with hipHostMallocDefault,

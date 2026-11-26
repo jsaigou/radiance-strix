@@ -423,6 +423,48 @@ Facts collect(const std::string& root, const std::vector<std::string>* managed) 
     return f;
 }
 
+std::vector<CardSample> sample_cards(const std::string& root, const std::vector<std::string>& bdfs) {
+    /* The line the driver marks with '*', without the mark and the level's index: "2350Mhz". */
+    auto current = [](const std::string& path) {
+        std::istringstream in(slurp(path));
+        std::string l;
+        while (std::getline(in, l)) {
+            if (l.find('*') == std::string::npos) continue;
+            l.erase(std::remove(l.begin(), l.end(), '*'), l.end());
+            const size_t colon = l.find(':');
+            return trim(colon == std::string::npos ? l : l.substr(colon + 1));
+        }
+        return std::string();
+    };
+    std::vector<CardSample> out;
+    for (const std::string& bdf : bdfs) {
+        const std::string dev = root + "/sys/bus/pci/devices/" + bdf;
+        CardSample c;
+        c.bdf          = bdf;
+        c.perf_level   = line(dev + "/power_dpm_force_performance_level");
+        c.sclk_cur     = current(dev + "/pp_dpm_sclk");
+        c.mclk_cur     = current(dev + "/pp_dpm_mclk");
+        c.busy_percent = (int)num(dev + "/gpu_busy_percent", -1);
+        for (const std::string& h : list(dev + "/hwmon")) {
+            const std::string hp = dev + "/hwmon/" + h;
+            /* amdgpu labels its sensors; an unlabelled temp1 is the edge sensor. */
+            for (int t = 1; t <= 8; ++t) {
+                const std::string base = hp + "/temp" + std::to_string(t);
+                const int64_t v = num(base + "_input", -1);
+                if (v < 0) continue;
+                const std::string label = line(base + "_label");
+                if (label == "edge" || (label.empty() && t == 1)) c.edge_mc = v;
+                else if (label == "junction")                     c.junction_mc = v;
+                else if (label == "mem")                          c.mem_mc = v;
+            }
+            if (c.power_uw < 0) c.power_uw = num(hp + "/power1_average", -1);
+            if (c.power_uw < 0) c.power_uw = num(hp + "/power1_input", -1);
+        }
+        out.push_back(std::move(c));
+    }
+    return out;
+}
+
 void probe_process(HostFacts* h) {
     struct rlimit rl{};
     if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0)

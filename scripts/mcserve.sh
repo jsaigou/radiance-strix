@@ -1,25 +1,25 @@
 #!/bin/sh
-# Start MiniCPM5-2B (fp8) as a long-lived server, like scripts/fnserve.sh: wait for /health, print
+# Start MiniCPM5-2B (IQ8R) as a long-lived server, like scripts/fnserve.sh: wait for /health, print
 # the endpoints and exit with the server still up. Stop it with scripts/fnstop.sh.
 #
 # Context is 131072, this checkpoint's n_ctx_train (the 200K of fnserve.sh is Flash-Next's).
 #
-# KV is 21.0 KiB a token at fp8 (42 layers x 2 kv heads x 128 x 2 planes), halved per rank at
-# tp 2, so a full-length sequence costs 1.38 GiB a rank and 8 of them do not fit. The pool is a
-# capacity, not a per-request reservation.
+# KV is 21.3 KiB a token at int8 (42 layers x 2 kv heads x (128 x 2 planes of codes + 4 bytes of
+# scales)), halved per rank at tp 2, so a full-length sequence costs 1.40 GiB a rank and 8 of them
+# do not fit. The pool is a capacity, not a per-request reservation.
 P="${P:-8100}"
-M="${M:-$HOME/models/rad/minicpm5-2b-dspark.v2.rad}"
+M="${M:-$HOME/models/rad/minicpm5-2b-iq8r.rad}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="${BUILD:-$ROOT/build}"
 cd "$BUILD" || exit 1
 pkill -f "bin/radianc[e]"; while pgrep -f "bin/radianc[e]" >/dev/null; do sleep 1; done; sleep 2
 env GPU_MAX_ALLOC_PERCENT=100 GPU_MAX_HEAP_SIZE=100 $EXTRA_ENV \
-nohup ./bin/radiance --model "$M" \
+nohup "$ROOT/scripts/radiance-flags" ./bin/radiance --model "$M" \
     --radiance-home radiance_home \
     --host 0.0.0.0 --port "$P" \
     --max-num-seqs ${SEQS:-8} --max-model-len ${MLEN:-131072} \
     --tp ${TP:-2} \
-    --gpu-headroom-mib ${HR:-160} --kv-cache-dtype ${KVD:-fp8} \
+    --gpu-headroom-mib ${HR:-160} --kv-cache-dtype ${KVD:-i8} \
     --max-num-batched-tokens ${MNBT:-512} \
     $EXTRA > "$HOME/mcserve.log" 2>&1 &
 echo "starting, log: ~/mcserve.log"

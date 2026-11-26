@@ -31,23 +31,24 @@ extern "C" long r4d_attn_decode_h256_gqa2_scratch_bytes(const R4DArgs* a) {
     return r4d_decode_scratch(a, r4d_decode_splits_win(a, B_TILE), B_OPT);
 }
 
-extern "C" int r4d_attn_decode_h256_gqa2_fp8kv(const R4DArgs* a, hipStream_t s) {
-    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT, 0>(a, s);
+extern "C" int r4d_attn_decode_h256_gqa2_i8kv(const R4DArgs* a, hipStream_t s) {
+    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, (B_OPT & ~O_KRAW) | O_KVI8, 0>(a, s);
 }
 extern "C" int r4d_attn_decode_h256_gqa2_bf16kv(const R4DArgs* a, hipStream_t s) {
     return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT, 1>(a, s);
 }
 // The same with q at R4DArgs::q_ld (O_QLD), for attn_paged_qrow; its own instances, so the dense
 // ones above keep their registers.
-extern "C" int r4d_attn_decode_h256_gqa2_qld_fp8kv(const R4DArgs* a, hipStream_t s) {
-    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT | O_QLD, 0>(a, s);
+extern "C" int r4d_attn_decode_h256_gqa2_qld_i8kv(const R4DArgs* a, hipStream_t s) {
+    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, (B_OPT & ~O_KRAW) | O_KVI8 | O_QLD, 0>(a, s);
 }
 extern "C" int r4d_attn_decode_h256_gqa2_qld_bf16kv(const R4DArgs* a, hipStream_t s) {
     return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT | O_QLD, 1>(a, s);
 }
 // ...and a tree verify's mask (O_TREE, attn_paged_qrow_tree), again its own instances.
-extern "C" int r4d_attn_decode_h256_gqa2_qld_tree_fp8kv(const R4DArgs* a, hipStream_t s) {
-    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT | O_QLD | O_TREE, 0>(a, s);
+extern "C" int r4d_attn_decode_h256_gqa2_qld_tree_i8kv(const R4DArgs* a, hipStream_t s) {
+    return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, (B_OPT & ~O_KRAW) | O_KVI8 | O_QLD | O_TREE,
+                                 0>(a, s);
 }
 extern "C" int r4d_attn_decode_h256_gqa2_qld_tree_bf16kv(const R4DArgs* a, hipStream_t s) {
     return r4d_decode_launch_win<B_HEAD_DIM, B_GQA, B_OPT | O_QLD | O_TREE, 1>(a, s);
@@ -81,7 +82,7 @@ extern "C" int r4d_attn_prefill_h256_gqa2_last_splits(void) { return g_prefill_l
 
 // a->splits > 1 with a->scratch set and no window is the split form: segments in the scratch, then
 // the merge. Anything else is the plain (windowed) form, unchanged.
-template <int KVP>
+template <int KVP, int XOPT = 0>
 static int prefill_launch_h256_gqa2(const R4DArgs* a, hipStream_t s) {
     if (a->head_dim != B_HEAD_DIM || a->block_size != B_BLOCK_SIZE) return -1;
     if (a->q_heads / a->kv_heads != B_GQA) return -2;
@@ -92,7 +93,7 @@ static int prefill_launch_h256_gqa2(const R4DArgs* a, hipStream_t s) {
     dim3 grid((a->q_len + BQ - 1) / BQ * splits, a->kv_heads, a->num_seqs);
     if (splits > 1) {
         hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, B_HEAD_DIM, B_GQA,
-                                                    B_BLOCK_SIZE, KVP, P_OPT | O_PSPLIT, 0>),
+                                                    B_BLOCK_SIZE, KVP, P_OPT | XOPT | O_PSPLIT, 0>),
                            grid, dim3(P_NWARPS * 32), 0, s, *a);
         CHK4();
         // The full-attention legs' merge constants, as r4d_decode_launch_win takes them: two rows
@@ -100,7 +101,7 @@ static int prefill_launch_h256_gqa2(const R4DArgs* a, hipStream_t s) {
         return r4d_prefill_combine<B_HEAD_DIM, 2, 256>(a, splits, P_TILE, s);
     }
     hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, B_HEAD_DIM, B_GQA,
-                                                B_BLOCK_SIZE, KVP, P_OPT, 1>),
+                                                B_BLOCK_SIZE, KVP, P_OPT | XOPT, 1>),
                        grid, dim3(P_NWARPS * 32), 0, s, *a);
     CHK4();
     return 0;
@@ -109,29 +110,32 @@ static int prefill_launch_h256_gqa2(const R4DArgs* a, hipStream_t s) {
 /* The split's f32 partials at declare (r4d_prefill_scratch). None for a windowed layer: `window`
  * is the op's parameter, the same at declare and at every launch, and a windowed launch never
  * splits. */
-static int64_t prefill_scratch_h256_gqa2(const RadArgs* a) {
+static int64_t prefill_scratch_h256_gqa2(const RadArgs* a, long long row) {
     if (r4d_geti_or(a, "window", 0) > 0) return 0;
-    return r4d_prefill_scratch(a, B_HEAD_DIM, 2LL * B_HEAD_DIM, P_BQ, P_TILE);
+    return r4d_prefill_scratch(a, B_HEAD_DIM, row, P_BQ, P_TILE);
 }
 extern "C" int64_t r4d_rad_attn_prefill_h256_gqa2_scratch(const RadArgs* a) {
-    return prefill_scratch_h256_gqa2(a);
+    return prefill_scratch_h256_gqa2(a, 2LL * B_HEAD_DIM);
+}
+extern "C" int64_t r4d_rad_attn_prefill_h256_gqa2_i8_scratch(const RadArgs* a) {
+    return prefill_scratch_h256_gqa2(a, 2LL * B_HEAD_DIM + 4);
 }
 
-extern "C" int r4d_attn_prefill_h256_gqa2_fp8kv(const R4DArgs* a, hipStream_t s) {
-    return prefill_launch_h256_gqa2<0>(a, s);
+extern "C" int r4d_attn_prefill_h256_gqa2_i8kv(const R4DArgs* a, hipStream_t s) {
+    return prefill_launch_h256_gqa2<0, O_KVI8>(a, s);
 }
 extern "C" int r4d_attn_prefill_h256_gqa2_bf16kv(const R4DArgs* a, hipStream_t s) {
     return prefill_launch_h256_gqa2<1>(a, s);
 }
 
-/* Prefill RadArgs wrappers, defined in this unit rather than the h256 dispatch. Absent descales
- * mean 1.0 (fill_paged leaves them null). */
-extern "C" int r4d_rad_attn_prefill_h256_gqa2_fp8(const RadArgs* a, RadStream s) {
+/* Prefill RadArgs wrappers, defined in this unit rather than the h256 dispatch; the int8 cache's
+ * token row is 2 * 256 + 4 bytes. */
+extern "C" int r4d_rad_attn_prefill_h256_gqa2_i8(const RadArgs* a, RadStream s) {
     R4DArgs r;
-    int rc = fill_paged(a, &r, B_HEAD_DIM);
+    int rc = fill_paged_row(a, &r, B_HEAD_DIM, 2 * B_HEAD_DIM + 4);
     if (rc != RAD_OK) return rc;
     if (prefill_h256_gqa2_can_split(&r)) r.splits = r4d_prefill_splits(a, &r, P_BQ, P_TILE);
-    return r4d_attn_prefill_h256_gqa2_fp8kv(&r, (hipStream_t)s);
+    return r4d_attn_prefill_h256_gqa2_i8kv(&r, (hipStream_t)s);
 }
 extern "C" int r4d_rad_attn_prefill_h256_gqa2_bf16(const RadArgs* a, RadStream s) {
     R4DArgs r;

@@ -301,6 +301,58 @@ TEST(the_cards_tree_acceptance_is_accept_tree_and_the_end_of_generation_cut) {
     CHECK(cut_cases > 100);
 }
 
+/* ================================================================== ADV_COMPACT */
+
+/* An accepted path's rows move to their committed positions whole, in every layer and head, and
+ * nothing else in the cache changes: at 512 bytes a row (bf16 and fp8 at head_dim 256 and 128)
+ * and at 516 and 260 (the int8 cache's K, V and two f16 scales, which is never whole 16-byte
+ * chunks). Run as the host backend does (one caller, every chunk) and as the kernel's 64 threads
+ * split a row; the path crosses a block boundary. A row that sampled nothing keeps its cache. */
+TEST(a_trees_accepted_rows_move_whole_at_every_row_size) {
+    for (int row_bytes : { 512, 516, 260, 1028 }) {
+        for (int cstep : { 1, 64 }) {
+            Slab s(ADV_ACCEPT);
+            const int layers = 2, heads = 3, bs = 16, blocks = Slab::kPitch;
+            const int64_t stride = (int64_t)blocks * heads * bs * row_bytes + 64;
+            std::vector<uint32_t> cache((size_t)(layers * stride / 4));
+            uint32_t rng = 0xc0a9ac7u + (uint32_t)row_bytes;
+            for (uint32_t& v : cache) v = lcg(rng);
+            std::vector<uint32_t> want = cache;
+
+            s.row(0, true, 0, 8, 0, /*card=*/3, 0, /*rout=*/0, 7);
+            s.row(1, true, 8, 8, 0, /*card=*/5, 8, /*rout=*/-1, 7);
+            const int32_t path[3] = { 2, 5, 7 }, base = 28;
+            for (int card : { 3, 5 }) {
+                StepSlot& S = s.st[card];
+                S.acc = 3; S.npath = 3; S.head = base + 3;
+                std::memcpy(S.path, path, sizeof path);
+            }
+            s.a.n_pool = 1;
+            s.a.pool[0] = { reinterpret_cast<char*>(cache.data()), stride, layers, heads,
+                            row_bytes, 0 };
+
+            auto at = [&](std::vector<uint32_t>& c, int l, int h, int pos) {
+                return reinterpret_cast<char*>(c.data()) + l * stride +
+                       (((int64_t)(pos / bs) * heads + h) * bs + pos % bs) * row_bytes;
+            };
+            for (int l = 0; l < layers; ++l)
+                for (int h = 0; h < heads; ++h)
+                    for (int t = 0; t < 3; ++t)
+                        std::memcpy(at(want, l, h, base + t + 1), at(want, l, h, base + path[t]),
+                                    (size_t)row_bytes);
+
+            CHECK_EQ(adv_compact_items(s.a), layers * heads);
+            for (int i = 0; i < s.a.n_seq; ++i)
+                for (int w = 0; w < adv_compact_items(s.a); ++w) {
+                    int p = 0, l = 0, h = 0;
+                    CHECK(adv_compact_item(s.a, w, &p, &l, &h));
+                    for (int c0 = 0; c0 < cstep; ++c0) adv_compact(s.a, i, p, l, h, c0, cstep);
+                }
+            CHECK(cache == want);
+        }
+    }
+}
+
 /* ================================================================== ADV_TRUNK */
 
 /* A verify step issued ahead takes its rows from the StepSlots: the bonus token and the head's
@@ -354,6 +406,49 @@ TEST(a_step_issued_ahead_takes_every_rows_tokens_positions_and_slots_from_its_st
         CHECK_EQ(s.used(1, i), used1[i]);   /* a state group counts from 0 and has no slots */
     }
     for (int t = 0; t < 9; ++t) CHECK_EQ(s.slot(1, t), 0);
+}
+
+/* --draft-depth adaptive (core/sched/draft_depth.h): the head ran for the deepest row of its step,
+ * so a slot holds every round's proposal, but the step issued ahead verifies only the chain each row
+ * really made -- its first d proposals, in 1 + d rows. The trunk advance takes exactly those (the
+ * rows' count is the batch's, never the slot's) and the acceptance behind that verify can accept no
+ * more than d, whatever the slot still holds past them. Two rows of one step differ in depth. */
+TEST(a_verify_of_a_chain_cut_short_takes_and_accepts_only_its_own_first_drafts) {
+    Slab s(ADV_TRUNK);
+    /* card 1 drafted five rounds and verifies two of them; card 3 verifies four */
+    s.row(0, true, 0, 3, /*ctx bound=*/40, /*card=*/1, 0, 0, 2);
+    s.row(1, true, 3, 5, 90, 3, 3, 3, 4);
+    for (int j = 0; j <= 5; ++j) { s.st[1].tok[j] = 700 + j; s.st[3].tok[j] = 800 + j; }
+    s.st[1].ctx = 20; s.st[1].n_acc = 3;
+    s.st[3].ctx = 60; s.st[3].n_acc = 1;
+    for (int t = 0; t < 8; ++t) s.w[Slab::TOK + t] = -5;
+    s.w[Slab::TOK + 8] = -5;
+    s.run();
+    const int32_t tok[8] = { 700, 701, 702, 800, 801, 802, 803, 804 };
+    const int32_t pos[8] = { 20, 21, 22, 60, 61, 62, 63, 64 };
+    for (int t = 0; t < 8; ++t) {
+        CHECK_EQ(s.w[Slab::TOK + t], tok[t]);
+        CHECK_EQ(s.w[Slab::POS + t], pos[t]);
+        CHECK_EQ(s.slot(0, t), pos[t]);
+    }
+    CHECK_EQ(s.w[Slab::TOK + 8], -5);            /* nothing past the rows the step has */
+    CHECK_EQ(s.used(0, 0), 23);
+    CHECK_EQ(s.used(0, 1), 65);
+    CHECK_EQ(s.w[Slab::ACC + 0], 3);
+    CHECK_EQ(s.w[Slab::ACC + 1], 1);
+
+    /* The acceptance behind that verify: the target agrees with every proposal the slot holds, and
+     * the row still accepts its own d only (the row descriptor's draft count), then emits the
+     * target's token at the row after them. */
+    Slab v(ADV_ACCEPT);
+    v.row(0, true, 0, 3, 20, 1, 0, 0, 2);
+    v.row(1, true, 3, 5, 60, 3, 3, 3, 4);
+    for (int t = 0; t < 8; ++t) v.w[Slab::TOK + t] = tok[t];
+    const int32_t y[8] = { 701, 702, 703, 801, 802, 803, 804, 805 };
+    for (int t = 0; t < 8; ++t) v.src[t] = y[t];
+    v.run();
+    CHECK_EQ(v.st[1].acc, 2);  CHECK_EQ(v.st[1].tok[0], 703);  CHECK_EQ(v.st[1].ctx, 23);
+    CHECK_EQ(v.st[3].acc, 4);  CHECK_EQ(v.st[3].tok[0], 805);  CHECK_EQ(v.st[3].ctx, 65);
 }
 
 /* A row the card moves keeps the host's offset between its position and its rotary position on
@@ -681,6 +776,68 @@ TEST(a_block_drafter_step_on_the_card_continues_where_the_verify_left_off) {
         }
         CHECK_EQ(n.w[Slab::CTX], 104);
         CHECK_EQ(n.w[Slab::ACC], 3);
+    }
+}
+
+/* ================================================================== a suffix step (--draft-suffix) */
+
+/* A suffix step is a host-built verify of up to 8 proposals behind the bonus token while the head
+ * drafts 3 rounds. The card's side of it: the acceptance walks all 8 drafts (a prefix of them, up to
+ * the end-of-generation cut), the head's history pass covers all 9 positions with round 1 on the
+ * last committed one and the rejected rows repeating it, and the 3 rounds publish the next verify's
+ * 3 proposals into tok[1..3] without touching what lies past them. */
+TEST(a_host_built_nine_row_verify_is_accepted_caught_up_and_followed_by_three_rounds) {
+    for (int acc_want = 0; acc_want <= 8; ++acc_want) {
+        const int ctx = 200, n = 9;
+        /* the verify: the bonus token and 8 proposals, a host row (no device row) */
+        Slab a(ADV_ACCEPT);
+        a.row(0, false, 0, n, ctx, /*card=*/3, /*rtok=*/0, /*rout=*/0, /*aux=*/8);
+        for (int j = 0; j < n; ++j) a.w[Slab::TOK + j] = 500 + j;
+        for (int j = 0; j <= 8; ++j) a.src[j] = j < acc_want ? 500 + j + 1 : 9000 + j;
+        a.run();
+        const StepSlot& S = a.st[3];
+        CHECK_EQ(S.acc, acc_want);
+        CHECK_EQ(S.tok[0], 9000 + acc_want);
+        CHECK_EQ(S.head, ctx + acc_want);
+        CHECK_EQ(S.ctx, ctx + acc_want + 1);
+        CHECK_EQ(S.n_acc, acc_want + 1);
+        CHECK_EQ(S.npath, 0);
+
+        /* the head's history pass over all nine rows: positions up to the last committed one, the
+         * rest repeating it, so no rejected proposal's hidden state reaches the head's cache */
+        Slab h(ADV_HIST);
+        h.st[3] = S;
+        h.row(0, true, 0, n, ctx, 3, 0, 0, /*aux=*/0);
+        for (int j = 0; j < n; ++j) h.src[j] = a.src[j];
+        h.run();
+        for (int j = 0; j < n; ++j) {
+            const int up = std::min(j, acc_want);
+            CHECK_EQ(h.w[Slab::POS + j], ctx + up);
+            CHECK_EQ(h.slot(0, j), ctx + up);
+            CHECK_EQ(h.w[Slab::OUT + j], up);
+        }
+        CHECK_EQ(h.used(0, 0), ctx + acc_want + 1);
+
+        /* the head's own rounds: 3 of the 8 the verify window allows */
+        for (int round = 2; round <= 3; ++round) {
+            Slab r(ADV_ROUND);
+            r.a.round = round;
+            r.st[3] = h.st[3];
+            r.row(0, true, 0, 1, 0, 3, 0, 0, 0);
+            r.src[0] = 7100 + round;
+            r.run();
+            h.st[3] = r.st[3];
+        }
+        Slab t(ADV_TAKE);
+        t.a.round = 3;
+        t.st[3] = h.st[3];
+        t.row(0, true, 0, 1, 0, 3, 0, 0, 0);
+        t.src[0] = 7200;
+        t.run();
+        const StepSlot& N = t.st[3];
+        CHECK_EQ(N.tok[0], 9000 + acc_want);
+        CHECK_EQ(N.tok[3], 7200);
+        for (int j = 4; j <= RAD_SCHED_MAX_SPEC; ++j) CHECK_EQ(N.tok[j], (int32_t)0x7f7f7f7f);   /* untouched */
     }
 }
 

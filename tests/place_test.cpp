@@ -2108,6 +2108,9 @@ struct LoanRig {
     /* None by default: on a slab this small the production count would leave most of the loan
      * empty. Tests of turnover set their own. */
     int         turnover = 0;
+    /* MoverConfig::turnover_adaptive and its floor, for the test of it. */
+    bool        adaptive = false;
+    int         floor = 0;
 
     explicit LoanRig(int n_expert = 8) : hf(n_expert) {}
 
@@ -2116,6 +2119,8 @@ struct LoanRig {
         RAD_TRY(h.init(hf.plan, hp));
         MoverConfig mc;
         mc.turnover_slots = turnover;
+        mc.turnover_adaptive = adaptive;
+        if (adaptive) mc.turnover_floor = floor;
         RAD_TRY(m.init(hf.f.prog, hf.plan, mc));
         RAD_TRY(rad_stream_create(&compute, 0));
         RAD_TRY(m.bind_compute_stream(compute));
@@ -2210,6 +2215,69 @@ TEST(every_lent_slot_is_filled_in_one_dispatch) {
     std::sort(at.begin(), at.end());
     for (size_t k = 1; k < at.size(); ++k)
         CHECK(at[k] - at[k - 1] >= r.hf.plan.classes[0].stride);
+}
+
+/* MoverConfig::turnover_adaptive: the slots kept free follow the swaps asked for. A quiet run keeps
+ * only the floor free and fills the rest; steps that propose swaps get three steps' worth of
+ * their mean back, up to the configured count, by drops (nothing crosses the link for them); and
+ * a quiet run gives them up again, each a copy in. */
+TEST(an_adaptive_turnover_follows_the_swaps_asked_for) {
+    LoanRig r(24);
+    r.turnover = 4;
+    r.adaptive = true;
+    r.floor = 1;
+    CHECK_OK(r.build());
+    CHECK_EQ(r.m.turnover_slots(), (int64_t)4);          /* the most it keeps */
+    CHECK_EQ(r.m.turnover_now(), (int64_t)1);            /* and what it starts from */
+    const int64_t stride = r.hf.plan.classes[0].stride;
+    const int64_t slots = r.m.flex_capacity() / stride;
+    CHECK(r.pooled() > slots);
+    REQUIRE(slots > 4);
+
+    auto settle = [&](int64_t proposed, int steps) {
+        for (int k = 0; k < steps; ++k) {
+            r.m.swap_demand(proposed);
+            CHECK_OK(r.dispatch());
+        }
+        for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) CHECK_OK(r.dispatch());
+        for (int k = 0; k < 4; ++k) CHECK_OK(r.dispatch());
+    };
+
+    CHECK_OK(r.m.set_loan(Mover::kLendKV, Loan::kAll));
+    for (Deadline dl; (r.m.flex_used_bytes() == 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();) {
+        r.m.swap_demand(0);
+        CHECK_OK(r.dispatch());
+    }
+    CHECK_EQ(r.m.turnover_now(), (int64_t)1);
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 1) * stride);
+
+    /* One swap a step, step after step: the mean reaches one, and three steps of it are three. */
+    const uint64_t d2h = r.m.stats().d2h_bytes, h2d = r.m.stats().h2d_bytes;
+    settle(1, 600);
+    CHECK_EQ(r.m.turnover_now(), (int64_t)3);
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 3) * stride);
+    CHECK_EQ(r.m.stats().dropped, (uint64_t)2);
+    /* Two a step would ask for six: the configured count bounds it. */
+    settle(2, 600);
+    CHECK_EQ(r.m.turnover_now(), (int64_t)4);
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 4) * stride);
+    CHECK_EQ(r.m.stats().dropped, (uint64_t)3);
+    CHECK_EQ(r.m.stats().d2h_bytes, d2h);                /* the drops crossed no link */
+    CHECK_EQ(r.m.stats().h2d_bytes, h2d);
+
+    /* Quiet again: back to the floor, and the three slots are filled again. */
+    settle(0, 800);
+    CHECK_EQ(r.m.turnover_now(), (int64_t)1);
+    CHECK_EQ(r.m.flex_used_bytes(), (slots - 1) * stride);
+    CHECK(r.m.stats().h2d_bytes > h2d);
+
+    /* Off, the count is the configured one whatever is asked for. */
+    LoanRig s(24);
+    s.turnover = 4;
+    CHECK_OK(s.build());
+    s.m.swap_demand(0);
+    CHECK_OK(s.dispatch());
+    CHECK_EQ(s.m.turnover_now(), (int64_t)4);
 }
 
 /* The turnover slots stay free, and a shrinking loan does not take them for good. The fill stops
@@ -2607,6 +2675,56 @@ TEST(a_second_lender_is_recalled_without_touching_the_first) {
     int32_t again = 0;
     for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u) again += arena.inside(r.addr(u));
     CHECK(again > 0);
+}
+
+/* The fleet lends free VRAM it backs into a range the engine reserved (Engine::xflex_tick).
+ * lendable_bytes sizes that range so every pooled unit gets a slot; the loan is the backed top of
+ * it, and a recall leaves nothing in it, so the range can be unbacked after. */
+TEST(the_fleets_loan_gives_every_pooled_unit_a_slot_and_comes_back_whole) {
+    if (!VMem::supported()) SKIP("the backend has no elastic memory");
+    LoanRig r;
+    CHECK_OK(r.build());
+    const int64_t b = r.m.lendable_bytes();
+    CHECK(b > 0);
+    const int64_t g = VMem::granularity();
+    VMem vm;
+    CHECK_OK(vm.reserve((b + g - 1) / g * g));
+    const int64_t before = r.m.flex_capacity();
+    LoanStrip st;
+    st.top = (char*)vm.base() + vm.size();
+    st.bytes = vm.size();
+    st.unit_bytes = 1;
+    st.unit_tokens = 1;
+    CHECK_OK(r.m.lend_from(Mover::kLendFleet, { st }));
+    const int64_t stride = r.hf.plan.classes[0].stride;
+    CHECK_EQ((r.m.flex_capacity() - before) / stride, (int64_t)r.pooled());
+    const int64_t ceil = r.m.loan_ceiling(Mover::kLendFleet);
+    CHECK(ceil > 0 && ceil <= vm.size());
+
+    /* Backed from the top, then lent: the fill reaches only the fleet's slots. */
+    const int64_t lend = (ceil + g - 1) / g * g;
+    CHECK_OK(vm.commit(vm.size() - lend, lend));
+    CHECK_OK(r.m.set_loan(Mover::kLendFleet, lend));
+    for (Deadline dl; (r.m.flex_used_bytes() == 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        CHECK_OK(r.dispatch());
+    auto in_range = [&](const void* p) {
+        return (const char*)p >= (const char*)vm.base() && (const char*)p < (const char*)vm.base() + vm.size();
+    };
+    int32_t in = 0;
+    for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u) {
+        CHECK(!r.loan.inside(r.addr(u)));
+        in += in_range(r.addr(u));
+    }
+    CHECK(in > 0);
+    CHECK(r.m.loan_held(Mover::kLendFleet) > 0);
+
+    /* The recall empties the range before it returns; unbacking it after is safe. */
+    CHECK_OK(r.m.reclaim(Mover::kLendFleet, 0, &r.h));
+    CHECK_EQ(r.m.loan_held(Mover::kLendFleet), (int64_t)0);
+    CHECK_EQ(resident_count(r.h, r.hf.plan), r.planned);
+    for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u) CHECK(!in_range(r.addr(u)));
+    CHECK_OK(vm.decommit(0, vm.size()));
+    CHECK_EQ(vm.committed(), (int64_t)0);
 }
 
 TEST(slot_pool_segments_have_their_own_targets) {
@@ -4583,6 +4701,43 @@ TEST(expert_pin_top_keeps_the_hottest_resident) {
     CHECK_EQ(pinned, 4);
     CHECK_EQ(hot_pinned, 4);
     CHECK(p.report(f.prog).find("pinned hot") != std::string::npos);
+}
+
+/* Real profiles carry per-layer shares in [0, 1] (xs_profile_load divides by the layer's total), so
+ * the cut must not assume integer gaps between shares: F = 0.25 pins the hottest quarter, not every
+ * resident expert. */
+TEST(expert_pin_top_cuts_fractional_shares) {
+    Fixture f;
+    build_moe_layers(f, 2, 8, 1 * MiB, 0);
+
+    std::vector<RadFileProfile> prof;
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < 8; ++e) {
+            RadFileProfile r{};
+            r.layer = l;
+            r.expert = e;
+            r.share = (float)(e + 1) / 36.0f;
+            prof.push_back(r);
+        }
+
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 1024;
+    c.host_pool_mib = 1024;
+    c.expert_pin_top = 0.25f;
+
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+
+    int pinned = 0, hot_pinned = 0;
+    for (const MoveUnit& mu : p.units) {
+        if (mu.expert < 0 || !mu.pinned) continue;
+        ++pinned;
+        if (mu.expert >= 6) ++hot_pinned;
+    }
+    CHECK_EQ(pinned, 4);
+    CHECK_EQ(hot_pinned, 4);
 }
 
 TEST(expert_pin_top_zero_pins_nothing) {

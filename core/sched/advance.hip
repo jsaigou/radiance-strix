@@ -8,6 +8,7 @@
 #include <cstdlib>
 
 #include "advance_impl.h"
+#include "device/chain_kernel.h"
 #include "rad_abi.h"
 
 extern "C" int rad_dev_chain_enabled(void);   /* core/device/device.h */
@@ -21,46 +22,16 @@ __global__ __launch_bounds__(kThreads) void rad_step_advance(rad::AdvanceArgs a)
     if (i < a.n_seq) rad::adv_row(a, i);
 }
 
-/* The chained form (RadKernelChainFn, abi/rad_abi.h): the backend gives a kernel named r4dchain*
- * a record at RAD_CHAIN_KARG_OFF and drops its barrier bit behind another chained kernel. Before
- * the first read one lane waits for the queue's counter to reach the record's target; after the
- * last write the block releases and adds 1. A record that does not check out means: run plain. */
-struct ChainRec {
-    unsigned long long  magic, target;
-    unsigned long long* ctr;
-    unsigned long long  check;
-};
-__device__ __forceinline__ const ChainRec* chain_rec() {
-    const ChainRec* r = (const ChainRec*)((const char*)__builtin_amdgcn_kernarg_segment_ptr() +
-                                          RAD_CHAIN_KARG_OFF);
-    const unsigned long long magic = r->magic, target = r->target, check = r->check;
-    if (magic != RAD_CHAIN_MAGIC ||
-        check != (magic ^ target ^ (unsigned long long)(uintptr_t)r->ctr ^ RAD_CHAIN_CHECK))
-        return nullptr;
-    return r;
-}
-
+/* The chained forms (chain_kernel.h), launched where launches chain. */
 __global__ __launch_bounds__(kThreads) void r4dchain_step_advance(rad::AdvanceArgs a) {
-    const ChainRec* r = chain_rec();
-    if (r) {
-        if (threadIdx.x == 0)
-            while (__hip_atomic_load(r->ctr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < r->target)
-                __builtin_amdgcn_s_sleep(1);
-        __syncthreads();
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-    }
+    rad_chain_wait();
     const int i = (int)(blockIdx.x * kThreads + threadIdx.x);
     if (i < a.n_seq) rad::adv_row(a, i);
-    if (r) {
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-        __syncthreads();
-        if (threadIdx.x == 0)
-            __hip_atomic_fetch_add(r->ctr, 1ull, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-    }
+    rad_chain_done();
 }
 
 /* ADV_COMPACT: block (x, y) is work item x (a pool, layer and head) of batch row y; its threads
- * split the K|V row into 16-byte chunks. Chained like the advance where launches chain, every
+ * split the K|V row into 16-byte chunks and its last words. Chained like the advance where launches chain, every
  * block waiting for the kernels before it and counting itself in after its moves. */
 constexpr int kCompactThreads = 64;
 __device__ __forceinline__ void step_compact_body(const rad::AdvanceArgs& a) {
@@ -72,21 +43,9 @@ __global__ __launch_bounds__(kCompactThreads) void rad_step_compact(rad::Advance
     step_compact_body(a);
 }
 __global__ __launch_bounds__(kCompactThreads) void r4dchain_step_compact(rad::AdvanceArgs a) {
-    const ChainRec* r = chain_rec();
-    if (r) {
-        if (threadIdx.x == 0)
-            while (__hip_atomic_load(r->ctr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < r->target)
-                __builtin_amdgcn_s_sleep(1);
-        __syncthreads();
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-    }
+    rad_chain_wait();
     step_compact_body(a);
-    if (r) {
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-        __syncthreads();
-        if (threadIdx.x == 0)
-            __hip_atomic_fetch_add(r->ctr, 1ull, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-    }
+    rad_chain_done();
 }
 
 }  // namespace

@@ -9,7 +9,7 @@ that report the geometry a kernel was launched with rather than every geometry i
     BUILD=... ./dis.sh r4d_gemm_fp8a8 gemm_8a8_prefill_kernelILb0E
     BUILD=... ./waterfall.sh                        # divergent VGPR indices, per kernel
     ./loop.sh                                       # its K loop, classified
-    ./trace.sh traces/dec -- ./bin/radiance ...     # then: ./tsum.sh traces/dec/k_kernel_trace.csv
+    ./trace.sh traces/dec -- ./bin/radiance --config radiance.yaml   # then: ./tsum.sh traces/dec/k_kernel_trace.csv
     ./selftest.sh                                   # the two parsers, on fixtures (ctest: isa_tools)
 
 `res.sh` and `waterfall.sh` exit nonzero when they looked at nothing -- no `.hip.o`, an object whose

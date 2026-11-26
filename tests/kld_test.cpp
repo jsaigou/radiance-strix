@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 using namespace rad;
 
@@ -322,10 +322,10 @@ TEST(the_reports_statistics_are_those_of_its_rows) {
     const std::vector<float> rows = read_rows(t.path + "/rep.json.rows");
     REQUIRE_EQ(rows.size(), (size_t)(55 * 4));
     std::ifstream in(t.path + "/rep.json");
-    const nlohmann::json rep = nlohmann::json::parse(in, nullptr, false);
+    const Json rep = Json::parse(in, nullptr, false);
     REQUIRE(!rep.is_discarded());
 
-    auto expect = [&](const nlohmann::json& j, size_t r0, size_t r1) {
+    auto expect = [&](const Json& j, size_t r0, size_t r1) {
         std::vector<double> kl;
         double sum = 0, nq = 0, np = 0, t1 = 0;
         for (size_t r = r0; r < r1; ++r) {
@@ -402,7 +402,7 @@ TEST(a_sparse_reference_scores_the_coarsened_kl) {
     CHECK_EQ((int64_t)std::filesystem::file_size(t.path + "/ref/rows.f32"), (int64_t)(55 * 3 * 4));
     {
         std::ifstream in(t.path + "/ref/kld.json");
-        const nlohmann::json m = nlohmann::json::parse(in, nullptr, false);
+        const Json m = Json::parse(in, nullptr, false);
         CHECK_EQ(m["format"].get<std::string>(), std::string("radiance-kld-top-1"));
         CHECK_EQ(m["top"].get<int>(), kTop);
     }
@@ -445,7 +445,7 @@ TEST(a_sparse_reference_scores_the_coarsened_kl) {
     CHECK(flips > 0);
     CHECK(sum_c > 0.5 * sum_f);     /* the head carries most of the divergence */
     std::ifstream in(t.path + "/rep.json");
-    const nlohmann::json rep = nlohmann::json::parse(in, nullptr, false);
+    const Json rep = Json::parse(in, nullptr, false);
     CHECK_EQ(rep["ref_form"].get<std::string>(), std::string("top-64 + tail"));
 }
 

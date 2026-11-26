@@ -74,7 +74,9 @@ PROMPTS = ("a", "hello", "longer prompt", "the quick brown fox jumps over the la
 def serve(build, rad, port, env, log, tp=1):
     """Start Radiance on the host kernels over `rad` and wait for /health. The caller stops it."""
     proc = subprocess.Popen(
-        [str(build / "bin/radiance"), "--model", str(rad), "--host", "127.0.0.1", "--port",
+        # The server reads a YAML file; scripts/radiance-flags writes these flags as one.
+        [str(Path(__file__).resolve().parent.parent / "scripts/radiance-flags"),
+         str(build / "bin/radiance"), "--model", str(rad), "--host", "127.0.0.1", "--port",
          str(port), "--kernels", "libref", "--debug-accept-reference-kernels", "--max-model-len",
          "64", "--max-num-batched-tokens", "32", "--max-num-seqs", "1", "--tp", str(tp)],
         env=env, stdout=log, stderr=subprocess.STDOUT)

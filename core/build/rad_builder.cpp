@@ -191,11 +191,12 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
             while (!role.empty() && role.front() == ' ') role.erase(role.begin());
             while (!role.empty() && role.back() == ' ') role.pop_back();
             const int k = rad_enc_find(&w.enc, role.c_str());
-            char e[256];
-            rad_enc_format(&w.enc, e, sizeof e);
-            if (k < 0)
+            if (k < 0) {
+                char e[256];
+                rad_enc_format(&w.enc, e, sizeof e);
                 return err(RAD_E_SHAPE, "weight '%s' takes plane '%s' of '%s', which is %s and has "
                                         "no such plane", n.c_str(), role.c_str(), w.source.c_str(), e);
+            }
             if (w.n_sel == RAD_ENC_MAX_PLANES)
                 return err(RAD_E_INVAL, "weight '%s': more than %d planes", n.c_str(),
                            RAD_ENC_MAX_PLANES);
@@ -214,14 +215,15 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
                            (p0.dtype == RAD_BF16 || p0.dtype == RAD_F16);
         /* A bf16 readout head over an f32 checkpoint tensor: the loader rounds it to bf16. */
         const bool narrow = w.n_sel == 1 && d->dtype == RAD_BF16 && p0.dtype == RAD_F32;
-        char e[256];
-        rad_enc_format(&w.enc, e, sizeof e);
-        if (!widen && !narrow)
+        if (!widen && !narrow) {
+            char e[256];
+            rad_enc_format(&w.enc, e, sizeof e);
             return err(RAD_E_DTYPE, "weight '%s' is declared %s, and '%s' holds %s as %s: only an "
                                     "exact widening or narrowing is done at load; anything else "
                                     "is a quantisation, which a recipe does before the container "
                                     "is written (spec §4.4)", n.c_str(), rad_dtype_name(d->dtype),
                        w.source.c_str(), p0.role, e);
+        }
         w.widen = widen;
         w.narrow = narrow;
     }
@@ -269,7 +271,7 @@ rad_weight Builder::decl_weight(const char* name, const RadWeightDecl* d) {
         w.stored_shape[i] = i < d->rank ? d->shape[i] : 0;
     w.align        = RAD_ALIGN_UNIT;
 
-    prog_.weights.push_back(w);
+    prog_.weights.push_back(std::move(w));
     const rad_weight h = (rad_weight)(prog_.weights.size() - 1);
     weight_by_name_.emplace(prog_.weights.back().name, h);
     return h;
@@ -480,7 +482,8 @@ int64_t Builder::kv_layer_bytes(rad_kvgroup g) {
     const int64_t bs = kv_block_size(g);
     if (bs <= 0) return 0;
     const int64_t nh = gi.decl.n_head_kv > 0 ? gi.decl.n_head_kv : 1;
-    return rad_dtype_bytes(gi.decl.dtype, 2 * bs * nh * gi.decl.head_dim);
+    return rad_dtype_bytes(gi.decl.dtype,
+                           bs * nh * rad_kv_row_elems(gi.decl.dtype, gi.decl.head_dim));
 }
 
 /* ================================================================== ops */
@@ -1563,8 +1566,8 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
         return RAD_E_INVAL;
     }
     /* References: a template with both of its slots, an item with one transcript before its one
-     * clip, and the clips' geometry; read whole by one branch's prompt (an unconditional branch
-     * would need references of its own). */
+     * clip, and the clips' geometry. Two branches may repeat the same reference prompt at
+     * guidance 1; reference CFG would need a separate unconditional frame map and is refused. */
     if (d->tmpl_ref) {
         auto once = [](const char* t, const char* k) {
             const char* a = t ? std::strstr(t, k) : nullptr;
@@ -1579,13 +1582,33 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
                              "{input} once each, and ref_item {text} before its one {audio}", nm);
             return RAD_E_INVAL;
         }
-        if (d->branches != 1 || !d->prompt_whole || d->ref_rate <= 0 || d->ref_hop <= 0 ||
-            d->ref_max <= 0 || d->ref_max_samples < d->ref_hop) {
-            err(RAD_E_INVAL, "declare_audio_generator '%s': references are read by a model of one "
-                             "branch from whole prompts, clips at a rate (%lld Hz) in frames of "
+        if (!d->prompt_whole || d->ref_rate <= 0 || d->ref_hop <= 0 ||
+            d->ref_max <= 0 || d->ref_max_samples < d->ref_hop ||
+            (d->branches != 1 && (!d->neg_tmpl || d->default_cfg != 1.0 ||
+                                  std::strstr(d->neg_tmpl, "{references}")))) {
+            err(RAD_E_INVAL, "declare_audio_generator '%s': references need whole prompts and "
+                             "guidance 1 (two branches need a plain negative template); clips at "
+                             "a rate (%lld Hz) in frames of "
                              "%lld samples, at most %d of them and %lld samples a request", nm,
                 (long long)d->ref_rate, (long long)d->ref_hop, (int)d->ref_max,
                 (long long)d->ref_max_samples);
+            return RAD_E_INVAL;
+        }
+    }
+    if (d->tmpl_ref_instruct || d->neg_tmpl_ref) {
+        auto once = [](const char* t, const char* key) {
+            const char* p = t ? std::strstr(t, key) : nullptr;
+            return p && !std::strstr(p + 1, key);
+        };
+        if (!d->tmpl_ref || !d->tmpl_ref_instruct || !d->neg_tmpl_ref || d->branches == 1 ||
+            !once(d->tmpl_ref_instruct, "{references}") ||
+            !once(d->tmpl_ref_instruct, "{input}") ||
+            !once(d->tmpl_ref_instruct, "{instructions}") ||
+            !once(d->neg_tmpl_ref, "{references}") || !once(d->neg_tmpl_ref, "{input}") ||
+            std::strstr(d->neg_tmpl_ref, "{instructions}")) {
+            err(RAD_E_INVAL, "declare_audio_generator '%s': reference direction needs paired "
+                             "conditional/reference-only templates with one references/input "
+                             "slot each and instructions only in the conditional template", nm);
             return RAD_E_INVAL;
         }
     }
@@ -1682,6 +1705,8 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
     prog_.agen_str.tmpl_plain = d->tmpl_plain ? d->tmpl_plain : "";
     prog_.agen_str.neg_tmpl = d->neg_tmpl ? d->neg_tmpl : "";
     prog_.agen_str.tmpl_ref = d->tmpl_ref ? d->tmpl_ref : "";
+    prog_.agen_str.tmpl_ref_instruct = d->tmpl_ref_instruct ? d->tmpl_ref_instruct : "";
+    prog_.agen_str.neg_tmpl_ref = d->neg_tmpl_ref ? d->neg_tmpl_ref : "";
     prog_.agen_str.ref_item = d->tmpl_ref && d->ref_item ? d->ref_item : "";
     prog_.audio_gen = *d;
     /* As for the image generator: the Program is moved after declare; strings live in agen_str. */
@@ -1690,6 +1715,8 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
     prog_.audio_gen.tmpl_plain = nullptr;
     prog_.audio_gen.neg_tmpl = nullptr;
     prog_.audio_gen.tmpl_ref = nullptr;
+    prog_.audio_gen.tmpl_ref_instruct = nullptr;
+    prog_.audio_gen.neg_tmpl_ref = nullptr;
     prog_.audio_gen.ref_item = nullptr;
     /* Without references the clips' geometry is nothing: the driver stages none. */
     if (!d->tmpl_ref) {
@@ -1730,7 +1757,8 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
                          "length (%lld)", nm, (long long)d->max_text);
         return RAD_E_INVAL;
     }
-    if (d->fps_num <= 0 || d->fps_den <= 0 || d->frames_per_chunk <= 0 || d->frames_tail < 0 ||
+    if (d->fps_num <= 0 || d->fps_den <= 0 || d->frames_per_chunk <= 0 ||
+        d->frames_tail <= -d->frames_per_chunk ||
         d->latents_per_chunk <= 0 || d->latents_tail < 0 || d->dec_latents < d->latents_per_chunk ||
         d->min_chunks <= 0 || d->max_chunks < d->min_chunks || d->default_chunks < d->min_chunks ||
         d->default_chunks > d->max_chunks ||
@@ -1760,8 +1788,12 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
             (long long)d->max_aspect, (long long)d->default_width, (long long)d->default_height);
         return RAD_E_INVAL;
     }
-    if (d->sample_rate <= 0 || d->audio_rate <= 0 || d->sample_rate % d->audio_rate != 0 ||
-        d->audio_channels <= 0 || d->audio_latent_channels <= 0) {
+    const bool has_audio = d->audio_channels > 0;
+    if (has_audio ? (d->sample_rate <= 0 || d->audio_rate <= 0 ||
+                     d->sample_rate % d->audio_rate != 0 || d->audio_latent_channels <= 0)
+                  : (d->sample_rate != 0 || d->audio_rate != 0 || d->audio_channels != 0 ||
+                     d->audio_latent_channels != 0 || d->audio_out != RAD_NULL_HANDLE ||
+                     d->audio_streams != 0 || d->max_ref_audios != 0 || d->max_enc_samples != 0)) {
         err(RAD_E_INVAL, "declare_video_generator '%s': the soundtrack is out of range (%lld Hz "
                          "at %lld latents a second, %lld channels of %lld)", nm,
             (long long)d->sample_rate, (long long)d->audio_rate, (long long)d->audio_channels,
@@ -1770,7 +1802,8 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
     }
     /* Form 1 (LTX-2's FlowMatchEulerDiscrete) steps both modalities the same sigmas and reads
      * no per-modality shift. */
-    const bool shifts = d->sched_kind == 1 || (d->shift_video > 0.0 && d->shift_audio > 0.0);
+    const bool shifts = d->sched_kind == 1 ||
+                        (d->shift_video > 0.0 && (!has_audio || d->shift_audio > 0.0));
     if (d->default_steps <= 0 || d->max_steps < d->default_steps || !shifts || d->max_lanes <= 0) {
         err(RAD_E_INVAL, "declare_video_generator '%s': the sampler is incomplete (%lld steps by "
                          "default, %lld at most, shifts %g and %g, %lld lanes)", nm,
@@ -1778,9 +1811,19 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
             (long long)d->max_lanes);
         return RAD_E_INVAL;
     }
-    /* Form 0 counts grid points, form 1 evaluations. */
+    if (d->sched_kind == RAD_VIDEO_SCHEDULE_UNIPC &&
+        (has_audio || d->n_rungs != 0 || d->dyn_shift != 0 || d->shift_terminal != 0.0 ||
+         d->upscale_max != 0.0 || d->max_steps > 1000 || !std::isfinite(d->shift_video) ||
+         d->shift_video > 100.0)) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': UniPC needs video only, a shift in "
+                         "(0, 100] and up to 1000 evaluations, with no rungs, dynamic shifting "
+                         "or upscaler", nm);
+        return RAD_E_INVAL;
+    }
+    /* Form 0 counts grid points. Form 1 can declare trained evaluations. */
     const int64_t rung_steps = d->sched_kind == 1 ? d->n_rungs : d->n_rungs + 1;
-    if (d->sched_kind < 0 || d->sched_kind > 1 || d->n_rungs < 0 || (d->n_rungs > 0 && !d->rungs) ||
+    if (d->sched_kind < 0 || d->sched_kind > RAD_VIDEO_SCHEDULE_UNIPC ||
+        d->n_rungs < 0 || (d->n_rungs > 0 && !d->rungs) ||
         (d->n_rungs > 0 && (d->default_steps != rung_steps || d->max_steps != rung_steps))) {
         err(RAD_E_INVAL, "declare_video_generator '%s': a trained schedule of %d rungs runs %lld "
                          "steps, which default_steps and max_steps must both be (%lld, %lld)", nm,
@@ -1816,7 +1859,8 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
         }
     if (d->step_text_rows < 0 || d->step_text_rows > d->max_text * 64 || d->image_crf < 0 ||
         d->image_crf > 51 || (d->image_cond != 0 && d->image_cond != 1) ||
-        (d->guidance != 0 && d->guidance != 1)) {
+        (d->guidance != 0 && d->guidance != RAD_VIDEO_GUIDANCE_FULL &&
+         d->guidance != RAD_VIDEO_GUIDANCE_CFG)) {
         err(RAD_E_INVAL, "declare_video_generator '%s': step_text_rows %lld, image_cond %d, "
                          "image_crf %d (0..51) or guidance %d is out of range", nm,
             (long long)d->step_text_rows, (int)d->image_cond, (int)d->image_crf, (int)d->guidance);
@@ -1878,16 +1922,17 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
         }
         return true;
     };
-    /* frames_out holds the last chunk, the largest, at the largest area; audio_out the longest
-     * soundtrack. */
-    const int64_t chunk_px = (d->frames_per_chunk + d->frames_tail) * d->max_area * 3;
-    const int64_t max_frames = d->frames_per_chunk * d->max_chunks + d->frames_tail;
-    const int64_t max_lat = (max_frames * d->fps_den * d->audio_rate * 2 + d->fps_num) /
-                            (2 * d->fps_num) + 1;
-    const int64_t max_samples = max_lat * (d->sample_rate / d->audio_rate);
-    if (!buf_ok(d->frames_out, RAD_U8, chunk_px, "frames_out") ||
-        !buf_ok(d->audio_out, RAD_F32, max_samples * d->audio_channels, "audio_out"))
-        return RAD_E_INVAL;
+    /* frames_out holds the largest chunk at the largest area; audio_out the longest soundtrack. */
+    const int64_t chunk_px = (d->frames_per_chunk + (d->max_chunks == 1 ? d->frames_tail : std::max<int64_t>(0, d->frames_tail))) * d->max_area * 3;
+    if (!buf_ok(d->frames_out, RAD_U8, chunk_px, "frames_out")) return RAD_E_INVAL;
+    if (has_audio) {
+        const int64_t max_frames = d->frames_per_chunk * d->max_chunks + d->frames_tail;
+        const int64_t max_lat = (max_frames * d->fps_den * d->audio_rate * 2 + d->fps_num) /
+                                (2 * d->fps_num) + 1;
+        const int64_t max_samples = max_lat * (d->sample_rate / d->audio_rate);
+        if (!buf_ok(d->audio_out, RAD_F32, max_samples * d->audio_channels, "audio_out"))
+            return RAD_E_INVAL;
+    }
     if (d->duration_out != RAD_NULL_HANDLE) {
         if (!buf_ok(d->duration_out, RAD_F32, 1, "duration_out")) return RAD_E_INVAL;
         if (!(d->duration_min > 0.0 && d->duration_max > d->duration_min) ||
@@ -2051,9 +2096,9 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
     if (d->kind == RAD_DRAFT_NONE) return RAD_OK;   /* declaring nothing is declaring nothing */
 
     const char* nm = d->name && *d->name ? d->name : "(unnamed)";
-    if (d->kind != RAD_DRAFT_SERIAL && d->kind != RAD_DRAFT_BLOCK) {
-        err(RAD_E_INVAL, "declare_drafter '%s': kind %d is neither RAD_DRAFT_SERIAL nor "
-                         "RAD_DRAFT_BLOCK", nm, d->kind);
+    const bool history = d->kind == RAD_DRAFT_HISTORY;
+    if (d->kind != RAD_DRAFT_SERIAL && d->kind != RAD_DRAFT_BLOCK && !history) {
+        err(RAD_E_INVAL, "declare_drafter '%s': unknown kind %d", nm, d->kind);
         return RAD_E_INVAL;
     }
     if (prog_.drafter.kind != RAD_DRAFT_NONE) {
@@ -2063,9 +2108,16 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
             prog_.drafter_name.c_str(), nm);
         return RAD_E_STATE;
     }
-    if (d->depth <= 0) {
-        err(RAD_E_INVAL, "declare_drafter '%s': depth %d. A drafter that proposes nothing is not "
-                         "declared at all -- leave the call out.", nm, d->depth);
+    if (history && (d->depth != 0 || prog_.ctx.max_spec != 0 || d->proposal ||
+                    d->proposal_pitch || d->block || d->window || !prog_.ctx.calib_dir ||
+                    !*prog_.ctx.calib_dir || prog_.ctx.calib_tokens <= 0)) {
+        err(RAD_E_INVAL, "declare_drafter '%s': HISTORY requires calibration, max_spec 0 and "
+                         "no proposal or block", nm);
+        return RAD_E_INVAL;
+    }
+    if (!history && d->depth <= 0) {
+        err(RAD_E_INVAL, "declare_drafter '%s': depth %d. A speculative drafter must propose "
+                         "at least one token.", nm, d->depth);
         return RAD_E_INVAL;
     }
     if (prog_.ctx.max_spec > 0 && d->depth != prog_.ctx.max_spec) {
@@ -2141,7 +2193,7 @@ int Builder::declare_drafter(const RadDrafterDecl* d) {
     /* A block drafter's proposal row holds its whole block's tokens, and the engine reads row s
      * at s * pitch (a short block fills only its front), so its pitch defaults to depth; a serial
      * one writes a token a pass, at pitch 1 by default. */
-    if (prog_.drafter.proposal_pitch == 0)
+    if (!history && prog_.drafter.proposal_pitch == 0)
         prog_.drafter.proposal_pitch = prog_.drafter.kind == RAD_DRAFT_BLOCK ? prog_.drafter.depth : 1;
     return RAD_OK;
 }
@@ -2197,6 +2249,11 @@ int Builder::lora_root(const char* native, const char* spellings) {
     }
     prog_.lora_roots.push_back(std::move(r));
     return RAD_OK;
+}
+
+int Builder::lora_source_targeted(const char* src) const {
+    if (!lora_targets_ || !src || !*src) return 0;
+    return lora::source_targeted(prog_, *lora_targets_, src) ? 1 : 0;
 }
 
 int Builder::lora_alias(const char* native, const char* from, const char* to, int64_t from_lo,
@@ -2289,6 +2346,38 @@ int Builder::drafter_tree(rad_buf parents) {
     }
     prog_.drafter_tree    = true;
     prog_.drafter_parents = parents;
+    return RAD_OK;
+}
+
+/* The routing counts' storage (rad_builder.h). The row count is checked in Ctx::bind_routing,
+ * which knows the reporting layers. */
+int Builder::route_table(rad_buf table) {
+    if (finished_) {
+        err(RAD_E_STATE, "route_table after declare finished");
+        return RAD_E_STATE;
+    }
+    if (prog_.route_table != RAD_NULL_HANDLE) {
+        err(RAD_E_STATE, "route_table: buffer '%s' is already the routing table",
+            prog_.buffers[prog_.route_table].name.c_str());
+        return RAD_E_STATE;
+    }
+    if (table == RAD_NULL_HANDLE || (size_t)table >= prog_.buffers.size()) {
+        err(RAD_E_INVAL, "route_table: buffer %u is not a declared buffer", (unsigned)table);
+        return RAD_E_INVAL;
+    }
+    const BufferInfo& bi = prog_.buffers[table];
+    if (bi.decl.dtype != RAD_I32) {
+        err(RAD_E_DTYPE, "route_table: buffer '%s' is not i32", bi.name.c_str());
+        return RAD_E_DTYPE;
+    }
+    if (bi.decl.domain != RAD_DOMAIN_DEVICE || bi.decl.kind != RAD_BUF_PERSIST) {
+        err(RAD_E_INVAL, "route_table: buffer '%s' must be a RAD_BUF_PERSIST device buffer: the "
+                         "core reads its rows at the end of every pass and between passes, where a "
+                         "transient's bytes belong to whichever buffer shares them",
+            bi.name.c_str());
+        return RAD_E_INVAL;
+    }
+    prog_.route_table = table;
     return RAD_OK;
 }
 
@@ -2512,7 +2601,8 @@ void Builder::finish_kv_groups() {
             case RAD_KV_RING:
                 /* One block holds K and V for block_size tokens, the block manager's unit. */
                 gi.bytes_per_block =
-                    rad_dtype_bytes(d.dtype, 2 * gi.block_size * elem_n_head * d.head_dim) * n_bound;
+                    rad_dtype_bytes(d.dtype, gi.block_size * elem_n_head *
+                                             rad_kv_row_elems(d.dtype, d.head_dim)) * n_bound;
                 gi.bytes_per_state = 0;
                 break;
             case RAD_KV_LINEAR:
@@ -2849,9 +2939,19 @@ int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const ch
     return B(b)->lora_alias(native, from, to, from_lo, from_hi, to_lo);
 }
 
+int rad_lora_source_targeted(RadBuilder* b, const char* src) {
+    if (!b || !src) return 0;
+    return B(b)->lora_source_targeted(src);
+}
+
 int rad_drafter_tree(RadBuilder* b, rad_buf parents) {
     if (!b) return RAD_E_INVAL;
     return B(b)->drafter_tree(parents);
+}
+
+int rad_route_table(RadBuilder* b, rad_buf table) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->route_table(table);
 }
 
 int rad_chain_on(void) { return rad_dev_chain_enabled(); }

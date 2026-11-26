@@ -159,7 +159,9 @@ static inline int avx_layout_mtp(const RadParam*, int, int operand, const RadEnc
     return layout_scaled(operand, 4, 5, enc, sel, planes, n, out);
 }
 
-/* gemm_nt_q: `b_scale` (operand 3) as the scale and zero of the grid `dtype` names. */
+/* gemm_nt_q: `b_scale` (operand 3) as the scale and zero of the grid `dtype` names, or a symmetric
+ * int8 grid's scale in two levels, an unsigned integer per (row, `group` of K) under a float a row
+ * (IQ8R), whose product is the scale: libref's two forms (ref_planes.h). */
 static inline int avx_layout_gemm_q(const RadParam* p, int n_p, int operand,
                                     const RadEncoding* enc, const int* sel,
                                     const RadTensor* planes, int n, RadLayout* out) {
@@ -168,6 +170,20 @@ static inline int avx_layout_gemm_q(const RadParam* p, int n_p, int operand,
     if (n < 2 || operand != 3) return RAD_E_UNSUPPORTED;
     const ZpGrid* zg = zp_grid(rad_param_gets(p, n_p, "dtype", nullptr));
     const long long group = rad_param_geti(p, n_p, "group", 0);
+    if (!zg && sel_roles(enc, sel, n, "scale", "scale.1")) {
+        if (group <= 0 || !rad_enc_is(enc, "affine") || enc->n_planes != 3) return RAD_E_DTYPE;
+        const RadEncPlane& c = enc->plane[0];
+        const RadEncPlane& s = enc->plane[sel[0]];
+        const RadEncPlane& s2 = enc->plane[sel[1]];
+        if (std::strncmp(c.role, "codes", RAD_ENC_STR) != 0 || c.dtype != RAD_I8 ||
+            c.block[0] != 1 || c.block[1] != 1)
+            return RAD_E_DTYPE;
+        if (s.kind != RAD_PLANE_TILED || s.dtype != RAD_U8 || s.block[0] != 1 ||
+            s.block[1] != group || s2.kind != RAD_PLANE_TILED || !float_scale_dt(s2.dtype) ||
+            s2.block[0] != 1 || s2.block[1] != 0)
+            return RAD_E_DTYPE;
+        return rad_planes_layout(enc, sel, planes, n, out);
+    }
     if (!zg || group <= 0 || !rad_enc_is(enc, "affine")) return RAD_E_DTYPE;
     if (enc->transform[0] && std::strncmp(enc->transform, "givens", RAD_ENC_STR) != 0)
         return RAD_E_DTYPE;

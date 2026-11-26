@@ -18,7 +18,13 @@ fail() { echo "llvm-check: $*" >&2; exit 1; }
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 cd "$B"
-cmds=$(ninja -t commands libr4d)
+# A build for one card (`docker/build.sh -t gfx1151`) compiles no libr4d -- that library is
+# another family's -- so there is no compile command to rerun and nothing to check: the
+# pairing this script verifies lives in device code this build does not contain.
+cmds=$(ninja -t commands libr4d 2>/dev/null) || {
+    echo "llvm-check: this build has no libr4d (its GPU targets are filtered); skipped"
+    exit 0
+}
 line=$(grep -m1 -F -- "-o $O " <<< "$cmds") || fail "no compile command for $O"
 eval "set -- $line"
 args=("$@")

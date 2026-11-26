@@ -203,6 +203,42 @@ TEST(the_kl_mode_records_or_scores_and_says_which_input_it_lacks) {
     CHECK_EQ(parse({ "--kld-record", "/r", "--kld-corpus", "/c", "--kld-top", "-1" }, &f), RAD_E_INVAL);
 }
 
+/* The diagnose mode: one mode a run, and its corpus and baseline belong to its workload. A run
+ * that took one of them without a DIR would measure nothing while looking configured. */
+TEST(the_diagnose_mode_takes_its_own_flags_and_nothing_else) {
+    Config c;
+    CHECK_EQ(parse({ "--diagnose", "/d", "--diagnose-tokens", "64", "--diagnose-runs", "1",
+                     "--diagnose-concurrency", "1,2", "--diagnose-prefill", "1024,4096",
+                     "--diagnose-corpus", "/c.jsonl", "--diagnose-baseline", "/b.json" }, &c), RAD_OK);
+    CHECK(c.diagnose_mode());
+    CHECK_EQ(c.diagnose, std::string("/d"));
+    CHECK_EQ(c.diagnose_tokens, 64);
+    CHECK_EQ(c.diagnose_runs, 1);
+    CHECK_EQ(c.diagnose_concurrency.size(), (size_t)2);
+    CHECK_EQ(c.diagnose_prefill.size(), (size_t)2);
+    CHECK_EQ(c.diagnose_corpus, std::string("/c.jsonl"));
+    CHECK_EQ(c.diagnose_baseline, std::string("/b.json"));
+
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.diagnose_mode());
+    CHECK_EQ(d.diagnose_tokens, 256);              /* the defaults the report states */
+    CHECK_EQ(d.diagnose_runs, 3);
+    CHECK_EQ(d.diagnose_concurrency.size(), (size_t)4);
+    CHECK_EQ(d.diagnose_prefill.size(), (size_t)4);
+
+    Config f;
+    CHECK_EQ(parse({ "--diagnose-corpus", "/c.jsonl" }, &f), RAD_E_INVAL);   /* no workload */
+    CHECK_EQ(parse({ "--diagnose-baseline", "/b.json" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/d", "--kld-ref", "/r" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/d", "--debug-graph" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/d", "--calib-corpus", "/c.jsonl", "--calib-dir", "/s" }, &f),
+             RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/d", "--diagnose-concurrency", "1,,2" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/d", "--diagnose-prefill", "8" }, &f), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--diagnose", "/d", "--diagnose-runs", "0" }, &f), RAD_E_INVAL);
+}
+
 /* Runtime LoRA: the adapters reach their fields in order, the targets as sorted leaf names, and a
  * combination that would size slots no adapter uses, or name an adapter that is not served, is
  * refused by name. A text model's slot count against its adapters, and its targets, are checked
@@ -312,7 +348,7 @@ TEST(the_sizes_and_counts_reach_the_fields_they_name) {
     CHECK_EQ(c.max_tok, 512ll);
     CHECK_EQ(c.max_seqs, 8ll);
     CHECK_EQ(c.max_ctx, 200000ll);
-    CHECK_EQ(c.host_pool_mib, 12288ll);
+    CHECK_EQ(c.host_pool_mib, 6144ll);   /* a rank's share of the 12288 at --tp 2 */
     CHECK_EQ(c.prefix_cache_mib, 4096ll);
     CHECK_EQ(c.prefix_cache_ttl, 600ll);
     CHECK_EQ(c.checkpoint_interval, 2048ll);
@@ -434,6 +470,50 @@ TEST(a_prefill_span_below_one_interval_is_refused) {
     CHECK_EQ(c.prefill_span, 4);
 }
 
+/* --prefill-span-pass piece|step and --prefill-span-min auto|N shape a span: piece and auto are
+ * the defaults (a pass a piece, the automatic minimum), and either is refused without a span to shape. */
+TEST(the_span_pass_and_the_span_minimum_need_a_span) {
+    LogGuard lg;
+    Config d;
+    CHECK(!d.prefill_span_step);
+    CHECK_EQ(d.prefill_span_min, -1);
+    CHECK_EQ(parse({ "--prefill-span", "2" }, &d), RAD_OK);
+    CHECK(!d.prefill_span_step);
+    CHECK_EQ(d.prefill_span_min, -1);
+
+    Config c;
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-pass", "step" }, &c), RAD_OK);
+    CHECK(c.prefill_span_step);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-pass", "piece" }, &c), RAD_OK);
+    CHECK(!c.prefill_span_step);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-pass", "whole" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--prefill-span-pass", "step" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--prefill-span", "1", "--prefill-span-pass", "step" }), RAD_E_INVAL);
+    /* piece without a span is the default said aloud. */
+    CHECK_EQ(parse_fresh({ "--prefill-span-pass", "piece" }), RAD_OK);
+
+    /* --prefill-tail-snapshot: on by default, off and on parse, nothing else does. */
+    CHECK(d.prefill_tail_snapshot);
+    Config t;
+    CHECK_EQ(parse({ "--prefill-tail-snapshot", "off" }, &t), RAD_OK);
+    CHECK(!t.prefill_tail_snapshot);
+    CHECK_EQ(parse({ "--prefill-tail-snapshot", "on" }, &t), RAD_OK);
+    CHECK(t.prefill_tail_snapshot);
+    CHECK_EQ(parse_fresh({ "--prefill-tail-snapshot", "maybe" }), RAD_E_INVAL);
+
+    Config m;
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "0" }, &m), RAD_OK);
+    CHECK_EQ(m.prefill_span_min, 0);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "16384" }, &m), RAD_OK);
+    CHECK_EQ(m.prefill_span_min, 16384);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "auto" }, &m), RAD_OK);
+    CHECK_EQ(m.prefill_span_min, -1);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "-1" }, &m), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--prefill-span", "2", "--prefill-span-min", "2k" }, &m), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--prefill-span-min", "0" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--prefill-span-min", "auto" }), RAD_OK);
+}
+
 /* A budget flag takes a whole number; a typo is refused rather than read as 0 or its prefix. */
 TEST(a_numeric_flag_refuses_what_is_not_a_number) {
     Config c;
@@ -478,6 +558,17 @@ TEST(prefill_interleave_takes_a_step_count_up_to_64) {
     CHECK_EQ(parse({ "--prefill-interleave", "auto:x" }, &c), RAD_E_INVAL);
 }
 
+TEST(mixed_step_target_is_an_opt_in_soft_millisecond_target) {
+    Config d;
+    REQUIRE_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.mixed_step_target_ms, 0);
+    Config c;
+    CHECK_EQ(parse({ "--mixed-step-target-ms", "150" }, &c), RAD_OK);
+    CHECK_EQ(c.mixed_step_target_ms, 150);
+    CHECK_EQ(parse({ "--mixed-step-target-ms", "60001" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--mixed-step-target-ms", "-1" }, &c), RAD_E_INVAL);
+}
+
 /* ================================================================== the table, the parser and the help agree
  *
  * One table (g_flags) drives the help text and the startup report, and a separate chain of ifs
@@ -520,12 +611,14 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
+        { "--mixed-step-target-ms", { "150" } },
+        { "--prefill-room-gate", { "off" } },
         { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
         { "--gpu-memory-mib", { "16384" } }, { "--gpu-headroom-mib", { "128" } },
-        { "--kv-cache-dtype", { "fp8" } },
-        { "--state-cache-dtype", { "f16" } }, { "--attn-prefill-fp8", { "both" } },
+        { "--kv-cache-dtype", { "i8" } },
+        { "--state-cache-dtype", { "f16" } },
         { "--kv-resident", { "65536" } },
         { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
@@ -534,18 +627,34 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--prefix-cache-mib", { "256" } }, { "--prefix-cache-ttl", { "60" } },
         { "--placement", { "all_vram" } }, { "--checkpoint-interval", { "256" } },
         { "--prefill-span", { "2" } },
+        { "--prefill-span-pass", { "step", "--prefill-span", "2" } },
+        { "--prefill-tail-snapshot", { "off" } },
+        { "--prefill-span-first", { "on" } },
+        { "--prefill-span-min", { "4096", "--prefill-span", "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
         { "--prefix-resume", { "nearest" } },
         { "--num-speculative-tokens", { "2" } }, { "--spec-ngram", { "4" } },
         { "--spec-ngram-min", { "1" } }, { "--spec-ngram-max", { "6" } },
         { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
-        { "--draft-coupling", { "on" } },
+        { "--draft-coupling", { "on" } }, { "--draft-verify", { "block" } },
+        { "--draft-suffix", { "on" } }, { "--draft-suffix-min-match", { "5" } },
+        { "--draft-suffix-max", { "6" } }, { "--draft-suffix-min-score", { "0.4" } },
+        { "--draft-depth", { "adaptive" } }, { "--draft-depth-max", { "5" } },
+        { "--draft-depth-min", { "2" } }, { "--draft-depth-stop", { "0.7" } },
+        { "--draft-depth-lag", { "0" } }, { "--draft-depth-stat", { "path" } },
+        { "--draft-depth-load", { "on", "--draft-depth", "adaptive" } },
+        { "--draft-depth-load-from", { "4" } }, { "--draft-depth-load-min", { "1" } },
+        { "--draft-depth-load-late", { "off" } }, { "--draft-depth-load-calib", { "static" } },
+        { "--draft-depth-load-tok-ms", { "0.23,0.36,0.43,0.51" } },
+        { "--draft-depth-load-row-ms", { "1.2,0.8" } }, { "--draft-depth-load-round-ms", { "0.5" } },
+        { "--draft-depth-load-jump-ms", { "1.3,1.4,2.3,0" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
         { "--api-key-env", { "RAD_KEY_ENV_INVENTORY" } },
         { "--allow-host", { "box" } },
         { "--trusted-proxy", { "127.0.0.0/8" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },
+        { "--control-vector-variant", { "uncensored", "--control-vector", "off" } },
         { "--generation-config", { "/g.json" } }, { "--override-chat-template", { "/t.jinja" } },
         { "--temp", { "0.7" } }, { "--top-k", { "40" } }, { "--top-p", { "0.9" } },
         { "--min-p", { "0.05" } }, { "--reasoning-effort", { "low" } },
@@ -589,6 +698,13 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--kld-lora", { "a", "--lora", "a=/adapters/a", "--kld-ref", "/r" } },
         { "--kld-lora-sources", { "doc/", "--kld-lora", "a", "--lora", "a=/adapters/a",
                                   "--kld-ref", "/r" } },
+        { "--diagnose", { "/d" } },
+        { "--diagnose-tokens", { "64", "--diagnose", "/d" } },
+        { "--diagnose-runs", { "1", "--diagnose", "/d" } },
+        { "--diagnose-concurrency", { "1,2", "--diagnose", "/d" } },
+        { "--diagnose-prefill", { "1024,4096", "--diagnose", "/d" } },
+        { "--diagnose-corpus", { "/c.jsonl", "--diagnose", "/d" } },
+        { "--diagnose-baseline", { "/b.json", "--diagnose", "/d" } },
     };
     return v;
 }
@@ -746,6 +862,37 @@ TEST(the_control_vector_flag_is_off_on_or_disabled) {
     }
 }
 
+/* The variant is a name a request gives as `model`, so it keeps the rule names keep, and it needs a
+ * loaded vector: with none it would answer as the stock model while the client asked for the
+ * vector. A --lora adapter of the same name would make `base:name` mean two things. */
+TEST(the_control_vector_variant_needs_a_vector_and_a_plain_name_of_its_own) {
+    {
+        Config c;
+        CHECK_EQ(parse({ "--control-vector", "off", "--control-vector-variant", "uncensored" }, &c),
+                 RAD_OK);
+        CHECK_EQ(c.control_vector_variant, std::string("uncensored"));
+    }
+    {
+        Config c;
+        CHECK_EQ(parse({}, &c), RAD_OK);
+        CHECK(c.control_vector_variant.empty());
+    }
+    auto refused = [](std::initializer_list<const char*> v) {
+        Config c;
+        int st = RAD_OK;
+        const std::string log = stderr_of([&] { st = parse(v, &c); });
+        CHECK_EQ(st, (int)RAD_E_INVAL);
+        CHECK(has(log, "--control-vector-variant"));
+    };
+    refused({ "--control-vector-variant", "uncensored" });
+    refused({ "--control-vector", "disabled", "--control-vector-variant", "uncensored" });
+    refused({ "--control-vector", "off", "--control-vector-variant", "base:uncensored" });
+    refused({ "--control-vector", "off", "--control-vector-variant", "two words" });
+    refused({ "--control-vector", "off", "--control-vector-variant", "" });
+    refused({ "--control-vector", "off", "--lora", "uncensored=/ad/u",
+              "--control-vector-variant", "uncensored" });
+}
+
 TEST(the_wire_mode_is_one_of_two_names) {
     Config c;
     CHECK_EQ(parse({ "--tp-wire", "exact" }, &c), RAD_OK);
@@ -786,25 +933,6 @@ TEST(weight_prefetch_is_on_or_off) {
     CHECK_EQ(parse({ "--weight-prefetch", "" }, &c), RAD_E_INVAL);
 }
 
-/* The prefill attention's e4m3 legs are lossy, so the default is off and anything but the four
- * names stops the server. */
-TEST(the_attention_fp8_mode_is_one_of_four_names) {
-    Config c;
-    CHECK_EQ(c.attn_prefill_fp8, 0);
-    CHECK_EQ(parse({ "--attn-prefill-fp8", "qk" }, &c), RAD_OK);
-    CHECK_EQ(c.attn_prefill_fp8, (int)RAD_ATTN_FP8_QK);
-    CHECK_EQ(parse({ "--attn-prefill-fp8", "pv" }, &c), RAD_OK);
-    CHECK_EQ(c.attn_prefill_fp8, (int)RAD_ATTN_FP8_PV);
-    CHECK_EQ(parse({ "--attn-prefill-fp8", "both" }, &c), RAD_OK);
-    CHECK_EQ(c.attn_prefill_fp8, (int)(RAD_ATTN_FP8_QK | RAD_ATTN_FP8_PV));
-    CHECK_EQ(std::string(attn_prefill_fp8_name(c.attn_prefill_fp8)), std::string("both"));
-    CHECK_EQ(parse({ "--attn-prefill-fp8", "off" }, &c), RAD_OK);
-    CHECK_EQ(c.attn_prefill_fp8, 0);
-    CHECK_EQ(parse({ "--attn-prefill-fp8", "3" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--attn-prefill-fp8", "" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--attn-prefill-fp8", "QK" }, &c), RAD_E_INVAL);
-}
-
 TEST(the_p2p_mode_is_one_of_three_names) {
     Config c;
     CHECK_EQ(c.p2p, RAD_P2P_AUTO);
@@ -835,21 +963,26 @@ TEST(the_state_cache_dtype_is_f32_or_f16) {
     CHECK_EQ(parse({ "--state-cache-dtype" }, &c), RAD_E_INVAL);
 }
 
-TEST(the_kv_cache_dtype_is_one_of_four_names) {
+TEST(the_kv_cache_dtype_is_one_of_three_names) {
     Config c;
     CHECK_EQ(parse({ "--kv-cache-dtype", "bf16" }, &c), RAD_OK);
     CHECK_EQ(c.kv_cache_dtype, std::string("bf16"));
     CHECK_EQ(parse({ "--kv-cache-dtype", "fp8" }, &c), RAD_OK);
     CHECK_EQ(c.kv_cache_dtype, std::string("fp8"));
-    CHECK_EQ(parse({ "--kv-cache-dtype", "fp8_v4" }, &c), RAD_OK);
-    CHECK_EQ(c.kv_cache_dtype, std::string("fp8_v4"));
-    CHECK_EQ(parse({ "--kv-cache-dtype", "k6_v4" }, &c), RAD_OK);
-    CHECK_EQ(c.kv_cache_dtype, std::string("k6_v4"));
-    /* Four values only: an "auto" resolving to bf16 would be a second name for the default, and
-     * each value should be unambiguous in a log. */
+    CHECK_EQ(parse({ "--kv-cache-dtype", "i8" }, &c), RAD_OK);
+    CHECK_EQ(c.kv_cache_dtype, std::string("i8"));
+    /* Three values only: an "auto" resolving to bf16 would be a second name for the default, and
+     * each value should be unambiguous in a log. The packed caches are refused by name, with the
+     * cache that serves in their place. */
     CHECK_EQ(parse({ "--kv-cache-dtype", "auto" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--kv-cache-dtype", "fp16" }, &c), RAD_E_INVAL);
-    CHECK_EQ(parse({ "--kv-cache-dtype", "v4" }, &c), RAD_E_INVAL);
+    for (const char* gone : { "fp8_v4", "k6_v4" }) {
+        int rc = RAD_OK;
+        const std::string err = stderr_of([&] { rc = parse({ "--kv-cache-dtype", gone }, &c); });
+        CHECK_EQ(rc, RAD_E_INVAL);
+        CHECK(err.find("i8 is the 8-bit cache") != std::string::npos);
+    }
+    CHECK_EQ(c.kv_cache_dtype, std::string("i8"));
 
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
@@ -962,6 +1095,145 @@ TEST(the_draft_window_is_fixed_or_adaptive) {
     CHECK_EQ(parse({ "--draft-window" }, &c), RAD_E_INVAL);
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Adaptive)), std::string("adaptive"));
     CHECK_EQ(std::string(draft_window_name(DraftWindow::Fixed)), std::string("fixed"));
+}
+
+/* --draft-depth is fixed unless asked for. adaptive switches the coupled drafting on (its rule reads
+ * the draft's laws), excludes the fixed block verify and --draft-window adaptive, and takes its knobs
+ * in range. */
+TEST(draft_depth_adaptive_parses_and_needs_a_coupled_chain) {
+    Config c;
+    CHECK_EQ(parse({}, &c), RAD_OK);
+    CHECK(!c.draft_depth_adaptive);
+    CHECK_EQ(c.draft_depth_max, 0);
+    CHECK_EQ(c.draft_depth_min, 1);
+    CHECK_EQ(c.draft_depth_lag, 1);
+    CHECK_EQ(c.draft_depth_stat, 0);
+    CHECK(c.draft_depth_stop == 0.85);
+    CHECK(!c.draft_coupling);
+    Config a;
+    CHECK_EQ(parse({ "--draft-depth", "adaptive", "--draft-depth-max", "6", "--draft-depth-stop", "0.6",
+                     "--draft-depth-lag", "0", "--draft-depth-stat", "path", "--draft-depth-min", "2" }, &a),
+             RAD_OK);
+    CHECK(a.draft_depth_adaptive);
+    CHECK(a.draft_coupling);
+    CHECK_EQ(a.draft_depth_max, 6);
+    CHECK_EQ(a.draft_depth_min, 2);
+    CHECK_EQ(a.draft_depth_lag, 0);
+    CHECK_EQ(a.draft_depth_stat, 1);
+    CHECK(a.draft_depth_stop == 0.6);
+    CHECK_EQ(parse({ "--draft-depth", "fixed" }, &a), RAD_OK);
+    CHECK(!a.draft_depth_adaptive);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-verify", "traversal" }), RAD_OK);
+    for (const char* bad : { "on", "auto", "" }) CHECK_EQ(parse_fresh({ "--draft-depth", bad }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth" }), RAD_E_INVAL);
+    for (const char* bad : { "-0.1", "1.5", "x" }) CHECK_EQ(parse_fresh({ "--draft-depth-stop", bad }), RAD_E_INVAL);
+    for (const char* bad : { "2", "-1" }) CHECK_EQ(parse_fresh({ "--draft-depth-lag", bad }), RAD_E_INVAL);
+    for (const char* bad : { "17", "-1" }) CHECK_EQ(parse_fresh({ "--draft-depth-max", bad }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth-min", "0" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth-stat", "mean" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-coupling", "off" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-window", "adaptive" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-window", "fixed" }), RAD_OK);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-verify", "block" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-depth-min", "4", "--draft-depth-max", "3" }),
+             RAD_E_INVAL);
+}
+
+/* --draft-depth-load is off unless asked for: the load-aware rule of the adaptive chain. It needs
+ * that chain and its `top` statistic, and takes its tables as comma lists. */
+TEST(draft_depth_load_parses_and_needs_the_adaptive_chain) {
+    Config c;
+    CHECK_EQ(parse({}, &c), RAD_OK);
+    CHECK(!c.draft_depth_load);
+    CHECK_EQ(c.draft_depth_load_from, 5);
+    CHECK_EQ(c.draft_depth_load_min, 2);
+    CHECK(c.draft_depth_load_late);
+    CHECK(c.draft_depth_load_online);
+    CHECK(c.draft_depth_load_tok_ms.empty() && c.draft_depth_load_jump_ms.empty());
+    Config a;
+    CHECK_EQ(parse({ "--draft-depth", "adaptive", "--draft-depth-load", "on", "--draft-depth-load-from", "3",
+                     "--draft-depth-load-min", "1", "--draft-depth-load-late", "off",
+                     "--draft-depth-load-calib", "static", "--draft-depth-load-row-ms", "1.1,0.8,0.7",
+                     "--draft-depth-load-jump-ms", "1.3,0,2" }, &a), RAD_OK);
+    CHECK(a.draft_depth_load && a.draft_depth_adaptive && a.draft_coupling);
+    CHECK_EQ(a.draft_depth_load_from, 3);
+    CHECK_EQ(a.draft_depth_load_min, 1);
+    CHECK(!a.draft_depth_load_late);
+    CHECK(!a.draft_depth_load_online);
+    CHECK_EQ(a.draft_depth_load_row_ms, std::string("1.1,0.8,0.7"));
+    CHECK_EQ(a.draft_depth_load_jump_ms, std::string("1.3,0,2"));
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-depth-load", "on", "--draft-verify", "traversal" }), RAD_OK);
+    /* not without the adaptive chain, and not with the drawn token's own mass as the statistic */
+    CHECK_EQ(parse_fresh({ "--draft-depth-load", "on" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "fixed", "--draft-depth-load", "on" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth", "adaptive", "--draft-depth-load", "on", "--draft-depth-stat", "path" }),
+             RAD_E_INVAL);
+    /* the knobs alone change nothing and are taken */
+    CHECK_EQ(parse_fresh({ "--draft-depth-load-from", "8" }), RAD_OK);
+    for (const char* bad : { "auto", "1", "" }) CHECK_EQ(parse_fresh({ "--draft-depth-load", bad }), RAD_E_INVAL);
+    for (const char* bad : { "1", "65", "x" }) CHECK_EQ(parse_fresh({ "--draft-depth-load-from", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "17" }) CHECK_EQ(parse_fresh({ "--draft-depth-load-min", bad }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth-load-calib", "auto" }), RAD_E_INVAL);
+    for (const char* bad : { "a", "1,", "1;2", "-1", "0", "1,2,3,4,5,6,7,8,9" })
+        CHECK_EQ(parse_fresh({ "--draft-depth-load-row-ms", bad }), RAD_E_INVAL);
+    for (const char* bad : { "1,2,3,4,5", "-0.5", "x" })
+        CHECK_EQ(parse_fresh({ "--draft-depth-load-jump-ms", bad }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--draft-depth-load-jump-ms", "0,0,0,0" }), RAD_OK);
+}
+
+
+/* The SuffixDecoding selector: off by default (bit-identical engine), min match 1..12, rows 1..32,
+ * a score in [0, 1]. */
+TEST(the_draft_suffix_flags_default_off_and_parse) {
+    Config c;
+    CHECK(!c.draft_suffix);
+    CHECK_EQ(c.draft_suffix_min_match, 6);
+    CHECK_EQ(c.draft_suffix_max, 7);
+    CHECK_NEAR(c.draft_suffix_min_score, 0.3, 1e-6);
+    CHECK_EQ(c.n_spec_head, 0);
+    CHECK_EQ(parse({ "--draft-suffix", "on", "--draft-suffix-min-match", "5", "--draft-suffix-max", "6",
+                     "--draft-suffix-min-score", "0.45" }, &c), RAD_OK);
+    CHECK(c.draft_suffix);
+    CHECK_EQ(c.draft_suffix_min_match, 5);
+    CHECK_EQ(c.draft_suffix_max, 6);
+    CHECK_NEAR(c.draft_suffix_min_score, 0.45, 1e-6);
+    CHECK_EQ(parse({ "--draft-suffix", "off" }, &c), RAD_OK);
+    CHECK(!c.draft_suffix);
+    for (const char* bad : { "yes", "1", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "13", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix-min-match", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "33", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix-max", bad }), RAD_E_INVAL);
+    for (const char* bad : { "-0.1", "1.5", "x", "" }) CHECK_EQ(parse_fresh({ "--draft-suffix-min-score", bad }), RAD_E_INVAL);
+}
+
+
+/* --draft-verify is token (alias rowwise) unless asked for; block and traversal parse. block
+ * implies the coupled drafting and refuses coupling off; traversal needs the coupling and says so. */
+TEST(the_draft_verify_is_token_block_or_traversal) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.draft_verify_block);
+    CHECK(!d.draft_verify_traversal);
+    Config c;
+    CHECK_EQ(parse({ "--draft-verify", "block" }, &c), RAD_OK);
+    CHECK(c.draft_verify_block);
+    CHECK(!c.draft_verify_traversal);
+    CHECK(c.draft_coupling);
+    Config t;
+    CHECK_EQ(parse({ "--draft-coupling", "on", "--draft-verify", "traversal" }, &t), RAD_OK);
+    CHECK(t.draft_verify_traversal);
+    CHECK(!t.draft_verify_block);
+    CHECK_EQ(parse({ "--draft-verify", "rowwise" }, &t), RAD_OK);
+    CHECK(!t.draft_verify_traversal);
+    CHECK_EQ(parse({ "--draft-verify", "token" }, &t), RAD_OK);
+    CHECK(!t.draft_verify_block);
+    Config b;
+    for (const char* bad : { "Block", "Traversal", "on", "" })
+        CHECK_EQ(parse({ "--draft-verify", bad }, &b), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--draft-verify" }, &b), RAD_E_INVAL);
+    Config off;
+    CHECK_EQ(parse({ "--draft-verify", "block", "--draft-coupling", "off" }, &off), RAD_E_INVAL);
+    Config nocouple;
+    CHECK_EQ(parse({ "--draft-verify", "traversal" }, &nocouple), RAD_E_INVAL);
 }
 
 /* --draft-coupling is off unless asked for, and only off and on parse: a misspelt value must not
@@ -1550,8 +1822,8 @@ TEST(a_repeated_flag_takes_the_last_one) {
     Config c;
     CHECK_EQ(parse({ "--port", "1", "--port", "8100" }, &c), RAD_OK);
     CHECK_EQ(c.port, 8100);
-    CHECK_EQ(parse({ "--kv-cache-dtype", "bf16", "--kv-cache-dtype", "fp8" }, &c), RAD_OK);
-    CHECK_EQ(c.kv_cache_dtype, std::string("fp8"));
+    CHECK_EQ(parse({ "--kv-cache-dtype", "bf16", "--kv-cache-dtype", "i8" }, &c), RAD_OK);
+    CHECK_EQ(c.kv_cache_dtype, std::string("i8"));
     /* A bad value is refused even after a good one. */
     CHECK_EQ(parse({ "--tp-wire", "exact", "--tp-wire", "nope" }, &c), RAD_E_INVAL);
 }
@@ -1561,10 +1833,10 @@ TEST(usage_names_every_flag_it_documents) {
      * for, so a flag added without a help line is caught. */
     const std::string text = stderr_of([] { config_usage("radiance"); });
     for (const char* f : { "--model", "--host-pool-mib", "--kv-cache-dtype",
-                           "--num-speculative-tokens", "--draft-window", "--draft-coupling",
+                           "--num-speculative-tokens", "--draft-window", "--draft-coupling", "--draft-verify",
                            "--checkpoint-policy",
                            "--prefix-cache-mib", "--prefix-cache-ttl", "--tp-wire",
-                           "--attn-prefill-fp8", "--embedding-placement", "--ngram-placement",
+                           "--embedding-placement", "--ngram-placement",
                            "--kld-record", "--kld-ref", "--default-max-tokens", "--max-tokens-cap",
                            "--presence-penalty", "--dry-sequence-breakers",
                            "--chat-template-kwargs", "--reasoning-format", "--max-n",
@@ -1595,6 +1867,21 @@ TEST(rope_scaling_takes_yarn_with_a_factor_above_one_or_none) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK(d.rope_scaling.empty());
+}
+
+/* The suffix selector and the adaptive chain depth are served together, with traversal verification
+ * (bring-up refuses what the model cannot do; the parse and the shown rows say what was asked). */
+TEST(the_suffix_selector_parses_beside_adaptive_depth_and_traversal) {
+    Config c;
+    CHECK_EQ(parse({ "--draft-suffix", "on", "--draft-depth", "adaptive", "--draft-coupling", "on",
+                     "--draft-verify", "traversal", "--num-speculative-tokens", "5" }, &c), RAD_OK);
+    CHECK(c.draft_suffix);
+    CHECK(c.draft_depth_adaptive);
+    CHECK(c.draft_coupling);
+    CHECK(c.draft_verify_traversal);
+    CHECK(!c.draft_verify_block);
+    CHECK_EQ(c.n_spec, 5);
+    CHECK_EQ(c.draft_suffix_max, 7);
 }
 
 RAD_TEST_MAIN()

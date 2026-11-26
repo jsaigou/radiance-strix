@@ -6,13 +6,13 @@
 #       --recipe data/recipes/gemma4-31b-dense-bf16-w4a8-df.recipe \
 #       --set quantization_config.quant_method=compressed-tensors -o gemma4-31b-dense-w4a8-df.rad
 #
-#   radiance serve gemma4-31b-dense-w4a8-df.rad --num-speculative-tokens auto ...
+#   served with `model: gemma4-31b-dense-w4a8-df.rad` and `num-speculative-tokens: auto`
 #
 # The drafter (z-lab/gemma-4-31B-it-DFlash) is five Qwen3-shaped layers of 5376 (64 heads / 8 kv
 # x 128, ffn 10752) and an fc over the trunk's residual stream at layers 1 12 23 35 46 57: 1.5 B
 # parameters, 3.1 GB at bf16. It denoises a block of 16 in one pass and proposes 15 tokens; z-lab
 # measures 4.2-8.6 accepted per step on B300 at bf16, against the assistant head's ~2. The plugin's
-# probe names that depth, so rad-convert declares at it and `--num-speculative-tokens auto` serves
+# probe names that depth, so rad-convert declares at it and `num-speculative-tokens: auto` serves
 # it; any other depth is refused by name.
 #
 # This starts from bf16, not from the QAT release. The drafter reads the trunk's hidden states at
@@ -27,7 +27,7 @@
 # reads at int4, and 352 MB at int8. It is the trunk's verifier; drop the line to keep it bf16.
 #
 # ~20 GiB: the int4 trunk's linears (~14 GiB), the bf16 table and its int8 head (2 GiB), the
-# vision tower, the drafter at block fp8 (1.4 GiB) and its head's block-fp8 copy (0.7 GiB).
+# vision tower, the drafter at int8 (1.4 GiB) and its head's int8 copy (0.7 GiB).
 #
 # q, k and v are one linear, blk.*.attn_qkv (q | k | v; q | k on the global layers, where v is
 # k): the plugin serves one GEMM a layer where three paid the skinny GEMM's fixed cost each. The
@@ -42,19 +42,19 @@ blk.*.ffn_gate_up.weight  rtn  codes=i4 group=128 scale=f16 rule=search
 
 output.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym
 
-# The DFlash drafter's seven linears: block fp8, read at fp8a8 against an E4M3 activation (the
-# drafter only proposes; the trunk verifies). All seven take one grid, because one quantised
+# The DFlash drafter's seven linears: int8 with an f16 scale per row and 128 of K, read at w8a8
+# against an int8 activation (the drafter only proposes; the trunk verifies). All seven take one grid, because one quantised
 # activation feeds several of them, and the plugin checks it.
-dflash.fc.weight                 rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.attn_q.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.attn_k.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.attn_v.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.attn_output.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.ffn_gate_up.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16
-dflash.blk.*.ffn_down.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.fc.weight                 rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.attn_q.weight       rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.attn_k.weight       rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.attn_v.weight       rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.attn_output.weight  rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.ffn_gate_up.weight  rtn codes=i8 group=128 scale=f16 clamp=sym
+dflash.blk.*.ffn_down.weight     rtn codes=i8 group=128 scale=f16 clamp=sym
 
-# The drafter's head: the target's tied table again under a name of its own, block fp8, which the
+# The drafter's head: the target's tied table again under a name of its own, int8, which the
 # draft head reads instead of the bf16 table. That halves the widest read on the draft path (704 MB
 # per rank at tp 4 in bf16), for half the table's bytes again. Drafts are verified, so this changes
 # what is proposed, never what is accepted.
-dflash.draft_head.weight         rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.draft_head.weight         rtn codes=i8 group=128 scale=f16 clamp=sym

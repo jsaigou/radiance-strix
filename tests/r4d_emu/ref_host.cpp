@@ -67,7 +67,19 @@ static bool hgain(const RadTensor* w, int64_t n) {
     return w && w->dtype == RAD_F32 && rad_tensor_numel(w) == n;
 }
 
-/* norm_add_norm, and with `route` norm_add_norm_route's three more outputs */
+/* The unnormalised Hadamard of 128 values in place, strides ascending: had_quant_act_i8g's. */
+static void hfwht128(float* v) {
+    for (int h = 1; h < 128; h <<= 1)
+        for (int i = 0; i < 128; ++i)
+            if ((i & h) == 0) {
+                const float x = v[i], y = v[i + h];
+                v[i] = x + y;
+                v[i + h] = x - y;
+            }
+}
+
+/* norm_add_norm, and with `route` norm_add_norm_route's three more outputs; an int8 `q` takes
+ * norm_add_norm_route_i8g's rotated int8 codes */
 static int nan_host(const RadArgs* a, bool route) {
     if (!a || a->n_t < (route ? 10 : 5)) return RAD_E_INVAL;
     const int64_t n = rad_args_geti_or(a, "n", 0);
@@ -84,7 +96,8 @@ static int nan_host(const RadArgs* a, bool route) {
         return RAD_E_DTYPE;
     int64_t ra, la, rx, lx, ry, ly, rr = 0, lr = 0, rq = 0, lq = 0, rs = 0, ls = 0;
     if (!hrows(A_, n, &ra, &la) || !hrows(X, n, &rx, &lx) || !hrows(Y, n, &ry, &ly)) return RAD_E_SHAPE;
-    if (route && (!hrows(R, n, &rr, &lr) || !hrows_as(Q, RAD_F8E4M3, n, &rq, &lq) ||
+    const bool i8 = route && Q->dtype == RAD_I8;
+    if (route && (!hrows(R, n, &rr, &lr) || !hrows_as(Q, i8 ? RAD_I8 : RAD_F8E4M3, n, &rq, &lq) ||
                   !hrows_as(S, RAD_F32, n / 128, &rs, &ls)))
         return RAD_E_SHAPE;
     if (ra < rx || ry < rx || (route && (rr < rx || rq < rx || rs < rx))) return RAD_E_SHAPE;
@@ -113,7 +126,19 @@ static int nan_host(const RadArgs* a, bool route) {
             rrow[i] = f2b(((xv[(size_t)i] * sx) * wr[i]) * mult);
             v[(size_t)i] = rb((xv[(size_t)i] * sx) * we[i]);
         }
-        for (int64_t g = 0; g < n / 128; ++g) {
+        for (int64_t g = 0; i8 && g < n / 128; ++g) {
+            hfwht128(v.data() + g * 128);
+            float am = 0.0f;
+            for (int64_t i = g * 128; i < g * 128 + 128; ++i)
+                am = std::fmax(am, std::fabs(v[(size_t)i]));
+            const float sc = am > 0.0f ? am * (1.0f / 127.0f) : 1.0f;
+            const float inv = 1.0f / sc;
+            srow[g] = sc;
+            for (int64_t i = g * 128; i < g * 128 + 128; ++i)
+                qrow[i] = (uint8_t)(int8_t)std::rint(
+                    std::fmin(std::fmax(v[(size_t)i] * inv, -127.0f), 127.0f));
+        }
+        for (int64_t g = 0; !i8 && g < n / 128; ++g) {
             float am = 0.0f;
             for (int64_t i = g * 128; i < g * 128 + 128; ++i)
                 am = std::fmax(am, std::fabs(v[(size_t)i]));

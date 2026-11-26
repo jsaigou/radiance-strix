@@ -44,7 +44,7 @@
 #include "mm/resample.h"
 #include "rad_internal.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <chrono>
@@ -60,7 +60,7 @@ namespace server {
 
 namespace {
 
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 using Clock = std::chrono::steady_clock;
 
 /* A pass once this much audio has come in since the turn's last one began. */

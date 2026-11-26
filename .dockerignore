@@ -5,3 +5,5 @@ build*
 .claude
 **/*.rad
 compile_commands.json
+dashboard/node_modules
+dashboard/dist

@@ -17,7 +17,7 @@
 # context (0% prefix hit, minutes per turn). Watch kv_util; the hit rate drops sharply as the pool
 # fills.
 #
-# Defaults are the production shape (gpu-headroom-mib 96, kv-cache-dtype fp8,
+# Defaults are the production shape (gpu-headroom-mib 96, kv-cache-dtype i8,
 # max-num-batched-tokens 2048, tp 2, speculation depth 3), with the prefix cache on and
 # --checkpoint-slots at its default, as multi-turn chat needs both.
 #
@@ -75,12 +75,12 @@ BUILD="${BUILD:-$ROOT/build}"
 cd "$BUILD" || exit 1
 pkill -f "bin/radianc[e]"; while pgrep -f "bin/radianc[e]" >/dev/null; do sleep 1; done; sleep 2
 env GPU_MAX_ALLOC_PERCENT=100 GPU_MAX_HEAP_SIZE=100 $EXTRA_ENV \
-nohup ./bin/radiance --model "$M" \
+nohup "$ROOT/scripts/radiance-flags" ./bin/radiance --model "$M" \
     --radiance-home radiance_home \
     --host 0.0.0.0 --port "$P" \
     --max-num-seqs ${SEQS:-8} --max-model-len ${MLEN:-200000} \
-    --tp ${TP:-2} --placement expert_tiered --host-pool-mib ${HOSTPOOL:-12288} \
-    --gpu-headroom-mib ${HR:-96} --kv-cache-dtype ${KVD:-fp8} \
+    --tp ${TP:-2} --placement expert_tiered --host-pool-mib ${HOSTPOOL:-24576} \
+    --gpu-headroom-mib ${HR:-96} --kv-cache-dtype ${KVD:-i8} \
     --prefix-cache-mib ${KVHOST:-4096} \
     --num-speculative-tokens ${NS:-3} \
     --max-num-batched-tokens ${MNBT:-2048} \

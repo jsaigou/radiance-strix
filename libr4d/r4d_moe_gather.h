@@ -7,6 +7,8 @@
 #include "r4d_common.h"
 
 // Internal linkage, as the unit's own definition had.
+#include "r4d_chain.h"
+
 namespace r4d_moegather {
 namespace {
 
@@ -31,16 +33,19 @@ __device__ float gather_weight(const void* ew, size_t i) {
     if constexpr (F32) return ((const float*)ew)[i];
     else return bf16_to_f32(((const uint16_t*)ew)[i]);
 }
-template <uint32_t NTHR, bool F32 = false>
-__global__ __launch_bounds__(NTHR) void gather_kernel(
-    const uint16_t* __restrict__ ye, const void* __restrict__ ew,
-    const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
-    uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
-    const int32_t* __restrict__ sorted, uint32_t T,
-    const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
-    uint32_t sh_ld, uint32_t sg_ld, int sig) {
-    __shared__ int32_t s_i[kGatherSlots];
-    __shared__ float   s_w[kGatherSlots];
+/* The body, over the block's two shared tables, which the kernel that calls it owns: a function
+ * because a block past the last token returns at once, and a chained block must still add to its
+ * queue's counter (r4d_chain.h). */
+#define R4D_MG_PARAMS                                                                            \
+    const uint16_t* __restrict__ ye, const void* __restrict__ ew,                                \
+    const int32_t* __restrict__ inv, uint16_t* __restrict__ y, uint32_t M, uint32_t n,           \
+    uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,                               \
+    const int32_t* __restrict__ sorted, uint32_t T, const uint16_t* __restrict__ sh,             \
+    const uint16_t* __restrict__ sg, uint32_t sh_ld, uint32_t sg_ld, int sig
+#define R4D_MG_ARGS                                                                              \
+    ye, ew, inv, y, M, n, top_k, ye_ld, ew_ld, y_ld, sorted, T, sh, sg, sh_ld, sg_ld, sig
+template <uint32_t NTHR, bool F32>
+__device__ __forceinline__ void gather_body(R4D_MG_PARAMS, int32_t* s_i, float* s_w) {
     const uint32_t t = blockIdx.x;
     if (t >= M) return;
     const bool cached = top_k <= kGatherSlots;
@@ -87,6 +92,23 @@ __global__ __launch_bounds__(NTHR) void gather_kernel(
         y[(size_t)t * y_ld + c] = f32_to_bf16(bf16_to_f32(p) + bf16_to_f32(g));
     }
 }
+template <uint32_t NTHR, bool F32 = false>
+__global__ __launch_bounds__(NTHR) void gather_kernel(R4D_MG_PARAMS) {
+    __shared__ int32_t s_i[kGatherSlots];
+    __shared__ float   s_w[kGatherSlots];
+    gather_body<NTHR, F32>(R4D_MG_ARGS, s_i, s_w);
+}
+/* The chained form, taken where the gather is the op's one launch (a decode step). */
+template <uint32_t NTHR, bool F32 = false>
+__global__ __launch_bounds__(NTHR) void r4dchain_moe_gather(R4D_MG_PARAMS) {
+    __shared__ int32_t s_i[kGatherSlots];
+    __shared__ float   s_w[kGatherSlots];
+    r4d_chain_wait();
+    gather_body<NTHR, F32>(R4D_MG_ARGS, s_i, s_w);
+    r4d_chain_done();
+}
+#undef R4D_MG_ARGS
+#undef R4D_MG_PARAMS
 
 }  // namespace
 }  // namespace r4d_moegather

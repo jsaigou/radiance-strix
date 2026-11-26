@@ -25,8 +25,8 @@ SRC is a merged checkpoint (config.json + *.safetensors) or a PEFT adapter (adap
 adapter_model.safetensors). OUT defaults to SRC's folder name + .rad beside SRC (or in out_dir).
 Optional config ~/.config/rad-export/config.json (or --config):
     {"image": "stilldeadcode/radiance", "out_dir": "/models/rad",
-     "recipes": {"Qwen3.8-27B": "q38-27b-fp8block-df2"},          # base-model substring -> recipe
-     "drafts":  {"q38-27b-fp8block-df2": "/models/Qwen3.8-27B-DFlash2"},   # recipe -> drafter
+     "recipes": {"Qwen3.8-27B": "q38-27b-iq8r"},                  # base-model substring -> recipe
+     "drafts":  {"q38-27b-iq8r": "/models/Qwen3.8-27B-DFlash2"},           # recipe -> drafter
      "bases":   {"Qwen/Qwen3.8-27B": "/models/Qwen3.8-27B"},             # adapter base id -> local copy
      "hub_cache": ["~/.cache/huggingface/hub"]}
 Run from an Unsloth Studio post-export hook (UNSLOTH_POST_EXPORT set), the last line names the .rad

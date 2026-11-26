@@ -35,6 +35,9 @@
 #include <cstdlib>
 #include <cstring>
 
+/* The f32 reference encoder shares rope's schema but keeps its activations in f32. */
+extern "C" int r4d_rad_encoder_rope(const RadArgs*, RadStream);
+
 namespace {
 
 constexpr uint32_t kWave    = 32;
@@ -264,7 +267,7 @@ __global__ __launch_bounds__(THR) void rmsnorm_kernel(R4D_RN_PARAMS) {
 }
 template <bool WF32, uint32_t THR, typename TX = uint16_t>
 __global__ __launch_bounds__(THR) void r4dchain_rmsnorm(R4D_RN_PARAMS) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     rmsnorm_body<WF32, THR, TX>(x, w, y, n, eps, wadd, mult, x_ld, y_ld, M);
     r4d_chain_done();
 }
@@ -319,7 +322,7 @@ __global__ __launch_bounds__(THR) void add_rmsnorm_kernel(R4D_ARN_PARAMS) {
 }
 template <bool WF32, uint32_t THR>
 __global__ __launch_bounds__(THR) void r4dchain_add_rmsnorm(R4D_ARN_PARAMS) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     add_rmsnorm_body<WF32, THR>(x, a, w, y, n, eps, wadd, mult, x_ld, a_ld, y_ld, M);
     r4d_chain_done();
 }
@@ -351,10 +354,12 @@ __global__ __launch_bounds__(kThreads) void rmsnorm_p_kernel(
 // `b_step` 0 reads one element per row; with b_ld 0 too, a scalar for the whole op. `div` (add
 // only) divides the sum after its rounding and rounds again, the last step of a mean summed
 // pairwise; 1 is the plain sum.
-__global__ __launch_bounds__(kThreads) void binary_kernel(
-    const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, uint16_t* __restrict__ y,
-    uint32_t n, uint32_t a_ld, uint32_t b_ld, uint32_t y_ld, int mul, uint32_t b_step,
-    float div) {
+//
+// r4dchain_binary is the chained form (r4d_chain.h), taken at decode heights.
+#define R4D_BIN_PARAMS                                                                           \
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, uint16_t* __restrict__ y,    \
+    uint32_t n, uint32_t a_ld, uint32_t b_ld, uint32_t y_ld, int mul, uint32_t b_step, float div
+__device__ __forceinline__ void binary_body(R4D_BIN_PARAMS) {
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ ar = a + (size_t)m * a_ld;
     const uint16_t* __restrict__ br = b + (size_t)m * b_ld;
@@ -366,6 +371,15 @@ __global__ __launch_bounds__(kThreads) void binary_kernel(
         yr[i] = f32_to_bf16(r);
     }
 }
+__global__ __launch_bounds__(kThreads) void binary_kernel(R4D_BIN_PARAMS) {
+    binary_body(a, b, y, n, a_ld, b_ld, y_ld, mul, b_step, div);
+}
+__global__ __launch_bounds__(kThreads) void r4dchain_binary(R4D_BIN_PARAMS) {
+    r4d_chain_wait_vec();
+    binary_body(a, b, y, n, a_ld, b_ld, y_ld, mul, b_step, div);
+    r4d_chain_done();
+}
+#undef R4D_BIN_PARAMS
 
 // The f32 form (a video decoder's residual stream, a vocoder's branch mean), with the same
 // broadcast rule and `div`. Flat over the M x n extent: a vocoder's last stages are a few channels
@@ -417,15 +431,27 @@ __global__ __launch_bounds__(kThreads) void mul_weight_f32_kernel(
 //
 // Row-wise with a pitch because the operand is a column slice: the gate is the second half of each
 // head of an interleaved [tokens, heads, 2*head_dim] projection, `n` wide inside a stride of 2n.
-__global__ __launch_bounds__(kThreads) void sigmoid_kernel(
-    const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
-    uint32_t n, uint32_t x_ld, uint32_t y_ld) {
+//
+// r4dchain_sigmoid is the chained form (r4d_chain.h), taken at decode heights.
+#define R4D_SIG_PARAMS                                                                           \
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ y, uint32_t n, uint32_t x_ld,         \
+    uint32_t y_ld
+__device__ __forceinline__ void sigmoid_body(R4D_SIG_PARAMS) {
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads)
         yr[i] = f32_to_bf16(1.0f / (1.0f + expf(-bf16_to_f32(xr[i]))));
 }
+__global__ __launch_bounds__(kThreads) void sigmoid_kernel(R4D_SIG_PARAMS) {
+    sigmoid_body(x, y, n, x_ld, y_ld);
+}
+__global__ __launch_bounds__(kThreads) void r4dchain_sigmoid(R4D_SIG_PARAMS) {
+    r4d_chain_wait_vec();
+    sigmoid_body(x, y, n, x_ld, y_ld);
+    r4d_chain_done();
+}
+#undef R4D_SIG_PARAMS
 
 // ---------------------------------------------------------------------------- logit_softcap
 // ref_logit_softcap: y = cap * tanh(x / cap), the final-logit softcap. Row-wise with a pitch like
@@ -459,7 +485,7 @@ __global__ __launch_bounds__(kThreads) void logit_softcap_kernel_f32(
 __global__ __launch_bounds__(kThreads) void r4dchain_logit_softcap(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
     uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
@@ -470,7 +496,7 @@ __global__ __launch_bounds__(kThreads) void r4dchain_logit_softcap(
 __global__ __launch_bounds__(kThreads) void r4dchain_logit_softcap_f32(
     const float* __restrict__ x, float* __restrict__ y,
     uint32_t n, float cap, uint32_t x_ld, uint32_t y_ld) {
-    r4d_chain_wait();
+    r4d_chain_wait_vec();
     const uint32_t m = blockIdx.x;
     const float* __restrict__ xr = x + (size_t)m * x_ld;
     float* __restrict__ yr = y + (size_t)m * y_ld;
@@ -507,10 +533,13 @@ __global__ __launch_bounds__(kThreads) void scale_kernel(
 // A row is split over grid.y, kSiluPer elements per thread, so decode's few rows use more than a
 // few workgroups. A thread's loads are unconditional (a column past the row reads the last element
 // and its store is dropped), so all are in flight at once.
+//
+// r4dchain_silu_mul is the chained form (r4d_chain.h), taken up to a decode step's routed slots.
 constexpr uint32_t kSiluPer = 4;
-__global__ __launch_bounds__(kThreads) void silu_mul_kernel(
-    const uint16_t* __restrict__ gu, uint16_t* __restrict__ y,
-    uint32_t n, uint32_t gu_ld, uint32_t y_ld) {
+#define R4D_SM_PARAMS                                                                            \
+    const uint16_t* __restrict__ gu, uint16_t* __restrict__ y, uint32_t n, uint32_t gu_ld,       \
+    uint32_t y_ld
+__device__ __forceinline__ void silu_mul_body(R4D_SM_PARAMS) {
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ gr = gu + (size_t)m * gu_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
@@ -529,14 +558,25 @@ __global__ __launch_bounds__(kThreads) void silu_mul_kernel(
         if (i < n) yr[i] = f32_to_bf16((g / (1.0f + expf(-g))) * bf16_to_f32(uv[u]));
     }
 }
+__global__ __launch_bounds__(kThreads) void silu_mul_kernel(R4D_SM_PARAMS) {
+    silu_mul_body(gu, y, n, gu_ld, y_ld);
+}
+__global__ __launch_bounds__(kThreads) void r4dchain_silu_mul(R4D_SM_PARAMS) {
+    r4d_chain_wait_vec();
+    silu_mul_body(gu, y, n, gu_ld, y_ld);
+    r4d_chain_done();
+}
+#undef R4D_SM_PARAMS
 
 // ---------------------------------------------------------------------------- gelu_mul
 // ref_gelu_mul: y[.., i] = gelu_tanh(gu[.., i]) * gu[.., n + i], gate first as in silu_mul. The tanh
 // GELU (gemma's gelu_pytorch_tanh), not erf, with the same constants as the gemm_nt_bias
 // "gelu_tanh" epilogue so the two agree bit for bit.
-__global__ __launch_bounds__(kThreads) void gelu_mul_kernel(
-    const uint16_t* __restrict__ gu, uint16_t* __restrict__ y,
-    uint32_t n, uint32_t gu_ld, uint32_t y_ld) {
+// r4dchain_gelu_mul is the chained form (r4d_chain.h), taken at decode heights.
+#define R4D_GM_PARAMS                                                                            \
+    const uint16_t* __restrict__ gu, uint16_t* __restrict__ y, uint32_t n, uint32_t gu_ld,        \
+    uint32_t y_ld
+__device__ __forceinline__ void gelu_mul_body(R4D_GM_PARAMS) {
     const uint32_t m = blockIdx.x;
     const uint16_t* __restrict__ gr = gu + (size_t)m * gu_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
@@ -547,6 +587,15 @@ __global__ __launch_bounds__(kThreads) void gelu_mul_kernel(
         yr[i] = f32_to_bf16(gelu * bf16_to_f32(gr[n + i]));
     }
 }
+__global__ __launch_bounds__(kThreads) void gelu_mul_kernel(R4D_GM_PARAMS) {
+    gelu_mul_body(gu, y, n, gu_ld, y_ld);
+}
+__global__ __launch_bounds__(kThreads) void r4dchain_gelu_mul(R4D_GM_PARAMS) {
+    r4d_chain_wait_vec();
+    gelu_mul_body(gu, y, n, gu_ld, y_ld);
+    r4d_chain_done();
+}
+#undef R4D_GM_PARAMS
 
 // ---------------------------------------------------------------------------- rope
 // ref_rope, in place over a fused [n_head + 2*n_head_kv] head row; the trailing V heads are left
@@ -579,11 +628,16 @@ __device__ __forceinline__ int rope_comp(int mode, uint32_t i, const int* sec, i
     return c;
 }
 
-__global__ __launch_bounds__(kThreads) void rope_kernel(
-    uint16_t* __restrict__ qkv, const int32_t* __restrict__ pos,
-    uint32_t head_dim, uint32_t n_rope_heads, uint32_t rot, uint32_t nfreq, int den, int gptj,
-    float theta, float rscale, uint32_t row_pitch,
-    int mode, int s0, int s1, int s2, int n_sec, uint32_t plane, RadYarn yarn, RadLlama3 l3) {
+// r4dchain_rope is the chained form (r4d_chain.h), taken at decode heights.
+#define R4D_ROPE_PARAMS                                                                          \
+    uint16_t* __restrict__ qkv, const int32_t* __restrict__ pos, uint32_t head_dim,              \
+    uint32_t n_rope_heads, uint32_t rot, uint32_t nfreq, int den, int gptj, float theta,         \
+    float rscale, uint32_t row_pitch, int mode, int s0, int s1, int s2, int n_sec,               \
+    uint32_t plane, RadYarn yarn, RadLlama3 l3
+#define R4D_ROPE_ARGS                                                                            \
+    qkv, pos, head_dim, n_rope_heads, rot, nfreq, den, gptj, theta, rscale, row_pitch, mode, s0, \
+    s1, s2, n_sec, plane, yarn, l3
+__device__ __forceinline__ void rope_body(R4D_ROPE_PARAMS) {
     const uint32_t m = blockIdx.x;
     const uint32_t half = rot / 2;
     const float div = rscale != 0.0f ? rscale : 1.0f;
@@ -620,6 +674,16 @@ __global__ __launch_bounds__(kThreads) void rope_kernel(
         hd[i1] = f32_to_bf16(x0 * s + x1 * c);
     }
 }
+__global__ __launch_bounds__(kThreads) void rope_kernel(R4D_ROPE_PARAMS) {
+    rope_body(R4D_ROPE_ARGS);
+}
+__global__ __launch_bounds__(kThreads) void r4dchain_rope(R4D_ROPE_PARAMS) {
+    r4d_chain_wait();
+    rope_body(R4D_ROPE_ARGS);
+    r4d_chain_done();
+}
+#undef R4D_ROPE_ARGS
+#undef R4D_ROPE_PARAMS
 
 // The same rotary at prefill row counts with each (token, pair) angle computed once. rope_kernel
 // gives every (head, pair) its own thread, which recomputes powf and the accurate sincosf for every
@@ -675,11 +739,13 @@ __global__ __launch_bounds__(kThreads) void rope_rows_kernel(
 // K then V inside a slot: key element d at [..., d], value element d at [..., head_dim + d]. A flat
 // slot index (`slot_mapping`) splits into block = slot / block_size, offset = slot % block_size. A
 // negative slot is padding and stores nothing.
-__global__ __launch_bounds__(kThreads) void kv_store_kernel(
-    const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
-    const int32_t* __restrict__ slot, uint16_t* __restrict__ kv,
-    uint32_t head_dim, uint32_t kv_heads, uint32_t block_size, uint32_t n_blocks,
-    uint32_t k_ld, uint32_t v_ld) {
+// The body: a padding row's block returns early, so the chained form (r4dchain_kv_store,
+// r4d_chain.h; taken at decode heights) wraps it.
+#define R4D_KVS_PARAMS                                                                           \
+    const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,                              \
+    const int32_t* __restrict__ slot, uint16_t* __restrict__ kv, uint32_t head_dim,              \
+    uint32_t kv_heads, uint32_t block_size, uint32_t n_blocks, uint32_t k_ld, uint32_t v_ld
+__device__ __forceinline__ void kv_store_body(R4D_KVS_PARAMS) {
     const uint32_t t = blockIdx.x;
     const int32_t s = slot[t];
     if (s < 0 || (uint32_t)s / block_size >= n_blocks) return;
@@ -694,6 +760,15 @@ __global__ __launch_bounds__(kThreads) void kv_store_kernel(
         c[head_dim + d] = v[(size_t)t * v_ld + j];
     }
 }
+__global__ __launch_bounds__(kThreads) void kv_store_kernel(R4D_KVS_PARAMS) {
+    kv_store_body(k, v, slot, kv, head_dim, kv_heads, block_size, n_blocks, k_ld, v_ld);
+}
+__global__ __launch_bounds__(kThreads) void r4dchain_kv_store(R4D_KVS_PARAMS) {
+    r4d_chain_wait();
+    kv_store_body(k, v, slot, kv, head_dim, kv_heads, block_size, n_blocks, k_ld, v_ld);
+    r4d_chain_done();
+}
+#undef R4D_KVS_PARAMS
 
 // The same scatter into an E4M3 cache: the write side of the fp8kv attention family and its
 // `k_descale` / `v_descale` operands.
@@ -814,84 +889,106 @@ __global__ __launch_bounds__(kThreads) void kv_store_streamed_kernel(
     }
 }
 
-// The fp8_v4 store: K as kv_store_fp8 writes it, V as int4 in groups of 32 with an f16 scale
-// (absmax / 7). Four columns a thread as above, so a group of 32 is 8 lanes; head_dim is a multiple
-// of 32, so a group never straddles two heads. A token's row is `row` bytes. K6 is the k6_v4 store:
-// K as int6 in groups of 32 (absmax / 31) in the row layout of abi/rad_builder.h's RAD_KVQ_K6V4, V
-// as above after it.
-template <int K6>
-__global__ __launch_bounds__(kThreads) void kv_store_fp8v4_kernel(
+// The int8 store (abi/rad_builder.h): a head's K and its V each as int8 codes against one f16
+// scale, the head's absmax / 127, written after the codes. One workgroup a (token, head) and one
+// dim a lane, so the absmax is a block reduction through LDS. The scale is rounded to f16 first
+// and the codes are taken against the rounded value, which is what a reader multiplies by; it is
+// clamped so 127 times it stays an f16. An all-zero head stores scale 0 and codes 0.
+//
+// kv_i8_quant is a lane's part of that: its K and V codes and the head's two scales. It holds the
+// block's barrier, so every lane of the block calls it, a padding row's included.
+struct KvI8 { uint8_t k, v; uint16_t ks, vs; };
+__device__ __forceinline__ KvI8 kv_i8_quant(const uint16_t* __restrict__ k,
+                                            const uint16_t* __restrict__ v, uint32_t head_dim,
+                                            uint32_t k_ld, uint32_t v_ld, float (*s_m)[32]) {
+    const uint32_t t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const bool in = d < head_dim;
+    const float kf = in ? bf16_to_f32(k[(size_t)t * k_ld + (size_t)h * head_dim + d]) : 0.0f;
+    const float vf = in ? bf16_to_f32(v[(size_t)t * v_ld + (size_t)h * head_dim + d]) : 0.0f;
+    float km = r4d_wave_max(fabsf(kf)), vm = r4d_wave_max(fabsf(vf));
+    if ((d & 31u) == 0u) { s_m[0][d >> 5] = km; s_m[1][d >> 5] = vm; }
+    __syncthreads();
+    km = 0.0f; vm = 0.0f;
+    for (uint32_t w = 0; w < blockDim.x / 32u; ++w) {
+        km = fmaxf(km, s_m[0][w]);
+        vm = fmaxf(vm, s_m[1][w]);
+    }
+    const __fp16 k16 = (__fp16)fminf(km / 127.0f, 515.0f);
+    const __fp16 v16 = (__fp16)fminf(vm / 127.0f, 515.0f);
+    const float ksc = (float)k16, vsc = (float)v16;
+    const float kr = ksc > 0.0f ? rintf(kf / ksc) : 0.0f;
+    const float vr = vsc > 0.0f ? rintf(vf / vsc) : 0.0f;
+    KvI8 q;
+    q.k  = (uint8_t)(int8_t)(int)fminf(fmaxf(kr, -127.0f), 127.0f);
+    q.v  = (uint8_t)(int8_t)(int)fminf(fmaxf(vr, -127.0f), 127.0f);
+    q.ks = __builtin_bit_cast(uint16_t, k16);
+    q.vs = __builtin_bit_cast(uint16_t, v16);
+    return q;
+}
+// A lane's bytes into a token's row of a head.
+__device__ __forceinline__ void kv_i8_put(uint8_t* __restrict__ c, uint32_t head_dim, KvI8 q) {
+    const uint32_t d = threadIdx.x;
+    c[d]            = q.k;
+    c[head_dim + d] = q.v;
+    if (d == 0u) {
+        *(uint16_t*)(c + 2 * head_dim)     = q.ks;
+        *(uint16_t*)(c + 2 * head_dim + 2) = q.vs;
+    }
+}
+
+// The body takes the block's reduction table from the kernel that calls it; it is a function
+// because a padding row's block returns early and the chained form (r4dchain_kv_store_i8,
+// r4d_chain.h, taken at decode heights) must still add to its queue's counter.
+#define R4D_KVI_PARAMS                                                                           \
+    const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,                              \
+    const int32_t* __restrict__ slot, uint8_t* __restrict__ kv, uint32_t head_dim,               \
+    uint32_t kv_heads, uint32_t block_size, uint32_t n_blocks, uint32_t k_ld, uint32_t v_ld
+#define R4D_KVI_ARGS k, v, slot, kv, head_dim, kv_heads, block_size, n_blocks, k_ld, v_ld
+__device__ __forceinline__ void kv_store_i8_body(R4D_KVI_PARAMS, float (*s_m)[32]) {
+    const uint32_t t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const KvI8 q = kv_i8_quant(k, v, head_dim, k_ld, v_ld, s_m);
+    const int32_t s = slot[t];
+    if (d >= head_dim || s < 0 || (uint32_t)s / block_size >= n_blocks) return;
+    const uint32_t blk = (uint32_t)s / block_size, off = (uint32_t)s % block_size;
+    const size_t row = 2 * (size_t)head_dim + 4;
+    kv_i8_put(kv + (((size_t)blk * kv_heads + h) * block_size + off) * row, head_dim, q);
+}
+__global__ __launch_bounds__(1024) void kv_store_i8_kernel(R4D_KVI_PARAMS) {
+    __shared__ float s_m[2][32];
+    kv_store_i8_body(R4D_KVI_ARGS, s_m);
+}
+__global__ __launch_bounds__(1024) void r4dchain_kv_store_i8(R4D_KVI_PARAMS) {
+    __shared__ float s_m[2][32];
+    r4d_chain_wait();
+    kv_store_i8_body(R4D_KVI_ARGS, s_m);
+    r4d_chain_done();
+}
+#undef R4D_KVI_ARGS
+#undef R4D_KVI_PARAMS
+
+// The int8 store of a streamed group: kv_store_i8's bytes to the token's row of its block in the
+// host mirror always, and to the ring at `res[block]` when that block is resident. A slot past the
+// id space stores nothing and a map entry outside [-1, slots) reads as absent, as in
+// kv_store_streamed_kernel.
+__global__ __launch_bounds__(1024) void kv_store_streamed_i8_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
     const int32_t* __restrict__ slot, uint8_t* __restrict__ kv,
-    uint32_t head_dim, uint32_t kv_heads, uint32_t block_size, uint32_t n_blocks,
-    uint32_t k_ld, uint32_t v_ld, float k_inv, float v_inv, uint32_t row) {
-    const uint32_t t = blockIdx.x;
+    const int32_t* __restrict__ res, uint8_t* __restrict__ host,
+    uint32_t head_dim, uint32_t kv_heads, uint32_t block_size, uint32_t blocks, uint32_t slots,
+    uint32_t k_ld, uint32_t v_ld) {
+    __shared__ float s_m[2][32];
+    const uint32_t t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const KvI8 q = kv_i8_quant(k, v, head_dim, k_ld, v_ld, s_m);
     const int32_t s = slot[t];
-    if (s < 0 || (uint32_t)s / block_size >= n_blocks) return;
+    if (d >= head_dim || s < 0) return;
     const uint32_t blk = (uint32_t)s / block_size, off = (uint32_t)s % block_size;
-    const size_t slot_base = ((size_t)blk * kv_heads * block_size + (size_t)off) * row;
-    const size_t head_step = (size_t)block_size * row;
-
-    for (uint32_t j = threadIdx.x * 4u; j < kv_heads * head_dim; j += kThreads * 4u) {
-        const uint32_t h = j / head_dim, d = j % head_dim;
-        uint8_t* __restrict__ c = kv + slot_base + (size_t)h * head_step;
-        float kf[4], vf[4];
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            kf[e] = bf16_to_f32(k[(size_t)t * k_ld + j + (uint32_t)e]) * k_inv;
-            vf[e] = bf16_to_f32(v[(size_t)t * v_ld + j + (uint32_t)e]) * v_inv;
-        }
-        const uint32_t voff = K6 ? head_dim * 3 / 4 : head_dim;
-        const uint32_t vsoff = K6 ? head_dim * 21 / 16 : head_dim * 3 / 2;
-        if constexpr (K6) {
-            // A group of 32 is 8 lanes; its scale absmax / 31 in f16, codes 6-bit two's complement.
-            float kmax = fmaxf(fmaxf(fabsf(kf[0]), fabsf(kf[1])), fmaxf(fabsf(kf[2]), fabsf(kf[3])));
-            for (int m = 4; m >= 1; m >>= 1) kmax = fmaxf(kmax, __shfl_xor(kmax, m, 32));
-            // Clamped so 31 times it stays an f16 (65504): a group gone inf
-            // or NaN decodes finite, as the E4M3 form's clamp to 448 does.
-            const __fp16 k16 = (__fp16)fminf(kmax / 31.0f, 2112.0f);
-            const float ksc = (float)k16;
-            uint32_t q[4];
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const float r = ksc > 0.0f ? rintf(kf[e] / ksc) : 0.0f;
-                q[e] = (uint32_t)((int)fminf(fmaxf(r, -31.0f), 31.0f)) & 0x3Fu;
-            }
-            *(uint16_t*)(c + d / 2) = (uint16_t)((q[0] & 15u) | ((q[1] & 15u) << 4) |
-                                                 ((q[2] & 15u) << 8) | ((q[3] & 15u) << 12));
-            // The high bits of dims x..x+3 of a 16-dim chunk (x = d % 16 in 0, 4, 8, 12): bits
-            // 0-3 of bytes x/2 and x/2+1 for x < 8, bits 4-7 of bytes (x-8)/2 and (x-8)/2+1 for
-            // x >= 8. The lane two over holds the dims eight on, so the lower lane writes both.
-            const uint32_t hb = ((q[0] >> 4) | ((q[1] >> 4) << 2)) | ((((q[2] >> 4) | ((q[3] >> 4) << 2))) << 8);
-            const uint32_t up = (uint32_t)__shfl_xor((int)hb, 2, 32);
-            if ((d & 15u) < 8u)
-                *(uint16_t*)(c + head_dim / 2 + (d / 16) * 4 + (d & 7u) / 2) = (uint16_t)(hb | (up << 4));
-            if ((d & 31u) == 0)
-                *(uint16_t*)(c + head_dim * 5 / 4 + (d / 32) * 2) = __builtin_bit_cast(uint16_t, k16);
-        } else {
-            int pk = 0;
-            pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(kf[0], -448.0f), 448.0f),
-                                                 fminf(fmaxf(kf[1], -448.0f), 448.0f), pk, false);
-            pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(kf[2], -448.0f), 448.0f),
-                                                 fminf(fmaxf(kf[3], -448.0f), 448.0f), pk, true);
-            *(uint32_t*)(c + d) = (uint32_t)pk;
-        }
-
-        float amax = fmaxf(fmaxf(fabsf(vf[0]), fabsf(vf[1])), fmaxf(fabsf(vf[2]), fabsf(vf[3])));
-        for (int m = 4; m >= 1; m >>= 1) amax = fmaxf(amax, __shfl_xor(amax, m, 32));
-        // Clamped so 7 times it stays an f16: see the K scale above.
-        const __fp16 s16 = (__fp16)fminf(amax / 7.0f, 8188.0f);
-        const float sc = (float)s16;
-        uint32_t q[4];
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const float r = sc > 0.0f ? rintf(vf[e] / sc) : 0.0f;
-            q[e] = (uint32_t)((int)fminf(fmaxf(r, -7.0f), 7.0f)) & 0xFu;
-        }
-        *(uint16_t*)(c + voff + d / 2) = (uint16_t)(q[0] | (q[1] << 4) | (q[2] << 8) | (q[3] << 12));
-        if ((d & 31u) == 0)
-            *(uint16_t*)(c + vsoff + (d / 32) * 2) = __builtin_bit_cast(uint16_t, s16);
-    }
+    if (blk >= blocks) return;
+    const size_t row = 2 * (size_t)head_dim + 4;
+    const size_t brow = (size_t)kv_heads * block_size * row;      // one block of every head
+    const size_t o = ((size_t)h * block_size + off) * row;
+    kv_i8_put(host + (size_t)blk * brow + o, head_dim, q);
+    const int32_t sl = res[blk];
+    if (sl >= 0 && (uint32_t)sl < slots) kv_i8_put(kv + (size_t)sl * brow + o, head_dim, q);
 }
 
 }  // namespace
@@ -1132,29 +1229,46 @@ extern "C" int r4d_rmsnorm_p_bf16(long x, long y, int M, int n, float eps,
 
 // `op` is 0 for a sum, 1 for a product. `b_ld` 0 broadcasts one row of n down the rows; -1 is a
 // one-element b, broadcast as a scalar.
-extern "C" int r4d_binary_bf16(long a, long b, long y, int M, int n, int op,
-                               int a_ld, int b_ld, int y_ld, long stream) {
+static int binary_bf16_emit(long a, long b, long y, int M, int n, int op, int a_ld, int b_ld,
+                            int y_ld, long stream, bool chain) {
     if (!a || !b || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!a_ld) a_ld = n;
     if (!y_ld) y_ld = n;
     const uint32_t b_step = b_ld < 0 ? 0u : 1u;
     if (b_ld < 0) b_ld = 0;
-    hipLaunchKernelGGL(binary_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
-                       (const uint16_t*)a, (const uint16_t*)b, (uint16_t*)y, (uint32_t)n,
-                       (uint32_t)a_ld, (uint32_t)b_ld, (uint32_t)y_ld, op, b_step, 1.0f);
+#define R4D_BIN(K_)                                                                              \
+    hipLaunchKernelGGL(K_, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,            \
+                       (const uint16_t*)a, (const uint16_t*)b, (uint16_t*)y, (uint32_t)n,        \
+                       (uint32_t)a_ld, (uint32_t)b_ld, (uint32_t)y_ld, op, b_step, 1.0f)
+    if (chain) R4D_BIN(r4dchain_binary);
+    else       R4D_BIN(binary_kernel);
+#undef R4D_BIN
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-extern "C" int r4d_sigmoid_bf16(long x, long y, int M, int n, int x_ld, int y_ld, long stream) {
+extern "C" int r4d_binary_bf16(long a, long b, long y, int M, int n, int op,
+                               int a_ld, int b_ld, int y_ld, long stream) {
+    return binary_bf16_emit(a, b, y, M, n, op, a_ld, b_ld, y_ld, stream, false);
+}
+
+static int sigmoid_emit(long x, long y, int M, int n, int x_ld, int y_ld, long stream, bool chain) {
     if (!x || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
-    hipLaunchKernelGGL(sigmoid_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
-                       (const uint16_t*)x, (uint16_t*)y, (uint32_t)n,
-                       (uint32_t)x_ld, (uint32_t)y_ld);
+#define R4D_SIG(K_)                                                                              \
+    hipLaunchKernelGGL(K_, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,            \
+                       (const uint16_t*)x, (uint16_t*)y, (uint32_t)n, (uint32_t)x_ld,            \
+                       (uint32_t)y_ld)
+    if (chain) R4D_SIG(r4dchain_sigmoid);
+    else       R4D_SIG(sigmoid_kernel);
+#undef R4D_SIG
     return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_sigmoid_bf16(long x, long y, int M, int n, int x_ld, int y_ld, long stream) {
+    return sigmoid_emit(x, y, M, n, x_ld, y_ld, stream, false);
 }
 
 // ---------------------------------------------------------------------------- fill
@@ -1254,29 +1368,47 @@ extern "C" int r4d_scale_bf16(long x, long s, uint32_t s_dt, long y, int M, int 
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-extern "C" int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream) {
+static int silu_mul_emit(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream,
+                         bool chain) {
     if (!gu || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!gu_ld) gu_ld = 2 * n;
     if (!y_ld) y_ld = n;
     const uint32_t chunks = ((uint32_t)n + kSiluPer * kThreads - 1u) / (kSiluPer * kThreads);
-    hipLaunchKernelGGL(silu_mul_kernel, dim3((uint32_t)M, chunks), dim3(kThreads), 0,
-                       (hipStream_t)stream, (const uint16_t*)gu, (uint16_t*)y, (uint32_t)n,
-                       (uint32_t)gu_ld, (uint32_t)y_ld);
+#define R4D_SM(K_)                                                                               \
+    hipLaunchKernelGGL(K_, dim3((uint32_t)M, chunks), dim3(kThreads), 0, (hipStream_t)stream,    \
+                       (const uint16_t*)gu, (uint16_t*)y, (uint32_t)n, (uint32_t)gu_ld,          \
+                       (uint32_t)y_ld)
+    if (chain) R4D_SM(r4dchain_silu_mul);
+    else       R4D_SM(silu_mul_kernel);
+#undef R4D_SM
     return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream) {
+    return silu_mul_emit(gu, y, M, n, gu_ld, y_ld, stream, false);
 }
 
 // GELU-gated product, the gemma FFN activation. Same shape and gate order as silu_mul; tanh GELU to
 // match ref_gelu_mul's act_gelu_tanh.
-extern "C" int r4d_gelu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream) {
+static int gelu_mul_emit(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream,
+                         bool chain) {
     if (!gu || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!gu_ld) gu_ld = 2 * n;
     if (!y_ld) y_ld = n;
-    hipLaunchKernelGGL(gelu_mul_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
-                       (const uint16_t*)gu, (uint16_t*)y, (uint32_t)n,
-                       (uint32_t)gu_ld, (uint32_t)y_ld);
+#define R4D_GM(K_)                                                                               \
+    hipLaunchKernelGGL(K_, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,            \
+                       (const uint16_t*)gu, (uint16_t*)y, (uint32_t)n, (uint32_t)gu_ld,          \
+                       (uint32_t)y_ld)
+    if (chain) R4D_GM(r4dchain_gelu_mul);
+    else       R4D_GM(gelu_mul_kernel);
+#undef R4D_GM
     return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_gelu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream) {
+    return gelu_mul_emit(gu, y, M, n, gu_ld, y_ld, stream, false);
 }
 
 // `n_rope_heads` is n_head + n_head_kv: the Q heads and the K heads of a fused projection, or just
@@ -1295,7 +1427,8 @@ extern "C" int r4d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_rope
 static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads, int rot, int den,
                        int gptj, float theta, float rscale, int row_pitch, int mode,
                        const int* sec, int n_sec, int plane, RadYarn yarn, long stream,
-                       int nfreq = -1, RadLlama3 l3 = RadLlama3{}, bool rows_form = false) {
+                       int nfreq = -1, RadLlama3 l3 = RadLlama3{}, bool rows_form = false,
+                       bool chain = false) {
     if (!qkv || !pos) return -1;
     if (M <= 0 || head_dim <= 0 || n_rope_heads <= 0) return -2;
     if (rot <= 0 || rot > head_dim || (rot & 1)) return -3;
@@ -1318,11 +1451,15 @@ static int rope_launch(long qkv, long pos, int M, int head_dim, int n_rope_heads
                            s0, s1, s2, n_sec, (uint32_t)plane, yarn, l3);
         return hipGetLastError() == hipSuccess ? 0 : -4;
     }
-    hipLaunchKernelGGL(rope_kernel, dim3((uint32_t)M, gy), dim3(kThreads), 0, (hipStream_t)stream,
-                       (uint16_t*)qkv, (const int32_t*)pos, (uint32_t)head_dim,
-                       (uint32_t)n_rope_heads, (uint32_t)rot, (uint32_t)nfreq, (int)den, gptj, theta,
-                       rscale,
-                       (uint32_t)row_pitch, mode, s0, s1, s2, n_sec, (uint32_t)plane, yarn, l3);
+#define R4D_ROPE(K_)                                                                             \
+    hipLaunchKernelGGL(K_, dim3((uint32_t)M, gy), dim3(kThreads), 0, (hipStream_t)stream,        \
+                       (uint16_t*)qkv, (const int32_t*)pos, (uint32_t)head_dim,                  \
+                       (uint32_t)n_rope_heads, (uint32_t)rot, (uint32_t)nfreq, (int)den, gptj,   \
+                       theta, rscale, (uint32_t)row_pitch, mode, s0, s1, s2, n_sec,              \
+                       (uint32_t)plane, yarn, l3)
+    if (chain) R4D_ROPE(r4dchain_rope);
+    else       R4D_ROPE(rope_kernel);
+#undef R4D_ROPE
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -1336,20 +1473,30 @@ extern "C" int r4d_rope_mc_bf16(long qkv, long pos, int M, int head_dim, int n_r
                        row_pitch, mode, sec, n_sec, plane, RadYarn{}, stream);
 }
 
-extern "C" int r4d_kv_store_bf16(long k, long v, long slot, long kv, int M, int head_dim,
-                                 int kv_heads, int block_size, int n_blocks,
-                                 int k_ld, int v_ld, long stream) {
+static int kv_store_emit(long k, long v, long slot, long kv, int M, int head_dim, int kv_heads,
+                         int block_size, int n_blocks, int k_ld, int v_ld, long stream,
+                         bool chain) {
     if (!k || !v || !slot || !kv) return -1;
     if (M <= 0 || head_dim <= 0 || kv_heads <= 0 || block_size <= 0 || n_blocks <= 0) return -2;
     if (!k_ld) k_ld = kv_heads * head_dim;
     if (!v_ld) v_ld = kv_heads * head_dim;
     /* The fp8 cache is a separate entry point (r4d_kv_store_fp8), selected by --kv-cache-dtype. */
-    hipLaunchKernelGGL(kv_store_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
-                       (hipStream_t)stream,
-                       (const uint16_t*)k, (const uint16_t*)v, (const int32_t*)slot,
-                       (uint16_t*)kv, (uint32_t)head_dim, (uint32_t)kv_heads,
-                       (uint32_t)block_size, (uint32_t)n_blocks, (uint32_t)k_ld, (uint32_t)v_ld);
+#define R4D_KVS(K_)                                                                              \
+    hipLaunchKernelGGL(K_, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,            \
+                       (const uint16_t*)k, (const uint16_t*)v, (const int32_t*)slot,             \
+                       (uint16_t*)kv, (uint32_t)head_dim, (uint32_t)kv_heads,                    \
+                       (uint32_t)block_size, (uint32_t)n_blocks, (uint32_t)k_ld, (uint32_t)v_ld)
+    if (chain) R4D_KVS(r4dchain_kv_store);
+    else       R4D_KVS(kv_store_kernel);
+#undef R4D_KVS
     return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_kv_store_bf16(long k, long v, long slot, long kv, int M, int head_dim,
+                                 int kv_heads, int block_size, int n_blocks,
+                                 int k_ld, int v_ld, long stream) {
+    return kv_store_emit(k, v, slot, kv, M, head_dim, kv_heads, block_size, n_blocks, k_ld, v_ld,
+                         stream, false);
 }
 
 // bf16 k and v in, E4M3 cache out. `k_scale` and `v_scale` are the reader's descales, so this
@@ -1397,25 +1544,32 @@ namespace {
 constexpr uint32_t kLgRows = 8;    // rows held in registers at once
 constexpr uint32_t kLgVec  = 8;    // bf16 per 128-bit load
 
-__global__ __launch_bounds__(kThreads) void logits_gemm_kernel(
+// LGR rows are held at once. Every row's sum is independent of the others (the same per-thread
+// 8-term chunks added in k order, the same lane butterfly, the same wave order), so LGR changes how
+// many times a column's weights are re-read -- once per LGR-row chunk -- and not one output byte.
+// The M > 8 head uses logits_gemm_body_wide below instead; this body stays the 8-row reference.
+template <uint32_t LGR>
+__device__ __forceinline__ void logits_gemm_body(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
     uint32_t M, uint32_t K, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
-    __shared__ float lds[kWaves][kLgRows];
+    __shared__ float lds[kWaves][LGR];
     const uint32_t j = blockIdx.x;
     if (j >= N) return;
     const uint16_t* __restrict__ wj = w + (size_t)j * K;
 
-    for (uint32_t r0 = 0; r0 < M; r0 += kLgRows) {
-        const uint32_t nr = (M - r0) < kLgRows ? (M - r0) : kLgRows;
-        float acc[kLgRows];
+    for (uint32_t r0 = 0; r0 < M; r0 += LGR) {
+        const uint32_t nr = (M - r0) < LGR ? (M - r0) : LGR;
+        float acc[LGR];
 #pragma unroll
-        for (uint32_t i = 0; i < kLgRows; ++i) acc[i] = 0.0f;
+        for (uint32_t i = 0; i < LGR; ++i) acc[i] = 0.0f;
 
         for (uint32_t k = threadIdx.x * kLgVec; k < K; k += kThreads * kLgVec) {
             uint16_t wv[kLgVec];
 #pragma unroll
             for (uint32_t p = 0; p < kLgVec; ++p) wv[p] = wj[k + p];
-            for (uint32_t i = 0; i < nr; ++i) {
+#pragma unroll
+            for (uint32_t i = 0; i < LGR; ++i) {
+                if (i >= nr) break;
                 const uint16_t* __restrict__ ar = a + (size_t)(r0 + i) * a_ld + k;
                 float s = 0.0f;
 #pragma unroll
@@ -1441,6 +1595,109 @@ __global__ __launch_bounds__(kThreads) void logits_gemm_kernel(
     }
 }
 
+__global__ __launch_bounds__(kThreads) void logits_gemm_kernel(
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
+    uint32_t M, uint32_t K, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
+    logits_gemm_body<kLgRows>(a, w, c, M, K, N, a_ld, c_ld);
+}
+
+// Wide form of the M > 8 head: a block takes LGC whole vocabulary columns and LGR rows a pass. Per
+// 8-wide k chunk each weight is one 16-byte load widened once, each activation row's chunk is one
+// 16-byte load widened once and shared by the LGC columns. Every (row, column) sum is formed exactly
+// as logits_gemm_body forms it -- s = 0; s += a[p] * w[p] for p = 0..7; acc += s per chunk in k
+// order; lane butterfly; then the eight wave partials in wave order -- so it is BYTE-IDENTICAL.
+// Needs a, w 16-byte aligned and a_ld a multiple of eight (the host checks).
+__device__ __forceinline__ void lg_widen8(const uint4 v, float* f) {
+    f[0] = __builtin_bit_cast(float, v.x << 16); f[1] = __builtin_bit_cast(float, v.x & 0xffff0000u);
+    f[2] = __builtin_bit_cast(float, v.y << 16); f[3] = __builtin_bit_cast(float, v.y & 0xffff0000u);
+    f[4] = __builtin_bit_cast(float, v.z << 16); f[5] = __builtin_bit_cast(float, v.z & 0xffff0000u);
+    f[6] = __builtin_bit_cast(float, v.w << 16); f[7] = __builtin_bit_cast(float, v.w & 0xffff0000u);
+}
+// Sixteen accumulators a lane, each wave-summed with r4d_wave_sum's exact tree (offsets 16, 8, 4, 2,
+// 1; every add is commutative, so a lane holding both operands' sums in either order is bit-equal):
+// after the offset-16 add both lanes of a pair hold the same sums, so one keeps the low eight values
+// and the other the high eight, and so down. Lane l ends with the wave sum of value (l >> 1) & 15.
+__device__ __forceinline__ float lg_wave_sum16(float (&a)[16], uint32_t lane) {
+    const bool l1 = lane & 2u, l2 = lane & 4u, l4 = lane & 8u, l8 = lane & 16u;
+    float b[8], c[4], d[2];
+#pragma unroll
+    for (uint32_t q = 0; q < 16; ++q) a[q] = a[q] + swap16(a[q]);
+#pragma unroll
+    for (uint32_t j = 0; j < 8; ++j) b[j] = r4d_dpp_xor_add<0x168>(r4d_pick(l8, a[8 + j], a[j]));
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) c[j] = r4d_dpp_xor_add<0x164>(r4d_pick(l4, b[4 + j], b[j]));
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) d[j] = r4d_dpp_xor_add<0x162>(r4d_pick(l2, c[2 + j], c[j]));
+    return r4d_dpp_xor_add<0x161>(r4d_pick(l1, d[1], d[0]));
+}
+template <uint32_t LGR, uint32_t LGC>
+__device__ __forceinline__ void logits_gemm_body_wide(
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
+    uint32_t M, uint32_t K, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
+    __shared__ float lds[kWaves][LGR * LGC];
+    const uint32_t j0 = blockIdx.x * LGC;
+    const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+
+    for (uint32_t r0 = 0; r0 < M; r0 += LGR) {
+        const uint32_t nr = (M - r0) < LGR ? (M - r0) : LGR;
+        float acc[LGR][LGC];
+#pragma unroll
+        for (uint32_t i = 0; i < LGR; ++i)
+#pragma unroll
+            for (uint32_t x = 0; x < LGC; ++x) acc[i][x] = 0.0f;
+
+        for (uint32_t k = threadIdx.x * kLgVec; k < K; k += kThreads * kLgVec) {
+            float wf[LGC][8];
+#pragma unroll
+            for (uint32_t x = 0; x < LGC; ++x) {
+                uint4 wv = make_uint4(0, 0, 0, 0);
+                if (j0 + x < N) wv = *(const uint4*)(w + (size_t)(j0 + x) * K + k);
+                lg_widen8(wv, wf[x]);
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < LGR; ++i) {
+                // rows past M re-read the last row (the sums are discarded): no dynamic row count
+                const uint32_t ri = (r0 + i) < M ? (r0 + i) : M - 1;
+                const uint4 av = *(const uint4*)(a + (size_t)ri * a_ld + k);
+                float af[8];
+                lg_widen8(av, af);
+#pragma unroll
+                for (uint32_t x = 0; x < LGC; ++x) {
+                    float s = 0.0f;
+#pragma unroll
+                    for (uint32_t p = 0; p < kLgVec; ++p) s += af[p] * wf[x][p];
+                    acc[i][x] += s;
+                }
+            }
+        }
+
+        static_assert((LGR * LGC) % 16 == 0, "reduce in groups of sixteen");
+#pragma unroll
+        for (uint32_t g = 0; g < LGR * LGC / 16; ++g) {
+            float t[16];
+#pragma unroll
+            for (uint32_t q = 0; q < 16; ++q) t[q] = acc[(g * 16 + q) / LGC][(g * 16 + q) % LGC];
+            const float v = lg_wave_sum16(t, lane);
+            if (!(lane & 1u)) lds[wave][g * 16 + ((lane >> 1) & 15u)] = v;
+        }
+        __syncthreads();
+        for (uint32_t t = threadIdx.x; t < nr * LGC; t += kThreads) {
+            float v = 0.0f;
+#pragma unroll
+            for (uint32_t q = 0; q < kWaves; ++q) v += lds[q][t];
+            const uint32_t i = t / LGC, x = t % LGC;
+            if (j0 + x < N) c[(size_t)(r0 + i) * c_ld + j0 + x] = v;
+        }
+        __syncthreads();
+    }
+}
+#define LG_WIDE_KERNEL(R, C)                                                                       \
+    __global__ __launch_bounds__(kThreads) void logits_gemm_wide_##R##x##C(                        \
+        const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,     \
+        uint32_t M, uint32_t K, uint32_t N, uint32_t a_ld, uint32_t c_ld) {                        \
+        logits_gemm_body_wide<R, C>(a, w, c, M, K, N, a_ld, c_ld);                                 \
+    }
+LG_WIDE_KERNEL(8, 8)
 
 // The same projection with each wave taking four whole vocabulary columns, for a head where the
 // 256-thread block per column is the cost: at n_embd 4096 a thread of that kernel makes two 16-byte
@@ -1534,6 +1791,128 @@ __global__ __launch_bounds__(kThreads) void logits_gemm_cols_kernel(
     }
 }
 
+// The column form at an n_embd that is not a multiple of 2048, such as Qwen3.8-27B's 5120. There a
+// thread of logits_gemm_kernel holds KLO + 1 chunks while 32q + l < QB * 32, else KLO
+// (KLO = K / 2048, QB = (K % 2048) / 256): at 5120 waves 0-3 of its block sum three chunks and
+// waves 4-7 two.
+//
+// BYTE-IDENTICAL to logits_gemm_kernel, as logits_gemm_cols_kernel is: lane l runs thread 32q + l
+// in turn for q = 0..7, with that thread's own chunk count, so every (row, column) keeps the block
+// kernel's order -- each chunk an eight-term sum from 0, the thread's chunks added from 0 in k
+// order, the lane butterfly per q, the wave sums added from 0 in q order. Three chunks for four
+// columns and eight rows do not fit the registers (256 VGPRs, 160 spilled), so a q step works XH
+// columns by RH rows at a time; which (row, column) pair is visited first changes nothing in any
+// pair's sum.
+//
+// At 5120 the three-chunk steps take four columns by four rows and the two-chunk steps four by
+// eight (256 VGPRs, no spills). Of five such shapes that compile without spills it was the fastest
+// on an R9700 at Qwen3.8-27B's TP2 slice (124160 x 5120, r4d_selftest --perflogits), in us,
+// against logits_gemm_kernel: 8 rows 2157.0 / 4288.6, 16 rows 3888.7 / 7997.9, 1 row 2010.1 /
+// 2005.5.
+constexpr uint32_t kLgSpan = kThreads * kLgVec;   // 2048: the k stride of one thread's chunks
+
+template <uint32_t KI, uint32_t K, uint32_t C, uint32_t XH, uint32_t RH>
+__device__ __forceinline__ void logits_cols_q(
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, uint32_t q, uint32_t lane,
+    uint32_t j0, uint32_t N, uint32_t r0, uint32_t nr, uint32_t a_ld, float (&v)[C][kLgRows]) {
+    constexpr uint32_t V = KI * kLgVec;
+    const uint32_t k0 = (q * kWave + lane) * kLgVec;
+#pragma unroll
+    for (uint32_t xb = 0; xb < C; xb += XH) {
+        uint4 wv[XH][KI];
+#pragma unroll
+        for (uint32_t x = 0; x < XH; ++x) {
+            const uint16_t* wr = w + (size_t)(j0 + xb + x < N ? j0 + xb + x : N - 1) * K + k0;
+#pragma unroll
+            for (uint32_t t = 0; t < KI; ++t) wv[x][t] = *(const uint4*)(wr + t * kLgSpan);
+        }
+        float wf[XH][V];
+#pragma unroll
+        for (uint32_t x = 0; x < XH; ++x)
+#pragma unroll
+            for (uint32_t t = 0; t < KI; ++t) {
+                const uint32_t ww[4] = { wv[x][t].x, wv[x][t].y, wv[x][t].z, wv[x][t].w };
+#pragma unroll
+                for (uint32_t p = 0; p < kLgVec; ++p)
+                    wf[x][t * kLgVec + p] = bf16_to_f32((uint16_t)(ww[p / 2] >> (16 * (p & 1))));
+            }
+#pragma unroll
+        for (uint32_t rb = 0; rb < kLgRows; rb += RH) {
+            if (rb >= nr) break;
+            uint4 av[RH][KI];
+#pragma unroll
+            for (uint32_t i = 0; i < RH; ++i) {
+                if (rb + i >= nr) break;
+                const uint16_t* ar = a + (size_t)(r0 + rb + i) * a_ld + k0;
+#pragma unroll
+                for (uint32_t t = 0; t < KI; ++t) av[i][t] = *(const uint4*)(ar + t * kLgSpan);
+            }
+#pragma unroll
+            for (uint32_t i = 0; i < RH; ++i) {
+                if (rb + i >= nr) break;
+                float af[V];
+#pragma unroll
+                for (uint32_t t = 0; t < KI; ++t) {
+                    const uint32_t aw[4] = { av[i][t].x, av[i][t].y, av[i][t].z, av[i][t].w };
+#pragma unroll
+                    for (uint32_t p = 0; p < kLgVec; ++p)
+                        af[t * kLgVec + p] = bf16_to_f32((uint16_t)(aw[p / 2] >> (16 * (p & 1))));
+                }
+#pragma unroll
+                for (uint32_t x = 0; x < XH; ++x) {
+                    float acc = 0.0f;
+#pragma unroll
+                    for (uint32_t t = 0; t < KI; ++t) {
+                        float s = 0.0f;
+#pragma unroll
+                        for (uint32_t p = 0; p < kLgVec; ++p)
+                            s += af[t * kLgVec + p] * wf[x][t * kLgVec + p];
+                        acc += s;
+                    }
+                    v[xb + x][rb + i] += r4d_wave_sum(acc);
+                }
+            }
+        }
+    }
+}
+
+// C columns a wave; the steps whose threads hold KLO + 1 chunks work XH_HI columns x RH_HI rows at
+// a time, the others XH_LO x RH_LO.
+template <uint32_t K, uint32_t C, uint32_t XH_HI, uint32_t RH_HI, uint32_t XH_LO, uint32_t RH_LO>
+__global__ __launch_bounds__(kThreads) void logits_gemm_cols_k_kernel(
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, float* __restrict__ c,
+    uint32_t M, uint32_t N, uint32_t a_ld, uint32_t c_ld) {
+    static_assert(K % (kWave * kLgVec) == 0, "a wave's 32 lanes must hold the same chunk count");
+    static_assert(C % XH_HI == 0 && C % XH_LO == 0 && kLgRows % RH_HI == 0 && kLgRows % RH_LO == 0,
+                  "a step's columns and rows must divide the wave's");
+    constexpr uint32_t KLO = K / kLgSpan, QB = (K % kLgSpan) / (kWave * kLgVec);
+    const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+    const uint32_t j0 = (blockIdx.x * kWaves + wave) * C;
+    if (j0 >= N) return;
+    for (uint32_t r0 = 0; r0 < M; r0 += kLgRows) {
+        const uint32_t nr = (M - r0) < kLgRows ? (M - r0) : kLgRows;
+        float v[C][kLgRows];
+#pragma unroll
+        for (uint32_t x = 0; x < C; ++x)
+#pragma unroll
+            for (uint32_t i = 0; i < kLgRows; ++i) v[x][i] = 0.0f;
+#pragma unroll 1
+        for (uint32_t q = 0; q < QB; ++q)
+            logits_cols_q<KLO + 1, K, C, XH_HI, RH_HI>(a, w, q, lane, j0, N, r0, nr, a_ld, v);
+#pragma unroll 1
+        for (uint32_t q = QB; q < kWaves; ++q)
+            logits_cols_q<KLO, K, C, XH_LO, RH_LO>(a, w, q, lane, j0, N, r0, nr, a_ld, v);
+#pragma unroll
+        for (uint32_t x = 0; x < C; ++x) {
+            float out = 0.0f;
+#pragma unroll
+            for (uint32_t i = 0; i < kLgRows; ++i)
+                if (i == lane) out = v[x][i];
+            if (lane < nr && j0 + x < N) c[(size_t)(r0 + lane) * c_ld + j0 + x] = out;
+        }
+    }
+}
+
 }  // namespace
 
 //   a  [M][K]       bf16, `a_ld` elements a row (0 = K)
@@ -1546,24 +1925,43 @@ extern "C" int r4d_logits_gemm_bf16(long a, long w, long c, int M, int K, int N,
     if (K % (int)kLgVec) return -3;      // a thread owns eight columns; see the kernel
     if (!a_ld) a_ld = K;
     if (!c_ld) c_ld = N;
-    hipLaunchKernelGGL(logits_gemm_kernel, dim3((uint32_t)N), dim3(kThreads), 0,
-                       (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)w, (float*)c,
-                       (uint32_t)M, (uint32_t)K, (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
+    // M > 8: eight rows by eight columns a block (logits_gemm_body_wide), 16-byte loads of both
+    // operands. Byte-identical to the 8-row kernel, which stays the form for M <= 8 and for operands
+    // that are not 16-byte aligned.
+    if (M > (int)kLgRows && !(((uintptr_t)a | (uintptr_t)w | ((uintptr_t)a_ld * 2)) & 15))
+        hipLaunchKernelGGL(logits_gemm_wide_8x8, dim3((uint32_t)(((uint32_t)N + 7) / 8)), dim3(kThreads), 0,
+                           (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)w, (float*)c,
+                           (uint32_t)M, (uint32_t)K, (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
+    else
+        hipLaunchKernelGGL(logits_gemm_kernel, dim3((uint32_t)N), dim3(kThreads), 0,
+                           (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)w, (float*)c,
+                           (uint32_t)M, (uint32_t)K, (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-// The column form; n_embd must be 4096 and an activation row whole 16 bytes.
+// The column form; n_embd must be 4096 or 5120 and an activation row whole 16 bytes.
 extern "C" int r4d_logits_gemm_bf16_cols(long a, long w, long c, int M, int K, int N, int a_ld,
                                          int c_ld, long stream) {
     if (!a || !w || !c) return -1;
     if (M <= 0 || N <= 0) return -2;
     if (!a_ld) a_ld = K;
     if (!c_ld) c_ld = N;
-    if (K != (int)(kLgKi * kThreads * kLgVec) || a_ld % (int)kLgVec) return -3;
+    if (a_ld % (int)kLgVec) return -3;
     const uint32_t per = kWaves * kLgCols;
-    hipLaunchKernelGGL(logits_gemm_cols_kernel, dim3(((uint32_t)N + per - 1) / per), dim3(kThreads),
-                       0, (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)w, (float*)c,
-                       (uint32_t)M, (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
+    const dim3 grid(((uint32_t)N + per - 1) / per);
+    if (K == (int)(kLgKi * kThreads * kLgVec)) {
+        hipLaunchKernelGGL(logits_gemm_cols_kernel, grid, dim3(kThreads), 0, (hipStream_t)stream,
+                           (const uint16_t*)a, (const uint16_t*)w, (float*)c, (uint32_t)M,
+                           (uint32_t)N, (uint32_t)a_ld, (uint32_t)c_ld);
+    } else if (K == 5120) {
+        hipLaunchKernelGGL((logits_gemm_cols_k_kernel<5120, kLgCols, kLgCols, kLgRows / 2, kLgCols,
+                                                       kLgRows>),
+                           grid, dim3(kThreads), 0, (hipStream_t)stream, (const uint16_t*)a,
+                           (const uint16_t*)w, (float*)c, (uint32_t)M, (uint32_t)N,
+                           (uint32_t)a_ld, (uint32_t)c_ld);
+    } else {
+        return -3;
+    }
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -2023,9 +2421,10 @@ static int binary(const RadArgs* a, int mul, RadStream s) {
                            (float)div);
         return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
     }
-    return r4d_binary_bf16(r4d_addr(A), r4d_addr(B), r4d_addr(Y), (int)M, (int)n, mul,
-                           (int)a_ld, (int)b_ld, (int)y_ld,
-                           (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+    return binary_bf16_emit(r4d_addr(A), r4d_addr(B), r4d_addr(Y), (int)M, (int)n, mul,
+                            (int)a_ld, (int)b_ld, (int)y_ld, (long)(uintptr_t)s,
+                            r4d_geti_or(a, "chain", 0) != 0 && M <= 64) == 0 ? RAD_OK
+                                                                             : RAD_E_DEVICE;
 }
 
 extern "C" int r4d_rad_add(const RadArgs* a, RadStream s) { return binary(a, 0, s); }
@@ -2103,8 +2502,10 @@ extern "C" int r4d_rad_sigmoid(const RadArgs* a, RadStream s) {
     if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
 
-    return r4d_sigmoid_bf16(r4d_addr(x), r4d_addr(y), (int)M, (int)n, (int)x_ld, (int)y_ld,
-                            (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+    return sigmoid_emit(r4d_addr(x), r4d_addr(y), (int)M, (int)n, (int)x_ld, (int)y_ld,
+                        (long)(uintptr_t)s, r4d_geti_or(a, "chain", 0) != 0 && M <= 64) == 0
+        ? RAD_OK
+        : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ fill */
@@ -2206,8 +2607,10 @@ extern "C" int r4d_rad_silu_mul(const RadArgs* a, RadStream s) {
     if (y_ld < 0 || gu_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0 || Mg < M) return R4D_NO(RAD_E_SHAPE);
 
-    return r4d_silu_mul_bf16(r4d_addr(gu), r4d_addr(y), (int)M, (int)n, (int)gu_ld, (int)y_ld,
-                             (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+    return silu_mul_emit(r4d_addr(gu), r4d_addr(y), (int)M, (int)n, (int)gu_ld, (int)y_ld,
+                         (long)(uintptr_t)s,
+                         r4d_geti_or(a, "chain", 0) != 0 && M <= 1024) == 0 ? RAD_OK
+                                                                            : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ gelu_mul */
@@ -2227,8 +2630,8 @@ extern "C" int r4d_rad_gelu_mul(const RadArgs* a, RadStream s) {
     if (y_ld < 0 || gu_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0 || Mg < M) return R4D_NO(RAD_E_SHAPE);
 
-    const int rc = r4d_gelu_mul_bf16(r4d_addr(gu), r4d_addr(y), (int)M, (int)n, (int)gu_ld, (int)y_ld,
-                                     (long)(uintptr_t)s);
+    const int rc = gelu_mul_emit(r4d_addr(gu), r4d_addr(y), (int)M, (int)n, (int)gu_ld, (int)y_ld,
+                                 (long)(uintptr_t)s, r4d_geti_or(a, "chain", 0) != 0 && M <= 64);
     return rc == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
@@ -2242,9 +2645,13 @@ static int rope_emit(const RadArgs* a, RadStream s, bool rows_form) {
     const RadTensor* qkv = r4d_opt(a, RP_QKV);
     const RadTensor* pos = r4d_opt(a, RP_POS);
     if (!qkv || !pos) return R4D_NO(RAD_E_INVAL);
+    if (qkv->dtype == RAD_F32) return r4d_rad_encoder_rope(a, s);
     R4D_NEED(dt_bf16(qkv));
     R4D_NEED(dt_i32(pos));
-    if (!r4d_contig(pos)) return R4D_NO(RAD_E_STRIDE);
+    /* A component list is read at its own pitch: a [C, M] view of a [C, P] buffer (a tower's
+     * per-pass rope positions) is row-contiguous with a leading stride wider than M. */
+    if (pos->rank == 2 ? pos->stride[1] != 1 : pos->stride[0] != 1)
+        return R4D_NO(RAD_E_STRIDE);
 
     const long long head_dim  = r4d_geti_or(a, "head_dim", 0);
     const long long n_head    = r4d_geti_or(a, "n_head", 0);
@@ -2303,7 +2710,7 @@ static int rope_emit(const RadArgs* a, RadStream s, bool rows_form) {
         if (mc != 3 && [&] { int t = 0; for (int c = 0; c < n_sec; ++c) t += sec[c];
                              return t != (int)(rot / 2); }())
             return R4D_NO(RAD_E_SHAPE);
-        plane = (int)pos->shape[1];
+        plane = (int)(pos->stride[0] >= pos->shape[1] ? pos->stride[0] : pos->shape[1]);
     }
 
     const float theta  = (float)r4d_getf(a, "theta", 10000.0);
@@ -2324,7 +2731,7 @@ static int rope_emit(const RadArgs* a, RadStream s, bool rows_form) {
     return rope_launch(r4d_addr(qkv), r4d_addr(pos), (int)Mp, (int)head_dim,
                        (int)(n_head + n_head_kv), (int)rot_l, (int)den, gptj, theta, rscale,
                        (int)pitch, mc, sec, n_sec, plane, yarn, (long)(uintptr_t)s,
-                       (int)nfreq, l3, rows_form) == 0
+                       (int)nfreq, l3, rows_form, r4d_geti_or(a, "chain", 0) != 0 && Mp <= 64) == 0
         ? RAD_OK
         : RAD_E_DEVICE;
 }
@@ -2350,7 +2757,9 @@ struct KvStoreGeom {
     long long head_dim, block_size, kv_heads, n_blocks, k_ld, v_ld, T;
 };
 
-static int kv_store_geom(const RadArgs* a, KvStoreGeom* g, long long row_per_hd16 = 32) {
+/* A token's row in a (block, head) page is head_dim * row_per_hd16 / 16 + row_extra elements. */
+static int kv_store_geom(const RadArgs* a, KvStoreGeom* g, long long row_per_hd16 = 32,
+                         long long row_extra = 0) {
     g->k  = r4d_opt(a, KS_K);
     g->v  = r4d_opt(a, KS_V);
     g->sm = r4d_opt(a, KS_SLOT);
@@ -2369,7 +2778,7 @@ static int kv_store_geom(const RadArgs* a, KvStoreGeom* g, long long row_per_hd1
      * disagrees. */
     if (g->kv->rank != 4) return R4D_NO(RAD_E_SHAPE);
     if (g->kv->shape[1] != g->kv_heads || g->kv->shape[2] != g->block_size ||
-        g->kv->shape[3] != g->head_dim * row_per_hd16 / 16) return R4D_NO(RAD_E_SHAPE);
+        g->kv->shape[3] != g->head_dim * row_per_hd16 / 16 + row_extra) return R4D_NO(RAD_E_SHAPE);
     g->n_blocks = g->kv->shape[0];
 
     const long long lane = g->kv_heads * g->head_dim;
@@ -2388,10 +2797,11 @@ extern "C" int r4d_rad_kv_store(const RadArgs* a, RadStream s) {
     if (rc != RAD_OK) return rc;
     R4D_NEED(dt_bf16(g.kv));
 
-    return r4d_kv_store_bf16(r4d_addr(g.k), r4d_addr(g.v), r4d_addr(g.sm), r4d_addr(g.kv),
-                             (int)g.T, (int)g.head_dim, (int)g.kv_heads, (int)g.block_size,
-                             (int)g.n_blocks, (int)g.k_ld, (int)g.v_ld,
-                             (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+    return kv_store_emit(r4d_addr(g.k), r4d_addr(g.v), r4d_addr(g.sm), r4d_addr(g.kv),
+                         (int)g.T, (int)g.head_dim, (int)g.kv_heads, (int)g.block_size,
+                         (int)g.n_blocks, (int)g.k_ld, (int)g.v_ld, (long)(uintptr_t)s,
+                         r4d_geti_or(a, "chain", 0) != 0 && g.T <= 64) == 0 ? RAD_OK
+                                                                           : RAD_E_DEVICE;
 }
 
 /* The E4M3 store. `k_scale` and `v_scale` are the attention side's descales (one per sequence and
@@ -2415,42 +2825,35 @@ extern "C" int r4d_rad_kv_store_fp8(const RadArgs* a, RadStream stream) {
                              (float)ks, (float)vs, stream) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
-/* The fp8_v4 and k6_v4 stores: the cache's last extent is a token's row, 25 or 22 * head_dim / 16
- * bytes. */
-static int kv_store_q4(const RadArgs* a, RadStream stream, int k6) {
-    const long long r16 = k6 ? 22 : 25;
+/* The int8 store: the cache's last extent is a token's row, 2 * head_dim + 4 bytes. A workgroup is
+ * a head's dims rounded up to whole waves. */
+extern "C" int r4d_rad_kv_store_i8(const RadArgs* a, RadStream stream) {
     KvStoreGeom g{};
-    const int rc = kv_store_geom(a, &g, r16);
+    const int rc = kv_store_geom(a, &g, 32, 4);
     if (rc != RAD_OK) return rc;
-    if (g.kv->dtype != RAD_F8E4M3) return R4D_NO(RAD_E_DTYPE);
-    if (g.head_dim % 32) return R4D_NO(RAD_E_SHAPE);
-    const double ks = r4d_getf(a, "k_scale", 1.0);
-    const double vs = r4d_getf(a, "v_scale", 1.0);
-    if (!(ks > 0.0) || !(vs > 0.0)) return R4D_NO(RAD_E_INVAL);
-    long long k_ld = g.k_ld ? g.k_ld : g.kv_heads * g.head_dim;
-    long long v_ld = g.v_ld ? g.v_ld : g.kv_heads * g.head_dim;
-    if (k6)
-        return R4D_EMIT(stream, kv_store_fp8v4_kernel<1>, dim3((uint32_t)g.T), dim3(kThreads), 0,
-                        (const uint16_t*)r4d_addr(g.k), (const uint16_t*)r4d_addr(g.v),
-                        (const int32_t*)r4d_addr(g.sm), (uint8_t*)r4d_addr(g.kv),
-                        (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
-                        (uint32_t)g.n_blocks, (uint32_t)k_ld, (uint32_t)v_ld, (float)(1.0 / ks),
-                        (float)(1.0 / vs), (uint32_t)(g.head_dim * r16 / 16)) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
-    return R4D_EMIT(stream, kv_store_fp8v4_kernel<0>, dim3((uint32_t)g.T), dim3(kThreads), 0,
-                    (const uint16_t*)r4d_addr(g.k), (const uint16_t*)r4d_addr(g.v),
+    if (g.kv->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
+    if (g.head_dim % 4 || g.head_dim > 1024) return R4D_NO(RAD_E_SHAPE);
+    const long long k_ld = g.k_ld ? g.k_ld : g.kv_heads * g.head_dim;
+    const long long v_ld = g.v_ld ? g.v_ld : g.kv_heads * g.head_dim;
+    const uint32_t thr = (uint32_t)((g.head_dim + 31) / 32 * 32);
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0 && g.T <= 64;
+    return R4D_EMIT(stream, (chain ? r4dchain_kv_store_i8 : kv_store_i8_kernel),
+                    dim3((uint32_t)g.T, (uint32_t)g.kv_heads), dim3(thr),
+                    0, (const uint16_t*)r4d_addr(g.k), (const uint16_t*)r4d_addr(g.v),
                     (const int32_t*)r4d_addr(g.sm), (uint8_t*)r4d_addr(g.kv),
                     (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
-                    (uint32_t)g.n_blocks, (uint32_t)k_ld, (uint32_t)v_ld, (float)(1.0 / ks),
-                    (float)(1.0 / vs), (uint32_t)(g.head_dim * r16 / 16)) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
+                    (uint32_t)g.n_blocks, (uint32_t)k_ld, (uint32_t)v_ld) == RAD_OK ? RAD_OK
+                                                                                    : RAD_E_DEVICE;
 }
-extern "C" int r4d_rad_kv_store_fp8v4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 0); }
-extern "C" int r4d_rad_kv_store_k6v4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 1); }
 
 /* The store of a streamed group: kv_store's geometry and conversion (E4M3, or bf16 with no
  * descales), plus the residency map `res` (read, never written: residency is the resolve's) and the
  * host mirror `host`. Both are one block a row of the same byte pitch. State faults are guarded,
  * not refused (see kv_store_streamed_kernel). */
+static int kv_store_streamed_i8(const RadArgs* a, RadStream stream);
 extern "C" int r4d_rad_kv_store_streamed(const RadArgs* a, RadStream stream) {
+    const RadTensor* kvt = r4d_opt(a, 3);
+    if (kvt && kvt->dtype == RAD_I8) return kv_store_streamed_i8(a, stream);
     KvStoreGeom g{};
     const int rc = kv_store_geom(a, &g);
     if (rc != RAD_OK) return rc;
@@ -2499,6 +2902,36 @@ extern "C" int r4d_rad_kv_store_streamed(const RadArgs* a, RadStream stream) {
                     (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
                     (uint32_t)blocks, (uint32_t)slots, (uint32_t)k_ld, (uint32_t)v_ld,
                     k_inv, v_inv) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* The same into the int8 cache: kv_store_i8's workgroup, a head's dims one a lane, and a row of
+ * 2 * head_dim + 4 bytes in both planes. */
+static int kv_store_streamed_i8(const RadArgs* a, RadStream stream) {
+    KvStoreGeom g{};
+    const int rc = kv_store_geom(a, &g, 32, 4);
+    if (rc != RAD_OK) return rc;
+    if (g.head_dim % 4 || g.head_dim > 1024) return R4D_NO(RAD_E_SHAPE);
+    const RadTensor* res  = r4d_opt(a, 4);
+    const RadTensor* host = r4d_opt(a, 5);
+    if (!res || !host) return R4D_NO(RAD_E_INVAL);
+    if (res->dtype != RAD_I32 || !r4d_contig(res)) return R4D_NO(RAD_E_STRIDE);
+    if (host->dtype != RAD_U8 || !r4d_contig(host) || host->rank != 2)
+        return R4D_NO(RAD_E_STRIDE);
+    const long long row    = g.kv_heads * g.block_size * (2 * g.head_dim + 4);
+    const long long blocks = host->shape[0], slots = g.kv->shape[0];
+    if (blocks <= 0 || slots <= 0 || row <= 0) return R4D_NO(RAD_E_SHAPE);
+    if (host->shape[1] != row || host->stride[0] != row) return R4D_NO(RAD_E_STRIDE);
+    if (r4d_numel(res) < blocks) return R4D_NO(RAD_E_SHAPE);
+    const long long k_ld = g.k_ld ? g.k_ld : g.kv_heads * g.head_dim;
+    const long long v_ld = g.v_ld ? g.v_ld : g.kv_heads * g.head_dim;
+    return R4D_EMIT(stream, kv_store_streamed_i8_kernel, dim3((uint32_t)g.T, (uint32_t)g.kv_heads),
+                    dim3((uint32_t)((g.head_dim + 31) / 32 * 32)), 0,
+                    (const uint16_t*)r4d_addr(g.k), (const uint16_t*)r4d_addr(g.v),
+                    (const int32_t*)r4d_addr(g.sm), (uint8_t*)r4d_addr(g.kv),
+                    (const int32_t*)r4d_addr(res), (uint8_t*)r4d_addr(host),
+                    (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
+                    (uint32_t)blocks, (uint32_t)slots, (uint32_t)k_ld,
+                    (uint32_t)v_ld) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ logits_gemm
@@ -2551,7 +2984,7 @@ extern "C" int r4d_rad_logits_gemm_cols(const RadArgs* a, RadStream s) {
     if (!r4d_contig(w)) return R4D_NO(RAD_E_STRIDE);
     const long long n_vocab = r4d_geti_or(a, "n_vocab", r4d_dim(w, 0));
     const long long n_embd  = r4d_geti_or(a, "n_embd", r4d_dim(w, 1));
-    if (n_vocab <= 0 || n_embd != 4096) return R4D_NO(RAD_E_SHAPE);
+    if (n_vocab <= 0 || (n_embd != 4096 && n_embd != 5120)) return R4D_NO(RAD_E_SHAPE);
     if (w->rank != 2 || w->shape[0] != n_vocab || w->shape[1] != n_embd)
         return R4D_NO(RAD_E_SHAPE);
     long long M = 0, My = 0;

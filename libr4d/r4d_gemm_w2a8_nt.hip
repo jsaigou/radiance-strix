@@ -28,6 +28,7 @@
 // r4d_gemm_w4a8_asym_nt_m64.
 #include "r4d.h"
 #include "r4d_gemm_args.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
 #include <hip/hip_bf16.h>
@@ -77,12 +78,13 @@ __device__ __forceinline__ v8i w2_mmai(v2i a, v2i b, v8i c) {
 #define R4D_W2A8_BOUNDS(MT, NPW) \
     ((MT) >= 4 ? 256 : (((MT) >= 2 || (NPW) >= 4) ? 512 : 1024))
 
+#define R4D_GEMM_W2A8_NT_PARAMS                                                                 \
+    const signed char* __restrict__ A, const float* __restrict__ Ascale,                        \
+    const unsigned* __restrict__ Wq, const unsigned* __restrict__ Ws,                           \
+    const float* __restrict__ Asum, __hip_bfloat16* __restrict__ C, int M, int K, int N,        \
+    int WV, int SK
 template <int MT, int NPW, bool NT>
-__global__ __launch_bounds__(R4D_W2A8_BOUNDS(MT, NPW)) void r4d_gemm_w2a8_nt_kernel(
-    const signed char* __restrict__ A, const float* __restrict__ Ascale,
-    const unsigned* __restrict__ Wq, const unsigned* __restrict__ Ws,
-    const float* __restrict__ Asum, __hip_bfloat16* __restrict__ C,
-    int M, int K, int N, int WV, int SK) {
+__device__ __forceinline__ void r4d_gemm_w2a8_nt_body(R4D_GEMM_W2A8_NT_PARAMS) {
   extern __shared__ float redw2[];
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
   const int col_local = wave / SK, ksplit = wave % SK;
@@ -223,8 +225,20 @@ __global__ __launch_bounds__(R4D_W2A8_BOUNDS(MT, NPW)) void r4d_gemm_w2a8_nt_ker
   }
 }
 
-void r4d_gemm_w2a8_nt(long a, long ascale, long wq, long ws, long asum, long c,
-                      int M, int K, int N, int WV, int SK, int MB, int NPW, int NT, long stream) {
+// The kernel around the body: CH `r4dchain` is the chained form (r4d_chain.h), taken at decode
+// heights.
+template <int MT, int NPW, bool NT, class CH>
+__global__ __launch_bounds__(R4D_W2A8_BOUNDS(MT, NPW))
+void r4d_gemm_w2a8_nt_kernel(R4D_GEMM_W2A8_NT_PARAMS) {
+  if (CH::on) r4d_chain_wait_vec();
+  r4d_gemm_w2a8_nt_body<MT, NPW, NT>(A, Ascale, Wq, Ws, Asum, C, M, K, N, WV, SK);
+  if (CH::on) r4d_chain_done();
+}
+#undef R4D_GEMM_W2A8_NT_PARAMS
+
+static void gemm_w2a8_nt_emit(long a, long ascale, long wq, long ws, long asum, long c,
+                              int M, int K, int N, int WV, int SK, int MB, int NPW, int NT,
+                              long stream, bool chain) {
   if (M < 1) throw std::runtime_error("r4d gemm_w2a8_nt: M must be >= 1");
   if (N % 16) throw std::runtime_error("r4d gemm_w2a8_nt: N must be a multiple of 16");
   if (K % (SK * R4D_GEMM_W2A8_GROUP))
@@ -249,8 +263,11 @@ void r4d_gemm_w2a8_nt(long a, long ascale, long wq, long ws, long asum, long c,
   auto Sump = (const float*)asum;
   auto Cp = (__hip_bfloat16*)c;
   hipStream_t st = (hipStream_t)stream;
-#define LW2(MT, NP, TT) hipLaunchKernelGGL((r4d_gemm_w2a8_nt_kernel<MT, NP, TT>), grid, block, \
-                                           smem, st, Ap, Asp, Wp, Sp, Sump, Cp, M, K, N, WV, SK)
+#define LW2C(MT, NP, TT, CH_)                                                                    \
+  hipLaunchKernelGGL((r4d_gemm_w2a8_nt_kernel<MT, NP, TT, CH_>), grid, block, smem, st, Ap, Asp,  \
+                     Wp, Sp, Sump, Cp, M, K, N, WV, SK)
+#define LW2(MT, NP, TT)                                                                          \
+  do { if (chain) LW2C(MT, NP, TT, r4dchain); else LW2C(MT, NP, TT, R4dUnchained); } while (0)
 #define LW2_MB(NP, TT) switch (MB) { \
     case 1: LW2(1, NP, TT); break; \
     case 2: LW2(2, NP, TT); break; \
@@ -266,6 +283,12 @@ void r4d_gemm_w2a8_nt(long a, long ascale, long wq, long ws, long asum, long c,
   }
 #undef LW2_MB
 #undef LW2
+#undef LW2C
+}
+
+void r4d_gemm_w2a8_nt(long a, long ascale, long wq, long ws, long asum, long c,
+                      int M, int K, int N, int WV, int SK, int MB, int NPW, int NT, long stream) {
+  gemm_w2a8_nt_emit(a, ascale, wq, ws, asum, c, M, K, N, WV, SK, MB, NPW, NT, stream, false);
 }
 
 int r4d_gemm_w2a8_nt_group(void) { return R4D_GEMM_W2A8_GROUP; }
@@ -288,10 +311,10 @@ extern "C" int r4d_rad_gemm_w2a8(const RadArgs* a, RadStream s) {
     if (c.mb < 1 || c.mb > 4) return R4D_NO(RAD_E_SHAPE);
     if (c.npw != 1 && c.npw != 2 && c.npw != 4) return R4D_NO(RAD_E_SHAPE);
     R4D_TRY("gemm_w2a8_nt",
-        r4d_gemm_w2a8_nt(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale),
-                         r4d_addr(g.asum), r4d_addr(g.y),
-                         (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw, c.nt,
-                         (long)(uintptr_t)s));
+        gemm_w2a8_nt_emit(r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale),
+                          r4d_addr(g.asum), r4d_addr(g.y),
+                          (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw, c.nt,
+                          (long)(uintptr_t)s, r4d_geti_or(a, "chain", 0) != 0 && g.M <= 64));
     return RAD_OK;
 }
 

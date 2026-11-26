@@ -19,7 +19,7 @@ extern "C" {
  * version is refused at load with both versions printed. Each also exports the layout's fingerprint
  * (rad_abi_layout.h), so two layouts given one number are refused as well. A new optional export
  * (e.g. rad_plugin_reference) is not a change of shape: a plugin without it gets the default. */
-#define RAD_ABI_VERSION 37u
+#define RAD_ABI_VERSION 43u
 
 /* ================================================================== plugin identity */
 /* One value per plugin, not flags (QUANT is 3). RAD_PLUGIN_QUANT is a quantiser plugin:
@@ -62,8 +62,8 @@ typedef struct RadArgs {
     int              world_size;
     /* ABI 35: host-side maximum KV length represented by this exact launch operand (a seqused
      * span or a supported one-sequence prefill boundary), or -1 when it cannot be proven. In a
-     * decode, verify or draft pass of an architecture with no rad_arch_pass_key it is instead the
-     * step's context bound plus its longest query, which the recorded pass's key holds. Plugins
+     * decode, verify or draft pass it is instead the step's context bound plus its longest query,
+     * which the recorded pass's key holds. Plugins
      * must not infer it from a device pointer or synchronously read device memory to get it. */
     int32_t          kv_used_max_h;
     /* The current rank's WGP count (HIP multiProcessorCount on RDNA); lets split launchers use
@@ -162,7 +162,8 @@ typedef int (*RadLayoutFn)(const RadParam* p, int n_p, int operand, const RadEnc
 
 /* Write the stored form `layout` described into `dst`, `dst_bytes` long, from the planes, which
  * now carry their bytes. Pure host code, run by the loader on a pool behind the container read,
- * so it has to keep pace with the disk. */
+ * so it has to keep pace with the disk. The planes are read only: the loader may hand them
+ * straight out of its read buffer, which the copies for other ranks read at the same time. */
 typedef int (*RadRelayoutFn)(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                              const int* sel, const RadTensor* planes, int n_planes, void* dst,
                              int64_t dst_bytes);
@@ -515,6 +516,15 @@ const RadKernelInfo* rad_kernel_at(int i);
 typedef int  (*RadPluginOpenFn) (void);
 typedef void (*RadPluginCloseFn)(void);
 
+/* Optional, symbol `rad_plugin_freed`. The core has freed the device memory [base, base + bytes)
+ * and nothing launched against it runs any more. A kernel library that keeps state keyed by an
+ * operand's address (a counter block per output buffer, made at the first launch and replayed by
+ * recorded passes) drops what it keeps for addresses inside the range. A process serving several
+ * models frees an engine's memory when it unloads the model, so state kept past that would pile
+ * up with every load. Called from the freeing thread, any number of times, possibly for ranges the
+ * plugin never saw. */
+typedef void (*RadPluginFreedFn)(const void* base, int64_t bytes);
+
 /* Optional promise about kernel `i` of rad_kernel_at: nonzero means every launch reads and writes
  * only its operands and the scratch it was handed (no allocation it keeps, no counter kept between
  * launches), so two launches may run at once on one device when their operands and scratch do not
@@ -534,7 +544,17 @@ typedef int  (*RadKernelConcurrentFn)(int i);
  * do, adds exactly once. The record is RAD_CHAIN_REC_BYTES at byte RAD_CHAIN_KARG_OFF of the
  * kernel's argument segment: { magic, target, ctr, check }, with check = magic ^ target ^ ctr ^
  * RAD_CHAIN_CHECK. A record whose magic or check does not match means: run without waiting and do
- * not add. Without the symbol, or with 0, the engine never asks. Symbol name: `rad_kernel_chain`. */
+ * not add. Without the symbol, or with 0, the engine never asks.
+ *
+ * 2 instead of 1 adds a second promise: the chained form's own acquire covers everything it reads
+ * behind the wait, scalar loads included. A compiler's agent-scope fence invalidates the vector
+ * caches only; a load every lane shares may be a scalar one, served from the scalar data cache,
+ * which still holds what was there before the launch in front wrote. A form that invalidates that
+ * cache behind its acquire (`s_dcache_inv`), or reads no operand through it, may say 2. Where
+ * every chainable row an engine loads says 2, the engine issues a chained launch that has lost
+ * its barrier bit without the packet processor's acquire as well: on an R9700 that acquire holds
+ * the processor ~0.9 us a launch, and it comes too early to serve a kernel that then waits for
+ * the launch in front. With 1 the packets keep it. Symbol name: `rad_kernel_chain`. */
 typedef int  (*RadKernelChainFn)(int i);
 #define RAD_CHAIN_KARG_OFF  992
 #define RAD_CHAIN_REC_BYTES 32

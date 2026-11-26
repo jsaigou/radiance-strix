@@ -8,7 +8,7 @@
 #       --recipe data/recipes/hy-memory-30b-a3b-bf16-w4.recipe -o hy-memory-30b-a3b-w4.rad
 #
 # The W4 GEMMs consume dynamic INT8 activations. Routed/shared outputs are reduced independently at
-# TP2 then combined in FP32. Use --tp 2 at serve time if one device cannot hold the .rad weights and
+# TP2 then combined in FP32. Use `tp: 2` at serve time if one device cannot hold the .rad weights and
 # KV cache.
 
 blk.*.attn_q.weight                  rtn  codes=u4 zero=u8 group=128 scale=f16

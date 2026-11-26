@@ -12,7 +12,7 @@
 #include "text/tokenizer.h"
 #include "rad_clef.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <cmath>
 #include <cstdlib>

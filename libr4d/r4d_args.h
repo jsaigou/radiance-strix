@@ -235,6 +235,10 @@ enum {
      * cannot be static_asserted against `r4d_gemm_fp8a8_block()` (a function, not a macro), so
      * r4d_gemm_fp8a8.hip checks it at launch. */
     R4D_FP8_BLOCK = 128,
+    /* IQR's 8-bit format (IQ8R): int8 codes rotated 128 wide, one bf16 scale per row per 256 of K
+     * against an int8 activation with one f32 scale per (token, 256). Twice the int8 block, so a
+     * fold covers two 128-wide rotation blocks. */
+    R4D_I8_GROUP_WIDE = 256,
     R4D_WAVE     = 32,
     R4D_NTILE    = 16     /* output rows per WMMA n-tile                          */
 };
@@ -260,7 +264,12 @@ enum {
     R4D_DT_MOEW5      = RAD_DT_PLUGIN_BASE + 8,
     /* The M2XFP4 GEMMs' stored weight: R4D_DT_MXFP4_FRAG's fragment-order e2m1 codes, then the
      * [K/32][N] meta plane the kernel reads beside the E8M0 exponents (r4d_layout.cpp, m2xfp4). */
-    R4D_DT_M2XFP4_FRAG = RAD_DT_PLUGIN_BASE + 9
+    R4D_DT_M2XFP4_FRAG = RAD_DT_PLUGIN_BASE + 9,
+    /* Six-bit expert codes: row-major permuted low nibbles followed by the transposed fifth
+     * magnitude bit and sign bit, one dword per 32 elements in each bit plane. */
+    R4D_DT_MOEW6      = RAD_DT_PLUGIN_BASE + 10,
+    /* A bf16x12 weight as the bf16x12 GEMM rows read it: one buffer of four regions, below. */
+    R4D_DT_BF16X12    = RAD_DT_PLUGIN_BASE + 11
 };
 
 /* The grouped MoE GEMM's code tables, as the four dwords w4_e4m3's byte permutes read
@@ -274,6 +283,23 @@ static constexpr uint32_t kW4nlPerm[4]  = { 0x504B4539u, 0x5B595653u, 0xD0CBC5B9
 static constexpr float kW4nlTable[16] = { 1.125f, 3.25f, 5.5f, 8.0f, 11.0f, 14.0f, 18.0f, 22.0f,
                                           -1.125f, -3.25f, -5.5f, -8.0f, -11.0f, -14.0f, -18.0f,
                                           -22.0f };
+/* w4nl's magnitudes as the int8 levels an int8 activation's WMMA multiplies, in units of
+ * kW4nlI8Unit: the integer set under 128 with the least squared distance from the table at one
+ * unit, and that unit, both over the code histogram of Qwen3.8-Flash-Next's GPTQ experts (19, 18,
+ * 17, 16, 12, 9, 5 and 4 percent by ascending magnitude), where the weight read this way is 2.4e-3
+ * of the stored one away in relative L2. w4nl_i8_dword packs entries 4d..4d+3 of the sixteen (the
+ * magnitudes, then their negatives) as kW4nlPerm packs its E4M3 bytes. */
+static constexpr int8_t kW4nlI8[8] = { 6, 17, 29, 42, 58, 74, 95, 116 };
+static constexpr float kW4nlI8Unit = 0.18965f;
+static constexpr uint32_t w4nl_i8_dword(int d) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int e = 4 * d + i;
+        const int8_t l = (int8_t)(e < 8 ? kW4nlI8[e] : -kW4nlI8[e - 8]);
+        v |= (uint32_t)(uint8_t)l << (8 * i);
+    }
+    return v;
+}
 
 /* `w5nl64a8h` decodes libquant's `table=w5nl`: thirty-two levels, sixteen magnitudes ascending
  * then their negatives, so a code's high bit is its sign and its low four bits index the
@@ -286,13 +312,58 @@ static constexpr float kW5nlTable[32] = {
     -0.8125f, -2.5f, -4.0f, -5.5f, -7.5f, -9.0f, -11.0f, -12.0f,
     -14.0f, -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -30.0f };
 
-/* The fixed second-level scale of `w4nl64a8h`, `w4nl32a8h` and `w5nl64a8h`: it multiplies a
- * weight's per-(row, 64 or 32 of K) E4M3 scale. A container states it (libquant's scale2_value=),
- * and the layout hook compares it with this before serving. Fixed rather than per row because the
- * experts' scales (with the rotation's 1/128 folded in) lie between 2^-15 and 2^-10.6 on
- * Qwen3.8-Flash-Next at group 64 (slightly lower at 32, half a binade lower for w5nl). Under
- * 2^-13 each is a normal E4M3 value, and E4M3 has three mantissa bits in every binade. */
+/* W6NL's 32 E4M3-exact positive magnitudes, ordered by the low five code bits; bit 5 is sign.
+ * The first and second 16 magnitudes are each expanded by w4_expand, then selected by bit 4. */
+static constexpr uint32_t kW6nlMagPerm[8] = { 0x4C494336u, 0x504F4E4Du, 0x54535251u, 0x58575655u,
+                                              0x5C5B5A59u, 0x605F5E5Du, 0x64636261u, 0x68676665u };
+static constexpr float kW6nlTable[64] = {
+    0.875f, 2.75f, 4.5f, 6.0f, 6.5f, 7.0f, 7.5f, 8.0f,
+    9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f, 16.0f,
+    18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f, 32.0f,
+    36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f, 64.0f,
+    -0.875f, -2.75f, -4.5f, -6.0f, -6.5f, -7.0f, -7.5f, -8.0f,
+    -9.0f, -10.0f, -11.0f, -12.0f, -13.0f, -14.0f, -15.0f, -16.0f,
+    -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -28.0f, -30.0f, -32.0f,
+    -36.0f, -40.0f, -44.0f, -48.0f, -52.0f, -56.0f, -60.0f, -64.0f };
+
+/* The fixed second-level scale of `w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h` and `w6nl64a8h`: it
+ * multiplies a weight's per-(row, 64 or 32 of K) E4M3 scale. A container states it (libquant's
+ * scale2_value=), and the layout hook compares it with this before serving. Fixed rather than per
+ * row because the experts' scales (with the rotation's 1/128 folded in) lie between 2^-15 and
+ * 2^-10.6 on Qwen3.8-Flash-Next at group 64 (slightly lower at 32, half a binade lower for w5nl).
+ * Under 2^-13 each is a normal E4M3 value, and E4M3 has three mantissa bits in every binade. */
 static constexpr float kW4G64Scale = 0x1p-13f;
+
+/* ================================================================== bf16x12's stored form
+ *
+ * libquant's `bf16x12` keeps a bf16 weight losslessly in blocks of 32 along K: each value's sign
+ * and mantissa (a byte) and its exponent field as an offset below the block's largest (4 bits),
+ * that largest field (a byte a block), and the blocks whose fields span more than 15 whole in an
+ * escape table (libquant/lq_bf16x12.cpp). The gemm_bf16x12 rows (_m16, _m64, _tiled) store it as
+ * one buffer of four regions, each starting on a multiple of R4D_X12_ALIGN:
+ *
+ *   SM   [N][K]     bytes   sign << 7 | mantissa
+ *   D    [N][K/2]   bytes   the offsets, two a byte
+ *   E    [N][K/32]  bytes   each block's largest exponent field; 0xFF marks a raw block
+ *   ESC  [cap][32]  bf16    the raw blocks, the whole table on every rank
+ *
+ * SM, D and each table row are in WMMA B-fragment order within a block, and a raw block's D holds
+ * its row of the table four times (r4d_gemm_bf16x12_nt_m64.hip states the order; r4d_layout.cpp
+ * writes it). A launch finds the regions from N and K; only the buffer's size depends on cap. */
+enum { R4D_X12_BLOCK = 32, R4D_X12_ALIGN = 256 };
+struct R4dX12Regions { long long sm, d, e, esc, bytes; };
+static inline long long r4d_x12_round(long long n) {
+    return (n + R4D_X12_ALIGN - 1) / R4D_X12_ALIGN * R4D_X12_ALIGN;
+}
+static inline R4dX12Regions r4d_x12_regions(long long N, long long K, long long cap) {
+    R4dX12Regions r;
+    r.sm = 0;
+    r.d = r4d_x12_round(N * K);
+    r.e = r.d + r4d_x12_round(N * K / 2);
+    r.esc = r.e + r4d_x12_round(N * (K / R4D_X12_BLOCK));
+    r.bytes = r.esc + r4d_x12_round(cap * R4D_X12_BLOCK * 2);
+    return r;
+}
 
 
 /* ================================================================== skinny-GEMM variants
@@ -315,6 +386,10 @@ struct R4dTileCfg { int variant; int bm; int bn; };
  * TN=4 a 256 x 128 one. The crossover depends on M (see r4d_gemm_mxfp4a8_tiled.hip), so 0, the
  * default, decides at issue; a fixed value is for a tuner. */
 struct R4dMxTileCfg { int tn; };
+
+/* The int4/int5 x int8 tiled GEMM's tile arm (r4d_gemm_wpa8i8_tiled.hip, WPT_ARMS). Arm 0 is the
+ * prefill tile as it always ran; the others serve the decode band above the skinny kernel's 64 rows. */
+struct R4dWpaCfg { int arm; };
 
 /* The MXFP4 decode GEMM's split-K width, K slab and weight-load hint. 0 on each is the rule in
  * r4d_gemm_mxfp4a8_decode.hip (it needs M and the shape, which exist only at issue); `nt` 1 streams
@@ -357,6 +432,7 @@ void r4d_cfg_gemm   (const RadArgs*, struct R4dGemmCfg*);
 void r4d_cfg_tiled  (const RadArgs*, struct R4dTileCfg*);
 void r4d_cfg_prefill(const RadArgs*, struct R4dTileCfg*);
 void r4d_cfg_mxfp4_tiled(const RadArgs*, struct R4dMxTileCfg*);
+void r4d_cfg_wpa8i8 (const RadArgs*, struct R4dWpaCfg*);
 void r4d_cfg_mxfp4_decode(const RadArgs*, struct R4dMxDecCfg*);
 void r4d_cfg_split  (const RadArgs*, struct R4dSplitCfg*);
 void r4d_cfg_ar     (const RadArgs*, struct R4dArCfg*);
@@ -372,6 +448,9 @@ void r4d_cfg_mv     (const RadArgs*, struct R4dMvCfg*);
 /* rmsnorm_quant_i8's decode form: 1 the row's operands in registers before the reductions, 0 the
  * pass-per-read kernel; the row's `reg` axis. */
 int  r4d_cfg_rmsq8_reg(const RadArgs*);
+/* The bf16x12 GEMM's activation loads: 0 with the weight's where a block covers two row tiles or
+ * fewer, else per block; 1 per block; 2 with the weight's (the row's `form` axis). */
+int  r4d_cfg_bf16x12_form(const RadArgs*);
 
 }  /* extern "C" */
 

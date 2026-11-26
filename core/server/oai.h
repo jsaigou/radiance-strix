@@ -53,9 +53,7 @@ ApiError err_internal(const std::string& why);
  * to an empty list), otherwise llama.cpp's four (newline, colon, quote, asterisk). */
 std::vector<std::string> dry_breakers(const std::vector<std::string>& deployment, bool set);
 
-/* Out of line on purpose: inlined, nlohmann's dump() trips a GCC 16 false-positive warning
- * (a speculatively devirtualised shared_ptr release reported as an out-of-bounds destroy) that
- * comes and goes with how deeply the caller inlines. */
+/* One dump entry point for response bodies, so every builder above serialises the same way. */
 std::string json_dump(const json& j);
 
 /* ================================================================== a parsed request */
@@ -592,6 +590,9 @@ private:
     void close(std::string& out);
     void text_delta(std::string& out, const std::string& text);
     void release_held(std::string& out);
+    /* The per-token delta event written directly (see ChatDeltaStream): the bytes the DOM dump
+     * produced, without building one. */
+    void delta(std::string& out, const char* dtype, const char* field, std::string_view text);
     static void event(std::string& out, const char* type, const json& data);
 
     const OaiRequest* r_;
@@ -622,6 +623,9 @@ private:
     std::string emit(const std::vector<ReplyDelta>& ev) override;
     void open(std::string& out, Item k, size_t call);
     void close(std::string& out);
+    /* The per-token delta event written directly: the bytes event() produced, without the DOM. */
+    void delta_event(std::string& out, const char* type, bool content_index, bool logprobs,
+                     std::string_view text);
     void event(std::string& out, const char* type, json data);
     json response(const char* status) const;
 

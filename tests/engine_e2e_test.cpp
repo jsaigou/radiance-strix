@@ -20,13 +20,15 @@
  * Every child gets ROCR_VISIBLE_DEVICES=99, so a machine with a card still runs the host backend.
  */
 #include "rad_test.h"
+#include "e2e_config.h"
 #include "tiny_golden.h"
+#include "lfm3_golden.h"
 #include "tiny_model.h"
 
 #include "mm/media.h"
 #include "server/oai.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -36,13 +38,15 @@
 #include <cerrno>
 #include <condition_variable>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 
-using json = nlohmann::json;
+using json = Json;
 
 namespace {
 
@@ -73,7 +77,7 @@ std::vector<std::string> engine_argv(const std::string& model,
     if (!kernels) { a.push_back("--kernels"); a.push_back("libref"); }
     if (ref) a.push_back("--debug-accept-reference-kernels");
     a.insert(a.end(), args.begin(), args.end());
-    return a;
+    return radtest::config_argv(a);
 }
 
 /* As a deployment runs: the arguments as given, so a reference library serves nothing. */
@@ -81,16 +85,18 @@ std::vector<std::string> serving_argv(const std::string& model,
                                       const std::vector<std::string>& args) {
     std::vector<std::string> a = { RAD_E2E_SERVER, "--model", model };
     a.insert(a.end(), args.begin(), args.end());
-    return a;
+    return radtest::config_argv(a);
 }
 
 /* The shape the preemption cases run in: four sequences of at most 512 tokens, 256 a step. Their
  * small KV pool comes from a small device, whose size small_device() finds. --prefill-interleave 0
  * pins the schedule these cases are sized for: the bring-up default auto:1 follows measured step
- * times, so on a loaded host the four sequences may never overlap enough to preempt. */
+ * times, so on a loaded host the four sequences may never overlap enough to preempt. The room
+ * gate is off: it admits a prompt only when the whole of it fits, which is what keeps a serving
+ * pool from preempting, and these cases exercise the preemption. */
 std::vector<std::string> small_pool_args() {
     return { "--max-num-seqs", "4", "--max-num-batched-tokens", "256", "--max-model-len", "512",
-             "--prefill-interleave", "0" };
+             "--prefill-interleave", "0", "--prefill-room-gate", "off" };
 }
 std::vector<std::string> device_env(int device_mib) {
     return { "RADIANCE_HOST_VRAM_MIB=" + std::to_string(device_mib) };
@@ -190,13 +196,12 @@ std::string words(tiny::Rng& r, size_t n) {
 struct World {
     /* RAD_E2E_KEEP keeps the checkpoints for tests/mktinygolden.py, which reads them. */
     tiny::TempDir dir{ "e2e", std::getenv("RAD_E2E_KEEP") != nullptr };
-    std::string qwen35, lfm2, gemma4, llama, llama_rad;
-    /* llama.rad with its lm head block fp8, and int8 per (row, 128 of K). */
-    std::string llama_fp8head, llama_i8head;
+    std::string qwen35, lfm2, lfm3, gemma4, llama, llama_rad;
+    /* llama.rad with its lm head int8 per (row, 128 of K). */
+    std::string llama_i8head;
     /* The llama as an int4 W4A16 release with zero points (tiny_model.h, write_llama_ct_int4),
      * and its container through the import rule. */
     std::string llama_int4, llama_int4_rad;
-    std::string llama_mxfp4;   /* llama's trunk as OCP-MXFP4 */
     /* qwen35 and gemma4 with 4 KiB of KV a token (wider KV heads), for the preemption cases: a MiB
      * of device is then about 256 tokens of pool, fine enough for small_device() to land between
      * one request and four. */
@@ -229,14 +234,13 @@ struct World {
             fprintf(stderr, "    checkpoints kept in %s\n", dir.path.c_str());
         qwen35 = dir / "qwen35";
         lfm2 = dir / "lfm2";
+        lfm3 = dir / "lfm3";
         gemma4 = dir / "gemma4";
         llama = dir / "llama";
         llama_rad = dir / "llama.rad";
-        llama_fp8head = dir / "llama_fp8head.rad";
         llama_i8head = dir / "llama_i8head.rad";
         llama_int4 = dir / "llama_int4";
         llama_int4_rad = dir / "llama_int4.rad";
-        llama_mxfp4 = dir / "llama_mxfp4.rad";
         qwen35_kv = dir / "qwen35_kv";
         gemma4_kv = dir / "gemma4_kv";
         qwen35_spec = dir / "qwen35_spec";
@@ -246,7 +250,7 @@ struct World {
         g31_df2 = dir / "g31_df2.rad";
         g31w = dir / "g31w";
         g31w_df2 = dir / "g31w_df2.rad";
-        for (const std::string* d : { &qwen35, &lfm2, &gemma4, &llama, &qwen35_kv, &gemma4_kv,
+        for (const std::string* d : { &qwen35, &lfm2, &lfm3, &gemma4, &llama, &qwen35_kv, &gemma4_kv,
                                       &qwen35_spec, &qwen3asr, &llama_int4, &g31, &g31_draft, &g31w })
             if (mkdir(d->c_str(), 0755) != 0) return;
         tiny::Qwen35 qkv;
@@ -270,17 +274,15 @@ struct World {
         tiny::Gemma4 g31ws = g31s;
         g31ws.window = 1024;
         if (!tiny::write_qwen35(qwen35, {}) || !tiny::write_lfm2(lfm2, {}) ||
+            !tiny::write_lfm3(lfm3, {}) ||
             !tiny::write_gemma4(gemma4, {}) || !tiny::write_llama(llama, {}) ||
             !tiny::write_qwen35(qwen35_kv, qkv) || !tiny::write_gemma4(gemma4_kv, gkv) ||
             !tiny::write_qwen35(qwen35_spec, qspec) || !tiny::write_qwen3asr(qwen3asr, {}) ||
-            !tiny::write_text(dir / "llama.recipe", tiny::kLlamaFp8Recipe) ||
-            !tiny::write_text(dir / "llama_fp8head.recipe",
-                              std::string(tiny::kLlamaFp8Recipe) + tiny::kLlamaFp8HeadRule) ||
+            !tiny::write_text(dir / "llama.recipe", tiny::kLlamaI8Recipe) ||
             !tiny::write_text(dir / "llama_i8head.recipe",
-                              std::string(tiny::kLlamaFp8Recipe) + tiny::kLlamaI8HeadRule) ||
+                              std::string(tiny::kLlamaI8Recipe) + tiny::kLlamaI8HeadRule) ||
             !tiny::write_llama_ct_int4(llama_int4, {}, true) ||
             !tiny::write_text(dir / "llama_int4.recipe", tiny::kInt4ImportRecipe) ||
-            !tiny::write_text(dir / "llama_mxfp4.recipe", tiny::kLlamaMxfp4Recipe) ||
             !tiny::write_gemma4(g31, g31s) || !tiny::write_gemma4(g31w, g31ws) ||
             !tiny::write_dflash2(g31_draft, {}))
             return;
@@ -302,10 +304,8 @@ struct World {
 
         const struct { std::string out; const char* recipe; const std::string* ckpt; }
             kConverts[] = { { llama_rad, "llama.recipe", &llama },
-                            { llama_fp8head, "llama_fp8head.recipe", &llama },
                             { llama_i8head, "llama_i8head.recipe", &llama },
-                            { llama_int4_rad, "llama_int4.recipe", &llama_int4 },
-                            { llama_mxfp4, "llama_mxfp4.recipe", &llama } };
+                            { llama_int4_rad, "llama_int4.recipe", &llama_int4 } };
         for (const auto& [out, recipe, ckpt] : kConverts) {
             const int st = tiny::run({ RAD_E2E_CONVERT, *ckpt, "-o", out, "--recipe",
                                        dir / recipe },
@@ -473,6 +473,20 @@ struct Server {
         a.insert(a.end(), args.begin(), args.end());
         if (!child.start(serving ? serving_argv(model, a) : engine_argv(model, a), engine_env(env)))
             return false;
+        return listening();
+    }
+
+    /* A whole configuration file, for a process of several models. */
+    bool start_yaml(const std::string& yaml, const std::vector<std::string>& env = {}) {
+        static int seq = 0;
+        const std::string path = radtest::tmp_path("fleet." + std::to_string(seq++) + ".yaml");
+        std::ofstream(path) << yaml;
+        if (!child.start({ RAD_E2E_SERVER, "--config", path }, engine_env(env))) return false;
+        return listening();
+    }
+
+    /* Drains the child's output and waits for the listen line; the port it names. */
+    bool listening() {
         drain = std::thread([this] {
             char buf[4096];
             for (;;) {
@@ -675,6 +689,33 @@ TEST(qwen35_a_prefill_span_changes_no_logit) {
     CHECK(log.find("prefill n_seq=1 n_tok=256") != std::string::npos);
 }
 
+/* --prefill-span-min is the deployment's own bound on the prompts that span: at 0 every document
+ * alone in the engine spans from its second interval on and the scheduler says so; above every
+ * document's length none does, and every step stays one interval. --prefill-span-pass step rides
+ * along: this plugin has no routed pass to widen and ignores it, so no logit changes either way. */
+TEST(qwen35_the_span_minimum_decides_which_prompts_span) {
+    std::string log;
+    check_recording_matches(world().qwen35, world().corpus,
+                            { "--max-num-batched-tokens", "256", "--max-num-seqs", "1",
+                              "--checkpoint-interval", "64", "--prefill-span", "4",
+                              "--prefill-span-pass", "step", "--prefill-span-min", "0" },
+                            { "RADIANCE_LOG_STEPS=1" }, &log);
+    CHECK(log.find("--prefill-span-min 0: every prefill alone in its step spans from its second "
+                   "interval on") != std::string::npos);
+    CHECK(log.find("prefill n_seq=1 n_tok=256") != std::string::npos);
+
+    std::string none;
+    check_recording_matches(world().qwen35, world().corpus,
+                            { "--max-num-batched-tokens", "256", "--max-num-seqs", "1",
+                              "--checkpoint-interval", "64", "--prefill-span", "4",
+                              "--prefill-span-min", "100000" },
+                            { "RADIANCE_LOG_STEPS=1" }, &none);
+    CHECK(none.find("--prefill-span-min 100000: a prefill spans when it is 100000 tokens or "
+                    "longer") != std::string::npos);
+    CHECK(none.find("prefill n_seq=1 n_tok=256") == std::string::npos);
+    CHECK(none.find("prefill n_seq=1 n_tok=64") != std::string::npos);
+}
+
 /* Documents batched together share every step's GEMMs and occupy other state slots and KV
  * blocks; each one's logits stay exactly those it gets alone. */
 TEST(qwen35_batching_documents_together_changes_no_logit) {
@@ -703,6 +744,128 @@ TEST(qwen35_preemption_by_recompute_changes_no_logit) {
         fprintf(stderr, "    %d MiB, a pool of %lld tokens, preempted %lld times\n%s\n", mib,
                 (long long)pool, n, tail(log, 40).c_str());
     CHECK(n > 0);
+}
+
+/* The diagnose mode end to end: the real binary starts as a serve would, runs its own workload
+ * through the scheduler, and writes a report whose sections are the ones the report format
+ * declares. Its arithmetic is tests/diagnose_test.cpp's; this is that the driver runs at all, that
+ * every prompt was salted and the cache emptied (no request reports a cached token), and that a
+ * second run on the same build reproduces every request's tokens, which is what --diagnose-baseline
+ * compares. The numbers themselves are a card's measurement, not this test's.
+ *
+ * The model, the corpus and the baseline all live under a directory named after a marker: the
+ * report is pasted into issues, so no path of the machine may reach it, and a variable whose name
+ * is an allowed prefix plus a secret suffix must not be reported at all. */
+TEST(the_diagnose_mode_measures_itself_and_reproduces_its_tokens) {
+    World& w = world();
+    tiny::TempDir d("diagnose");
+    REQUIRE(d.ok());
+    const std::string private_dir = d / "MARKER-private-home";
+    REQUIRE_EQ(mkdir(private_dir.c_str(), 0755), 0);
+    const std::string model = private_dir + "/model.rad";
+    REQUIRE_EQ(symlink(w.llama_rad.c_str(), model.c_str()), 0);
+    const std::string corpus = private_dir + "/corpus.jsonl";
+    std::string body;
+    for (int i = 0; i < 3; ++i) {
+        tiny::Rng r(40 + i);
+        body += json{ { "category", "prose" }, { "prompt", words(r, 120) }, { "max_tokens", 8 } }
+                        .dump() + "\n";
+    }
+    REQUIRE(tiny::write_text(corpus, body));
+    /* One point of each sweep, one measured run: the driver's whole shape, quickly. */
+    const std::vector<std::string> shared = {
+        "--diagnose-corpus", corpus, "--diagnose-tokens", "8", "--diagnose-runs", "1",
+        "--diagnose-concurrency", "1", "--diagnose-prefill", "512",
+        "--max-model-len", "1024", "--max-num-seqs", "2", "--max-num-batched-tokens", "256" };
+    std::vector<std::string> a = { "--diagnose", d / "first" };
+    a.insert(a.end(), shared.begin(), shared.end());
+    const Ran r = radiance(model, a, { "RADIANCE_API_KEY_SYNTHETIC_SECRET_IN_NAME=x" }, 600);
+    REQUIRE_RAN(r);
+
+    std::string text;
+    {
+        const std::string path = d.path + "/first/diagnose.json";
+        FILE* f = std::fopen(path.c_str(), "rb");
+        REQUIRE(f != nullptr);
+        char buf[4096];
+        for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+        std::fclose(f);
+    }
+    const json rep = json::parse(text, nullptr, false);
+    REQUIRE(rep.is_object());
+    for (const char* k : { "engine", "workload", "categories", "concurrency", "prefill",
+                           "interference", "environment", "not_measured", "verdict", "problems",
+                           "warnings" })
+        CHECK(rep.contains(k));
+    CHECK_EQ(rep["verdict"].get<std::string>(), std::string("valid"));
+    CHECK_EQ(rep["problems"].size(), (size_t)0);
+    /* Every point of the workload ran: three prose prompts once each, one stream, one 512-token
+     * prefill, and a prompt arriving into a running stream. A point the engine could not run is
+     * named in the report, never left as a zero. */
+    REQUIRE_EQ(rep["categories"].size(), (size_t)1);
+    const json& cat = rep["categories"][0];
+    CHECK_EQ(cat["prompts"].get<int64_t>(), (int64_t)3);
+    CHECK_EQ(cat["runs"].size(), (size_t)3);
+    CHECK_EQ(rep["concurrency"].size(), (size_t)1);
+    CHECK_EQ(rep["concurrency"][0]["streams"].get<int64_t>(), (int64_t)1);
+    REQUIRE_EQ(rep["prefill"].size(), (size_t)1);
+    CHECK_EQ(rep["prefill"][0]["prompt_tokens"].get<int64_t>(), (int64_t)512);
+    CHECK(rep["interference"]["runs"][0]["arrival_ttft_ms"].get<double>() > 0);
+    CHECK(rep["interference"]["runs"][0]["interference"]["stall_ratio"].get<double>() > 0);
+
+    /* Salted and uncached, and the step ring lost nothing: the workload's own statement of its
+     * validity, checked afterwards from what each run recorded. */
+    int64_t cached = 0, lost = 0;
+    for (const json& run : cat["runs"]) {
+        cached += run["requests"]["cached_prompt_tokens"].get<int64_t>();
+        lost += run["steps"]["lost"].get<int64_t>();
+        CHECK(run["steps"]["recorded"].get<int64_t>() > 0);
+        CHECK(run["requests"]["outputs"][0].size() > 0);
+    }
+    CHECK_EQ(cached, (int64_t)0);
+    CHECK_EQ(lost, (int64_t)0);
+    /* What the run was taken under, and whether its runs agree. The verdict itself is not held
+     * here: these are a CI host's timings. */
+    REQUIRE(rep.contains("conditions"));
+    CHECK_EQ(rep["conditions"]["fingerprint"].get<std::string>().size(), (size_t)16);
+    CHECK(rep["conditions"]["cards"].empty());   /* the host backend serves no card */
+    CHECK(rep["stability"].contains("verdict"));
+    CHECK_EQ(cat["prompts_summary"].size(), (size_t)3);
+    CHECK(rep["thermal"]["cards"].empty());
+    CHECK(rep["reproducibility"].is_array());
+    /* Names, not values: the report is pasted into issues. */
+    for (const json& n : rep["environment"]["variables"])
+        CHECK(n.get<std::string>().find('=') == std::string::npos);
+    /* No path and no secret-suffixed name in either artifact of either run. */
+    for (const char* marker : { "MARKER", "SYNTHETIC_SECRET" }) {
+        CHECK(text.find(marker) == std::string::npos);
+        CHECK(tiny::read_text(d.path + "/first/diagnose.md").find(marker) == std::string::npos);
+    }
+
+    /* The same build, the same workload: identical tokens, which is what the baseline compares. */
+    const std::string baseline = private_dir + "/baseline.json";
+    REQUIRE(tiny::write_text(baseline, text));
+    std::vector<std::string> b = { "--diagnose", d / "second", "--diagnose-baseline", baseline };
+    b.insert(b.end(), shared.begin(), shared.end());
+    const Ran r2 = radiance(model, b, {}, 600);
+    REQUIRE_RAN(r2);
+    const std::string json2 = tiny::read_text(d.path + "/second/diagnose.json");
+    const std::string md = tiny::read_text(d.path + "/second/diagnose.md");
+    CHECK(md.find("# Diagnosis") == 0);
+    CHECK(md.find("**Verdict: valid**") != std::string::npos);
+    CHECK(md.find("## Parity") != std::string::npos);
+    CHECK(md.find("## Reproducibility") != std::string::npos);
+    {
+        /* Two runs on one machine, one after the other: the same conditions. */
+        const json rep2 = json::parse(json2, nullptr, false);
+        REQUIRE(rep2.is_object());
+        CHECK(rep2["parity"]["conditions"].is_array());
+        CHECK(rep2["parity"]["conditions"].empty());
+    }
+    for (const char* marker : { "MARKER", "SYNTHETIC_SECRET" }) {
+        CHECK(json2.find(marker) == std::string::npos);
+        CHECK(md.find(marker) == std::string::npos);
+    }
 }
 
 /* A document longer than the whole KV pool could never be admitted: admission takes only a chunk
@@ -765,22 +928,6 @@ TEST(a_checkpoint_store_the_host_cannot_hold_is_refused_at_startup) {
                                        "--checkpoint-slots", "1000000000" }, {}, 120);
     const bool named = has(r.log, "checkpoint slots: 1000000000 linear-state snapshot(s) of ") &&
                        has(r.log, "Lower --checkpoint-slots");
-    if (r.status == 0 || r.status == 124 || !named)
-        fprintf(stderr, "    exited %d:\n%s\n", r.status, tail(r.log, 20).c_str());
-    CHECK(r.status != 0);
-    CHECK(r.status != 124);
-    CHECK(named);
-}
-
-/* --attn-prefill-fp8 is a permission an exact kernel also satisfies. The host libraries have no
- * e4m3 attention, so asked for it the start is refused by the flag's name instead of serving the
- * exact form under it. */
-TEST(an_attention_fp8_mode_no_kernel_takes_is_refused_at_startup) {
-    World& w = world();
-    REQUIRE(w.ok);
-    const Ran r = radiance(w.qwen35, { "--host", "127.0.0.1", "--port", "0",
-                                       "--attn-prefill-fp8", "both" }, {}, 120);
-    const bool named = has(r.log, "not starting: --attn-prefill-fp8 both, but no attention kernel");
     if (r.status == 0 || r.status == 124 || !named)
         fprintf(stderr, "    exited %d:\n%s\n", r.status, tail(r.log, 20).c_str());
     CHECK(r.status != 0);
@@ -986,58 +1133,6 @@ TEST(runtime_lora_scores_as_the_merged_checkpoint_does) {
     CHECK(kl > 0.05);
 }
 
-/* An MXFP4 trunk: its GEMM's `group` is the weight's 32-wide exponent block, while the
- * activation it reads is scaled per 128, and the adapter's shrink reads that activation at the
- * activation's grid. Against the merged checkpoint, the adapter takes the container from the
- * adapter's whole effect down to the MXFP4 rounding, on libref and on libavx. (The tiny llama's
- * MXFP4 container declares at one rank only.) */
-TEST(runtime_lora_reads_an_mxfp4_trunks_activation_at_its_own_grid) {
-    World& w = world();
-    REQUIRE(w.ok);
-    tiny::TempDir d("e2e_lora_mx");
-    const std::string adapter = d / "adapter", merged = d / "merged", ref = d / "ref";
-    const std::vector<std::string> targets = { "q_proj", "k_proj", "v_proj", "o_proj",
-                                               "gate_proj", "up_proj", "down_proj" };
-    REQUIRE(tiny::write_lora(adapter, w.llama, targets, 8, 16.0, 23, 0.25f, merged));
-    const std::vector<std::string> one = { "--max-num-batched-tokens", "512", "--max-num-seqs", "1" };
-    std::vector<std::string> rec = { "--kld-record", ref, "--kld-corpus", w.corpus_short };
-    rec.insert(rec.end(), one.begin(), one.end());
-    const Ran recorded = radiance(merged, rec);
-    REQUIRE_RAN(recorded);
-    auto score = [&](const std::vector<std::string>& args, const std::vector<std::string>& env) {
-        tiny::TempDir o("e2e_lora_mx_kld");
-        std::vector<std::string> a = { "--kld-ref", ref, "--kld-out", o / "kld.json" };
-        a.insert(a.end(), one.begin(), one.end());
-        a.insert(a.end(), args.begin(), args.end());
-        const Ran r = radiance(w.llama_mxfp4, a, env);
-        if (r.status != 0) {
-            fprintf(stderr, "    child exited %d:\n%s\n", r.status, tail(r.log).c_str());
-            return -1.0;
-        }
-        const json j = json::parse(tiny::read_text(o / "kld.json"), nullptr, false);
-        return j.is_object() && j.contains("all") ? j["all"]["kld"]["mean"].get<double>() : -1.0;
-    };
-    const double base = score({}, {});
-    fprintf(stderr, "    the MXFP4 base against the merged checkpoint: mean KL %.3g\n", base);
-    REQUIRE(base > 0.05);
-    const std::vector<std::string> ad = { "--lora", "ad=" + adapter, "--kld-lora", "ad" };
-    struct Arm { const char* what; std::vector<std::string> args, env; };
-    std::vector<Arm> arms = { { "libref", ad, {} } };
-#if defined(__x86_64__)
-    if (::access(RAD_E2E_HOME "/kernels/libavx.so", R_OK) == 0) {
-        std::vector<std::string> avx = { "--kernels", "libavx" };
-        avx.insert(avx.end(), ad.begin(), ad.end());
-        arms.push_back({ "libavx", avx, {} });
-    }
-#endif
-    for (const Arm& a : arms) {
-        const double kl = score(a.args, a.env);
-        fprintf(stderr, "    the MXFP4 container with the adapter, %s: mean KL %.3g\n", a.what, kl);
-        CHECK(kl >= 0);
-        CHECK(kl < base / 4);
-    }
-}
-
 /* Off is off: without --lora or --max-loras the declared graph names no adapter op, buffer or
  * declined GEMM, and with an adapter it is the same graph plus the adapter ops and their buffers
  * over the same weights. */
@@ -1136,31 +1231,111 @@ TEST(runtime_lora_refuses_targets_it_cannot_serve_at_startup) {
     CHECK(has(s.log, "has the served model's own name"));
 }
 
+/* LFM3's IQ8R container (data/recipes/lfm3-1.7b-iq8r.recipe) beside the bf16 container of the same
+ * checkpoint, a tiny LFM3 at widths the recipe's scale group divides: the recipe quantises the
+ * eight trunk linears of every layer and nothing else, the engine serves it, and its record stays
+ * near the bf16 one. On random weights of this size rounding to int8 moves an agreed top token's
+ * log-probability by up to 0.2 and changes the top token at one position in sixteen; a rotation
+ * applied on one side only, or a scale plane read at the wrong group, leaves no resemblance. */
+TEST(lfm3_iq8r_container_tracks_the_bf16_one) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("e2e_lfm3_iq8r");
+    tiny::Lfm3 spec;
+    spec.hidden = 256; spec.heads = 4; spec.kv_heads = 2; spec.ffn = 512;
+    const std::string ckpt = d / "ckpt";
+    REQUIRE_EQ(mkdir(ckpt.c_str(), 0755), 0);
+    REQUIRE(tiny::write_lfm3(ckpt, spec));
+    REQUIRE(World::write_corpus(d / "corpus.jsonl", { kTinyGoldPrompt }));
+    auto convert = [&](const std::string& out, bool iq8r, std::string* log) {
+        std::vector<std::string> argv = { RAD_E2E_CONVERT, d / "ckpt", "-o", out };
+        if (iq8r) {
+            argv.push_back("--recipe");
+            argv.push_back(RAD_E2E_RECIPES "/lfm3-1.7b-iq8r.recipe");
+        }
+        const int st = tiny::run(argv, engine_env({}), log);
+        if (st != 0) fprintf(stderr, "    rad-convert exited %d:\n%s\n", st, tail(*log).c_str());
+        return st;
+    };
+    std::string blog, qlog;
+    REQUIRE_EQ(convert(d / "bf16.rad", false, &blog), 0);
+    REQUIRE_EQ(convert(d / "iq8r.rad", true, &qlog), 0);
+    /* 2 conv layers x 4 linears and 2 attention layers x 6; the gate is not among them */
+    CHECK(qlog.find("20 quantised by the recipe") != std::string::npos);
+
+    struct Top { int32_t id; float lp; };
+    const size_t row = 16 * sizeof(Top);
+    auto record = [&](const char* name) {
+        const std::string out = d / (std::string(name) + ".rec");
+        Ran r = radiance(d / (std::string(name) + ".rad"),
+                         { "--kld-record", out, "--kld-corpus", d / "corpus.jsonl" });
+        if (r.status != 0) fprintf(stderr, "    %s:\n%s\n", name, tail(r.log).c_str());
+        return r.status == 0 ? tiny::read_text(out + "/top.bin") : std::string();
+    };
+    const std::string a = record("bf16"), q = record("iq8r");
+    REQUIRE(!a.empty());
+    REQUIRE_EQ(q.size(), a.size());
+    REQUIRE(a != q);                                   /* the int8 trunk is what ran */
+    const int n = (int)(a.size() / row);
+    int same = 0;
+    double worst = 0;
+    for (int p = 0; p < n; ++p) {
+        Top x, y;
+        std::memcpy(&x, a.data() + (size_t)p * row, sizeof x);
+        std::memcpy(&y, q.data() + (size_t)p * row, sizeof y);
+        if (x.id != y.id) continue;
+        ++same;
+        worst = std::max(worst, (double)std::fabs(x.lp - y.lp));
+    }
+    fprintf(stderr, "    lfm3 iq8r against bf16: %d of %d top tokens equal, worst |dlogp| %.4f\n",
+            same, n, worst);
+    CHECK(same * 10 >= n * 9);
+    CHECK(worst < 0.5);
+}
+
 /* ================================================================== against transformers */
 
 /* Each family's forward pass against transformers' own, run in float32 over the same weights
  * (tests/tiny_golden.h, from tests/mktinygolden.py): the gated delta net with its query scale and
  * (1 + w) norms, the gated and partial-rotary attention, LFM2's convolutions, Gemma 4's sliding and
- * K-equals-V global layers, soft cap and layer scalars. bf16 activations put this engine within
+ * K-equals-V global layers, soft cap and layer scalars; LFM3 against LiquidAI's own modelling code
+ * (tests/lfm3_golden.h, from tests/mklfm3golden.py), for its sandwich norms, head gates, partial
+ * rotary and sliding window. bf16 activations put this engine within
  * about 0.08 of transformers' log-probabilities; a wrong rotary width, window or epsilon moves
  * them by 0.5 or more and changes the top token at a tenth of the positions. So at every position
  * the top token must agree, unless transformers' own top two are within the bound, and the
  * log-probability of an agreed token must be within 0.2. */
+/* Inkling 2's loop checkpoint (tests/tiny_model.h write_inkling2, golden tests/inkling2_logp_golden.h)
+ * is not yet compared with the engine: the bf16 arithmetic the engine runs drifts from the f32 golden
+ * by about 3 nats mean over the top-16 on this tiny model, so no tolerance here is meaningful yet.
+ * The plugin declares and runs the document end to end (arch/inkling2); the comparison is blocked on
+ * finding the operation that amplifies the bf16 rounding. */
+TEST(inkling2_logits_match_the_golden) {
+    SKIP("blocked: the tiny Inkling 2 model drifts ~3 nats under bf16 (see the comment above); "
+         "the plugin runs end to end but its logits are not yet checked against the golden");
+}
+
 TEST(each_family_computes_what_transformers_computes) {
     World& w = world();
     REQUIRE(w.ok);
     tiny::TempDir d("e2e_gold");
     REQUIRE(World::write_corpus(d / "corpus.jsonl", { kTinyGoldPrompt }));
-    for (const TinyGold& g : kTinyGold) {
+    std::vector<const TinyGold*> golds;
+    for (const TinyGold& g : kTinyGold) golds.push_back(&g);
+    golds.push_back(&kLfm3Gold);
+    for (const TinyGold* gp : golds) {
+        const TinyGold& g = *gp;
         const std::string family = g.family;
         const std::string model = family == "qwen35" ? w.qwen35
                                 : family == "lfm2"   ? w.lfm2
+                                : family == "lfm3"   ? w.lfm3
                                                      : w.gemma4;
         const uint64_t h = fnv1a(tiny::read_text(model + "/model.safetensors"));
         if (h != g.weights_fnv)
             fprintf(stderr, "    %s: the checkpoint is not the one the golden was made from; "
-                            "regenerate tests/tiny_golden.h with tests/mktinygolden.py\n",
-                    g.family);
+                            "regenerate tests/%s\n",
+                    g.family, family == "lfm3" ? "lfm3_golden.h with tests/mklfm3golden.py"
+                                               : "tiny_golden.h with tests/mktinygolden.py");
         REQUIRE_EQ(h, g.weights_fnv);
         const std::string out = d / family;
         Ran r = radiance(model, { "--kld-record", out, "--kld-corpus", d / "corpus.jsonl" });
@@ -1203,6 +1378,15 @@ TEST(lfm2_chunking_and_batching_change_no_logit) {
     check_recording_matches(world().lfm2, world().corpus_short,
                             { "--max-num-batched-tokens", "64", "--max-num-seqs", "1" });
     check_recording_matches(world().lfm2, world().corpus_short,
+                            { "--max-num-batched-tokens", "512", "--max-num-seqs", "4" });
+}
+
+/* LFM3 has both states at once: the convolution's rolling window, seven taps wide, and an 8-token
+ * attention window on its sliding layers, which every document crosses. */
+TEST(lfm3_chunking_and_batching_change_no_logit) {
+    check_recording_matches(world().lfm3, world().corpus_short,
+                            { "--max-num-batched-tokens", "64", "--max-num-seqs", "1" });
+    check_recording_matches(world().lfm3, world().corpus_short,
                             { "--max-num-batched-tokens", "512", "--max-num-seqs", "4" });
 }
 
@@ -1323,6 +1507,7 @@ TEST(libavx_alone_serves_every_family_within_rounding_of_libref) {
     const struct { const char* name; const std::string* model; const std::string* corpus; }
         kRuns[] = { { "qwen35 on libavx", &w.qwen35, &w.corpus },
                     { "lfm2 on libavx", &w.lfm2, &w.corpus_short },
+                    { "lfm3 on libavx", &w.lfm3, &w.corpus_short },
                     { "gemma4 on libavx", &w.gemma4, &w.corpus_short },
                     { "llama_fp8 on libavx", &w.llama_rad, &w.corpus_tiny },
                     { "qwen3asr's decoder on libavx", &w.qwen3asr, &w.corpus_short } };
@@ -1617,7 +1802,6 @@ TEST(libavx_alone_serves_a_quantised_head_within_rounding_of_libref) {
     REQUIRE(world().ok);
     World& w = world();
     const struct { const char* name; const std::string* model; } kRuns[] = {
-        { "llama, fp8 head, on libavx alone", &w.llama_fp8head },
         { "llama, int8 head, on libavx alone", &w.llama_i8head } };
     for (const auto& run : kRuns)
         check_within_rounding(run.name, score_against_reference(
@@ -1675,7 +1859,8 @@ struct Family {
     const char* name;
     std::string World::*model;
 };
-const Family kSpecFamilies[] = { { "lfm2", &World::lfm2 }, { "gemma4", &World::gemma4 },
+const Family kSpecFamilies[] = { { "lfm2", &World::lfm2 }, { "lfm3", &World::lfm3 },
+                                 { "gemma4", &World::gemma4 },
                                  { "qwen35", &World::qwen35_spec } };
 
 const std::vector<int32_t>& repetitive_prompt() {
@@ -1773,7 +1958,7 @@ TEST(concurrent_requests_return_what_each_returns_alone) {
     for (uint64_t i = 0; i < 4; ++i) prompts.push_back(prompt_ids(100 + i, 60 + 37 * i));
     const struct { const char* name; std::string World::*model; const char* n_spec; } kRuns[] = {
         { "qwen35", &World::qwen35, "4" }, { "lfm2", &World::lfm2, "4" },
-        { "gemma4", &World::gemma4, "4" } };
+        { "lfm3", &World::lfm3, "4" }, { "gemma4", &World::gemma4, "4" } };
     for (const auto& run : kRuns) {
         std::vector<std::vector<int32_t>> alone;
         {
@@ -1983,6 +2168,70 @@ TEST(a_prompt_resumed_from_a_window_snapshot_returns_what_a_cold_run_does) {
     }
 }
 
+/* LFM3 resumes three kinds of state at once: the full-attention layers from the cached blocks, the
+ * sliding layers from a window snapshot, and the convolutions' last inputs from the same checkpoint
+ * slot. The convolutions make it a linear-state model to the scheduler, so checkpoints follow the
+ * interval and not the window's lower floor. Under `exact` a prompt sharing a 200-token head
+ * resumes at a checkpoint (every 64 tokens) inside it; under `nearest` a prompt that extends a
+ * 600-token one resumes from that prompt's tail checkpoint, 75 windows deep. Either way the reply,
+ * and every probability in it, equals a cold run's, and so does a repeat, which resumes further
+ * in. */
+TEST(lfm3_resumed_from_the_prefix_cache_returns_what_a_cold_run_does) {
+    REQUIRE(world().ok);
+    struct Case {
+        const char* name;
+        std::vector<int32_t> first, second;
+        std::vector<std::string> args;
+        int64_t lo, hi;                     /* where the shared hit must end */
+    };
+    std::vector<Case> cases;
+    {
+        const std::vector<int32_t> head = prompt_ids(7, 200);
+        std::vector<int32_t> a = head, b = head;
+        for (int32_t t : prompt_ids(8, 70)) a.push_back(t);
+        for (int32_t t : prompt_ids(9, 90)) b.push_back(t);
+        cases.push_back({ "exact", a, b,
+                          { "--num-speculative-tokens", "0", "--checkpoint-interval", "64" }, 1,
+                          200 });
+        const std::vector<int32_t> c = prompt_ids(51, 600);
+        std::vector<int32_t> d = c;
+        for (int32_t t : prompt_ids(52, 60)) d.push_back(t);
+        cases.push_back({ "nearest", c, d,
+                          { "--num-speculative-tokens", "0", "--checkpoint-interval", "64",
+                            "--prefix-resume", "nearest" },
+                          512, 599 });
+    }
+    for (const Case& k : cases) {
+        json cold;
+        {
+            Server s;
+            REQUIRE(s.start(world().lfm3, kPlain));
+            cold = post(s.port, "/completion", completion(k.second, 24, 0.0, 0, 3));
+            CHECK_EQ(s.stop(), 0);
+        }
+        Server s;
+        REQUIRE(s.start(world().lfm3, k.args));
+        (void)post(s.port, "/completion", completion(k.first, 24, 0.0, 0, 3));
+        const json shared = post(s.port, "/completion", completion(k.second, 24, 0.0, 0, 3));
+        const json again = post(s.port, "/completion", completion(k.second, 24, 0.0, 0, 3));
+        const int64_t c1 = timing(shared, "cache_n"), c2 = timing(again, "cache_n");
+        REQUIRE(cold.contains("completion_probabilities"));
+        const bool same = tokens_of(shared) == tokens_of(cold) &&
+                          tokens_of(again) == tokens_of(cold) &&
+                          shared["completion_probabilities"] == cold["completion_probabilities"] &&
+                          again["completion_probabilities"] == cold["completion_probabilities"];
+        if (!(c1 >= k.lo && c1 <= k.hi && c2 > c1 && same))
+            fprintf(stderr, "    %s: cached %lld then %lld, %s a cold run's\n", k.name,
+                    (long long)c1, (long long)c2, same ? "equal to" : "NOT equal to");
+        CHECK(c1 >= k.lo);
+        CHECK(c1 <= k.hi);
+        CHECK(c2 > c1);
+        CHECK_EQ(tokens_of(cold).size(), (size_t)24);
+        CHECK(same);
+        CHECK_EQ(s.stop(), 0);
+    }
+}
+
 /* The row a running server's /diagnostics reports for `option`, or null. */
 json config_row(int port, const std::string& option) {
     Call c;
@@ -1993,6 +2242,72 @@ json config_row(int port, const std::string& option) {
     for (const json& r : d["configuration"])
         if (r.value("option", "") == option) return r;
     return json();
+}
+
+/* Several models in one process (docs/MULTIMODEL.md): two architectures, and one architecture
+ * twice, each answering under its own name exactly what it answers alone, behind one listener. */
+TEST(several_models_in_one_process_answer_as_they_do_alone) {
+    REQUIRE(world().ok);
+    const json req = completion({ 1, 2, 3, 4, 5 }, 6);
+    auto alone = [&](const std::string& model) -> json {
+        Server s;
+        if (!s.start(model, { "--max-num-seqs", "4" })) return json::array();
+        int st = 0;
+        const json r = post(s.port, "/completion", req, &st);
+        CHECK_EQ(st, 200);
+        CHECK_EQ(s.stop(), 0);
+        return r.value("tokens", json::array());
+    };
+    const json q_alone = alone(world().qwen35), l_alone = alone(world().llama);
+    CHECK(!q_alone.empty() && !l_alone.empty());
+
+    const std::string common =
+        "server: {host: 127.0.0.1, port: 0, http-threads: 4, kernels: libref,\n"
+        "         debug-accept-reference-kernels: true}\n"
+        "defaults: {max-num-seqs: 4, gpu-memory-mib: 200}\n";
+    {
+        Server s;
+        REQUIRE(s.start_yaml(common + "models:\n  q: {model: " + world().qwen35 + ", aliases: [default]}\n"
+                             "  l: {model: " + world().llama + "}\n"));
+        int st = 0;
+        json named = req;
+        named["model"] = "q";
+        CHECK(post(s.port, "/completion", named, &st).value("tokens", json::array()) == q_alone);
+        CHECK_EQ(st, 200);
+        named["model"] = "l";
+        CHECK(post(s.port, "/completion", named, &st).value("tokens", json::array()) == l_alone);
+        CHECK_EQ(st, 200);
+        /* No model: the one aliased default. An unknown one: not found. */
+        CHECK(post(s.port, "/completion", req, &st).value("tokens", json::array()) == q_alone);
+        named["model"] = "nope";
+        post(s.port, "/completion", named, &st);
+        CHECK_EQ(st, 404);
+
+        Call c;
+        std::string body;
+        CHECK(c.send(s.port, "GET", "/v1/models", "") && c.read(&body) == 200);
+        std::set<std::string> ids;
+        for (const json& m : json::parse(body, nullptr, false).value("data", json::array()))
+            ids.insert(m.value("id", ""));
+        CHECK(ids == std::set<std::string>({ "q", "l", "default" }));
+        CHECK_EQ(s.stop(), 0);
+    }
+    {
+        /* One plugin, two instances: each keeps its own state (RadBuildCtx::slot_base). */
+        Server s;
+        REQUIRE(s.start_yaml(common + "models:\n  a: {model: " + world().qwen35 + "}\n"
+                             "  b: {model: " + world().qwen35 + "}\n"));
+        int st = 0;
+        json named = req;
+        for (const char* m : { "a", "b", "a" }) {
+            named["model"] = m;
+            CHECK(post(s.port, "/completion", named, &st).value("tokens", json::array()) == q_alone);
+            CHECK_EQ(st, 200);
+        }
+        post(s.port, "/completion", req, &st);
+        CHECK_EQ(st, 400);                                   /* several models, none named */
+        CHECK_EQ(s.stop(), 0);
+    }
 }
 
 /* --checkpoint-slots auto, the default, sizes the snapshot store from --max-num-seqs and what the
@@ -2016,12 +2331,12 @@ TEST(the_snapshot_store_is_sized_by_auto_unless_a_count_is_given) {
           "geometric-backoff keeps 2 for a 4096-token session at a 2048-token interval",
           "checkpoint slots: auto: 12 linear-state snapshot(s) of " },
         { &World::qwen35, { "--max-num-seqs", "4", "--checkpoint-slots", "auto" }, "12",
-          "command line", "3 a sequence", "checkpoint slots: auto: 12 " },
+          "models.qwen35.checkpoint-slots", "3 a sequence", "checkpoint slots: auto: 12 " },
         { &World::qwen35,
           { "--max-num-seqs", "4", "--checkpoint-policy", "keep-all", "--checkpoint-interval", "256" },
           "68", "auto", "keep-all keeps 16 for a 4096-token session at a 256-token interval",
           "checkpoint slots: auto: 68 " },
-        { &World::qwen35, { "--max-num-seqs", "4", "--checkpoint-slots", "5" }, "5", "command line",
+        { &World::qwen35, { "--max-num-seqs", "4", "--checkpoint-slots", "5" }, "5", "models.qwen35.checkpoint-slots",
           "", "checkpoint slots: 5 linear-state snapshot(s) of " },
         { &World::qwen35, { "--max-num-seqs", "4", "--no-prefix-cache" }, "0", "auto",
           "prefix caching is off", "" },
@@ -2120,7 +2435,8 @@ TEST(a_requests_last_step_issues_no_step_ahead) {
 TEST(a_decoded_token_has_the_probabilities_prefilling_it_gives) {
     REQUIRE(world().ok);
     const struct { const char* name; std::string World::*model; double tol; } kRuns[] = {
-        { "lfm2", &World::lfm2, 0.0 }, { "gemma4", &World::gemma4, 0.0 },
+        { "lfm2", &World::lfm2, 0.0 }, { "lfm3", &World::lfm3, 0.0 },
+        { "gemma4", &World::gemma4, 0.0 },
         { "llama_fp8", &World::llama_rad, 0.0 }, { "qwen35", &World::qwen35, 0.1 } };
     const std::vector<int32_t> p = prompt_ids(31, 120);
     for (const auto& run : kRuns) {
@@ -2212,27 +2528,32 @@ TEST(preemption_by_recompute_continues_each_stream_exactly) {
 namespace {
 
 /* The tiny Qwen-Image pipeline (tiny_model.h: QwenImage) as rad-convert makes it containers, the
- * bf16 one and the one whose DiT linears are block fp8, written once per process. Empty when a
+ * bf16 one and the one whose DiT linears are rotated int8, written once per process. The text
+ * encoder is 128 wide so that its activations take the int8 pair's scale group too. Empty when a
  * step fails. */
 struct QwenImageContainers {
     tiny::TempDir dir{ "e2e_qimg", std::getenv("RAD_E2E_KEEP") != nullptr };
-    std::string pipeline, bf16, fp8;   /* the diffusers folder, and its two containers */
+    std::string pipeline, bf16, i8;   /* the diffusers folder, and its two containers */
     QwenImageContainers() {
         const std::string p = dir / "qwen_image";
-        if (!dir.ok() || mkdir(p.c_str(), 0755) != 0 || !tiny::write_qwen_image(p, {}) ||
-            !tiny::write_text(dir / "fp8.recipe", tiny::kQwenImageFp8Recipe))
+        tiny::QwenImage shape;
+        shape.te_hidden = 128;
+        shape.te_head_dim = 32;
+        shape.te_ffn = 256;
+        if (!dir.ok() || mkdir(p.c_str(), 0755) != 0 || !tiny::write_qwen_image(p, shape) ||
+            !tiny::write_text(dir / "i8.recipe", tiny::kQwenImageI8Recipe))
             return;
         for (const bool q : { false, true }) {
-            const std::string rad = dir / (q ? "qwen_image_fp8.rad" : "qwen_image.rad");
+            const std::string rad = dir / (q ? "qwen_image_i8.rad" : "qwen_image.rad");
             std::vector<std::string> argv = { RAD_E2E_CONVERT, p, "-o", rad };
-            if (q) { argv.push_back("--recipe"); argv.push_back(dir / "fp8.recipe"); }
+            if (q) { argv.push_back("--recipe"); argv.push_back(dir / "i8.recipe"); }
             std::string log;
             const int st = tiny::run(argv, engine_env(), &log);
             if (st != 0) {
                 fprintf(stderr, "    rad-convert exited %d:\n%s\n", st, tail(log).c_str());
                 return;
             }
-            (q ? fp8 : bf16) = rad;
+            (q ? i8 : bf16) = rad;
         }
         pipeline = p;
     }
@@ -2307,8 +2628,8 @@ double psnr(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
  * generator declares has a libavx row, the picture comes back, a seed repeats it byte for byte, and
  * it agrees with libref's within rounding (the two libraries round the DiT's and the decoder's
  * products in different orders). Another seed gives another picture, so the agreement is not two
- * constant images. Guidance runs a second, negative conditioning beside the first; the fp8
- * container takes the fused fp8 norm, the fp8 GEMMs and the int8 attention scores. */
+ * constant images. Guidance runs a second, negative conditioning beside the first; the int8
+ * container takes the fused int8 norm, the int8 GEMMs and the int8 attention scores. */
 TEST(qwen_image_generates_on_libavx_alone_as_on_libref) {
 #if defined(__x86_64__)
     NEED_ARTIFACT(RAD_E2E_HOME "/kernels/libavx.so");
@@ -2317,8 +2638,8 @@ TEST(qwen_image_generates_on_libavx_alone_as_on_libref) {
 #endif
     if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
     const QwenImageContainers& q = qwen_image();
-    REQUIRE(!q.bf16.empty() && !q.fp8.empty());
-    for (const std::string* model : { &q.bf16, &q.fp8 })
+    REQUIRE(!q.bf16.empty() && !q.i8.empty());
+    for (const std::string* model : { &q.bf16, &q.i8 })
         for (const double cfg : { 0.0, 3.0 }) {
             const Picture a = generate(*model, { "libavx" }, false, 7, 3, cfg);
             const Picture b = generate(*model, { "libavx" }, false, 7, 3, cfg);
@@ -2328,7 +2649,7 @@ TEST(qwen_image_generates_on_libavx_alone_as_on_libref) {
             CHECK(a.png == b.png);
             const double same = psnr(a.rgba, ref.rgba), other = psnr(a.rgba, c.rgba);
             fprintf(stderr, "    %s, cfg %.0f: libavx against libref %.1f dB, against another "
-                    "seed %.1f dB\n", model == &q.fp8 ? "fp8" : "bf16", cfg, same, other);
+                    "seed %.1f dB\n", model == &q.i8 ? "int8" : "bf16", cfg, same, other);
             CHECK(same > 40.0);
             CHECK(other < 30.0);
         }
@@ -3088,6 +3409,38 @@ TEST(nemotron35_rerank_real_weights_match_native_scores_and_rankings) {
         REQUIRE_EQ(s.stop(), 0);
         if (const char* output = std::getenv("RAD_NEMOTRON_RERANK_SERVER_LOG"))
             REQUIRE(tiny::write_text(output, s.output()));
+    }
+}
+
+
+TEST(undersized_guidance_is_rejected_without_blocking_the_image_server) {
+    if (!rad::mm::decoder_available()) SKIP("this build has no image codec");
+    const QwenImageContainers& model = qwen_image();
+    REQUIRE(!model.bf16.empty());
+    const json guided = {{"prompt", "a red mug"}, {"negative_prompt", "a blue mug"},
+                         {"size", "64x64"}, {"seed", 7}, {"num_inference_steps", 1},
+                         {"true_cfg_scale", 3.0}, {"output_format", "png"}};
+    for (const int entries : {1, 2}) {
+        Server server;
+        REQUIRE(server.start(model.bf16, {"--max-num-seqs", std::to_string(entries)},
+                             device_env(2048)));
+        int status = 0;
+        const json result = post(server.port, "/v1/images/generations", guided, &status);
+        CHECK_EQ(status, entries == 1 ? 400 : 200);
+        if (entries == 1) {
+            CHECK(result.dump().find("--max-num-seqs") != std::string::npos);
+            json plain = guided;
+            plain["true_cfg_scale"] = 1.0;
+            plain.erase("negative_prompt");
+            const json recovered = post(server.port, "/v1/images/generations", plain, &status);
+            REQUIRE_EQ(status, 200);
+            REQUIRE(recovered.contains("data") && recovered["data"].size() == 1);
+            CHECK(!recovered["data"][0].value("b64_json", std::string()).empty());
+        } else {
+            REQUIRE(result.contains("data") && result["data"].size() == 1);
+            CHECK(!result["data"][0].value("b64_json", std::string()).empty());
+        }
+        CHECK_EQ(server.stop(), 0);
     }
 }
 

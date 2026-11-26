@@ -3,6 +3,8 @@
 #include "string.h"
 #include "utils.h"
 
+#include "util/json.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -86,9 +88,15 @@ struct context; // forward declaration
 // marking input can be useful for tracking data provenance
 // and preventing template injection attacks
 //
-// Note: T_JSON can be nlohmann::ordered_json
+// Note: T_JSON can be rad::Json
 template<typename T_JSON>
 void global_from_json(context & ctx, const T_JSON & json_obj, bool mark_input);
+
+/* One global from a JSON value, converted in place: a caller assembling several globals from
+ * JSON values it already holds (a chat render's messages and tools) need not first copy them
+ * into an intermediate JSON object for global_from_json to convert back out. */
+void global_set_from_json(context & ctx, const std::string & key,
+                          const rad::Json & j, bool mark_input);
 
 //
 // base value type
@@ -177,7 +185,7 @@ protected:
 
 const func_builtins & global_builtins();
 
-std::string value_to_json(const value & val, int indent = -1, const std::string_view item_sep = ", ", const std::string_view key_sep = ": ");
+std::string value_to_json(const value & val, int indent = -1, const std::string_view item_sep = ", ", const std::string_view key_sep = ": ", bool sort_keys = false);
 
 // Note: only used for debugging purposes
 std::string value_to_string_repr(const value & val);
@@ -290,7 +298,9 @@ using value_float = std::shared_ptr<value_float_t>;
 struct value_string_t : public value_t {
     value_string_t() { val_str = string(); }
     value_string_t(const std::string & v) { val_str = string(v); }
+    value_string_t(std::string && v) { val_str = string(std::move(v)); }
     value_string_t(const string & v) { val_str = v; }
+    value_string_t(string && v) { val_str = std::move(v); }
     virtual std::string type() const override { return "String"; }
     virtual string as_string() const override { return val_str; }
     virtual std::string as_repr() const override {
@@ -317,7 +327,7 @@ struct value_string_t : public value_t {
     }
 protected:
     virtual bool equivalent(const value_t & other) const override {
-        return typeid(*this) == typeid(other) && val_str.str() == other.val_str.str();
+        return typeid(*this) == typeid(other) && val_str.equals(other.val_str);
     }
 };
 using value_string = std::shared_ptr<value_string_t>;
@@ -459,6 +469,15 @@ protected:
 };
 using value_array = std::shared_ptr<value_array_t>;
 
+/* A block statement's results, carried up to the gather that actually needs text. If and for
+ * statements used to gather their bodies into a fresh string at every nesting level, copying
+ * every shared part's bytes each time; as a carrier, the parts are only flattened once -- by
+ * the top-level render, or by exec_statements where a real string value is required (a set
+ * block, a macro body). It is an array for storage only: the gathers recurse into it where a
+ * plain array value would print its repr, and it never reaches template expressions. */
+struct value_stmt_results_t : public value_array_t {};
+using value_stmt_results = std::shared_ptr<value_stmt_results_t>;
+
 
 struct value_tuple_t : public value_array_t {
     value_tuple_t(value & v) {
@@ -482,13 +501,40 @@ using value_tuple = std::shared_ptr<value_tuple_t>;
 
 struct value_object_t : public value_t {
     std::unordered_map<value, value, value_hasher, value_equivalence> unordered;
+    /* The hash index over val_obj, built only once an object outgrows a linear scan. The
+     * objects a chat render builds by the thousand -- messages, calls, scopes -- hold a
+     * handful of keys each, and for those the map's bucket array and per-key nodes cost more
+     * than every lookup they would ever serve. val_obj stays the ordered authority either way. */
+    bool unordered_built_ = false;
+    static constexpr size_t kHashIndexThreshold = 32;
+    void build_unordered() {
+        if (unordered_built_) {
+            return;
+        }
+        unordered.reserve(val_obj.size() * 2);
+        for (const auto & pair : val_obj) {
+            unordered.emplace(pair.first, pair.second);
+        }
+        unordered_built_ = true;
+    }
+    void maybe_build_unordered() {
+        if (val_obj.size() > kHashIndexThreshold) {
+            build_unordered();
+        }
+    }
+    value * find_key_linear(const value & key) {
+        for (auto & pair : val_obj) {
+            if (*(pair.first) == *key) {
+                return &pair.second;
+            }
+        }
+        return nullptr;
+    }
     bool has_builtins = true; // context and loop objects do not have builtins
     value_object_t() = default;
     value_object_t(value & v) {
         val_obj = v->val_obj;
-        for (const auto & pair : val_obj) {
-            unordered[pair.first] = pair.second;
-        }
+        maybe_build_unordered();
     }
     value_object_t(const std::map<value, value> & obj) {
         for (const auto & pair : obj) {
@@ -501,7 +547,31 @@ struct value_object_t : public value_t {
         }
     }
     void insert(const std::string & key, const value & val) {
+        // The common case is re-binding a name that is already present (a loop variable, a
+        // scope copy): find it by name first so no key value is allocated for the lookup.
+        if (is_immutable()) {
+            throw std::runtime_error("Attempting to modify immutable type");
+        }
+        for (auto & pair : val_obj) {
+            const auto * ks = dynamic_cast<const value_string_t *>(pair.first.get());
+            if (ks && ks->val_str.parts.size() == 1 && ks->val_str.parts[0].val == key) {
+                pair.second = val;
+                if (unordered_built_) {
+                    unordered[pair.first] = val;
+                }
+                return;
+            }
+        }
         insert(mk_val<value_string>(key), val);
+    }
+    /* Take another object's entries wholesale (a scope inheriting its parent's variables):
+     * the ordered list copies in one allocation instead of a key allocation and a scan per
+     * variable. The hash index, if the size calls for one, is rebuilt from the copy. */
+    void copy_entries_from(const value_object_t & other) {
+        val_obj = other.val_obj;
+        unordered.clear();
+        unordered_built_ = false;
+        maybe_build_unordered();
     }
     virtual std::string type() const override { return "Object"; }
     virtual bool is_immutable() const override { return false; }
@@ -518,53 +588,125 @@ struct value_object_t : public value_t {
         return ss.str();
     }
     virtual bool as_bool() const override {
-        return !unordered.empty();
+        return !val_obj.empty();
     }
     virtual bool has_key(const value & key) override {
         if (!key->is_immutable() || !key->is_hashable()) {
             throw std::runtime_error("Object key of unhashable type: " + key->type());
         }
-        return unordered.find(key) != unordered.end();
+        if (unordered_built_) {
+            return unordered.find(key) != unordered.end();
+        }
+        return find_key_linear(key) != nullptr;
     }
     virtual void insert(const value & key, const value & val) override {
-        bool replaced = false;
         if (is_immutable()) {
             throw std::runtime_error("Attempting to modify immutable type");
         }
-        if (has_key(key)) {
-            // if key exists, replace value in ordered list instead of appending
-            for (auto & pair : val_obj) {
-                if (*(pair.first) == *key) {
-                    pair.second = val;
-                    replaced = true;
-                    break;
+        if (!key->is_immutable() || !key->is_hashable()) {
+            throw std::runtime_error("Object key of unhashable type: " + key->type());
+        }
+        if (unordered_built_) {
+            auto it = unordered.find(key);
+            if (it != unordered.end()) {
+                // if key exists, replace value in ordered list instead of appending
+                it->second = val;
+                for (auto & pair : val_obj) {
+                    if (*(pair.first) == *key) {
+                        pair.second = val;
+                        break;
+                    }
                 }
+                return;
             }
-        }
-        unordered[key] = val;
-        if (!replaced) {
+            unordered.emplace(key, val);
             val_obj.push_back({key, val});
+            return;
         }
+        if (value * existing = find_key_linear(key)) {
+            *existing = val;
+            return;
+        }
+        val_obj.push_back({key, val});
+        maybe_build_unordered();
+    }
+    /* Insert a key the caller knows is absent (a fresh object's fields): no lookup first. */
+    void insert_new(const value & key, const value & val) {
+        if (is_immutable()) {
+            throw std::runtime_error("Attempting to modify immutable type");
+        }
+        if (unordered_built_) {
+            unordered.emplace(key, val);
+        }
+        val_obj.push_back({key, val});
+        maybe_build_unordered();
+    }
+    void insert_new(const std::string & key, const value & val) {
+        insert_new(mk_val<value_string>(key), val);
     }
     virtual value & at(const value & key, value & default_val) override {
-        if (!has_key(key)) {
-            return default_val;
+        if (!key->is_immutable() || !key->is_hashable()) {
+            throw std::runtime_error("Object key of unhashable type: " + key->type());
         }
-        return unordered.at(key);
+        if (unordered_built_) {
+            auto it = unordered.find(key);
+            return it == unordered.end() ? default_val : it->second;
+        }
+        if (value * v = find_key_linear(key)) {
+            return *v;
+        }
+        return default_val;
     }
     virtual value & at(const value & key) override {
-        if (!has_key(key)) {
-            throw std::runtime_error("Key '" + key->as_string().str() + "' not found in value of type " + type());
+        if (!key->is_immutable() || !key->is_hashable()) {
+            throw std::runtime_error("Object key of unhashable type: " + key->type());
         }
-        return unordered.at(key);
+        if (unordered_built_) {
+            auto it = unordered.find(key);
+            if (it == unordered.end()) {
+                throw std::runtime_error("Key '" + key->as_string().str() + "' not found in value of type " + type());
+            }
+            return it->second;
+        }
+        if (value * v = find_key_linear(key)) {
+            return *v;
+        }
+        throw std::runtime_error("Key '" + key->as_string().str() + "' not found in value of type " + type());
+    }
+    /* A string key by value, without allocating a key value and hashing it: objects here are
+     * message/argument records of a few keys, so the ordered scan is the cheaper lookup. */
+    value * find_string_key(const std::string & key) {
+        for (auto & pair : val_obj) {
+            const auto * ks = dynamic_cast<const value_string_t *>(pair.first.get());
+            if (!ks) {
+                continue;
+            }
+            size_t off = 0;
+            bool eq = true;
+            for (const auto & part : ks->val_str.parts) {
+                if (key.compare(off, part.val.size(), part.val) != 0) {
+                    eq = false;
+                    break;
+                }
+                off += part.val.size();
+            }
+            if (eq && off == key.size()) {
+                return &pair.second;
+            }
+        }
+        return nullptr;
     }
     virtual value & at(const std::string & key, value & default_val) override {
-        value key_val = mk_val<value_string>(key);
-        return at(key_val, default_val);
+        if (value * v = find_string_key(key)) {
+            return *v;
+        }
+        return default_val;
     }
     virtual value & at(const std::string & key) override {
-        value key_val = mk_val<value_string>(key);
-        return at(key_val);
+        if (value * v = find_string_key(key)) {
+            return *v;
+        }
+        throw std::runtime_error("Key '" + key + "' not found in value of type " + type());
     }
     virtual const func_builtins & get_builtins() const override;
     virtual bool is_hashable() const override {

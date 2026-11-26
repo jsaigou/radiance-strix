@@ -11,7 +11,7 @@
 #include "llama/common/json-schema-to-grammar.h"
 #include "shim/log.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cctype>
@@ -23,7 +23,7 @@
 
 namespace rad {
 
-using ojson = nlohmann::ordered_json;
+using ojson = Json;
 
 namespace {
 
@@ -47,7 +47,7 @@ bool confusable(const std::string& a, const std::string& b) {
     return a.starts_with(b) || b.starts_with(a) || occurs_inside(a, b) || occurs_inside(b, a);
 }
 
-std::string show(const std::string& s) { return nlohmann::json(s).dump(); }
+std::string show(const std::string& s) { return Json(s).dump(); }
 
 int refuse(std::string* why, const std::string& s) {
     if (why) *why = s;
@@ -202,10 +202,13 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
     if (object && !f.section_open.empty())
         return no("section-wrapped object arguments are not supported");
     /* Without a suffix the name ends at what follows it: the object's `{`, or a tagged call's
-     * first argument or close. */
-    if (!f.name_suffix.empty()) {
-        if (trim_ws(f.name_suffix).empty())
-            return no("name_suffix must end the function name with something besides whitespace");
+     * first argument or close. A suffix of nothing but whitespace is that same ending, written
+     * out: the name stops at the whitespace (Ling 3.0's `<tool_call>NAME\n<arg_key>`), so the
+     * reader treats it as a suffixless name, while the grammar still writes the template's
+     * newline. The object family has no such terminator -- its `{` ends the name -- and keeps
+     * the refusal. */
+    const bool name_by_ws = !object && !f.name_suffix.empty() && trim_ws(f.name_suffix).empty();
+    if (!f.name_suffix.empty() && !name_by_ws) {
         if (is_ws((unsigned char)f.name_suffix[0]))
             return no("name_suffix " + show(f.name_suffix) + " may not begin with whitespace");
     }
@@ -216,10 +219,11 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
         if (f.arg_name_suffix.empty() && f.arg_value_prefix.empty())
             return no("nothing ends an argument name: arg_name_suffix and arg_value_prefix are "
                       "empty");
-        if (f.name_suffix.empty()) {
-            /* The name runs to the first arg_prefix or call_end. A wrapped format also reads
-             * name_prefix alone as a call, told from prose only by its closed name tag, and
-             * without a suffix there is none. */
+        if (f.name_suffix.empty() || name_by_ws) {
+            /* The name runs to the first arg_prefix or call_end, written either with no suffix
+             * or with the whitespace that ends it. A wrapped format also reads name_prefix
+             * alone as a call, told from prose only by its closed name tag, and without a
+             * suffix there is none. */
             if (!f.call_open.empty())
                 return no("name_suffix is empty, which a tagged call allows only when name_prefix "
                           "opens it, and call_open is set");
@@ -353,6 +357,7 @@ int chat_format_from_abi(const RadChatFormat* in, ChatFormat* out, std::string* 
     f.object_bare_keys    = c.object_bare_keys != 0;
     f.reasoning_anywhere  = c.reasoning_anywhere != 0;
     f.arg_json_value_prefix = s(c.arg_json_value_prefix);
+    f.content_open        = s(c.content_open);
     *out = std::move(f);
     return RAD_OK;
 }
@@ -468,6 +473,7 @@ std::string chat_format_describe(const ChatFormat& f) {
              (f.reasoning_anywhere ? " anywhere" : "");
     else
         s += " no reasoning";
+    if (!f.content_open.empty()) s += "; content " + show(f.content_open);
     if (f.has_tools() && !f.section_open.empty())
         s += "; section " + show(f.section_open) + ".." + show(f.section_close);
     if (f.has_tools() && f.object_args()) {
@@ -498,7 +504,8 @@ std::string chat_format_describe(const ChatFormat& f) {
 
 std::vector<std::string> chat_format_markers(const ChatFormat& f) {
     std::vector<std::string> out;
-    for (const std::string* s : { &f.reasoning_open, &f.reasoning_close, &f.section_open,
+    for (const std::string* s : { &f.reasoning_open, &f.reasoning_close, &f.content_open,
+                                  &f.section_open,
                                   &f.section_close, &f.call_open, &f.call_close, &f.name_prefix,
                                   &f.name_suffix, &f.call_end, &f.arg_prefix, &f.arg_name_suffix,
                                   &f.arg_value_prefix, &f.arg_json_value_prefix,

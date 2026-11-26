@@ -20,6 +20,11 @@ struct caps {
 
     bool supports_object_arguments = false;
 
+    // RADIANCE: what the first probe render that threw said, empty when none did. The probes
+    // ignore exceptions, so a template calling something this engine lacks and a template
+    // without tool support both come back supports_tools = false; this tells them apart.
+    std::string probe_error;
+
     // for reporting on server
     std::map<std::string, bool> to_map() const;
 

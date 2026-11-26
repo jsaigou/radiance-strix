@@ -269,13 +269,14 @@ static TileFn pick_tile(uint32_t da, uint32_t db) {
 
 /* ------------------------------------------------------------------ the codebook experts
  *
- * Qwen3.8-Flash-Next's experts (docs/MOE-W4.md) are u4 or u5 codes indexing a table of 16 or 32
- * f32 levels, with a scale per (row, group of K): bf16 per 128 (`w4nla8h`), or E4M3 per 64 or 32
- * times one fixed f32 (`w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h`). Element (n, k) of an expert is
- * table[code(n, k)] * scale(n, k / group), times `scale.1` where there is one. The codes view takes
- * the planes `codes,table` and the two-level forms' scale view `scale,scale.1`; such a weight is
- * stored in the joined form of abi/rad_planes.h, which these rows' layout hooks ask for. A view of
- * one plane (w4nla8h's bf16 scale, every view of the other dtypes) is stored as it is.
+ * Qwen3.8-Flash-Next's experts (docs/MOE-W4.md) are u4, u5 or u6 codes indexing a table of 16, 32
+ * or 64 f32 levels, with a scale per (row, group of K): bf16 per 128 (`w4nla8h`), or E4M3 per 64
+ * or 32 times one fixed f32 (`w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h`, `w6nl64a8h`). Element (n, k)
+ * of an expert is table[code(n, k)] * scale(n, k / group), times `scale.1` where there is one. The
+ * codes view takes the planes `codes,table` and the two-level forms' scale view `scale,scale.1`;
+ * such a weight is stored in the joined form of abi/rad_planes.h, which these rows' layout hooks
+ * ask for. A view of one plane (w4nla8h's bf16 scale, every view of the other dtypes) is stored as
+ * it is.
  *
  * The three unrotated GGUF forms share that path with bf16 activations and f16 scales, and no
  * activation scale: `iq4nl32a16` is IQ4_NL's u4 codes into a sixteen-entry i8 table, `q50a16` is
@@ -296,21 +297,26 @@ static TileFn pick_tile(uint32_t da, uint32_t db) {
  * of the unrotated GGUF forms), and whether the activation is rotated (fwht128). `bits` is 0 for
  * any other dtype. */
 struct CbForm { int bits; int64_t group; uint32_t sdt; bool level; uint32_t cdt; uint32_t tdt;
-                bool rot; };
+                bool rot; bool fp4; };
 static CbForm cb_form(const RadParam* p, int n_p) {
     const RadParam* d = rad_param_find(p, n_p, "dtype");
     const char* s = d && d->kind == RAD_P_STR ? d->sval : nullptr;
-    if (s && !std::strcmp(s, "w4nla8h"))   return CbForm{ 4, 128, RAD_BF16, false, RAD_U4, RAD_F32, true };
-    if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true, RAD_U4, RAD_F32, true };
-    if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true, RAD_U4, RAD_F32, true };
-    if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true, RAD_U5, RAD_F32, true };
+    if (s && !std::strcmp(s, "nvfp4a8i8")) return CbForm{ 4, 16, RAD_F8E4M3, true, RAD_U4, RAD_F32, false, true };
+    if (s && !std::strcmp(s, "w4nla8h"))   return CbForm{ 4, 128, RAD_BF16, false, RAD_U4, RAD_F32, true, false };
+    if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true, RAD_U4, RAD_F32, true, false };
+    if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true, RAD_U4, RAD_F32, true, false };
+    if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true, RAD_U5, RAD_F32, true, false };
+    if (s && !std::strcmp(s, "w6nl64a8h")) return CbForm{ 6, 64, RAD_F8E4M3, true, RAD_U6, RAD_F32, true, false };
+    /* The same stored experts under their names against an int8 activation. */
+    if (s && !std::strcmp(s, "w4nl64a8i8h")) return CbForm{ 4, 64, RAD_F8E4M3, true, RAD_U4, RAD_F32, true, false };
+    if (s && !std::strcmp(s, "w4nl32a8i8h")) return CbForm{ 4, 32, RAD_F8E4M3, true, RAD_U4, RAD_F32, true, false };
     /* The unrotated GGUF forms (f16 scales per 32 or 64, bf16 activations): IQ4_NL's codes join a
      * sixteen-entry i8 table; Q5_0's signed i5 and Q2_0's u2 codes have implicit tables and are
      * stored as single planes. */
-    if (s && !std::strcmp(s, "iq4nl32a16")) return CbForm{ 4, 32, RAD_F16, false, RAD_U4, RAD_I8, false };
-    if (s && !std::strcmp(s, "q50a16"))     return CbForm{ 5, 32, RAD_F16, false, RAD_I5, 0,      false };
-    if (s && !std::strcmp(s, "q20a16"))     return CbForm{ 2, 64, RAD_F16, false, RAD_U2, 0,      false };
-    return CbForm{ 0, 0, 0, false, 0, 0, false };
+    if (s && !std::strcmp(s, "iq4nl32a16")) return CbForm{ 4, 32, RAD_F16, false, RAD_U4, RAD_I8, false, false };
+    if (s && !std::strcmp(s, "q50a16"))     return CbForm{ 5, 32, RAD_F16, false, RAD_I5, 0,      false, false };
+    if (s && !std::strcmp(s, "q20a16"))     return CbForm{ 2, 64, RAD_F16, false, RAD_U2, 0,      false, false };
+    return CbForm{ 0, 0, 0, false, 0, 0, false, false };
 }
 
 /* Whether a selection of several planes for `operand` is what `dtype` names: the codes operands of
@@ -321,8 +327,8 @@ static int cb_check(const RadParam* p, int n_p, int operand, const RadEncoding* 
     const CbForm f = cb_form(p, n_p);
     const bool codes = operand == 2 || operand == 6 || operand == 8 || operand == 10;
     const bool scale = operand == 3 || operand == 7 || operand == 9 || operand == 11;
-    const bool rot = enc && (f.rot ? std::strcmp(enc->transform, "fwht128") == 0
-                                    : enc->transform[0] == 0);
+    const bool rot = enc && (f.fp4 || (f.rot ? std::strcmp(enc->transform, "fwht128") == 0
+                                             : enc->transform[0] == 0));
     if (!f.bits || (!codes && !scale) || !enc || !sel || n_planes < 1 || !rot)
         return RAD_E_DTYPE;
     for (int i = 0; i < n_planes; ++i)
@@ -389,7 +395,7 @@ static const RadPlanesHeader* cb_joined(const RadTensor& t) {
  * `row_bytes` apart, the layout rad_planes.h keeps. */
 struct CbTensor {
     RadTensor t;              /* `data`: the codes plane, from the tile's first weight row */
-    float     tab[32];
+    float     tab[64];
     int64_t   cols = 0, row_bytes = 0;
     int       bits = 0;
 };
@@ -403,9 +409,9 @@ struct LdCb {
 
 /* An expert's codes: 1 with `out` filled, 0 for a plain plane these kernels do not read as a
  * codebook, RAD_E_DTYPE for a joined form they do not read and RAD_E_SHAPE for codes not covering
- * [n, k]. A u4 or u5 entry is always joined (only its table says what a code means); Q5_0's signed
- * i5 and Q2_0's u2 entries are the plain planes GGUF stores, whose code is the level (Q5_0) or the
- * level plus one (Q2_0). */
+ * [n, k]. A u4, u5 or u6 entry is always joined (only its table says what a code means); Q5_0's
+ * signed i5 and Q2_0's u2 entries are the plain planes GGUF stores, whose code is the level
+ * (Q5_0) or the level plus one (Q2_0). */
 static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbTensor* out) {
     if (w.dtype == RAD_I5 || w.dtype == RAD_U2) {
         if (!w.data || w.rank < 2 || w.shape[0] < n || w.shape[1] < k) return RAD_E_SHAPE;
@@ -421,13 +427,13 @@ static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbTensor* out) {
             out->tab[c] = i5 ? (float)(c < 16 ? c : c - 32) : (float)(c - 1);
         return 1;
     }
-    if (w.dtype != RAD_U4 && w.dtype != RAD_U5) return 0;
+    if (w.dtype != RAD_U4 && w.dtype != RAD_U5 && w.dtype != RAD_U6) return 0;
     const RadPlanesHeader* h = rad_planes_header(w.data);
     const RadPlanesEntry *ec = nullptr, *et = nullptr;
     const void* codes = h ? rad_planes_find(w.data, "codes", &ec) : nullptr;
     const void* tab = h ? rad_planes_find(w.data, "table", &et) : nullptr;
     if (!codes || !tab || h->n_planes != 2) return RAD_E_DTYPE;
-    const int bits = ec->dtype == RAD_U4 ? 4 : ec->dtype == RAD_U5 ? 5 : 0;
+    const int bits = ec->dtype == RAD_U4 ? 4 : ec->dtype == RAD_U5 ? 5 : ec->dtype == RAD_U6 ? 6 : 0;
     /* A rotated codebook's table is f32; IQ4_NL's is the sixteen signed bytes it indexes. */
     const bool i8tab = et->dtype == RAD_I8;
     if (!bits || ec->kind != RAD_PLANE_TILED || ec->block[0] != 1 || ec->block[1] != 1 ||
@@ -446,6 +452,26 @@ static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbTensor* out) {
     out->cols = ec->cols;
     out->row_bytes = ec->row_bytes;
     out->bits = bits;
+    return 1;
+}
+
+/* NVFP4's codes are e2m1 nibbles (sign bit 3, magnitude index in bits 0-2 of {0, 0.5, 1, 1.5, 2,
+ * 3, 4, 6}) read through this table as a u4 codebook, so one tile serves both forms. Code 8 is
+ * negative zero, which contributes zero either way. */
+static const float kE2m1Table[16] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                                      -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f };
+
+/* An NVFP4 expert's codes: the plain e2m1 plane, two codes a byte with element k in nibble k & 1
+ * (rad_load_bits), row-major with a row every K / 2 bytes. A plain plane needs no joining. */
+static int cb_fp4(const RadTensor& w, int64_t n, int64_t k, CbTensor* out) {
+    if (w.dtype != RAD_FP4E2M1 || w.rank < 2 || w.shape[0] < n || w.shape[1] < k || !w.data ||
+        k % 2 || w.stride[1] != 1)
+        return RAD_E_DTYPE;
+    out->t = w;
+    std::memcpy(out->tab, kE2m1Table, sizeof kE2m1Table);
+    out->cols = k;
+    out->row_bytes = k / 2;
+    out->bits = 4;
     return 1;
 }
 
@@ -569,7 +595,9 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
 
     const Mat ma = as_mat(A, K);
     const Scales SA = make_scales(as_, AR, K, false);
-    const int64_t gp = p_int(a, "group", 0);
+    /* The activation's scales are per `a_group` of K where the caller states one (an int8
+     * activation at one scale per 256 against experts scaled per 128), else per `group`. */
+    const int64_t gp = p_int(a, "a_group", p_int(a, "group", 0));
     if (quant && gp > 0 && SA.p && SA.group != gp) return RAD_E_SHAPE;
 
     const int64_t y_rs = row_stride(Y, N);
@@ -585,6 +613,7 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
     std::vector<CbTensor>  cbt;
     std::vector<CbScale>   cbs;
     bool codebook = false;
+    const CbForm cf = quant ? cb_form(a->p, a->n_p) : CbForm{ 0, 0, 0, false, 0, 0, false, false };
     for (int64_t e = 0; e < n_expert; ++e) {
         const int q = (int)(e % nc);
         const RadTensor* tw = Wq[q];
@@ -603,7 +632,7 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
         }
         if (quant) {
             CbTensor ct;
-            const int jc = cb_codes(we[(size_t)e], n, k, &ct);
+            const int jc = cf.fp4 ? cb_fp4(we[(size_t)e], n, k, &ct) : cb_codes(we[(size_t)e], n, k, &ct);
             if (jc < 0) return jc;
             if (e == 0 && jc > 0) {
                 codebook = true;
@@ -761,8 +790,14 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
 int ref_moe_gemm(const RadArgs* a, RadStream)   { return moe_gemm_impl(a, false); }
 int ref_moe_gemm_q(const RadArgs* a, RadStream s) {
     const char* dt = p_str(a, "dtype", "");
-    if (dt && std::strcmp(dt, "w4a8") == 0) return ref_moe_gemm_w4a8(a, s);
     if (dt && std::strcmp(dt, "w4a4") == 0) return ref_moe_gemm_w4a4(a, s);
+    /* w4a8 over bf16 scales has its own body, summed in the order libr3d's kernel sums. Any other
+     * four-bit expert (f16 scales, a code plane with a zero point) is a form that body does not
+     * read, and the general one does. */
+    if (dt && std::strcmp(dt, "w4a8") == 0) {
+        const int rc = ref_moe_gemm_w4a8(a, s);
+        if (rc != RAD_E_DTYPE) return rc;
+    }
     return moe_gemm_impl(a, true);
 }
 int ref_moe_gemm_q_mod4(const RadArgs* a, RadStream) { return moe_gemm_impl(a, true, 4); }

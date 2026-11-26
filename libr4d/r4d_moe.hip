@@ -39,10 +39,10 @@
 // breaking the byte-level reproducibility of spec §17.
 #include "r4d.h"
 #include "r4d_common.h"
+#include "r4d_chain.h"
 #include "r4d_fp8_wmma.h"
 #include "r4d_plugin.h"
 #include "r4d_emit.h"
-#include "r4d_chain.h"
 #include "r4d_gemm_args.h"
 #include "r4d_moe_sort.h"
 #include "r4d_moe_gather.h"
@@ -74,6 +74,7 @@ using r4d_moesort::scatter_small_kernel;
 using r4d_moegather::kGatherSlots;
 using r4d_moegather::kGatherSelfT;
 using r4d_moegather::gather_kernel;
+using r4d_moegather::r4dchain_moe_gather;
 constexpr uint32_t kBlock = 128;          // the fp8 scale block, along K and along N
 /* Run-map entry that owns no expert: rows above `off[n_expert]` are dropped slots whose output must
  * be zeroed. Declared here because the GEMM reads it; the map is built further down. */
@@ -84,6 +85,8 @@ using r4d_fp8::i2v;
 using r4d_fp8::f8v;
 using r4d_fp8::mma;
 using r4d_fp8::acc_zero;
+using r4d_fp8::acc_val;
+using r4d_fp8::mma8;
 using r4d_fp8::acc_row;
 using r4d_fp8::frag_c;
 using r4d_fp8::frag;
@@ -488,6 +491,45 @@ __device__ __forceinline__ Stage8 w5_expand(uint4 p, uint32_t sg, const uint32_t
     return r;
 }
 
+/* W6NL: low nibbles address both halves of the 32 positive levels. The transposed magnitude
+ * bit selects a byte from those expansions and the transposed sign bit supplies E4M3's sign. */
+__device__ __forceinline__ Stage8 w6_expand(uint4 p, uint32_t mh, uint32_t sg,
+                                           const uint32_t (&tab)[4]) {
+    const uint32_t high[4] = { 0x5C5B5A59u, 0x605F5E5Du, 0x64636261u, 0x68676665u };
+    Stage8 l = w4_expand(p, tab), h = w4_expand(p, high);
+    uint32_t a[8] = { l.v.x, l.v.y, l.v.z, l.v.w, l.w.x, l.w.y, l.w.z, l.w.w };
+    const uint32_t b[8] = { h.v.x, h.v.y, h.v.z, h.v.w, h.w.x, h.w.y, h.w.z, h.w.w };
+#pragma unroll
+    for (uint32_t m = 0; m < 8; ++m) {
+        const uint32_t top = (mh << m) & 0x80808080u;
+        const uint32_t mask = top | (top - (top >> 7));
+        a[m] = (a[m] ^ ((a[m] ^ b[m]) & mask)) | ((sg << m) & 0x80808080u);
+    }
+    l.v = make_uint4(a[0], a[1], a[2], a[3]);
+    l.w = make_uint4(a[4], a[5], a[6], a[7]);
+    return l;
+}
+
+/* ---- the codebook levels against an int8 activation ---------------------------------------------
+ *
+ * The iu8 WMMA wants the levels as int8. The two's-complement nibble is its own value
+ * (kW4IntPermI8). w4nl's magnitudes are 1.125, 3.25, 5.5, 8, 11, 14, 18 and 22: the unit that makes
+ * all of them integers is 1/8, at which 22 is 176 and past int8, and a second WMMA over the other
+ * half of each level costs a third of the kernel's time. So the levels are read as the int8 set
+ * nearest them at one unit, r4d_args.h's kW4nlI8 times kW4nlI8Unit (folded into the scale): each
+ * within 1.2% of its level. */
+static constexpr uint32_t kW4IntPermI8[4] = { 0x03020100u, 0x07060504u, 0xFBFAF9F8u, 0xFFFEFDFCu };
+static constexpr uint32_t kW4nlPermI8[4] = {
+    w4nl_i8_dword(0), w4nl_i8_dword(1), w4nl_i8_dword(2), w4nl_i8_dword(3) };
+
+/* The staged bytes of a four-bit row segment: E4M3 from `tab`, or at I8 the int8 levels, `tab`'s
+ * for the integer grid and w4nl's at the subgroup-scaled forms (W4 2 and 3). */
+template <int W4, bool I8>
+__device__ __forceinline__ Stage8 moe_w4_bytes(uint4 p, const uint32_t (&tab)[4]) {
+    if constexpr (I8 && (W4 == 2 || W4 == 3)) return w4_expand(p, kW4nlPermI8);
+    else return w4_expand(p, tab);
+}
+
 /* The packed half of a Stage8's worth of K, or zeros for a row this block does not own. Zeros
  * expand to entry 0 (E4M3 zero under -8..7, 1.125 under w4nl); either way the column contributes
  * nothing, since staging gives an unowned column a weight scale of zero. */
@@ -645,17 +687,20 @@ struct MoeCls {
     uint32_t w_s0, s_s0;   /* bytes an entry of a stacked plane; 0 marks a pointer table */
     uint32_t n, k, w_ld, s_ld;
 };
-/* W4: the code table (r4d_args.h's kW4IntPerm, kW4nlPerm or kW5nlMagPerm), shared by all classes. */
+/* W4: the code table (r4d_args.h's kW4IntPerm, kW4nlPerm, kW5nlMagPerm or the first half of
+ * kW6nlMagPerm), shared by all classes. */
 struct MoeTab { uint32_t v[4]; };
 
 /* W4 is the weight's form: 0 block E4M3; 1 four-bit with one bf16 scale per (row, 128 of K); 2 the
  * same codes with one E4M3 scale per (row, 64 of K) times the fixed kW4G64Scale (w4nl64a8h); 3 the
  * same per (row, 32 of K) (w4nl32a8h); 4 five-bit codes, form 2's magnitudes and scales plus a sign
- * bit per code from the plane after a row's nibbles (w5nl64a8h). At 2-4 a staged 128-wide tile holds
- * two or four scale groups, each in its own accumulator; a tile's E4M3 scales are one 16- or 32-bit
- * load.
+ * bit per code from the plane after a row's nibbles (w5nl64a8h); 5 six-bit codes, form 2's scales,
+ * a row's nibbles followed by a plane of each code's high magnitude bit, which selects between two
+ * sets of sixteen magnitudes, and then its sign plane (w6nl64a8h). At 2-5 a staged 128-wide tile
+ * holds two or four scale groups, each in its own accumulator; a tile's E4M3 scales are one 16- or
+ * 32-bit load.
  *
- * FK is the K staged per pass: kFK (one 128-wide scale block) or, at W4 2-4 only, two blocks, which
+ * FK is the K staged per pass: kFK (one 128-wide scale block) or, at W4 2-5 only, two blocks, which
  * doubles the bytes in flight per barrier pair and halves the passes. Each scale group keeps its
  * own accumulator and the fold runs the two blocks in K order, so FK 256 is bit-identical to 128.
  *
@@ -675,29 +720,41 @@ constexpr uint32_t moe_waves(uint32_t ntl, int w4, bool es, bool al, uint32_t fk
               : (w4 <= 1 ? 9u : 8u);
 }
 
+#define R4D_MOEGQ_PARAMS                                                                        \
+    const uint8_t* __restrict__ Aq, const float* __restrict__ As, const MoeCls c_even,          \
+    const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,                                     \
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,                        \
+    uint16_t* __restrict__ Y, const uint32_t* __restrict__ map, uint32_t T, uint32_t N,         \
+    uint32_t n_expert, uint32_t top_k, uint32_t a_ld, uint32_t as_ld, uint32_t y_ld,            \
+    uint32_t mode, const MoeTab tab
 template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
           bool ES = false, bool AL = false, bool SK = false, uint32_t FK = kFK, bool UW = false,
-          bool RS = false>
-__device__ __forceinline__ void moe_gemm_q_kernel_body(
-    const uint8_t* __restrict__ Aq, const float* __restrict__ As,
-    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
-    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
-    uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
-    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
-    /* `mode`: bit 0 `a_sorted`, bits 1-2 the class shift (1 for two classes, 2 for four), bits 8+
-     * `parts`. */
+          bool RS = false, bool I8 = false>
+__device__ __forceinline__ void moe_gemm_q_body(R4D_MOEGQ_PARAMS) {
+    /* `mode`: bit 0 `a_sorted`, bits 1-2 the class shift (1 for two classes, 2 for four), bit 3
+     * the activation's scale per 256 of K instead of per 128 (`a_group`: block b reads scale
+     * b >> 1), bits 8+ `parts`. */
     const uint32_t a_sorted = mode & 1u, cshift = (mode >> 1) & 3u, parts = mode >> 8;
+    const uint32_t ash = (mode >> 3) & 1u;
     constexpr uint32_t FM = MT * 16, FN = NTL * 16;
     constexpr uint32_t NTHR = WGM * WGN * kWave;
     constexpr uint32_t WM = MT / WGM, WN = NTL / WGN;
     static_assert(MT % WGM == 0 && NTL % WGN == 0, "the wave grid must divide the tile");
     /* The block-fp8 weight has one scale per 128x128 tile; a w4 weight one per row, so its block
      * may span two fp8 scale rows (the aligned form's 256-column down tile). */
-    static_assert(W4 != 0 || kBlock % FN == 0,
+    /* I8: the activation is int8 and the WMMA the iu8 one, its int32 sums read as numbers at the
+     * fold (r4d_fp8_wmma.h, mma8). The weight is then int8 too: at W4 0 the codes themselves with
+     * one bf16 scale per (row, 128 of K), the four-bit forms' scale grid, and at W4 1 to 3 the
+     * levels as int8 (moe_w4_bytes). kRowS: the weight's scale varies per row. */
+    constexpr bool kRowS = W4 != 0 || I8;
+    static_assert(!I8 || W4 <= 3, "the five- and six-bit levels have no int8 form");
+    static_assert(kRowS || kBlock % FN == 0,
                   "a block's N rows must sit in one 128-row weight scale row");
-    /* Scale groups per 128-wide block: one, or the 64- or 32-column groups at W4 2-4. */
-    constexpr uint32_t kSub = W4 == 3 ? 4u : (W4 == 2 || W4 == 4) ? 2u : 1u;
+    /* Scale groups per 128-wide block: one, or the 64- or 32-column groups at W4 2-5. */
+    constexpr uint32_t kSub = W4 == 3 ? 4u : (W4 == 2 || W4 == 4 || W4 == 5) ? 2u : 1u;
+    /* What multiplies a subgroup's E4M3 scale: the format's fixed second level, and at I8 the
+     * levels' unit. */
+    constexpr float kSubScale = I8 ? kW4G64Scale * kW4nlI8Unit : kW4G64Scale;
     /* 128-wide blocks per staged pass (one, or two at FK 256), and scale groups per pass. */
     constexpr uint32_t kBpS  = FK / kBlock;
     constexpr uint32_t kSubT = kSub * kBpS;
@@ -769,7 +826,8 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
     constexpr uint32_t kEwTPR = FK / 32, kEwRPP = NTHR / kEwTPR;
     constexpr uint32_t kEwBP = (FN + kEwRPP - 1) / kEwRPP;
     [[maybe_unused]] uint4    ew_b4[AL && W4 ? kEwBP : 1];
-    [[maybe_unused]] uint32_t ew_sp[AL && W4 == 4 ? kEwBP : 1];
+    [[maybe_unused]] uint32_t ew_sp[AL && (W4 == 4 || W4 == 5) ? kEwBP : 1];
+    [[maybe_unused]] uint32_t ew_hp[AL && W4 == 5 ? kEwBP : 1];
     [[maybe_unused]] Stage8   ew_b8[AL && !W4 ? kEwBP : 1];
     [[maybe_unused]] bool     ew_ok[AL ? kEwBP : 1];
     [[maybe_unused]] const uint8_t*  ew_wp  = nullptr;
@@ -804,8 +862,11 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
             if constexpr (W4) {
                 ew_b4[p] = moe_w4_load<W4, true>(ew_wp, ew_ok[p] ? wn0 + r : 0u,
                                                 C.w_ld, sk, true);
-                if constexpr (W4 == 4)
-                    ew_sp[p] = u32_load_w<true>((const uint32_t*)(wr + (C.k >> 1) + (sk >> 3)));
+                if constexpr (W4 == 4 || W4 == 5)
+                    ew_sp[p] = u32_load_w<true>((const uint32_t*)(wr + (C.k >> 1) +
+                                                 (W4 == 5 ? (C.k >> 3) : 0) + (sk >> 3)));
+                if constexpr (W4 == 5)
+                    ew_hp[p] = u32_load_w<true>((const uint32_t*)(wr + (C.k >> 1) + (sk >> 3)));
             } else
                 ew_b8[p] = stage8_load_w<true>(wr + sk, true);
         }
@@ -1029,7 +1090,7 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
         const uint32_t wn0 = part * fc + j0;          /* the weight row of the block's column 0 */
         const uint32_t K = C.k, w_ld = C.w_ld, ws_ld = C.s_ld;
         const uint32_t kb_n = wn0 / kBlock;           /* the weight scale's N row for this block */
-        if constexpr (W4) (void)kb_n;                 /* w4 scales vary per ROW, not per N block */
+        if constexpr (kRowS) (void)kb_n;              /* these scales vary per ROW, not per N block */
 
         /* Both table entries load before either is made uniform, so the two readfirstlanes wait on
          * one round trip. */
@@ -1050,7 +1111,7 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
          * scale fold. */
         const bool wlive = !SK || (r0 + wgm * WM * 16 < re);
         f8v raw[WM][WN], out[WM][WN];
-        /* The other scale groups' accumulators at W4 2-4 (`raw` is the first's), for every block of
+        /* The other scale groups' accumulators at W4 2-5 (`raw` is the first's), for every block of
          * the pass; one unused element otherwise. Each starts fresh at its group's first WMMA, so
          * none is zeroed. */
         f8v rx[kSubT > 1 ? kSubT - 1 : 1][kSubT > 1 ? WM : 1][kSubT > 1 ? WN : 1];
@@ -1075,7 +1136,8 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
          * the fold reads them from LDS. Bit-identical. */
         Stage8 apre[kAP];
         uint4  bpre4[kBP];      /* W4: packed nibbles, expanded at store time as before */
-        uint32_t spre[W4 == 4 ? kBP : 1];   /* W4 4: the same 32 elements' sign bits */
+        uint32_t spre[(W4 == 4 || W4 == 5) ? kBP : 1];
+        uint32_t hpre[W4 == 5 ? kBP : 1];
         Stage8 bpre8[kBP];      /* otherwise: the fp8 bytes themselves */
         /* kUL: whether each staged row is live. Under kUL every row's tile is loaded (a dead row
          * reads a row that exists) and the zero is selected at the LDS store. A guarded load writes
@@ -1113,9 +1175,9 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
                 if (tid < FM) {
                     const int32_t tok = s_tok[tid];
                     pok = tok >= 0 && (r0 + tid) >= rs && (r0 + tid) < re;
-                    const size_t ar = (size_t)(pok ? tok : 0) * as_ld + kbk;
+                    const size_t ar = (size_t)(pok ? tok : 0) * as_ld;
 #pragma unroll
-                    for (uint32_t h = 0; h < kBpS; ++h) pau[h] = As[ar + h];
+                    for (uint32_t h = 0; h < kBpS; ++h) pau[h] = As[ar + ((kbk + h) >> ash)];
                 } else if (tid < FM + FN) {
                     const uint32_t nn = tid - FM;
                     pok = j0 + nn < fc;
@@ -1124,7 +1186,7 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
                     for (uint32_t h = 0; h < kBpS; ++h) {
                         if constexpr (W4 == 3)
                             pwu[h] = u32_load_w<UW>((const uint32_t*)Wsp + wr + h);
-                        else if constexpr (W4)
+                        else if constexpr (kRowS)
                             pwu[h] = u16_load_w<UW>(Wsp + wr + h);
                         else
                             pwu[h] = u16_load_w<UW>(Wsp + (size_t)kb_n * ws_ld + kbk + h);
@@ -1135,7 +1197,7 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
                 const bool    ok  = tok >= 0 && (r0 + tid) >= rs && (r0 + tid) < re;
 #pragma unroll
                 for (uint32_t h = 0; h < kBpS; ++h)
-                    pas[h] = ok ? As[(size_t)tok * as_ld + kbk + h] : 0.0f;
+                    pas[h] = ok ? As[(size_t)tok * as_ld + ((kbk + h) >> ash)] : 0.0f;
             } else if (tid < FM + FN) {
                 const uint32_t nn = tid - FM;
 #pragma unroll
@@ -1145,7 +1207,7 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
                                      ? u32_load_w<UW>((const uint32_t*)Wsp +
                                                       (size_t)(wn0 + nn) * ws_ld + kbk + h)
                                      : 0u;
-                    else if constexpr (W4)
+                    else if constexpr (kRowS)
                         pws[h] = j0 + nn < fc
                                      ? u16_load_w<UW>(Wsp + (size_t)(wn0 + nn) * ws_ld + kbk + h)
                                      : 0u;
@@ -1178,7 +1240,8 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
                         bok[p] = ew_ok[p];
                         if constexpr (W4) {
                             bpre4[p] = ew_b4[p];
-                            if constexpr (W4 == 4) spre[p] = ew_sp[p];
+                            if constexpr (W4 == 4 || W4 == 5) spre[p] = ew_sp[p];
+                            if constexpr (W4 == 5) hpre[p] = ew_hp[p];
                         } else
                             bpre8[p] = ew_b8[p];
                         continue;
@@ -1186,7 +1249,8 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
                     /* The dead rows' zeros, as w4_load / stage8_load give them. */
                     if constexpr (W4) {
                         bpre4[p] = ew_ok[p] ? ew_b4[p] : make_uint4(0, 0, 0, 0);
-                        if constexpr (W4 == 4) spre[p] = ew_ok[p] ? ew_sp[p] : 0u;
+                        if constexpr (W4 == 4 || W4 == 5) spre[p] = ew_ok[p] ? ew_sp[p] : 0u;
+                        if constexpr (W4 == 5) hpre[p] = ew_ok[p] ? ew_hp[p] : 0u;
                     } else {
                         bpre8[p].v = ew_ok[p] ? ew_b8[p].v : make_uint4(0, 0, 0, 0);
                         bpre8[p].w = ew_ok[p] ? ew_b8[p].w : make_uint4(0, 0, 0, 0);
@@ -1201,17 +1265,20 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
                 const bool ok = (j0 + r) < fc;
                 /* W4: half the bytes of the row, expanded on the way in; `w_ld` is already the
                  * packed byte pitch. At W4 4 the row's sign plane (one bit per element) follows its
-                 * K/2 bytes of nibbles. Under kUL a dead row reads the tile's first row and the
+                 * K/2 bytes of nibbles; at W4 5 the high magnitude bits' plane does, and the sign
+                 * plane follows that. Under kUL a dead row reads the tile's first row and the
                  * store selects its zero (see bok). */
                 const uint8_t* wr = Wp + (size_t)(kUL && !ok ? wn0 : wn0 + r) * w_ld;
                 if constexpr (kUL) bok[p] = ok;
                 if constexpr (W4) {
                     bpre4[p] = moe_w4_load<W4, UW>(Wp, kUL && !ok ? wn0 : wn0 + r,
                                                   w_ld, cc + sk, kUL || ok);
-                    if constexpr (W4 == 4)
+                    if constexpr (W4 == 4 || W4 == 5)
                         spre[p] = kUL || ok ? u32_load_w<UW>((const uint32_t*)(wr + (K >> 1) +
-                                                                             ((cc + sk) >> 3)))
-                                           : 0u;
+                                                (W4 == 5 ? (K >> 3) : 0) + ((cc + sk) >> 3))) : 0u;
+                    if constexpr (W4 == 5)
+                        hpre[p] = kUL || ok ? u32_load_w<UW>((const uint32_t*)(wr + (K >> 1) +
+                                                                             ((cc + sk) >> 3))) : 0u;
                 } else
                     bpre8[p] = stage8_load_w<UW>(wr + cc + sk, kUL || ok);
             }
@@ -1251,10 +1318,13 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
                 /* a dead row's zero, where the packed form held it before (see bok) */
                 const bool live = !kUL || bok[p];
                 const uint4 b4 = live ? bpre4[p] : make_uint4(0, 0, 0, 0);
-                if constexpr (W4 == 4)
+                if constexpr (W4 == 5)
+                    stage8_store<FK>(s_b, r, sk, w6_expand(b4, live ? hpre[p] : 0u,
+                                                          live ? spre[p] : 0u, tab.v));
+                else if constexpr (W4 == 4)
                     stage8_store<FK>(s_b, r, sk, w5_expand(b4, live ? spre[p] : 0u, tab.v));
                 else if constexpr (W4)
-                    stage8_store<FK>(s_b, r, sk, w4_expand(b4, tab.v));
+                    stage8_store<FK>(s_b, r, sk, moe_w4_bytes<W4, I8>(b4, tab.v));
                 else
                     stage8_store<FK>(s_b, r, sk, kUL ? stage8_keep(bpre8[p], live) : bpre8[p]);
             }
@@ -1280,9 +1350,9 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
                         for (uint32_t q = 0; q < kSub; ++q)
                             s_ws[(h * kSub + q) * FN + tid - FM] =
                                 r4d_fp8::e4m3((uint32_t)((pws_v(h) >> (8 * q)) & 0xFFu)) *
-                                kW4G64Scale;
+                                kSubScale;
                 } else {
-                    s_ws[tid - FM] = (W4 || tid == FM) ? bscale(pws_v(0)) : 0.0f;
+                    s_ws[tid - FM] = (kRowS || tid == FM) ? bscale(pws_v(0)) : 0.0f;
                 }
             }
             if (c0 + FK < K) issue(c0 + FK, std::false_type{});
@@ -1306,10 +1376,10 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
                     if (SK && r0 + (wgm * WM + i) * 16 >= re) continue;
 #pragma unroll
                     for (uint32_t j = 0; j < WN; ++j)
-                        acc[i][j] = mma(af[i], bf[j], fresh ? acc_zero() : acc[i][j]);
+                        acc[i][j] = mma8<I8>(af[i], bf[j], fresh ? acc_zero() : acc[i][j]);
                 }
             };
-            /* At W4 2-4 each scale group of the tile has its own accumulator, so no group's WMMA
+            /* At W4 2-5 each scale group of the tile has its own accumulator, so no group's WMMA
              * waits on the previous group's fold; all fold once at the end of the tile, and each
              * group's first step starts its accumulator. At FK 256 group g of the pass is group
              * g % kSub of block g / kSub, in K order. */
@@ -1334,7 +1404,7 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
                  * w4:   one bf16 per (row, 128 of K); a 128x128 block scale would spend all sixteen
                  *       levels on its largest row. A fragment's lanes hold sixteen consecutive
                  *       output columns, so the scale is a per-lane constant per N tile.
-                 * W4 2-4: groups of 64 or 32 K, two or four per tile, each sum under its scale.
+                 * W4 2-5: groups of 64 or 32 K, two or four per tile, each sum under its scale.
                  *
                  * The fp8 form is written out separately because a * (b * c) and (a * b) * c differ
                  * in the last bit, and its output is byte-checked. */
@@ -1359,22 +1429,23 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
                         for (uint32_t j = 0; j < WN; ++j)
 #pragma unroll
                             for (uint32_t t = 0; t < 8; ++t) {
-                                float v = raw[i][j][t] * wq[0][j];
+                                float v = acc_val<I8>(raw[i][j][t]) * wq[0][j];
 #pragma unroll
-                                for (uint32_t q = 1; q < kSub; ++q) v += rx[q - 1][i][j][t] * wq[q][j];
+                                for (uint32_t q = 1; q < kSub; ++q)
+                                    v += acc_val<I8>(rx[q - 1][i][j][t]) * wq[q][j];
                                 out[i][j][t] += v * as[0][i][t];
                                 if constexpr (kBpS > 1) {
                                     /* FK 256: the second 128-wide block, folded after the first
                                      * with the expression a separate 128 pass would use, so `out`
                                      * sees the same updates. */
-                                    float v1 = rx[kSub - 1][i][j][t] * wq[kSub][j];
+                                    float v1 = acc_val<I8>(rx[kSub - 1][i][j][t]) * wq[kSub][j];
 #pragma unroll
                                     for (uint32_t q = 1; q < kSub; ++q)
-                                        v1 += rx[kSub + q - 1][i][j][t] * wq[kSub + q][j];
+                                        v1 += acc_val<I8>(rx[kSub + q - 1][i][j][t]) * wq[kSub + q][j];
                                     out[i][j][t] += v1 * as[1][i][t];
                                 }
                             }
-                } else if constexpr (W4) {
+                } else if constexpr (kRowS) {
                     float wsj[WN];
 #pragma unroll
                     for (uint32_t j = 0; j < WN; ++j)
@@ -1385,7 +1456,7 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
                         for (uint32_t j = 0; j < WN; ++j)
 #pragma unroll
                             for (uint32_t t = 0; t < 8; ++t) {
-                                out[i][j][t] += raw[i][j][t] * as[0][i][t] * wsj[j];
+                                out[i][j][t] += acc_val<I8>(raw[i][j][t]) * as[0][i][t] * wsj[j];
                                 raw[i][j][t] = 0.0f;
                             }
                 } else {
@@ -1431,35 +1502,20 @@ __device__ __forceinline__ void moe_gemm_q_kernel_body(
     }
 }
 
-/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
-template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
-          bool ES = false, bool AL = false, bool SK = false, uint32_t FK = kFK, bool UW = false,
-          bool RS = false>
+/* The kernel around the body, whose blocks return where their work ends: CH `r4dchain` is the
+ * chained form (r4d_chain.h), every block waiting before its first read and adding once after
+ * its last write. */
+template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4, bool ES, bool AL, bool SK,
+          uint32_t FK, bool UW, bool RS, bool I8, class CH>
 __global__ __launch_bounds__(WGM * WGN * kWave) R4D_WAVES(moe_waves(NTL, W4, ES, AL, FK, RS))
-void moe_gemm_q_kernel(
-    const uint8_t* __restrict__ Aq, const float* __restrict__ As,
-    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
-    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
-    uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
-    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
-    moe_gemm_q_kernel_body<MT, NTL, WGM, WGN, W4, ES, AL, SK, FK, UW, RS>(Aq, As, c_even, c_odd, c_2, c_3, sorted, off, Y, map, T, N, n_expert, top_k, a_ld, as_ld, y_ld, mode, tab);
+void moe_gemm_q_kernel(R4D_MOEGQ_PARAMS) {
+    if (CH::on) r4d_chain_wait();
+    moe_gemm_q_body<MT, NTL, WGM, WGN, W4, ES, AL, SK, FK, UW, RS, I8>(
+        Aq, As, c_even, c_odd, c_2, c_3, sorted, off, Y, map, T, N, n_expert, top_k, a_ld, as_ld,
+        y_ld, mode, tab);
+    if (CH::on) r4d_chain_done();
 }
-template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, int W4 = 0,
-          bool ES = false, bool AL = false, bool SK = false, uint32_t FK = kFK, bool UW = false,
-          bool RS = false>
-__global__ __launch_bounds__(WGM * WGN * kWave) R4D_WAVES(moe_waves(NTL, W4, ES, AL, FK, RS))
-void r4dchain_moe_gemm_q(
-    const uint8_t* __restrict__ Aq, const float* __restrict__ As,
-    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
-    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
-    uint16_t* __restrict__ Y, const uint32_t* __restrict__ map,
-    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t top_k,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
-    r4d_chain_wait();
-    moe_gemm_q_kernel_body<MT, NTL, WGM, WGN, W4, ES, AL, SK, FK, UW, RS>(Aq, As, c_even, c_odd, c_2, c_3, sorted, off, Y, map, T, N, n_expert, top_k, a_ld, as_ld, y_ld, mode, tab);
-    r4d_chain_done();
-}
+#undef R4D_MOEGQ_PARAMS
 
 /* ================================================================== moe_gemm_q, the down decode form
  *
@@ -1492,21 +1548,25 @@ void r4dchain_moe_gemm_q(
  *
  * Sorted operand only: a run's activation rows are [rs, re) of `Aq` with no gather. Every row in a
  * run is a placed slot (the scatter fills exactly [0, off[n_expert])), so `sorted` is not read. */
-template <int W4>
-__device__ __forceinline__ void moe_down_dec_kernel_body(
-    const uint8_t* __restrict__ Aq, const float* __restrict__ As,
-    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
-    const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
-    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t G,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
+#define R4D_MOEDD_PARAMS                                                                        \
+    const uint8_t* __restrict__ Aq, const float* __restrict__ As, const MoeCls c_even,          \
+    const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3, const int32_t* __restrict__ off,    \
+    uint16_t* __restrict__ Y, uint32_t T, uint32_t N, uint32_t n_expert, uint32_t G,            \
+    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab
+template <int W4, bool I8 = false>
+__device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS) {
     constexpr bool UW = true;
     constexpr uint32_t FM = 16, FN = 64, FK = kFK, NTHR = 4 * kWave;
-    constexpr uint32_t kSub = W4 == 3 ? 4u : (W4 == 2 || W4 == 4) ? 2u : 1u;
+    constexpr uint32_t kSub = W4 == 3 ? 4u : (W4 == 2 || W4 == 4 || W4 == 5) ? 2u : 1u;
+    /* moe_gemm_q_kernel's I8, with its per-row scale and its subgroup unit. */
+    constexpr bool kRowS = W4 != 0 || I8;
+    constexpr float kSubScale = I8 ? kW4G64Scale * kW4nlI8Unit : kW4G64Scale;
+    static_assert(!I8 || W4 <= 3, "the five- and six-bit levels have no int8 form");
     constexpr uint32_t NPT = kMaxExpert / NTHR;
     static_assert(kMaxExpert % NTHR == 0, "the offsets divide over the block's threads");
     static_assert(FK % (kSub * r4d_fp8::kK) == 0, "a scale group is whole WMMA K steps");
     static_assert(FM + FN <= NTHR, "a thread stages each row's and each column's scale");
-    const uint32_t cshift = (mode >> 1) & 3u, parts = mode >> 8;
+    const uint32_t cshift = (mode >> 1) & 3u, parts = mode >> 8, ash = (mode >> 3) & 1u;
 
     __shared__ uint8_t  s_a[FM * lds_pitch<FK>()];
     __shared__ uint8_t  s_b[FN * lds_pitch<FK>()];
@@ -1634,7 +1694,8 @@ __device__ __forceinline__ void moe_down_dec_kernel_body(
      * zero selected at the LDS store, scale-role registers uninitialised (see the note there). */
     Stage8 apre[kAP];
     uint4  bpre4[kBP];
-    uint32_t spre[W4 == 4 ? kBP : 1];
+    uint32_t spre[(W4 == 4 || W4 == 5) ? kBP : 1];
+    uint32_t hpre[W4 == 5 ? kBP : 1];
     Stage8 bpre8[kBP];
     using PwsT = uint32_t;              /* a 16-bit scale zero-extended: see u16_load_w */
     float pau[1];
@@ -1645,18 +1706,18 @@ __device__ __forceinline__ void moe_down_dec_kernel_body(
         const uint32_t n0 = cg0 + s.g * FN, part = n0 / fy, j0 = n0 - part * fy;
         const uint32_t wn0 = part * fc + j0;          /* the weight row of the tile's column 0 */
         const uint32_t kb_n = wn0 / kBlock;
-        if constexpr (W4) (void)kb_n;
+        if constexpr (kRowS) (void)kb_n;
         if (tid < FM) {
             const uint32_t row = rs + tid;
             pok = row < re;
-            pau[0] = As[(size_t)(pok ? row : 0u) * as_ld + kbk];
+            pau[0] = As[(size_t)(pok ? row : 0u) * as_ld + (kbk >> ash)];
         } else if (tid < FM + FN) {
             const uint32_t nn = tid - FM;
             pok = j0 + nn < fc;
             const size_t wr = (size_t)(pok ? wn0 + nn : wn0) * ws_ld + kbk;
             if constexpr (W4 == 3)
                 pwu[0] = u32_load_w<UW>((const uint32_t*)Wsp + wr);
-            else if constexpr (W4)
+            else if constexpr (kRowS)
                 pwu[0] = u16_load_w<UW>(Wsp + wr);
             else
                 pwu[0] = u16_load_w<UW>(Wsp + (size_t)kb_n * ws_ld + kbk);
@@ -1677,10 +1738,12 @@ __device__ __forceinline__ void moe_down_dec_kernel_body(
             if constexpr (W4) {
                 const uint8_t* wr = Wp + (size_t)(wn0 + r) * w_ld;
                 bpre4[p] = moe_w4_load<W4, UW>(Wp, wn0 + r, w_ld, cc + sk, ok);
-                if constexpr (W4 == 4)
+                if constexpr (W4 == 4 || W4 == 5)
                     spre[p] = ok ? u32_load_w<UW>((const uint32_t*)(wr + (K >> 1) +
-                                                                    ((cc + sk) >> 3)))
-                                 : 0u;
+                                      (W4 == 5 ? (K >> 3) : 0) + ((cc + sk) >> 3))) : 0u;
+                if constexpr (W4 == 5)
+                    hpre[p] = ok ? u32_load_w<UW>((const uint32_t*)(wr + (K >> 1) +
+                                                                    ((cc + sk) >> 3))) : 0u;
             } else
                 bpre8[p] = stage8_load_w<UW>(Wp + (size_t)(wn0 + r) * w_ld + cc + sk, ok);
         }
@@ -1706,10 +1769,12 @@ __device__ __forceinline__ void moe_down_dec_kernel_body(
         for (uint32_t q = 0; q < kBP; ++q) {
             const uint32_t r = sn + q * kRPP;
             if (r >= FN) continue;
-            if constexpr (W4 == 4)
+            if constexpr (W4 == 5)
+                stage8_store<FK>(s_b, r, sk, w6_expand(bpre4[q], hpre[q], spre[q], tab.v));
+            else if constexpr (W4 == 4)
                 stage8_store<FK>(s_b, r, sk, w5_expand(bpre4[q], spre[q], tab.v));
             else if constexpr (W4)
-                stage8_store<FK>(s_b, r, sk, w4_expand(bpre4[q], tab.v));
+                stage8_store<FK>(s_b, r, sk, moe_w4_bytes<W4, I8>(bpre4[q], tab.v));
             else
                 stage8_store<FK>(s_b, r, sk, bpre8[q]);
         }
@@ -1721,9 +1786,9 @@ __device__ __forceinline__ void moe_down_dec_kernel_body(
 #pragma unroll
                 for (uint32_t q = 0; q < kSub; ++q)
                     s_ws[q * FN + tid - FM] =
-                        r4d_fp8::e4m3((uint32_t)((pws >> (8 * q)) & 0xFFu)) * kW4G64Scale;
+                        r4d_fp8::e4m3((uint32_t)((pws >> (8 * q)) & 0xFFu)) * kSubScale;
             } else {
-                s_ws[tid - FM] = (W4 || tid == FM) ? bscale(pws) : 0.0f;
+                s_ws[tid - FM] = (kRowS || tid == FM) ? bscale(pws) : 0.0f;
             }
         }
         const Pass nxt = advance(cur);
@@ -1734,7 +1799,7 @@ __device__ __forceinline__ void moe_down_dec_kernel_body(
         auto kstep = [&](uint32_t ks, f8v& acc, bool fresh = false) {
             const i2v af = frag<FK>(s_a, 0, ks, lane);
             const i2v bf = frag<FK>(s_b, wave * 16, ks, lane);
-            acc = mma(af, bf, fresh ? acc_zero() : acc);
+            acc = mma8<I8>(af, bf, fresh ? acc_zero() : acc);
         };
         if constexpr (kSub > 1) {
             constexpr uint32_t kG = FK / kSub;
@@ -1759,16 +1824,16 @@ __device__ __forceinline__ void moe_down_dec_kernel_body(
                 for (uint32_t q = 0; q < kSub; ++q) wq[q] = s_ws[q * FN + wave * 16 + frag_c(lane)];
 #pragma unroll
                 for (uint32_t t = 0; t < 8; ++t) {
-                    float v = raw[t] * wq[0];
+                    float v = acc_val<I8>(raw[t]) * wq[0];
 #pragma unroll
-                    for (uint32_t q = 1; q < kSub; ++q) v += rx[q - 1][t] * wq[q];
+                    for (uint32_t q = 1; q < kSub; ++q) v += acc_val<I8>(rx[q - 1][t]) * wq[q];
                     out[t] += v * as[t];
                 }
-            } else if constexpr (W4) {
+            } else if constexpr (kRowS) {
                 const float wsj = s_ws[wave * 16 + frag_c(lane)];
 #pragma unroll
                 for (uint32_t t = 0; t < 8; ++t) {
-                    out[t] += raw[t] * as[t] * wsj;
+                    out[t] += acc_val<I8>(raw[t]) * as[t] * wsj;
                     raw[t] = 0.0f;
                 }
             } else {
@@ -1799,27 +1864,17 @@ __device__ __forceinline__ void moe_down_dec_kernel_body(
     }
 }
 
-/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
-template <int W4>
-__global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
-    const uint8_t* __restrict__ Aq, const float* __restrict__ As,
-    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
-    const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
-    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t G,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
-    moe_down_dec_kernel_body<W4>(Aq, As, c_even, c_odd, c_2, c_3, off, Y, T, N, n_expert, G, a_ld, as_ld, y_ld, mode, tab);
+/* The kernel around the body, as moe_gemm_q_kernel around its own: CH `r4dchain` is the chained
+ * form. */
+template <int W4, bool I8, class CH>
+__global__ __launch_bounds__(4 * kWave)
+void moe_down_dec_kernel(R4D_MOEDD_PARAMS) {
+    if (CH::on) r4d_chain_wait();
+    moe_down_dec_body<W4, I8>(Aq, As, c_even, c_odd, c_2, c_3, off, Y, T, N, n_expert, G, a_ld,
+                              as_ld, y_ld, mode, tab);
+    if (CH::on) r4d_chain_done();
 }
-template <int W4>
-__global__ __launch_bounds__(4 * kWave) void r4dchain_moe_down_dec(
-    const uint8_t* __restrict__ Aq, const float* __restrict__ As,
-    const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
-    const int32_t* __restrict__ off, uint16_t* __restrict__ Y,
-    uint32_t T, uint32_t N, uint32_t n_expert, uint32_t G,
-    uint32_t a_ld, uint32_t as_ld, uint32_t y_ld, uint32_t mode, const MoeTab tab) {
-    r4d_chain_wait();
-    moe_down_dec_kernel_body<W4>(Aq, As, c_even, c_odd, c_2, c_3, off, Y, T, N, n_expert, G, a_ld, as_ld, y_ld, mode, tab);
-    r4d_chain_done();
-}
+#undef R4D_MOEDD_PARAMS
 
 /* One or a few routed rows at I4 with BF16 scales per 128 K (signed or a 16-entry codebook).
  * A block owns one sorted row and 64 columns;
@@ -1831,6 +1886,7 @@ __global__ __launch_bounds__(4 * kWave) void r4dchain_moe_down_dec(
  *
  * Sorted rows are resolved independently, so singleton, repeated and empty expert runs, both
  * activation orders, parity/mod4 classes and dropped slots all retain their ordinary meaning. */
+template <bool I8 = false>
 __global__ __launch_bounds__(4 * kWave) void moe_w4_rows_kernel(
     const uint8_t* __restrict__ Aq, const float* __restrict__ As,
     const MoeCls c_even, const MoeCls c_odd, const MoeCls c_2, const MoeCls c_3,
@@ -1851,7 +1907,7 @@ __global__ __launch_bounds__(4 * kWave) void moe_w4_rows_kernel(
         else hi = mid;
     }
     const uint32_t e = (uint32_t)__builtin_amdgcn_readfirstlane((int)lo);
-    const uint32_t cshift = (mode >> 1) & 3u, parts = mode >> 8;
+    const uint32_t cshift = (mode >> 1) & 3u, parts = mode >> 8, ash = (mode >> 3) & 1u;
     const uint32_t cls = e & ((1u << cshift) - 1u);
     const MoeCls& C = cls == 0 ? c_even : cls == 1 ? c_odd : cls == 2 ? c_2 : c_3;
     const uint32_t fy = N / parts, fc = C.n / parts;
@@ -1867,7 +1923,7 @@ __global__ __launch_bounds__(4 * kWave) void moe_w4_rows_kernel(
     const uint16_t* Ws = uw_ptr<true>((const uint16_t*)wtab_at(C.s, C.s_s0, e >> cshift));
     float out = 0.f;
     for (uint32_t g = 0; g < C.k / kBlock; ++g) {
-        const float as = As[(size_t)arow * as_ld + g];
+        const float as = As[(size_t)arow * as_ld + (g >> ash)];
         const float ws = bscale(u16_load_w<true>(Ws + (size_t)(wn0 + col) * C.s_ld + g));
         f8v raw = acc_zero();
 #pragma unroll
@@ -1882,10 +1938,10 @@ __global__ __launch_bounds__(4 * kWave) void moe_w4_rows_kernel(
                 const i2v af = { (int)a.x, (int)a.y };
                 const i2v bf = { (int)w4_e4m3(w & 0x0f0f0f0fu, tab.v),
                                  (int)w4_e4m3((w >> 4) & 0x0f0f0f0fu, tab.v) };
-                raw = mma(af, bf, raw);
+                raw = mma8<I8>(af, bf, raw);
             }
         }
-        out += raw[0] * as * ws;
+        out += acc_val<I8>(raw[0]) * as * ws;
     }
     if (lane < 16 && n0 + col < N) Y[(size_t)row * y_ld + n0 + col] = f32_to_bf16(out);
 }
@@ -1928,15 +1984,15 @@ __device__ __forceinline__ mb_v8bf mb_frag(const uint16_t* __restrict__ tile, ui
     return u.f;
 }
 
+#define R4D_MOE16_PARAMS                                                                    \
+    const uint16_t* __restrict__ A, const void* const* __restrict__ Wt, size_t w_s0,            \
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,                        \
+    uint16_t* __restrict__ Y, uint32_t T, uint32_t N, uint32_t K, uint32_t n_expert,            \
+    uint32_t top_k, uint32_t a_sorted, uint32_t a_ld, uint32_t w_ld, uint32_t y_ld,             \
+    const uint32_t* __restrict__ map
 template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, bool ES = false, bool AL = false,
           bool SK = false>
-__global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
-    const uint16_t* __restrict__ A, const void* const* __restrict__ Wt, size_t w_s0,
-    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off,
-    uint16_t* __restrict__ Y,
-    uint32_t T, uint32_t N, uint32_t K, uint32_t n_expert, uint32_t top_k, uint32_t a_sorted,
-    uint32_t a_ld, uint32_t w_ld, uint32_t y_ld,
-    const uint32_t* __restrict__ map) {
+__device__ __forceinline__ void moe_gemm_bf16_body(R4D_MOE16_PARAMS) {
     constexpr uint32_t FM = MT * 16, FN = NTL * 16;
     constexpr uint32_t NTHR = WGM * WGN * kWave;
     constexpr uint32_t WM = MT / WGM, WN = NTL / WGN;
@@ -2151,6 +2207,17 @@ __global__ __launch_bounds__(WGM * WGN * kWave) void moe_gemm_bf16_kernel(
         if (ES) break;
     }
 }
+
+/* The kernel around the body, as moe_gemm_q_kernel around its own: CH `r4dchain` is the chained
+ * form, which the launcher takes at decode heights. */
+template <uint32_t MT, uint32_t NTL, uint32_t WGM, uint32_t WGN, bool ES, bool AL, bool SK, class CH>
+__global__ __launch_bounds__(WGM * WGN * kWave)
+void moe_gemm_bf16_kernel(R4D_MOE16_PARAMS) {
+    if (CH::on) r4d_chain_wait();
+    moe_gemm_bf16_body<MT, NTL, WGM, WGN, ES, AL, SK>(A, Wt, w_s0, sorted, off, Y, T, N, K, n_expert, top_k, a_sorted, a_ld, w_ld, y_ld, map);
+    if (CH::on) r4d_chain_done();
+}
+#undef R4D_MOE16_PARAMS
 
 /* ================================================================== moe_gather
  *
@@ -2593,7 +2660,7 @@ static inline bool r4d_moe_decode_band(long long T, long long n_expert) {
 }
 /* Row limit, per weight format, for staging two 128-wide K blocks per pass (FK 256) in the decode
  * form of the token-operand projection (gate_up). Only formats that already fold scale groups
- * (W4 2-4) with every class's K a multiple of 256 qualify. Bit-identical either way; a constant, so
+ * (W4 2-5) with every class's K a multiple of 256 qualify. Bit-identical either way; a constant, so
  * recorded and live passes take the same kernel.
  *
  * Measured (gate_up, us, one block / two): the 4-bit formats gain at 10-20 rows but not at 40-160
@@ -2602,7 +2669,8 @@ static inline bool r4d_moe_decode_band(long long T, long long n_expert) {
  * the 4-bit formats still take two blocks up to 80 rows (two sequences at depth 3): on Flash-Next
  * (w4nl64a8h) a one-stream step at depth 3 is 1.1% shorter at TP4 and no slower at TP2. */
 template <int W4>
-constexpr long long kMoeGuFk256Rows = W4 == 4 ? (1ll << 40) : (W4 == 2 || W4 == 3) ? 80 : 0;
+constexpr long long kMoeGuFk256Rows = (W4 == 4 || W4 == 5) ? (1ll << 40)
+                                   : (W4 == 2 || W4 == 3) ? 80 : 0;
 /* The decode form's staged K, pinnable for tests: 0 kMoeGuFk256Rows's rule, 1 one 128-wide block
  * per pass, 2 two wherever allowed. r4d_selftest compares both byte for byte. */
 static int g_moe_fk_pin = 0;
@@ -2651,10 +2719,12 @@ static inline long long r4d_blockmap_bytes(long long cap) {
  * The prefix is parallel (a DPP scan per wave and one exchange of wave totals, 256 counts per tile;
  * three tiles at 512 experts), not 513 dependent LDS round trips on one thread ahead of a GEMM that
  * waits for the map. Integer sums are order-independent. */
+template <class CH>
 __global__ __launch_bounds__(256) void moe_blockmap_kernel(
     const int32_t* __restrict__ off, uint32_t n_expert, uint32_t T, uint32_t FM, uint32_t cap,
     uint32_t* __restrict__ map) {
     constexpr uint32_t NT = 256, NW = NT / kWave, kTiles = (kMaxExpert + NT) / NT;
+    if (CH::on) r4d_chain_wait();
     __shared__ uint32_t s_cnt[kMaxExpert + 1];
     __shared__ int32_t  s_wt[kTiles][NW];
     const uint32_t tid = threadIdx.x, lane = tid % kWave, wave = tid / kWave;
@@ -2722,6 +2792,7 @@ __global__ __launch_bounds__(256) void moe_blockmap_kernel(
             map[1 + 2 * o + 1] = r;
         }
     }
+    if (CH::on) r4d_chain_done();
 }
 
 /* Launch form: 0 the rule; for tests, 1 pins the run-aligned prefill form, 2 the (tile, run)
@@ -2732,13 +2803,42 @@ static int g_moe_prefill_form = 0;
  * projection's 256-column tile (use 128 or 64), 2 the 256-column tile (refused where the shape
  * cannot take it or the launch is not aligned). r4d_selftest compares them byte for byte. */
 static int g_moe_down_tile_pin = 0;
+/* The 256-column down tile's rows a block: 32 over sixteen waves of one 16-row M tile and two column
+ * tiles each, or 64 over the same sixteen waves of two M tiles each (MT 4, WGM 2). The 64-row block
+ * stages its run's weight tile once for twice the rows and runs twice the WMMA steps between two
+ * barriers, with half the blocks; each element is the 32-row block's sum, a wave's second M tile
+ * being what another block's wave computed. Built for the form measured, the int8 activation under
+ * w4nl64's scales.
+ *
+ * Flash-Next's down (2560 x 384:256 at a rank of two, 512 experts, top 10), us a layer in the
+ * engine's prefill (stamped, card 0), 32 -> 64 rows: a pass of 20480 rows 693 -> 633, 40960 rows
+ * 1288 -> 1097, 81920 rows 2441 -> 1971. r4d_selftest --perfmoe over a measured routing, us a
+ * launch: 1024 tokens 527 -> 533, 1536 667 -> 652, 2048 807 -> 764, 4096 1407 -> 1258, 8192
+ * 2673 -> 2297.
+ *
+ * Not the bandwidth it looks like at 32 rows (843 MB of weight and output in 1.37 ms at 4096
+ * tokens): a block that takes several row tiles in turn, and so reads its weight tile from cache
+ * after the first, was no faster than the 64-row block (1255-1320 us at 4096), and 128-row blocks
+ * over thirty-two waves, or of four M tiles a wave, slower (1390-2170).
+ *
+ * The rule takes 64 rows from a mean of 32 routed rows an expert (kMoeDownMtRowsPerExpert: 16384
+ * rows at 512 experts). Pinnable for tests: -1 the rule, 2 or 4 the M tiles a block.
+ * r4d_selftest compares them byte for byte. */
+constexpr long long kMoeDownMtRowsPerExpert = 32;
+static int g_moe_down_mt_pin = -1;
+static inline int r4d_moe_down_mt(long long T, long long n_expert) {
+    if (g_moe_down_mt_pin > 0) return g_moe_down_mt_pin;
+    return T >= kMoeDownMtRowsPerExpert * n_expert ? 4 : 2;
+}
 
 /* One body for the fp8 and w4 launchers, which differ only in the weight dtype and its two
  * pitches, so their shape checks cannot drift apart.
  *
  * `ncls` is the class count: 2 for `moe_gemm_q` (odd class = operands 6 and 7 at N_odd/K_odd), 4
  * for `moe_gemm_q_mod4` (classes 1..3 = operands 6/7, 8/9, 10/11 at N_1/K_1 .. N_3/K_3, `y` at 12). */
-template <int W4>
+/* I8: the int8 activation's rows (dtypes i8a8 and i8a8h at W4 0, the four-bit forms' `a8i8`
+ * names), the kernels' I8. */
+template <int W4, bool I8 = false>
 static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     int emit_rc = RAD_OK;
     if (ncls != 2 && ncls != 4) return R4D_NO(RAD_E_INVAL);
@@ -2776,15 +2876,21 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     const long long group = r4d_geti_or(a, "group", kBlock);
     if (parts <= 0 || n_expert <= 0 || top_k <= 0) return R4D_NO(RAD_E_SHAPE);
     if (group != (long long)kBlock) return R4D_NO(RAD_E_SHAPE);
+    /* `a_group`: the K one activation scale covers, 128 or, for an int8 activation quantised as
+     * IQ8R's are, 256 (two of the kernel's K blocks under one scale). */
+    const long long a_group = r4d_geti_or(a, "a_group", kBlock);
+    if (a_group != (long long)kBlock && !(I8 && a_group == 2 * (long long)kBlock))
+        return R4D_NO(RAD_E_UNSUPPORTED);
     long long N = 0, K = 0;
     for (int q = 0; q < ncls; ++q) {
         if (Nc[q] <= 0 || Kc[q] <= 0) return R4D_NO(RAD_E_SHAPE);
         /* A part of every class is whole 64-column tiles, so a tile is all weight or all padding. */
-        if (Kc[q] % kBlock || Nc[q] % (64 * parts)) return R4D_NO(RAD_E_SHAPE);
+        if (Kc[q] % a_group || Nc[q] % (64 * parts)) return R4D_NO(RAD_E_SHAPE);
         if (Nc[q] > N) N = Nc[q];
         if (Kc[q] > K) K = Kc[q];
     }
-    if (Aq->dtype != RAD_F8E4M3 || As->dtype != RAD_F32 || Y->dtype != RAD_BF16)
+    if (Aq->dtype != (I8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3) || As->dtype != RAD_F32 ||
+        Y->dtype != RAD_BF16)
         return R4D_NO(RAD_E_DTYPE);
     if (sorted->dtype != RAD_I32 || off->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
 
@@ -2795,7 +2901,7 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     const long long a_ld = r4d_rows_pitch(Aq, K, &M);
     if (a_ld < 0 || M <= 0) return R4D_NO(RAD_E_STRIDE);
     long long Ms = 0;
-    const long long as_ld = r4d_rows_pitch(As, K / kBlock, &Ms);
+    const long long as_ld = r4d_rows_pitch(As, K / a_group, &Ms);
     if (as_ld < 0 || Ms < M) return R4D_NO(RAD_E_STRIDE);
     if (r4d_numel(sorted) < T || r4d_numel(off) < n_expert + 1) return R4D_NO(RAD_E_SHAPE);
 
@@ -2807,23 +2913,28 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     if (M < (a_sorted ? T : (T + top_k - 1) / top_k)) return R4D_NO(RAD_E_SHAPE);
 
     /* The code table, from the dtype the layout hook accepted: w4nla8h's levels, w5nl64a8h's
-     * magnitudes, or two's complement for w4a8 and w4a8h. */
+     * magnitudes, w6nl64a8h's lower sixteen magnitudes, or two's complement for w4a8 and w4a8h. */
     const char* wdt = r4d_gets(a, "dtype");
-    const uint32_t* tab = W4 == 4 ? kW5nlMagPerm
+    const uint32_t* tab = I8 ? kW4IntPermI8
+                        : W4 == 5 ? kW6nlMagPerm
+                        : W4 == 4 ? kW5nlMagPerm
                         : (W4 && wdt && (!std::strcmp(wdt, "w4nla8h") ||
                                          !std::strcmp(wdt, "w4nl64a8h") ||
                                          !std::strcmp(wdt, "w4nl32a8h"))) ? kW4nlPerm : kW4IntPerm;
 
     /* One class's tables. The kernel wants the weight pitch in bytes: half the element count for a
-     * 4-bit plane, five eighths for the 5-bit one. `wtab_of` reports the declared element stride,
-     * so the scaling happens here. */
+     * 4-bit plane, five eighths for the 5-bit one, three quarters for the 6-bit one. `wtab_of`
+     * reports the declared element stride, so the scaling happens here. */
     auto cls_of = [&](const RadTensor* w, const RadTensor* ws, long long cnt, long long n,
                       long long k, MoeCls* c) -> int {
         long long w_ld = 0, ws_ld = 0;
         size_t w_s0 = 0, s_s0 = 0;
-        int rc = wtab_of(w, W4 == 4 ? (uint32_t)R4D_DT_MOEW5
-                            : W4 ? (uint32_t)R4D_DT_MOEW4 : (uint32_t)RAD_F8E4M3,
-                         W4 == 4 ? 5 : W4 ? 4 : 8, cnt, n, k, &c->w, &w_s0, &w_ld);
+        int rc = wtab_of(w, W4 == 5 ? (uint32_t)R4D_DT_MOEW6
+                            : W4 == 4 ? (uint32_t)R4D_DT_MOEW5
+                            : W4 ? (uint32_t)R4D_DT_MOEW4
+                            : I8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3,
+                         W4 == 5 ? 6 : W4 == 4 ? 5 : W4 ? 4 : 8,
+                         cnt, n, k, &c->w, &w_s0, &w_ld);
         if (rc != RAD_OK) return rc;
         if constexpr (W4 >= 2) {
             /* One E4M3 byte per (row, group of 64 or 32 K). The pitch is derived, not read: the
@@ -2834,9 +2945,11 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
                          &s_s0, &ws_ld);
             if (rc != RAD_OK) return rc;
             /* A 5-bit row is its nibbles then its sign bits; the kernel finds the signs K/2 bytes
-             * in. */
-            if (W4 == 4 ? (w_ld % 8 || k % 32) : (w_ld % 2)) return R4D_NO(RAD_E_STRIDE);
-            w_ld = W4 == 4 ? w_ld / 8 * 5 : w_ld / 2;
+             * in. A 6-bit row is its nibbles, its high magnitude bits and then its sign bits; the
+             * kernel finds them K/2 and 5K/8 bytes in. */
+            if (W4 == 5 ? (w_ld % 4 || k % 32) : W4 == 4 ? (w_ld % 8 || k % 32) : (w_ld % 2))
+                return R4D_NO(RAD_E_STRIDE);
+            w_ld = W4 == 5 ? w_ld / 4 * 3 : W4 == 4 ? w_ld / 8 * 5 : w_ld / 2;
             ws_ld = k / kBlock;
         } else if constexpr (W4) {
             /* The scale plane is one bf16 per (row, 128 of K), not per 128x128 tile. */
@@ -2844,6 +2957,10 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
             if (rc != RAD_OK) return rc;
             if (w_ld < k || w_ld % 64) return R4D_NO(RAD_E_STRIDE); // whole 64-K fragment tiles
             w_ld /= 2;
+        } else if constexpr (I8) {
+            /* Int8 codes row-major, one bf16 scale per (row, 128 of K). */
+            rc = wtab_of(ws, RAD_BF16, 16, cnt, n, k / kBlock, &c->s, &s_s0, &ws_ld);
+            if (rc != RAD_OK) return rc;
         } else {
             rc = wtab_of(ws, RAD_BF16, 16, cnt, (n + kBlock - 1) / kBlock, k / kBlock, &c->s,
                          &s_s0, &ws_ld);
@@ -2873,7 +2990,8 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     const MoeCls& c3 = cl[3];
     const uint32_t cshift = ncls == 4 ? 2u : 1u;
     if (parts > 0xFFFFFF) return R4D_NO(RAD_E_SHAPE);
-    const uint32_t mode = (a_sorted ? 1u : 0u) | (cshift << 1) | ((uint32_t)parts << 8);
+    const uint32_t mode = (a_sorted ? 1u : 0u) | (cshift << 1) |
+                          (a_group != (long long)kBlock ? 8u : 0u) | ((uint32_t)parts << 8);
     MoeTab tabv{};
     for (int i = 0; i < 4; ++i) tabv.v[i] = tab[i];
 
@@ -2883,7 +3001,7 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     if constexpr (W4 == 1) {
         if (T <= top_k && T <= 32 && g_moe_prefill_form == 0 &&
             g_moe_down_dec_pin == 0 && g_moe_fk_pin == 0) {
-            emit_rc = R4D_EMIT(stream, (moe_w4_rows_kernel),
+            emit_rc = R4D_EMIT(stream, (moe_w4_rows_kernel<I8>),
                                dim3((unsigned)T, (unsigned)(N / 64)), dim3(4 * kWave), 0,
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                                (const int32_t*)sorted->data, (const int32_t*)off->data,
@@ -2900,9 +3018,8 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
      * rows take the aligned 32-row form; r4d_moe_decode_band has the crossover. */
     const uint32_t ny = (uint32_t)(N / 64);
     const int form = g_moe_prefill_form;
-    /* The chained forms (r4d_chain.h) where the row resolved with `chain`, at decode heights. */
-    const bool ch = r4d_geti_or(a, "chain", 0) != 0 &&
-                    r4d_chain_rows_ok(a_sorted ? (T + top_k - 1) / top_k : M);
+    /* The decode band's launch has a chained form (r4d_chain.h); the prefill forms have none. */
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0;
     if ((form == 0 && r4d_moe_decode_band(T, n_expert)) || form == 2) {
         /* The decode grid is (tile, run) wide (the kernel's ES note); decode has one tile of rows,
          * which alone would give only N/64 workgroups. */
@@ -2916,12 +3033,15 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
         if (dn_dec && g2 > 0) {
             const unsigned slots  = (unsigned)(std::min(T, n_expert) + (T + 15) / 16);
             const unsigned groups = (unsigned)((N + 64 * g2 - 1) / (64 * g2));
-            emit_rc = R4D_EMIT(stream, (ch ? &r4dchain_moe_down_dec<W4> : &moe_down_dec_kernel<W4>),
-                               dim3(slots + 1u, groups), dim3(4 * kWave), 0,
-                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
-                               (const int32_t*)off->data, (uint16_t*)Y->data,
-                               (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)g2,
-                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
+#define R4D_MOE_DD(CH_)                                                                          \
+            emit_rc = R4D_EMIT(stream, (moe_down_dec_kernel<W4, I8, CH_>),                       \
+                               dim3(slots + 1u, groups), dim3(4 * kWave), 0,                     \
+                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3, \
+                               (const int32_t*)off->data, (uint16_t*)Y->data,                    \
+                               (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)g2,       \
+                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv)
+            if (chain) R4D_MOE_DD(r4dchain); else R4D_MOE_DD(R4dUnchained);
+#undef R4D_MOE_DD
             if (emit_rc != RAD_OK) return emit_rc;
             R4D_MOE_CHK();
             return RAD_OK;
@@ -2933,11 +3053,15 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
         const bool rs = n_expert <= (long long)kMaxExpert;
         auto pick = [&](auto fk) {
             constexpr uint32_t F = decltype(fk)::value;
-            if (ch)
-                return rs ? &r4dchain_moe_gemm_q<1, 4, 1, 4, W4, true, false, false, F, true, true>
-                          : &r4dchain_moe_gemm_q<1, 4, 1, 4, W4, true, false, false, F, true, false>;
-            return rs ? &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, true, true>
-                      : &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, true, false>;
+            if (chain)
+                return rs ? &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, true, true, I8,
+                                               r4dchain>
+                          : &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, true, false, I8,
+                                               r4dchain>;
+            return rs ? &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, true, true, I8,
+                                           R4dUnchained>
+                      : &moe_gemm_q_kernel<1, 4, 1, 4, W4, true, false, false, F, true, false, I8,
+                                           R4dUnchained>;
         };
         auto kern = pick(std::integral_constant<uint32_t, kFK>{});
         if constexpr (W4 >= 2) {
@@ -2970,24 +3094,41 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
          * instead of 128 over eight. Each wave's share is unchanged, so every element is the same
          * sum; the wider block stages the activation and run prologue once for twice the columns.
          * Other shapes keep the 128- or 64-column tile. */
-        bool dn_wide = W4 != 0 && a_sorted && parts == 1 && N % (2 * kPrefillCols) == 0;
+        bool dn_wide = (W4 != 0 || I8) && a_sorted && parts == 1 &&
+                       N % (2 * kPrefillCols) == 0;
         for (int q = 0; q < ncls; ++q) dn_wide = dn_wide && Nc[q] % (2 * kPrefillCols) == 0;
         const int tpin = g_moe_down_tile_pin;
         if (tpin < 0 || tpin > 2) return R4D_NO(RAD_E_INVAL);
         if (tpin == 2 && (!map || !dn_wide)) return R4D_NO(RAD_E_UNSUPPORTED);
         if (tpin == 1) dn_wide = false;
+        /* The 256-column tile's M tiles a block (r4d_moe_down_mt); the 64-row block's map has fewer
+         * entries than the scratch holds. */
+        int dmt = 2;
+        if constexpr (W4 == 2 && I8) { if (map && dn_wide) dmt = r4d_moe_down_mt(T, n_expert); }
+        const long long dfm = dmt * 16;
+        const long long dcap = dmt == 2 ? cap : r4d_blockmap_cap(T, n_expert, dfm);
         if (map) {
-            emit_rc = R4D_EMIT(stream, moe_blockmap_kernel, dim3(1), dim3(256), 0,
+            emit_rc = R4D_EMIT(stream, moe_blockmap_kernel<R4dUnchained>, dim3(1), dim3(256), 0,
                                (const int32_t*)off->data, (uint32_t)n_expert, (uint32_t)T,
-                               (uint32_t)kPrefillRows, (uint32_t)cap, map);
+                               (uint32_t)dfm, (uint32_t)dcap, map);
             if (emit_rc != RAD_OK) return emit_rc;
             /* Every aligned instantiation uses UW and issues its first pass at the map read (see
              * the early-weight note at the kernel). */
-            if (dn_wide) {
-                /* Only a w4 weight takes it (dn_wide is false otherwise); the block-fp8
-                 * instantiation would not compile, its scale being per 128x128 tile. */
-                if constexpr (W4 != 0)
-                    emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, 2 * kPrefillCols / 16, 2, 8, W4, false, true, true, kFK, true>),
+            if (dn_wide && dmt == 4) {
+                if constexpr (W4 == 2 && I8)
+                    emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<4, 2 * kPrefillCols / 16, 2, 8, W4, false, true, true, kFK, true, false, I8, R4dUnchained>),
+                               dim3((unsigned)dcap, (unsigned)(N / (2 * kPrefillCols))),
+                               dim3(16 * kWave), 0,
+                               (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
+                               (const int32_t*)sorted->data, (const int32_t*)off->data,
+                               (uint16_t*)Y->data, (const uint32_t*)map,
+                               (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
+                               (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
+            } else if (dn_wide) {
+                /* Only a weight with a scale per row takes it (dn_wide is false otherwise); the
+                 * block-fp8 instantiation would not compile, its scale being per 128x128 tile. */
+                if constexpr (W4 != 0 || I8)
+                    emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, 2 * kPrefillCols / 16, 2, 8, W4, false, true, true, kFK, true, false, I8, R4dUnchained>),
                                dim3((unsigned)cap, (unsigned)(N / (2 * kPrefillCols))),
                                dim3(16 * kWave), 0,
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
@@ -2996,7 +3137,7 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
                                (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
                                (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
             } else if (wide_n) {
-                emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true, kFK, true>),
+                emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, true, true, kFK, true, false, I8, R4dUnchained>),
                                dim3((unsigned)cap, nyw), dim3(8 * kWave), 0,
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                                (const int32_t*)sorted->data, (const int32_t*)off->data,
@@ -3004,7 +3145,7 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
                                (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
                                (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
             } else {
-                emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, true, true, kFK, true>),
+                emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, true, true, kFK, true, false, I8, R4dUnchained>),
                                dim3((unsigned)cap, ny), dim3(4 * kWave), 0,
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
                                (const int32_t*)sorted->data, (const int32_t*)off->data,
@@ -3013,7 +3154,7 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
                                (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
             }
         } else if (wide_n) {
-            emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, false, true>),
+            emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, kPrefillCols / 16, 2, 4, W4, false, false, true, kFK, false, false, I8, R4dUnchained>),
                                dim3((unsigned)((T + kPrefillRows - 1) / kPrefillRows), nyw),
                                dim3(8 * kWave), 0,
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
@@ -3022,7 +3163,7 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
                                (uint32_t)T, (uint32_t)N, (uint32_t)n_expert, (uint32_t)top_k,
                                (uint32_t)a_ld, (uint32_t)as_ld, (uint32_t)y_ld, mode, tabv);
         } else {
-            emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, false, true>),
+            emit_rc = R4D_EMIT(stream, (moe_gemm_q_kernel<kPrefillRows / 16, 4, 2, 2, W4, false, false, true, kFK, false, false, I8, R4dUnchained>),
                                dim3((unsigned)((T + kPrefillRows - 1) / kPrefillRows), ny),
                                dim3(4 * kWave), 0,
                                (const uint8_t*)Aq->data, (const float*)As->data, ce, co, c2, c3,
@@ -3054,40 +3195,73 @@ static int64_t moe_gemm_map_scratch(const RadArgs* a) {
     return r4d_blockmap_bytes(r4d_blockmap_cap(T, n_expert, kPrefillRows));
 }
 
+/* The run map and the decode band for another unit's grouped GEMM over the same sort
+ * (r4d_moe_iqr.hip): the map's entry bound and bytes at `fm` rows a block, and its one launch. */
+long long r4d_moe_blockmap_cap(long long T, long long n_expert, long long fm) {
+    return r4d_blockmap_cap(T, n_expert, fm);
+}
+long long r4d_moe_blockmap_bytes(long long cap) { return r4d_blockmap_bytes(cap); }
+int r4d_moe_blockmap_emit(RadStream s, const int32_t* off, uint32_t n_expert, uint32_t T,
+                          uint32_t fm, uint32_t cap, uint32_t* map) {
+    return R4D_EMIT(s, moe_blockmap_kernel<R4dUnchained>, dim3(1), dim3(256), 0, off, n_expert, T, fm,
+                    cap, map);
+}
+bool r4d_moe_in_decode_band(long long T, long long n_expert) {
+    return r4d_moe_decode_band(T, n_expert);
+}
+
 extern "C" int64_t r4d_rad_moe_gemm_q_scratch(const RadArgs* a)    { return moe_gemm_map_scratch(a); }
 extern "C" int64_t r4d_rad_moe_gemm_w4a8_scratch(const RadArgs* a) { return moe_gemm_map_scratch(a); }
 
 extern "C" void r4d_moe_gemm_pin_prefill(int form) { g_moe_prefill_form = form; }
 extern "C" void r4d_moe_gemm_pin_fk(int pin) { g_moe_fk_pin = pin; }
 extern "C" void r4d_moe_gemm_pin_down_tile(int pin) { g_moe_down_tile_pin = pin; }
+extern "C" void r4d_moe_gemm_pin_down_mt(int pin) {
+    g_moe_down_mt_pin = (pin == 2 || pin == 4) ? pin : -1;
+}
 extern "C" void r4d_moe_gemm_pin_down_dec(int pin) {
     g_moe_down_dec_pin = pin < (int)kMoeDownDecMaxG ? pin : (int)kMoeDownDecMaxG;
 }
 
-extern "C" int r4d_rad_moe_gemm_q(const RadArgs* a, RadStream s) {
-    return moe_gemm_launch<0>(a, s);
-}
-
 /* The four-bit forms (an E4M3 scale per 64 or 32 of K for w4nl64a8h / w4nl32a8h, else a bf16
- * scale per 128) and the five-bit w5nl64a8h. */
+ * scale per 128), the five-bit w5nl64a8h and the six-bit w6nl64a8h. */
 extern "C" int r4d_rad_moe_gemm_w4a8(const RadArgs* a, RadStream stream) {
     const char* wdt = r4d_gets(a, "dtype");
     if (wdt && !std::strcmp(wdt, "w4nl64a8h")) return moe_gemm_launch<2>(a, stream);
     if (wdt && !std::strcmp(wdt, "w4nl32a8h")) return moe_gemm_launch<3>(a, stream);
     if (wdt && !std::strcmp(wdt, "w5nl64a8h")) return moe_gemm_launch<4>(a, stream);
+    if (wdt && !std::strcmp(wdt, "w6nl64a8h")) return moe_gemm_launch<5>(a, stream);
     return moe_gemm_launch<1>(a, stream);
 }
 
-/* `moe_gemm_q_mod4`: the same launches over four classes, by expert number mod 4. The run map and
- * its scratch are the two-class op's, since they depend only on the offsets. */
-extern "C" int r4d_rad_moe_gemm_q_mod4(const RadArgs* a, RadStream s) {
-    return moe_gemm_launch<0>(a, s, 4);
+/* The int8 activation's rows. `i8a8` and `i8a8h`: int8 experts, row-major codes with a bf16 scale
+ * per (row, 128 of K). The four-bit experts keep their stored planes: `w4a8i8` and `w4a8i8h` the
+ * integer grid with a bf16 scale per (row, 128), `w4nl64a8i8h` and `w4nl32a8i8h` the w4nl codebook
+ * with an E4M3 scale per (row, 64 or 32 of K). */
+static int moe_gemm_w4a8i8(const RadArgs* a, RadStream stream, int ncls) {
+    const char* wdt = r4d_gets(a, "dtype");
+    if (wdt && !std::strcmp(wdt, "w4nl64a8i8h")) return moe_gemm_launch<2, true>(a, stream, ncls);
+    if (wdt && !std::strcmp(wdt, "w4nl32a8i8h")) return moe_gemm_launch<3, true>(a, stream, ncls);
+    return moe_gemm_launch<1, true>(a, stream, ncls);
+}
+extern "C" int r4d_rad_moe_gemm_i8a8(const RadArgs* a, RadStream s) {
+    return moe_gemm_launch<0, true>(a, s);
+}
+extern "C" int r4d_rad_moe_gemm_i8a8_mod4(const RadArgs* a, RadStream s) {
+    return moe_gemm_launch<0, true>(a, s, 4);
+}
+extern "C" int r4d_rad_moe_gemm_w4a8i8(const RadArgs* a, RadStream s) {
+    return moe_gemm_w4a8i8(a, s, 2);
+}
+extern "C" int r4d_rad_moe_gemm_w4a8i8_mod4(const RadArgs* a, RadStream s) {
+    return moe_gemm_w4a8i8(a, s, 4);
 }
 extern "C" int r4d_rad_moe_gemm_w4a8_mod4(const RadArgs* a, RadStream stream) {
     const char* wdt = r4d_gets(a, "dtype");
     if (wdt && !std::strcmp(wdt, "w4nl64a8h")) return moe_gemm_launch<2>(a, stream, 4);
     if (wdt && !std::strcmp(wdt, "w4nl32a8h")) return moe_gemm_launch<3>(a, stream, 4);
     if (wdt && !std::strcmp(wdt, "w5nl64a8h")) return moe_gemm_launch<4>(a, stream, 4);
+    if (wdt && !std::strcmp(wdt, "w6nl64a8h")) return moe_gemm_launch<5>(a, stream, 4);
     return moe_gemm_launch<1>(a, stream, 4);
 }
 
@@ -3142,15 +3316,23 @@ extern "C" int r4d_rad_moe_gemm_bf16(const RadArgs* a, RadStream stream) {
 
     const uint32_t ny = (uint32_t)(N / 64);
     const int form = g_moe_prefill_form;
+    /* Chained forms (r4d_chain.h) up to a decode step's routed slots, in either band: a layer's
+     * few plain experts beside a quantised table are a table of at most eight, which a verify
+     * step's forty slots put in the prefill form, run map included. */
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0 && T <= 1024;
     if ((form == 0 && r4d_moe_decode_band(T, n_expert)) || form == 2) {
         const unsigned tiles = (unsigned)((T + 15) / 16);
-        emit_rc = R4D_EMIT(stream, (moe_gemm_bf16_kernel<1, 4, 1, 4, true>),
-                           dim3(tiles * 16u, ny), dim3(4 * kWave), 0,
-                           (const uint16_t*)A->data, tab, w_s0,
-                           (const int32_t*)sorted->data, (const int32_t*)off->data,
-                           (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)K,
-                           (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),
-                           (uint32_t)a_ld, (uint32_t)w_ld, (uint32_t)y_ld, nullptr);
+#define R4D_MOE16D(CH_)                                                                          \
+        R4D_EMIT(stream, (moe_gemm_bf16_kernel<1, 4, 1, 4, true, false, false, CH_>),            \
+                 dim3(tiles * 16u, ny), dim3(4 * kWave), 0,                                      \
+                 (const uint16_t*)A->data, tab, w_s0,                                            \
+                 (const int32_t*)sorted->data, (const int32_t*)off->data,                        \
+                 (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)K,                      \
+                 (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),              \
+                 (uint32_t)a_ld, (uint32_t)w_ld, (uint32_t)y_ld, nullptr)
+        if (chain) emit_rc = R4D_MOE16D(r4dchain);
+        else       emit_rc = R4D_MOE16D(R4dUnchained);
+#undef R4D_MOE16D
     } else {
         const long long cap = r4d_blockmap_cap(T, n_expert, kPrefillRows);
         uint32_t* map = (form != 3 && n_expert <= (long long)kMaxExpert && a->scratch &&
@@ -3161,25 +3343,34 @@ extern "C" int r4d_rad_moe_gemm_bf16(const RadArgs* a, RadStream stream) {
         const unsigned nyw = (unsigned)(N / kPrefillCols);
         const unsigned gx = map ? (unsigned)cap : (unsigned)((T + kPrefillRows - 1) / kPrefillRows);
         if (map) {
-            emit_rc = R4D_EMIT(stream, moe_blockmap_kernel, dim3(1), dim3(256), 0,
-                               (const int32_t*)off->data, (uint32_t)n_expert, (uint32_t)T,
-                               (uint32_t)kPrefillRows, (uint32_t)cap, map);
+#define R4D_MOEBM(CH_)                                                                           \
+            R4D_EMIT(stream, moe_blockmap_kernel<CH_>, dim3(1), dim3(256), 0,                    \
+                     (const int32_t*)off->data, (uint32_t)n_expert, (uint32_t)T,                 \
+                     (uint32_t)kPrefillRows, (uint32_t)cap, map)
+            if (chain) emit_rc = R4D_MOEBM(r4dchain);
+            else       emit_rc = R4D_MOEBM(R4dUnchained);
+#undef R4D_MOEBM
             if (emit_rc != RAD_OK) return emit_rc;
         }
-#define R4D_MOE16(AL_, NTL_, WGN_, NYG_)                                                         \
+#define R4D_MOE16C(AL_, NTL_, WGN_, NYG_, CH_)                                                   \
         R4D_EMIT(stream,                                                                       \
-                 (moe_gemm_bf16_kernel<kPrefillRows / 16, NTL_, 2, WGN_, false, AL_, true>),    \
+                 (moe_gemm_bf16_kernel<kPrefillRows / 16, NTL_, 2, WGN_, false, AL_, true,      \
+                                       CH_>),                                                   \
                  dim3(gx, NYG_), dim3(2 * WGN_ * kWave), 0,                                      \
                  (const uint16_t*)A->data, tab, w_s0,                                            \
                  (const int32_t*)sorted->data, (const int32_t*)off->data,                        \
                  (uint16_t*)Y->data, (uint32_t)T, (uint32_t)N, (uint32_t)K,                      \
                  (uint32_t)n_expert, (uint32_t)top_k, (uint32_t)(a_sorted ? 1 : 0),              \
                  (uint32_t)a_ld, (uint32_t)w_ld, (uint32_t)y_ld, (const uint32_t*)map)
+#define R4D_MOE16(AL_, NTL_, WGN_, NYG_)                                                         \
+        (chain ? R4D_MOE16C(AL_, NTL_, WGN_, NYG_, r4dchain)                                    \
+               : R4D_MOE16C(AL_, NTL_, WGN_, NYG_, R4dUnchained))
         if (map)  emit_rc = wide_n ? R4D_MOE16(true, kPrefillCols / 16, 4, nyw)
                                    : R4D_MOE16(true, 4, 2, ny);
         else      emit_rc = wide_n ? R4D_MOE16(false, kPrefillCols / 16, 4, nyw)
                                    : R4D_MOE16(false, 4, 2, ny);
 #undef R4D_MOE16
+#undef R4D_MOE16C
     }
     if (emit_rc != RAD_OK) return emit_rc;
     R4D_MOE_CHK();
@@ -3291,25 +3482,26 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given) {
     }
 
     const unsigned gy = (unsigned)((n + 255) / 256);
+    /* The chained form where the row resolved with `chain` and this launch is the op's only one
+     * (no prepass before it: a decode step). */
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0 && (self || given) && M <= 64;
+#define R4D_MG(...)                                                                              \
+    hipLaunchKernelGGL((__VA_ARGS__), dim3((unsigned)M, gy), dim3(256), 0, (hipStream_t)s,       \
+                       (const uint16_t*)ye->data, (const void*)ew->data, inv,                    \
+                       (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,            \
+                       (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,                         \
+                       self ? (const int32_t*)sorted->data : nullptr, (uint32_t)T,               \
+                       sh ? (const uint16_t*)sh->data : nullptr,                                 \
+                       sh ? (const uint16_t*)sg->data : nullptr,                                 \
+                       (uint32_t)sh_ld, (uint32_t)sg_ld, sig)
     if (ew->dtype == RAD_F32) {
-        hipLaunchKernelGGL(
-            (gather_kernel<256, true>), dim3((unsigned)M, gy), dim3(256), 0, (hipStream_t)s,
-            (const uint16_t*)ye->data, ew->data, inv, (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n,
-            (uint32_t)top_k, (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
-            self ? (const int32_t*)sorted->data : nullptr, (uint32_t)T,
-            sh ? (const uint16_t*)sh->data : nullptr, sh ? (const uint16_t*)sg->data : nullptr,
-            (uint32_t)sh_ld, (uint32_t)sg_ld, sig);
-        R4D_MOE_CHK();
-        return RAD_OK;
+        if (chain) R4D_MG(r4dchain_moe_gather<256, true>);
+        else       R4D_MG(gather_kernel<256, true>);
+    } else {
+        if (chain) R4D_MG(r4dchain_moe_gather<256>);
+        else       R4D_MG(gather_kernel<256>);
     }
-    hipLaunchKernelGGL((gather_kernel<256>), dim3((unsigned)M, gy), dim3(256), 0, (hipStream_t)s,
-                       (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,
-                       (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,
-                       (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
-                       self ? (const int32_t*)sorted->data : nullptr, (uint32_t)T,
-                       sh ? (const uint16_t*)sh->data : nullptr,
-                       sh ? (const uint16_t*)sg->data : nullptr,
-                       (uint32_t)sh_ld, (uint32_t)sg_ld, sig);
+#undef R4D_MG
     R4D_MOE_CHK();
     return RAD_OK;
 }
@@ -3461,8 +3653,8 @@ struct RgGeom {
 };
 
 /* `lg` is neither const nor __restrict__: every block writes it and the last one reads it back. */
-template <uint32_t MAXOWN, uint32_t NW>
-__device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
+template <uint32_t MAXOWN, uint32_t NW, class CH>
+__global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
     const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
     const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
     int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
@@ -3470,6 +3662,7 @@ __device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
     RgGeom g, Protect prot) {
     /* The GEMM's partial tiles, then (last block only, after two barriers) the sort's LDS; the
      * shim sizes it for the larger. */
+    if (CH::on) r4d_chain_wait();
     extern __shared__ __align__(16) unsigned char rg_smem[];
     float* const red = (float*)rg_smem;
     const uint32_t tid = threadIdx.x, wave = tid / kWave, lane = tid % kWave;
@@ -3516,40 +3709,20 @@ __device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
     if (tid == 0)
         s_arrived = __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
     __syncthreads();
-    if (s_arrived + 1u != gridDim.x * gridDim.y) return;
-    if (tid == 0) __hip_atomic_store(ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    __threadfence();
+    if (s_arrived + 1u == gridDim.x * gridDim.y) {
+        if (tid == 0) __hip_atomic_store(ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __threadfence();
 
-    /* router_topk_scatter_kernel, from here to the end. */
-    ScatterLds<NW>& sl = *reinterpret_cast<ScatterLds<NW>*>(rg_smem);
-    for (uint32_t e = tid; e < g.n_local; e += blockDim.x) sl.cnt[e] = 0;
-    const SlotSink snk{sl.e, g.base, g.n_local, prot};
-    for (uint32_t m = wave; m < g.M; m += NW)
-        router_topk_row<MAXOWN>(lg, ids, w, m, g.n_expert, g.top_k, g.lg_ld, g.norm, lane, snk);
-    lds_barrier();
-    scatter_small_place(sorted, off, cnt, g.M * g.top_k, g.n_local, sl);
-}
-
-/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
-template <uint32_t MAXOWN, uint32_t NW>
-__global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
-    const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
-    const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
-    int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
-    int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
-    RgGeom g, Protect prot) {
-    router_gemm_topk_scatter_kernel_body<MAXOWN, NW>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot);
-}
-template <uint32_t MAXOWN, uint32_t NW>
-__global__ __launch_bounds__(NW * kWave) void r4dchain_router_gemm_topk_scatter(
-    const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
-    const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
-    int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
-    int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
-    RgGeom g, Protect prot) {
-    r4d_chain_wait();
-    router_gemm_topk_scatter_kernel_body<MAXOWN, NW>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot);
-    r4d_chain_done();
+        /* router_topk_scatter_kernel, from here to the end. */
+        ScatterLds<NW>& sl = *reinterpret_cast<ScatterLds<NW>*>(rg_smem);
+        for (uint32_t e = tid; e < g.n_local; e += blockDim.x) sl.cnt[e] = 0;
+        const SlotSink snk{sl.e, g.base, g.n_local, prot};
+        for (uint32_t m = wave; m < g.M; m += NW)
+            router_topk_row<MAXOWN>(lg, ids, w, m, g.n_expert, g.top_k, g.lg_ld, g.norm, lane, snk);
+        lds_barrier();
+        scatter_small_place(sorted, off, cnt, g.M * g.top_k, g.n_local, sl);
+    }
+    if (CH::on) r4d_chain_done();
 }
 
 /* The arrival counter belongs to the op instance and is taken at init, not on the launch path.
@@ -3725,18 +3898,18 @@ extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stre
     g.sk = (uint32_t)cr.sk;          g.tpb = (uint32_t)tpb;
     g.nrb = (uint32_t)nrb;           g.skg = wg ? (uint32_t)cg.sk : 0u;
     const dim3 grid((unsigned)(nrb + (wg ? 1 : 0)), (unsigned)((M + 15) / 16));
-    /* The chained form (r4d_chain.h) where the row resolved with `chain`. */
-    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(M);
 
-#define R4D_RG_L(OWN, NWV)                                                                      \
-    emit_rc = R4D_EMIT(stream, (ch ? &r4dchain_router_gemm_topk_scatter<OWN, NWV>               \
-                                   : &router_gemm_topk_scatter_kernel<OWN, NWV>), grid,         \
+#define R4D_RG_E(OWN, NWV, CH_)                                                                 \
+    emit_rc = R4D_EMIT(stream, (router_gemm_topk_scatter_kernel<OWN, NWV, CH_>), grid,          \
                        dim3((NWV) * kWave), lds,                                                \
                        (const uint16_t*)x->data, (const uint16_t*)wr->data,                     \
                        wg ? (const uint16_t*)wg->data : (const uint16_t*)nullptr,               \
                        (uint16_t*)lg->data, gate ? (uint16_t*)gate->data : (uint16_t*)nullptr,  \
                        (int32_t*)ids->data, (uint16_t*)w->data, (int32_t*)sorted->data,         \
                        (int32_t*)off->data, (int32_t*)cnt->data, ctr, g, prot)
+#define R4D_RG_L(OWN, NWV)                                                                      \
+    do { if (chain) R4D_RG_E(OWN, NWV, r4dchain); else R4D_RG_E(OWN, NWV, R4dUnchained); } while (0)
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0;
     if (n_expert <= (long long)(8 * kWave)) {
         if      (nw == 8)  R4D_RG_L(8, 8);
         else if (nw == 16) R4D_RG_L(8, 16);
@@ -3747,6 +3920,7 @@ extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stre
         else               R4D_RG_L(16, 32);
     }
 #undef R4D_RG_L
+#undef R4D_RG_E
     if (emit_rc != RAD_OK) return emit_rc;
     R4D_MOE_CHK();
     return RAD_OK;

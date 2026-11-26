@@ -211,12 +211,25 @@ struct Dec {
 #pragma unroll
             for (uint32_t i = 0; i < NW; ++i) cw[e][i] = colw(r, e, i);
     }
+    /* Bits 16 .. 47 of words i and i + 1 of each column's stream. A state that crosses that
+     * bound starts past bit 16 of word i (L is at most 16), so it is a field of this word: one
+     * extract a state, where a funnel shift and a mask each would be two. */
+    __device__ static void mids(const uint32_t (&cw)[4][NW], uint32_t (&mw)[4][NW]) {
+#pragma unroll
+        for (uint32_t e = 0; e < 4; ++e)
+#pragma unroll
+            for (uint32_t i = 0; i < NW; ++i)
+                mw[e][i] = i + 1u < NW ? __builtin_amdgcn_alignbit(cw[e][i + 1u], cw[e][i], 16u) : 0u;
+    }
     /* Row q's state of column e: L bits from bit q B of the column's stream. */
-    __device__ static uint32_t state(const uint32_t (&cw)[4][NW], uint32_t q, uint32_t e) {
+    __device__ static uint32_t state(const uint32_t (&cw)[4][NW], const uint32_t (&mw)[4][NW],
+                                     uint32_t q, uint32_t e) {
         constexpr uint32_t L = F::L;
+        static_assert(L <= 16u, "a crossing state within bits 16 .. 47");
         const uint32_t o = q * B, i = o >> 5, s = o & 31u;
         if (s + L <= 32u) return (cw[e][i] >> s) & ((1u << L) - 1u);
-        return window(cw[e][i], cw[e][i + 1u], s, L);
+        if (s % 8u == 0u && L % 8u == 0u) return window(cw[e][i], cw[e][i + 1u], s, L);
+        return (mw[e][i] >> (s - 16u)) & ((1u << L) - 1u);
     }
     static constexpr bool HALF = H16 && TR && !MAD && F::LRB != 0;
     static constexpr uint32_t kTab = F::KIND == kTable ? 256u
@@ -280,20 +293,20 @@ struct Dec {
         if constexpr (TR) {
             /* All 64 states, then all 64 lookups, then the values: the LDS reads go out together
              * instead of each waiting on the last's use. */
-            uint32_t st[64], cw[4][NW];
+            uint32_t st[64], cw[4][NW], mw[4][NW];
             columns(r, cw);
+            mids(cw, mw);
 #pragma unroll
             for (uint32_t q = 0; q < 16; ++q)
 #pragma unroll
-                for (uint32_t e = 0; e < 4; ++e) st[q * 4 + e] = state(cw, q, e);
+                for (uint32_t e = 0; e < 4; ++e) st[q * 4 + e] = state(cw, mw, q, e);
             [[maybe_unused]] int32_t t[HALF ? 1 : 64];
             [[maybe_unused]] _Float16 th[HALF ? 64 : 1];
             if constexpr (MAD) {
                 /* bytesum((st * A + B) & 0x3F3F3F3F) - 126: st < 2^16 and A < 2^24, so the
                  * 24-bit multiply is the full product mod 2^32 */
                 constexpr Form f{ F::KIND, F::B, F::LV, F::L, F::LRB, F::SC, 0 };
-                const uint32_t* ab = (const uint32_t*)(c.W + aux_off(f, c.N, (int64_t)c.nkb * 128) +
-                                                       ((int64_t)1 << F::L));
+                const uint32_t* ab = (const uint32_t*)(c.W + aux_off(f, c.N, (int64_t)c.nkb * 128));
                 const uint32_t A = ab[0], Bc = ab[1];
 #pragma unroll
                 for (uint32_t i = 0; i < 64; ++i) {
@@ -370,15 +383,15 @@ struct Dec {
     __device__ static void hashes(const Raw& r, const Ctx& c, uint32_t (&h)[16][4]) {
         static_assert(MAD, "hashes: a computed trellis");
         constexpr Form f{ F::KIND, F::B, F::LV, F::L, F::LRB, F::SC, 0 };
-        const uint32_t* ab = (const uint32_t*)(c.W + aux_off(f, c.N, (int64_t)c.nkb * 128) +
-                                               ((int64_t)1 << F::L));
+        const uint32_t* ab = (const uint32_t*)(c.W + aux_off(f, c.N, (int64_t)c.nkb * 128));
         const uint32_t A = ab[0], Bc = ab[1];
-        uint32_t cw[4][NW];
+        uint32_t cw[4][NW], mw[4][NW];
         columns(r, cw);
+        mids(cw, mw);
 #pragma unroll
         for (uint32_t q = 0; q < 16; ++q)
 #pragma unroll
-            for (uint32_t e = 0; e < 4; ++e) h[15u - q][e] = (__umul24(state(cw, q, e), A) + Bc) & 0x3F3F3F3Fu;
+            for (uint32_t e = 0; e < 4; ++e) h[15u - q][e] = (__umul24(state(cw, mw, q, e), A) + Bc) & 0x3F3F3F3Fu;
     }
 
     /* Zero: the zero of row (rt*16 + q) for block kb is subtracted bytewise after `rows`. */

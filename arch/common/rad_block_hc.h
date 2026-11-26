@@ -77,12 +77,13 @@ struct HyperConn {
          * skips its own on every step takes_ar() accepts. The block's partial sum is the write's
          * input buffer, so this saves a launch. */
         int     reduce  = 0;
-        /* Whether the read also emits Hadamard-rotated fp8 codes of the block input, for a
-         * consumer whose weight carries the rotation (MoeFP8's rotated expert plane). Produced in
-         * the plain codes' finisher, so requires `quant`; the consumer declares no quantiser. */
+        /* Whether the read also emits Hadamard-rotated codes of the block input, for a consumer
+         * whose weight carries the rotation (MoeFP8's rotated expert plane). Produced in the
+         * plain codes' finisher, so requires `quant`; the consumer declares no quantiser. */
         int     rotate  = 0;
         /* Whether the plain codes are int8 (q8/s8) rather than E4M3 (q/s), for int8 trunk linears
-         * (LinearFP8::i8). The rotated codes stay E4M3, the routed experts' operand. */
+         * (LinearFP8::i8). The rotated codes take the same dtype (had_quant_act_i8g's beside int8,
+         * had_quant_act_fp8's beside E4M3), so `Wire::rq` is declared to match. */
         int     codes_i8 = 0;
         /* The most rows one read is declared for, 0 for max_tok; a wider step reads in pieces
          * (read_pieces). The read's scratch is sized for its band (some 22 KiB a row at
@@ -115,6 +116,11 @@ struct HyperConn {
      * `mix`), read from their encoding at declare. */
     bool       mix_e4m3 = false;
     rad_op     op_read = 0, op_write = 0;
+    /* The block input's own int8 pair is the rotated one (ActFP8::q8_rot, a trunk stored rotated):
+     * the read writes its rotated codes there and its plain ones into `pq` / `ps`, a pair of this
+     * connection's that nothing reads. */
+    bool       xrot = false;
+    rad_buf    pq = 0, ps = 0;
     /* The write with the all-reduce folded in; 0 when not requested or not served.
      * `op_ar_write6` is the same on the rotated 6-bit wire, declared only when a lossy payload is
      * accepted and issued on the steps ar_wire_is_exact rejects (every trunk all-reduce at a
@@ -164,10 +170,21 @@ struct HyperConn {
      * (hc_down_kchunk in libr4d), so one read over twice the rows sums in a different order than
      * two reads over half of them; reading a wide step in pieces computes what the narrower steps
      * did. */
-    void read_pieces(RadCtx* c_, int64_t T) const {
+    void read_pieces(RadCtx* c_, int64_t T) const { read_span(c_, T, 0, T); }
+    /* The same with a boundary at `cut` (a checkpoint inside the step, RadBatch::ckpt_cut): rows
+     * [0, cut) are read as a chunk of `cut` rows reads them, then [cut, T) on their own; 0 is
+     * none. */
+    void read_pieces(RadCtx* c_, int64_t T, int64_t cut) const {
+        if (cut <= 0 || cut >= T) { read_span(c_, T, 0, T); return; }
+        read_span(c_, T, 0, cut);
+        read_span(c_, T, cut, T);
+    }
+    /* Rows [a, b) in pieces of Config::read_rows from `a`; one read where they fit in one. */
+    void read_span(RadCtx* c_, int64_t T, int64_t a, int64_t b) const {
         const int64_t piece = c.read_rows;
-        if (piece <= 0 || T <= piece) { read(c_, T, 0, T); return; }
-        for (int64_t r0 = 0; r0 < T; r0 += piece) read(c_, T, r0, T - r0 < piece ? T - r0 : piece);
+        auto one = [&](int64_t r0, int64_t n) { read(c_, T, r0, n); };
+        if (piece <= 0 || b - a <= piece) { one(a, b - a); return; }
+        for (int64_t r0 = a; r0 < b; r0 += piece) one(r0, b - r0 < piece ? b - r0 : piece);
     }
 };
 
@@ -193,6 +210,17 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
         return RAD_E_INVAL;
     }
     if (c.quant && (c.codes_i8 ? (!w.x.q8 || !w.x.s8) : (!w.x.q || !w.x.s))) return RAD_E_INVAL;
+    /* A trunk whose int8 linears are stored rotated reads the rotated codes alone: `x`'s int8 pair
+     * is then that pair (ActFP8::q8_rot), and every reader of the block input -- the trunk's
+     * projections and the rotated experts -- takes it. The read derives the rotated codes in its
+     * plain codes' finisher, so the plain ones still have somewhere to go: a pair of this
+     * connection's own that nothing reads. */
+    xrot = c.quant && c.codes_i8 && w.x.q8_rot;
+    if (xrot && c.rotate) {
+        fprintf(stderr, "radiance: %s: the block input's own codes are the rotated ones "
+                        "(ActFP8::q8_rot), so there is no second rotated pair to ask for\n", name);
+        return RAD_E_INVAL;
+    }
     if (c.rotate && (!c.quant || !w.rq || !w.rs)) {
         fprintf(stderr, "radiance: %s: the rotated codes need the plain ones (quant) and the "
                         "rq/rs pair on the wire\n", name);
@@ -248,8 +276,16 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
     rad_buf wr[6] = { w.x.x, 0, 0, 0, 0, 0 };
     int n_wr = 1;
     if (c.inject) wr[n_wr++] = w.inj;
-    if (c.quant)  { wr[n_wr++] = c.codes_i8 ? w.x.q8 : w.x.q; wr[n_wr++] = c.codes_i8 ? w.x.s8 : w.x.s; }
-    if (c.rotate) { wr[n_wr++] = w.rq;  wr[n_wr++] = w.rs; }
+    if (xrot) {
+        pq = decl_b(b, nm.f("%s.plain.q8", name), RAD_I8, { g.max_tok, g.n_embd });
+        ps = decl_b(b, nm.f("%s.plain.s8", name), RAD_F32, { g.max_tok, fp8_blocks(g.n_embd) });
+        if (!pq || !ps || w.x.g8 != RAD_FP8_BLOCK) return RAD_E_INVAL;
+        wr[n_wr++] = pq;     wr[n_wr++] = ps;
+        wr[n_wr++] = w.x.q8; wr[n_wr++] = w.x.s8;
+    } else {
+        if (c.quant)  { wr[n_wr++] = c.codes_i8 ? w.x.q8 : w.x.q; wr[n_wr++] = c.codes_i8 ? w.x.s8 : w.x.s; }
+        if (c.rotate) { wr[n_wr++] = w.rq;  wr[n_wr++] = w.rs; }
+    }
 
     op_read = RAD_OP(b, "hc_read",
                   RAD_PARAMS(RAD_RANGE("M", 1, c.read_rows > 0 && c.read_rows < g.max_tok
@@ -259,7 +295,7 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
                              RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype),
                              RAD_F64("wadd", g.wadd), RAD_INT("inject", c.inject ? 1 : 0),
                              RAD_INT("group", c.quant ? RAD_FP8_BLOCK : 0),
-                             RAD_INT("rotate", c.rotate ? 1 : 0),
+                             RAD_INT("rotate", (c.rotate || xrot) ? 1 : 0),
                              RAD_STR("mix", mix_e4m3 ? "e4m3" : "bf16")),
                   wts, n_wts);
     if (!op_read) return RAD_E_INVAL;
@@ -358,11 +394,14 @@ inline void HyperConn::read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) con
                 c.inject ? RAD_W(w_inj) : RAD_NONE,
                 brow_slice(w.x.x, r0, rows, g.n_embd),
                 c.inject ? brow_slice(w.inj, r0, rows, c.hc) : RAD_NONE,
-                c.quant  ? brow_slice(c.codes_i8 ? w.x.q8 : w.x.q, r0, rows, g.n_embd) : RAD_NONE,
-                c.quant  ? brow_slice(c.codes_i8 ? w.x.s8 : w.x.s, r0, rows,
+                c.quant  ? brow_slice(xrot ? pq : c.codes_i8 ? w.x.q8 : w.x.q, r0, rows,
+                                      g.n_embd) : RAD_NONE,
+                c.quant  ? brow_slice(xrot ? ps : c.codes_i8 ? w.x.s8 : w.x.s, r0, rows,
                                       fp8_blocks(g.n_embd)) : RAD_NONE,
-                c.rotate ? brow_slice(w.rq, r0, rows, g.n_embd) : RAD_NONE,
-                c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE);
+                (c.rotate || xrot) ? brow_slice(xrot ? w.x.q8 : w.rq, r0, rows, g.n_embd)
+                                   : RAD_NONE,
+                (c.rotate || xrot) ? brow_slice(xrot ? w.x.s8 : w.rs, r0, rows,
+                                                fp8_blocks(g.n_embd)) : RAD_NONE);
 }
 
 /* ================================================================== the control-vector projection

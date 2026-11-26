@@ -29,7 +29,7 @@
 
 #include <arch/rad_gemma4_chat.h>
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -43,7 +43,22 @@
 
 using namespace rad;
 using namespace rad::chatdiff;
-using json = nlohmann::ordered_json;
+using json = Json;
+
+/* v with every object's members in key order, so two values compare whatever order their keys
+ * were written in. */
+static json keys_sorted(const json& v) {
+    if (v.is_array()) {
+        json out = json::array();
+        for (const json& e : v) out.push_back(keys_sorted(e));
+        return out;
+    }
+    if (!v.is_object()) return v;
+    std::vector<std::pair<std::string, json>> m;
+    for (auto it = v.begin(); it != v.end(); ++it) m.emplace_back(it.key(), keys_sorted(it.value()));
+    std::sort(m.begin(), m.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    return json(json::object_t(std::move(m)));
+}
 
 /* ================================================================== fixtures */
 
@@ -257,8 +272,8 @@ TEST(rendered_replies_read_back_as_the_template_wrote_them) {
             CHECK_EQ(m.calls[i].name, want["name"].get<std::string>());
             CHECK(m.calls[i].closed);
             /* Compared as values: the template writes keys in sorted order. */
-            CHECK(nlohmann::json::parse(m.calls[i].arguments) ==
-                  nlohmann::json::parse(want["arguments"].get<std::string>()));
+            CHECK(keys_sorted(Json::parse(m.calls[i].arguments)) ==
+                  keys_sorted(Json::parse(want["arguments"].get<std::string>())));
         }
         const std::string r = msg.contains("reasoning_content") ? msg["reasoning_content"].get<std::string>() : "";
         CHECK_EQ(m.reasoning, r.empty() ? r : r + "\n");
@@ -842,7 +857,9 @@ TEST(the_chat_bridge_serves_gemma_from_its_declaration) {
     server::ChatRender r;
     std::string why;
     const json msgs = json::array({ { { "role", "user" }, { "content", "List /work." } } });
-    REQUIRE_EQ(br.apply(msgs, agent_tools(), opt, &r, &why), RAD_OK);
+    REQUIRE_EQ(br.apply(msgs, agent_tools(), opt, &r,
+                        &why),
+               RAD_OK);
     CHECK_EQ(r.generation_prompt, kOff);
     CHECK(r.grammar_lazy);
     REQUIRE_EQ(r.grammar_triggers.size(), (size_t)1);

@@ -51,34 +51,24 @@ int kvstream_configure(const Config& cfg, int64_t ctx, const std::vector<KVGroup
     out->ctx_blocks     = shape.ctx_blocks;
     if (!shape.streams()) return RAD_OK;
     /* Before anything is allocated: the group needs the ops its streamed path issues (KVStreamOps).
-     * The gated fp8 attention (rad_block_attn_gated_fp8.h) and GLM-5.3's MLA block
+     * The gated attention (rad_block_attn_gated_fp8.h) and GLM-5.3's MLA block
      * (rad_block_glm_mla.h) declare both. Without them the flag is ignored and the configuration is
      * exactly the one without it. */
     const KVStreamOps ops = kvstream_ops(prog, &gi);
     if (!ops.streams()) {
-        /* A packed cache (fp8_v4, k6_v4) is declared to the core as plain E4M3, so the dtype check
-         * below cannot see it; its architecture declares the resolve but no store row. The
-         * operator's answer is then the cache layout, not the model. */
-        if ((cfg.kv_cache_dtype == "fp8_v4" || cfg.kv_cache_dtype == "k6_v4") && ops.resolve &&
-            !ops.store && !ops.folded)
-            RAD_WARN("--kv-resident %lld ignored: group '%s' has a %s cache, and the streamed store "
-                     "has no writer for that layout (E4M3 and bf16 only); the group stays "
-                     "resident",
-                     (long long)cfg.kv_resident, gi.name.c_str(), cfg.kv_cache_dtype.c_str());
-        else
-            RAD_WARN("--kv-resident %lld ignored: architecture '%s' declares no %s for group '%s', "
-                     "so the group stays resident",
-                     (long long)cfg.kv_resident,
-                     prog.meta.arch_id && *prog.meta.arch_id ? prog.meta.arch_id : "(unnamed)",
-                     ops.missing(), gi.name.c_str());
+        RAD_WARN("--kv-resident %lld ignored: architecture '%s' declares no %s for group '%s', "
+                 "so the group stays resident",
+                 (long long)cfg.kv_resident,
+                 prog.meta.arch_id && *prog.meta.arch_id ? prog.meta.arch_id : "(unnamed)",
+                 ops.missing(), gi.name.c_str());
         *out = KVStreamSetup{};
         return RAD_OK;
     }
-    /* The streamed store has E4M3 and bf16 rows only. Packed layouts were ignored above; this
-     * refuses a core dtype no architecture ships a full group in (f32, f16). */
-    if (gi.decl.dtype != RAD_F8E4M3 && gi.decl.dtype != RAD_BF16) {
-        RAD_ERR("--kv-resident %lld: group '%s' has a %s cache, and the streamed store has E4M3 "
-                "and bf16 rows only (--kv-cache-dtype fp8 or bf16); leave --kv-resident off",
+    /* The streamed store has int8, bf16 and E4M3 rows; this refuses a core dtype no architecture
+     * ships a full group in (f32, f16). */
+    if (gi.decl.dtype != RAD_I8 && gi.decl.dtype != RAD_BF16 && gi.decl.dtype != RAD_F8E4M3) {
+        RAD_ERR("--kv-resident %lld: group '%s' has a %s cache, and the streamed store has int8, "
+                "bf16 and E4M3 rows only; leave --kv-resident off",
                 (long long)cfg.kv_resident, out->group_name.c_str(),
                 rad_dtype_name(gi.decl.dtype));
         return RAD_E_INVAL;

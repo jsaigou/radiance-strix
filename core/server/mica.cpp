@@ -8,7 +8,7 @@
 #include "mica.h"
 #include "systemone.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include <algorithm>
 #include <cmath>

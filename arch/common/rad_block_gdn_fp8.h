@@ -126,12 +126,19 @@ struct GdnFP8 {
      * convolution in the recurrent update's prologue. The pair is declared either way; cr_rows is
      * the widest decode window the fold serves. */
     rad_op  op_cr = 0;
+    /* Whether op_cr writes the out projection's codes; otherwise q_o follows it. */
+    bool    cr_codes = false;
     int64_t cr_rows = 0;
     /* Set by the architecture after declare: a `prefetch` of the out-projection's leading bytes
-     * (decl_prefetch, rad_arch.h), issued on the second lane beside the decode recurrent update on
-     * steps of up to pf_out_rows rows and pf_out_seqs sequences. 0 where none is declared. */
+     * (decl_prefetch, rad_arch.h), issued beside the decode recurrent update on steps of up to
+     * pf_out_rows rows and pf_out_seqs sequences. 0 where none is declared. */
     rad_op  op_pf_out = 0;
     int64_t pf_out_rows = 0, pf_out_seqs = 0;
+    /* The same read as a second op for steps of at least pf_out_v_rows rows, where the
+     * architecture measured another workgroup count for them (decl_prefetch's `blocks`); 0 where
+     * every step takes op_pf_out. */
+    rad_op  op_pf_out_v = 0;
+    int64_t pf_out_v_rows = 0;
     rad_op op_ar = 0, op_add = 0;
     /* The next block absorbs this block's closing all-reduce (see rad_block_attn_gated_fp8.h). */
     bool ar_out = false;
@@ -339,17 +346,25 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
      * tokens per sequence. Optional (no RAD_ARCH_TRY): without it the pair runs. */
     {
         const int64_t hi = g.max_tok < 8 ? g.max_tok : 8;
-        op_cr = rw(b, RAD_OP(b, w.o.q8_rot ? "gdn_conv_recurrent_update_had" : "gdn_conv_recurrent_update",
-                       RAD_PARAMS(RAD_RANGE("q_len", 1, hi), RAD_INT("head_k", cfg.head_k),
-                                  RAD_INT("head_v", cfg.head_v),
-                                  RAD_INT("conv_width", cfg.conv_width),
-                                  RAD_INT("n_head_v", cfg.n_head_v), RAD_F64("scale", q_scale),
-                                  RAD_F64("eps", g.eps), RAD_STR("act", cfg.act),
-                                  RAD_STR("state_form",
-                                          g.max_spec > 0 ? "anchor" : "per_candidate")),
-                       RAD_WEIGHTS(w_conv, w_a_log, w_dt_bias, w_out_norm)),
+        /* The fold's rotated epilogue writes one scale per (row, 128), or per 256 for an IQ8R
+         * trunk's codes (ActFP8::g8; `group`, stated to that form alone: last, and cut off
+         * otherwise), where this rank's value heads pair up. */
+        const bool cr_wide = w.o.q8_rot && w.o.g8 == RAD_I8_GROUP_WIDE && cfg.n_head_v % 2 == 0;
+        cr_codes = w.o.cq() && (!w.o.q8_rot || w.o.g8 == RAD_FP8_BLOCK || cr_wide);
+        const RadParam cp[] = { RAD_RANGE("q_len", 1, hi), RAD_INT("head_k", cfg.head_k),
+                                RAD_INT("head_v", cfg.head_v),
+                                RAD_INT("conv_width", cfg.conv_width),
+                                RAD_INT("n_head_v", cfg.n_head_v), RAD_F64("scale", q_scale),
+                                RAD_F64("eps", g.eps), RAD_STR("act", cfg.act),
+                                RAD_STR("state_form", g.max_spec > 0 ? "anchor" : "per_candidate"),
+                                RAD_INT("group", RAD_I8_GROUP_WIDE) };
+        const rad_weight cw[] = { w_conv, w_a_log, w_dt_bias, w_out_norm };
+        op_cr = rw(b, rad_decl_op(b, w.o.q8_rot && cr_codes ? "gdn_conv_recurrent_update_had"
+                                                            : "gdn_conv_recurrent_update",
+                                  cp, (int)(sizeof cp / sizeof *cp) - (cr_wide && cr_codes ? 0 : 1),
+                                  cw, 4),
                    {w.in.x, w.ab}, {w.o.x});
-        if (op_cr && w.o.cq()) {
+        if (op_cr && cr_codes) {
             const rad_buf oq[2] = { w.o.cq(), w.o.cs() };
             RAD_ARCH_TRY(rad_op_writes(b, op_cr, oq, 2));
         }
@@ -357,6 +372,9 @@ inline int GdnFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
     }
 
     RAD_ARCH_TRY(q_o.declare(b, g, w.o, v_dim));
+    /* qwen4exp_lora: linear_attn.out_proj is a LoRA module kind. The plain bf16 view is
+     * taken only when a runtime adapter targets this source (see the gated attn block). */
+    out.plain_bf16_view = s.out && rad_lora_source_targeted(b, s.out);
     RAD_ARCH_TRY(out.declare(b, nm, g, nm.f("blk.%d.ssm_out", l), g.n_embd, v_dim,
                              RAD_SHARD_COL, grp_layer(l), { s.out }, w.o, w.h.x, 0, {},
                              cfg.uneven() ? cfg.v_first * cfg.head_v : 0,
@@ -455,8 +473,12 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     /* At decode and verify sizes the a|b projection is nearly all launch cost and reads only the
      * norm's output, as the in-projection does, so it runs beside it on lane 1 and is joined before
      * the convolution reads `ab`. A prefill chunk keeps one lane, where the two would share
-     * bandwidth. */
-    if (ab_lane && T <= 64 && rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK) {
+     * bandwidth. Where launches chain it stays on lane 0: its chained form starts beside the
+     * in-projection without the two lane joins, each of which holds a launch back until the host
+     * has seen the other lane finish (Qwen3.8-27B on two cards: the projection started 55 us late
+     * and the update behind it another 20 to 40 us). */
+    if (ab_lane && !rad_chain_on() && T <= 64 && rad_lane_join(c, 0, 1) == RAD_OK &&
+        rad_lane(c, 1) == RAD_OK) {
         RAD_ISSUE_N(c, op_ab, T, brows(w.h.x, T), RAD_W(w_ab), brows(w.ab, T));
         rad_lane(c, 0);
         in.step(c, w.h, w.in.x, T);
@@ -490,11 +512,18 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
 
     /* The recurrent update at decode heights runs one workgroup per (sequence, head) and leaves the
      * card's memory mostly idle, so the out-projection's weight is read into the on-die cache
-     * beside it, on the second lane behind a join from lane 0 (as prefetch_beside). */
+     * beside it: in front of the update on lane 0 where launches chain (the read's chained form
+     * holds nothing behind it), else on the second lane behind a join from lane 0 (as
+     * prefetch_beside). */
     if (op_pf_out && D > 0 && D <= pf_out_seqs && P == 0 && T <= pf_out_rows) {
-        if (rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK)
-            RAD_ISSUE(c, op_pf_out, RAD_W(out.w));
-        rad_lane(c, 0);
+        const rad_op pf = op_pf_out_v && T >= pf_out_v_rows ? op_pf_out_v : op_pf_out;
+        if (prefetch_lane0()) {
+            RAD_ISSUE(c, pf, RAD_W(out.w));
+        } else {
+            if (rad_lane_join(c, 0, 1) == RAD_OK && rad_lane(c, 1) == RAD_OK)
+                RAD_ISSUE(c, pf, RAD_W(out.w));
+            rad_lane(c, 0);
+        }
     }
     if (D > 0 && op_cr && qd <= cr_rows) {
         RAD_ISSUE_N(c, op_cr, qd,
@@ -505,8 +534,9 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                     praw2(st_idx, RAD_I32, D, st_w), praw(batch->num_accepted, RAD_I32, D),
                     praw(batch->cu_seqlens, RAD_I32, D + 1),
                     bcol(w.in.x, conv_dim, v_dim, DT), RAD_W(w_out_norm), brows(w.o.x, DT),
-                    w.o.cq() ? brows(w.o.cq(), DT) : RAD_NONE,
-                    w.o.cq() ? brows(w.o.cs(), DT) : RAD_NONE);
+                    cr_codes ? brows(w.o.cq(), DT) : RAD_NONE,
+                    cr_codes ? brows(w.o.cs(), DT) : RAD_NONE);
+        if (w.o.cq() && !cr_codes) q_o.step(c, T, 0, DT);
     } else if (D > 0) {
         RAD_ISSUE_N(c, op_conv_update, qd,
                     bcol(w.in.x, 0, conv_dim, DT), RAD_W(w_conv), RAD_NONE, kv_cache(kv_conv, layer),
@@ -530,7 +560,43 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * gated norm, quantiser and out projection are per row, so a pure prefill step can finish them
      * a piece at a time and hand off each piece's reduction behind it. */
     const bool cut = !own_ar && pieces && pieces->cuts(T) && D == 0 && P > 0 && !op_add;
+    /* A checkpoint inside the step (RadBatch::ckpt_cut): the convolution, solve and scan run over
+     * [0, cut) and [cut, T) as two pieces, each the chunk of those rows (the state handed on
+     * through the cache, the second piece's context its first row's position, as ArPieces' pieces
+     * do), and the state and convolution slots go to the checkpoint stage between them. The first
+     * piece is issued at the band a chunk of its rows takes, so the snapshot holds the bytes a
+     * step ending at the checkpoint leaves. */
+    const int64_t ck = batch->ckpt_cut;
+    const bool ck_split = P == 1 && D == 0 && ck > 0 && ck < T && batch->ckpt_cu;
+    if (ck_split) {
+        for (int64_t p = 0; p < 2; ++p) {
+            const int64_t n = p == 0 ? ck : T - ck;
+            const int32_t* cu = batch->ckpt_cu + p;
+            RAD_ISSUE_N(c, op_conv_prep, n,
+                        bcol(w.in.x, 0, conv_dim, T), RAD_W(w_conv), RAD_NONE, RAD_W(w_a_log),
+                        RAD_W(w_dt_bias), kv_cache(kv_conv, layer), praw(cu, RAD_I32, 2),
+                        bcol(w.ab, 0, H, T), bcol(w.ab, H, H, T),
+                        praw(cv_idx, RAD_I32, 1),
+                        praw(p == 0 ? batch->ctx_lens : batch->positions + ck, RAD_I32, 1),
+                        brows(w.q, T), brows(w.k, T), brows(w.v, T),
+                        brows(w.gdec, T), brows(w.beta, T));
+            RAD_ISSUE_N(c, op_kkt, n,
+                        brows(w.k, T), brows(w.beta, T), brows(w.gdec, T),
+                        praw(cu, RAD_I32, 2), brows(w.kkt, T));
+            RAD_ISSUE_N(c, op_scan, n,
+                        brows(w.q, T), brows(w.k, T), brows(w.v, T), brows(w.kkt, T),
+                        brows(w.gdec, T), brows(w.beta, T),
+                        kv_cache(kv_state, layer), praw(cu, RAD_I32, 2),
+                        brows(w.o.x, T), kv_cache(kv_state, layer),
+                        praw2(st_idx, RAD_I32, 1, st_w));
+            if (p == 0) {
+                rad_ckpt_snap(c, kv_state, layer);
+                rad_ckpt_snap(c, kv_conv, layer);
+            }
+        }
+    }
     if (P > 0) {
+        if (!ck_split) {
         RAD_ISSUE(c, op_conv_prep,
                   bcol(w.in.x, 0, conv_dim, T), RAD_W(w_conv), RAD_NONE, RAD_W(w_a_log), RAD_W(w_dt_bias),
                   kv_cache(kv_conv, layer), praw(batch->cu_seqlens + D, RAD_I32, P + 1),
@@ -548,6 +614,7 @@ inline void GdnFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                   kv_cache(kv_state, layer), praw(batch->cu_seqlens + D, RAD_I32, P + 1),
                   brows(w.o.x, T), kv_cache(kv_state, layer),
                   praw2(st_idx ? st_idx + D * st_w : nullptr, RAD_I32, P, st_w));
+        }
         if (cut) {
             for (int64_t r0 = 0; r0 < T; r0 += pieces->rows) {
                 const int64_t n = T - r0 < pieces->rows ? T - r0 : pieces->rows;

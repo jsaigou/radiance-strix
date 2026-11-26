@@ -53,7 +53,9 @@
 #include <map>
 #include <mutex>
 #include <utility>
+#include <vector>
 
+#include "r4d_keyed.h"
 #include "r4d_plugin.h"
 #include "r4d_launch.h"
 #include "rad_plugin.h"
@@ -962,23 +964,50 @@ static int z_fan(int64_t base, int64_t S, int64_t M, int64_t tile) {
  * that could overlap never share a block; the reducer leaves every counter zero. A block too small
  * for a launch is replaced by a larger one and the old one is kept, since a recorded pass may
  * still name it. */
+/* Every block made for a (device, t), the current one last; all of them go when the memory `t`
+ * lives in is freed (r4d_keyed.h). */
+struct ShrinkBlocks { std::vector<unsigned*> all; int64_t cap = 0; };
+static std::mutex g_shrink_mu;
+static std::map<std::pair<int, const char*>, ShrinkBlocks> g_shrink;
+
+static void shrink_freed(const char* lo, const char* hi) {
+    std::vector<std::pair<int, unsigned*>> gone;
+    {
+        std::lock_guard<std::mutex> lk(g_shrink_mu);
+        for (auto it = g_shrink.begin(); it != g_shrink.end();) {
+            if (it->first.second >= lo && it->first.second < hi) {
+                for (unsigned* p : it->second.all) gone.push_back({ it->first.first, p });
+                it = g_shrink.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    int was = 0;
+    (void)hipGetDevice(&was);
+    for (auto& [dev, p] : gone) {
+        (void)hipSetDevice(dev);
+        (void)hipFree(p);
+    }
+    (void)hipSetDevice(was);
+}
+[[maybe_unused]] static const int g_shrink_reg = r4d::on_freed(shrink_freed);
+
 static unsigned* shrink_ctr(const void* t, int64_t n, RadStream stream) {
-    static std::mutex mu;
-    static std::map<std::pair<int, const void*>, std::pair<unsigned*, int64_t>> blocks;
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess) return nullptr;
-    std::lock_guard<std::mutex> lk(mu);
-    const auto key = std::make_pair(dev, t);
-    auto it = blocks.find(key);
-    if (it != blocks.end() && it->second.second >= n) return it->second.first;
-    int64_t cap = it != blocks.end() ? 2 * it->second.second : 4096;
+    std::lock_guard<std::mutex> lk(g_shrink_mu);
+    ShrinkBlocks& b = g_shrink[std::make_pair(dev, static_cast<const char*>(t))];
+    if (!b.all.empty() && b.cap >= n) return b.all.back();
+    int64_t cap = !b.all.empty() ? 2 * b.cap : 4096;
     while (cap < n) cap *= 2;
     void* p = nullptr;
     if (hipMalloc(&p, (size_t)cap * sizeof(unsigned)) != hipSuccess) return nullptr;
     /* On the launch's own stream, so the zeros land before the kernel that counts on them. */
     if (hipMemsetAsync(p, 0, (size_t)cap * sizeof(unsigned), (hipStream_t)stream) != hipSuccess)
         return nullptr;
-    blocks[key] = std::make_pair((unsigned*)p, cap);
+    b.all.push_back((unsigned*)p);
+    b.cap = cap;
     return (unsigned*)p;
 }
 

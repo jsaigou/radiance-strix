@@ -47,8 +47,9 @@
  * ---- the rest ------------------------------------------------------------------------------------
  *
  * After the codes, at aux_off(), the form's table (Table: 256 int8, zero-padded; Grid: 2^B * V;
- * Trellis: 2^L; TrellisMad: its 2^L values, kept for the unrelayout, then A and B as two u32) or,
- * for Zero, its zero plane as u8 in the scale order below. The scale buffer is
+ * Trellis: 2^L; TrellisMad: A and B alone as two u32, the values being computed from them where
+ * they are read and the stored table regenerated on the way back) or, for Zero, its zero plane as
+ * u8 in the scale order below. The scale buffer is
  * tile-major, [N/16][K/128][16]: the 16 rows of a tile side by side for one 128-K block, as the
  * int8 GEMMs' (r4d_fp8_layout.cpp): bf16, or E4M3 bytes followed at s2_off() by the second level as
  * f32 (one, or one a row) and, with rb > 1, at blk_off() the bf16 block scale B per [N/rb][K/128].
@@ -124,7 +125,7 @@ R4D_IQR_HD constexpr int64_t aux_bytes(const Form& f, int64_t N, int64_t K) {
     return f.kind == kTable ? 256
          : f.kind == kGrid ? ((int64_t)1 << f.bits) << f.lv
          : f.kind == kTrellis ? (int64_t)1 << f.L
-         : f.kind == kTrellisMad ? ((int64_t)1 << f.L) + 8
+         : f.kind == kTrellisMad ? 8
          : f.kind == kZero ? N * (K / 128)
          : 0;
 }

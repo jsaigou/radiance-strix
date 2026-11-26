@@ -19,6 +19,7 @@
 #include "rad_philox.h"
 #include "rad_runtime.h"   /* RAD_VGEOM_* */
 #include "rad_planes.h"
+#include "rad_umt5_attention.h"
 
 #include <algorithm>
 #include <cmath>
@@ -625,6 +626,159 @@ TEST(mla_attention_reads_an_e4m3_latent_cache_as_its_values) {
     CHECK_EQ(out.at(1), 2);
 }
 
+/* These expectations come from two decoded latent vectors, not a second attention call.
+ * D512 embeds the D2 example at channels 0 and 256, across the two separately scaled halves. */
+TEST(mla_attention_reads_both_i8_latent_half_scales_in_qk_and_pv) {
+    for (int64_t d : { 2LL, 512LL }) {
+        T q(RAD_F32, { 1, 1, d }), kv(RAD_I8, { 2, 1, 4, d + 4 });
+        T bt(RAD_I32, { 1, 2 }), len(RAD_I32, { 1 }), out(RAD_F32, { 1, 1, d });
+        bt.n({ 1, 0 });
+        len.n({ 2 });
+        auto put = [&](int token, int a, int b, float s0, float s1) {
+            const int64_t base = (4 + token) * (d + 4); // page 1, not a dense prefix
+            std::fill(kv.mem.begin() + base, kv.mem.begin() + base + d, 0);
+            kv.mem[(size_t)base] = (uint8_t)(int8_t)a;
+            kv.mem[(size_t)(base + d / 2)] = (uint8_t)(int8_t)b;
+            const uint16_t bits[] = { f32_to_f16(s0), f32_to_f16(s1) };
+            std::memcpy(kv.mem.data() + base + d, bits, sizeof bits);
+        };
+        put(0, 1, 2, 2, 3); // z0 = (2,6)
+        put(1, 3, 1, 1, 4); // z1 = (3,4)
+        // Invisible rows contain NaN scales: reading past length cannot accidentally pass.
+        put(2, 127, 127, NAN, NAN);
+        put(3, 127, 127, NAN, NAN);
+        A a;
+        a.t(q).t(kv).t(bt).t(len).t(out).i("M", 32).i("latent_dim", d).i("heads", 1)
+         .i("blocks", 2).i("block_size", 4).d("scale", 1).s("dtype", "f32").s("kv_dtype", "i8");
+        for (int part : { -1, 0, 1 }) {
+            std::fill(q.mem.begin(), q.mem.end(), 0);
+            if (part >= 0) st_dt(RAD_F32, q.t.data, part * (d / 2), 1);
+            const double w = part < 0 ? 0.5 : part == 0 ? 1 / (1 + std::exp(1.0))
+                                                                    : 1 / (1 + std::exp(-2.0));
+            REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+            for (int64_t c = 0; c < d; ++c) {
+                const double want = c == 0 ? 2 * w + 3 * (1 - w)
+                                    : c == d / 2 ? 6 * w + 4 * (1 - w) : 0;
+                CHECK_NEAR(out.at(c), want, 2e-6);
+            }
+        }
+        // A single token exposes the exact F32 product, including signed codes and a scale
+        // whose product is not BF16. Quantization's zero-scale half must stay zero too.
+        put(0, -127, 127, 0.3333f, 0.001f);
+        len.n({ 1 });
+        REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+        CHECK_EQ(out.at(0), -127.0f * f16_to_f32(f32_to_f16(0.3333f)));
+        CHECK_EQ(out.at(d / 2), 127.0f * f16_to_f32(f32_to_f16(0.001f)));
+        put(0, 0, -127, 0, 0.125f);
+        REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+        CHECK_EQ(out.at(0), 0);
+        CHECK_EQ(out.at(d / 2), -15.875f);
+        len.n({ 0 });
+        REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+        for (int64_t c = 0; c < d; ++c) CHECK_EQ(out.at(c), 0);
+        len.n({ 2 });
+        bt.n({ -1, 99 });
+        REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+        for (int64_t c = 0; c < d; ++c) CHECK_EQ(out.at(c), 0);
+    }
+}
+
+TEST(mla_attention_reads_a_latent_written_by_the_i8_kv_store) {
+    constexpr int64_t D = 512, HD = D / 2, BS = 4;
+    T k(RAD_BF16, { BS, 1, HD }), v(RAD_BF16, { BS, 1, HD });
+    T slots(RAD_I32, { BS }), kv(RAD_I8, { 2, 1, BS, D + 4 });
+    for (int64_t t = 0; t < BS; ++t)
+        for (int64_t c = 0; c < HD; ++c) {
+            st_dt(RAD_BF16, k.t.data, t * HD + c, (float)(t + 1));
+            st_dt(RAD_BF16, v.t.data, t * HD + c, (float)(-2 * (t + 1)));
+        }
+    slots.n({ 4, 5, 6, 7 });
+    A store;
+    store.t(k).t(v).t(slots).t(kv).i("M", BS).i("head_dim", HD).i("n_head_kv", 1)
+         .i("block_size", BS).s("kv_dtype", "i8");
+    REQUIRE_EQ(run("kv_store", store), RAD_OK);
+    T q(RAD_F32, { 1, 1, D }), bt(RAD_I32, { 1, 1 }), len(RAD_I32, { 1 });
+    T out(RAD_F32, { 1, 1, D });
+    bt.n({ 1 });
+    len.n({ BS });
+    A a;
+    a.t(q).t(kv).t(bt).t(len).t(out).i("M", 1).i("latent_dim", D).i("heads", 1)
+     .i("blocks", 1).i("block_size", BS).d("scale", 0.0625).s("dtype", "f32").s("kv_dtype", "i8");
+    REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+    float want[2] = {};
+    for (int t = 0; t < BS; ++t) {
+        want[0] += 127.0f * f16_to_f32(f32_to_f16((float)(t + 1) / 127.0f));
+        want[1] -= 127.0f * f16_to_f32(f32_to_f16((float)(2 * (t + 1)) / 127.0f));
+    }
+    for (int64_t c = 0; c < D; ++c) CHECK_EQ(out.at(c), want[c >= HD] / BS);
+}
+
+TEST(mla_i8_latent_refuses_a_missing_scale_plane_odd_dimension_or_overlapping_rows) {
+    T q(RAD_F32, { 1, 1, 512 }), kv(RAD_I8, { 1, 1, 4, 516 });
+    T bt(RAD_I32, { 1, 1 }), len(RAD_I32, { 1 }), out(RAD_F32, { 1, 1, 512 });
+    len.n({ 1 });
+    std::fill(out.mem.begin(), out.mem.end(), 0x5a);
+    const auto before = out.mem;
+    auto refused = [&](RadTensor cache, int64_t d, int rc) {
+        A a;
+        a.t(q).t(kv).t(bt).t(len).t(out).i("M", 1).i("latent_dim", d).i("heads", 1)
+         .i("blocks", 1).i("block_size", 4).d("scale", 1).s("dtype", "f32").s("kv_dtype", "i8");
+        a.ts[0].shape[2] = a.ts[4].shape[2] = d;
+        a.ts[1] = cache;
+        CHECK_EQ(run("mla_attn", a), rc);
+        CHECK(out.mem == before);
+    };
+    RadTensor bad = kv.t;
+    bad.shape[3] = 512;
+    refused(bad, 512, RAD_E_SHAPE);
+    bad = kv.t;
+    bad.shape[3] = 515;
+    refused(bad, 511, RAD_E_SHAPE);
+    bad = kv.t;
+    bad.stride[3] = 2;
+    refused(bad, 512, RAD_E_STRIDE);
+    bad = kv.t;
+    bad.stride[2] = 515;
+    refused(bad, 512, RAD_E_STRIDE);
+    bad = kv.t;
+    bad.stride[0] = 4 * 516 - 1;
+    refused(bad, 512, RAD_E_STRIDE);
+}
+
+TEST(mla_latent_shape_keeps_queries_wide_and_appends_only_i8_scale_bytes) {
+    const RadKernelInfo* k = kern("mla_attn");
+    REQUIRE(k && k->opd_shape);
+    for (const char* cache : { "", "bf16", "fp8_e4m3", "i8" }) {
+        A a;
+        a.i("M", 3).i("latent_dim", 512).i("heads", 16).i("blocks", 2).i("block_size", 4)
+         .d("scale", 0.0625).s("dtype", "bf16");
+        if (*cache) a.s("kv_dtype", cache);
+        const RadArgs* args = a.get();
+        RadOpdDesc q{}, kv{}, out{};
+        REQUIRE_EQ(k->opd_shape(args->p, args->n_p, 0, &q), RAD_OK);
+        REQUIRE_EQ(k->opd_shape(args->p, args->n_p, 1, &kv), RAD_OK);
+        REQUIRE_EQ(k->opd_shape(args->p, args->n_p, 4, &out), RAD_OK);
+        CHECK_EQ(q.dtype, (uint32_t)RAD_BF16);
+        CHECK_EQ(out.dtype, (uint32_t)RAD_BF16);
+        CHECK_EQ(q.shape[2], 512LL);
+        CHECK_EQ(out.shape[2], 512LL);
+        CHECK_EQ(kv.rank, 4u);
+        CHECK_EQ(kv.shape[0], 6LL);
+        CHECK_EQ(kv.shape[2], 4LL);
+        const bool i8 = !std::strcmp(cache, "i8");
+        const uint32_t want_dt = i8 ? (uint32_t)RAD_I8 : !std::strcmp(cache, "fp8_e4m3")
+                                                      ? (uint32_t)RAD_F8E4M3 : (uint32_t)RAD_BF16;
+        CHECK_EQ(kv.dtype, want_dt);
+        CHECK_EQ(kv.shape[3], i8 ? 516LL : 512LL);
+    }
+    A odd;
+    odd.i("M", 1).i("latent_dim", 511).i("heads", 1).i("blocks", 1).i("block_size", 4)
+       .d("scale", 1).s("dtype", "bf16").s("kv_dtype", "i8");
+    const RadArgs* args = odd.get();
+    RadOpdDesc kv{};
+    CHECK_EQ(k->opd_shape(args->p, args->n_p, 1, &kv), RAD_E_UNSUPPORTED);
+}
+
 TEST(dsa_score_relu_is_per_head_before_signed_weights_and_masks_invalid_history) {
     T q(RAD_F8E4M3, { 2, 2, 2 }), qs(RAD_F32, { 2, 2 }), gate(RAD_F32, { 2, 2 });
     T k(RAD_F8E4M3, { 3, 2 }), ks(RAD_F32, { 3 }), bt(RAD_I32, { 2, 3 });
@@ -1052,6 +1206,42 @@ TEST(group_router_selects_only_inside_the_best_groups) {
     CHECK_EQ(run("router_sigmoid_group_topk", bad), RAD_E_SHAPE);
 }
 
+TEST(group_router_at_the_tiny_geometry_keeps_four_of_eight_sixteen_expert_groups) {
+    T lg(RAD_F32, { 1, 128 }), bias(RAD_F32, { 128 }), ids(RAD_I32, { 1, 8 }), w(RAD_F32, { 1, 8 });
+    // One planted expert a group (16 a group): p 0.90, 0.30, 0.85, 0.10, 0.80, 0.05, 0.75, 0.70,
+    // and a floor of 0.001 everywhere else. The planted sums lead, so topk_group 4 keeps groups
+    // 0, 2, 4 and 6: the four largest planted experts are in, groups 1, 3, 5 and 7 bring nothing.
+    const float planted[8] = { 0.90f, 0.30f, 0.85f, 0.10f, 0.80f, 0.05f, 0.75f, 0.70f };
+    std::vector<float> p(128, 0.001f), lgv;
+    for (int g = 0; g < 8; ++g) p[g * 16 + 2] = planted[g];
+    for (size_t i = 0; i < p.size(); ++i) lgv.push_back(std::log(p[i] / (1 - p[i])));
+    lg.f(lgv);
+    bias.f(std::vector<float>(128, 0.0f));
+    A a;
+    a.t(lg).t(bias).t(ids).t(w).i("M", 1).i("n_expert", 128).i("top_k", 8).i("n_group", 8)
+        .i("topk_group", 4).i("norm", 1).d("route_scale", 2.5).s("dtype", "f32");
+    auto has = [&](int e) {
+        for (int i = 0; i < 8; ++i)
+            if (ids.iat(i) == e) return true;
+        return false;
+    };
+    REQUIRE_EQ(run("router_sigmoid_group_topk", a), RAD_OK);
+    CHECK_EQ(ids.iat(0), 2);    // the kept groups' planted experts, in score order:
+    CHECK_EQ(ids.iat(1), 34);   // 0.90, 0.85, 0.80, 0.75
+    CHECK_EQ(ids.iat(2), 66);
+    CHECK_EQ(ids.iat(3), 98);
+    for (int g : { 1, 3, 5, 7 }) CHECK(!has(g * 16 + 2));  // the dropped groups stay out
+    CHECK_NEAR(w.at(0), 2.5f * 0.90f / (0.90f + 0.85f + 0.80f + 0.75f + 0.004f), 1e-5);
+    // A correction bias ranks group 3's sum past group 6's and seats its expert; the weights
+    // stay the unbias'd sigmoid.
+    std::vector<float> bs(128, 0.0f);
+    bs[3 * 16 + 2] = 0.9f;
+    bias.f(bs);
+    REQUIRE_EQ(run("router_sigmoid_group_topk", a), RAD_OK);
+    CHECK(has(50));
+    CHECK(!has(98));
+}
+
 TEST(paged_latent_attention_is_causal_adds_the_rotary_part_and_gates_per_head) {
     // One sequence of three tokens, the last two queried (positions 1 and 2). Token 0 and 1 sit
     // in page 1, token 2 in page 0; a row is the latent (2) then the rotary part (2).
@@ -1219,6 +1409,23 @@ TEST(plugin_surface) {
  * longer has a fallback or an oracle, which must be a decision, not an oversight (docs/OPS.md). */
 TEST(op_vocabulary) {
     static const char* kOps[] = {
+
+        "flow_unipc_step",
+
+        "timestep_embed_f64",
+
+        "wan_vae_frame_cu",
+        "wan_vae_history",
+        "wan_vae_expand",
+        "wan_unpatch",
+        "wan_mod_norm",
+        "wan_gated_add",
+        "wan_rope_table",
+        "wan_rope",
+
+        "attn_umt5",
+        "gelu_umt5",
+
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "hc_project",
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
@@ -1234,11 +1441,11 @@ TEST(op_vocabulary) {
         "fill",
         "gather_rows", "scatter_rows", "ngram_ids", "ple_gate", "ple_conv", "causal_conv1d",
         /* Mamba-2's conv1d (Nemotron-3.5-Bolt): ple_conv with a bias inside the silu. */
-        "ple_conv_bias",
+        "ple_conv_bias", "sconv_res",
         "embed_lookup_q", "embed_lookup_iq4xs", "cast",
         "scale_rows",
         "softmax",
-        "quant_act_i8", "quant_act_i8g", "quant_act_fp8", "quant_cols_fp8", "had_quant_act_fp8", "givens_dense_quant", "givens_rotate", "had_quant_act_i8",
+        "quant_act_i8", "quant_act_i8g", "quant_act_fp8", "quant_cols_fp8", "had_quant_act_i8",
         "had_quant_act_i8g",
         "gram_accum",
         /* The fused fp8 forms. A host run needs every op covered, so these keep a host-backend run
@@ -1248,17 +1455,17 @@ TEST(op_vocabulary) {
         /* Tree verification (rad_drafter_tree): the drafter's tree and the attention over it. */
         "dflash_tree", "attn_paged_tree", "attn_paged_anchor_window",
         "rmsnorm_had_quant_i8",
-        "gated_had_quant_i8",
+        "gated_had_quant_i8", "gated_quant_i8",
         "dequant", "dequant_w4",
         "gemm_nt", "gemm_nt_bias", "gemm_nt_q", "gemm_nt_q_bias", "grid_embed",
         /* Runtime LoRA's two halves, issued by the core beside a trunk GEMM. */
         "lora_shrink", "lora_expand", "lora_expand_mm",
-        "grid_embed_aa", "grid_embed_cpe",
+        "grid_embed_aa", "grid_embed_cpe", "grid_embed_pad", "window_order",
         "attn_paged", "attn_dense", "kv_store", "kv_store_streamed", "rope", "rope_table",
-        "attn_paged_sink",
+        "attn_paged_sink", "attn_paged_rel",
         "qk_norm_rope", "qsa_block_key",
         /* libr4d's row-form names, served by the base op's row. */
-        "rmsnorm_rows", "rope_rows", "gemm_nt_q_short", "gemm_nt_q_gated_wide",
+        "rmsnorm_rows", "rope_rows",
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
          * issues them has no other host path. */
         "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "kv_resolve", "dflash_conv",
@@ -1278,7 +1485,6 @@ TEST(op_vocabulary) {
         "ln_mod", "gate_add", "timestep_embed", "gather_rows2", "lane_gather", "lane_store",
         "randn_lanes", "flow_euler", "chan_affine", "conv2d_nhwc", "im2col_nhwc", "l2norm_chan",
         "d2s_add", "s2d_avg_add", "to_rgba8", "gelu_tanh", "scatter_add_rows", "attn_prefix_self",
-        "ln_mod_quant_fp8",
         /* SDXL's (arch/sdxl): CLIP-L's activation and the k-diffusion sampler over a
          * discrete-time denoiser. */
         "gelu_quick", "kd_input", "kd_step",
@@ -1290,11 +1496,11 @@ TEST(op_vocabulary) {
         "chan_split", "interleave2", "iota", "cu_repeat", "int_affine", "frame_store",
         /* Fish Audio drama-3's (arch/fishomni): the repetition-aware choice between two draws,
          * and its codec encoder's residual quantiser step. */
-        "ras_pick", "vq_encode",
+        "ras_pick", "vq_encode", "vq_euclidean", "elu",
         /* The video generator's (MiniMax-H3): its DiT's modulated norm and sampler step, its
          * decoder's patch unfold, tiles, stitch and positions, and the vocoder's alias-free
          * activation. */
-        "rms_mod", "rms_mod_quant_fp8", "flow_x0_step", "flow_res_multistep", "patch_unfold",
+        "rms_mod", "flow_x0_step", "flow_res_multistep", "patch_unfold",
         "vtile_gather",
         "vtile_stitch", "grid_pos3", "snake_aa",
         /* Its step-distilled form's video sparse attention: the tile selection and the
@@ -1328,6 +1534,8 @@ TEST(op_vocabulary) {
         "position_scale", "embed_attn", "ministral_rope", "pixtral_rope", "pixtral_merge",
         /* LiLiCorr's candidate correlator (Nemotron-3.5-Bolt's drafter). */
         "lili_cand", "lili_attn", "lili_factor", "lili_walk",
+        /* Block attention residuals and SiTU (Inkling 2). */
+        "attn_res_mix", "situ_mul", "l2_clip",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);
@@ -1340,6 +1548,7 @@ TEST(op_vocabulary) {
     CHECK_EQ(kern("attn_paged")->n_constraints, 1);
     CHECK(std::strcmp(kern("attn_paged")->constraints[0].key, "block_size") == 0);
     CHECK_EQ(kern("attn_paged_tree")->n_constraints, 1);
+    CHECK_EQ(kern("attn_paged_rel")->n_constraints, 1);
     CHECK_EQ(kern("attn_paged_sink")->n_constraints, 1);
     CHECK(std::strcmp(kern("attn_paged_sink")->constraints[0].key, "block_size") == 0);
     CHECK_EQ(kern("kv_store")->n_constraints, 1);
@@ -1347,7 +1556,7 @@ TEST(op_vocabulary) {
     CHECK_EQ(kern("gdn_chunk_scan")->n_constraints, 0);
     int constrained = 0;
     for (int i = 0; i < api().kernel_count(); ++i) constrained += api().kernel_at(i)->n_constraints > 0;
-    CHECK_EQ(constrained, 5);
+    CHECK_EQ(constrained, 6);   /* the paged-block rows (attn_paged_rel among them) and kv_store */
 }
 
 /* ================================================================== the numerics
@@ -1682,6 +1891,107 @@ TEST(op_silu_mul_and_unary) {
     A c; c.t(x).t(s).i("M", 1).i("n", 2).s("dtype", "f32");
     CHECK_OK(run("silu", c));
     CHECK_NEAR(s.at(1), 0.73105858f, 1e-6);
+}
+
+/* Block attention residuals against a double-precision reference of the same contract (OPS.md),
+ * over state planes pitched in a [max_blocks, max_tok, n] buffer: only the first n_state planes
+ * and the first M rows of each are read. */
+static std::vector<double> attn_res_expect(const std::vector<float>& st, int64_t MT, int64_t nS,
+                                           const std::vector<float>& cur,
+                                           const std::vector<float>* add,
+                                           const std::vector<float>& q,
+                                           const std::vector<float>* w, int64_t M, int64_t n,
+                                           int64_t nQ, double eps) {
+    std::vector<double> y((size_t)(nQ * M * n));
+    for (int64_t t = 0; t < M; ++t) {
+        std::vector<std::vector<double>> v;
+        for (int64_t i = 0; i <= nS; ++i) {
+            std::vector<double> x((size_t)n);
+            for (int64_t c = 0; c < n; ++c) {
+                if (i < nS) x[(size_t)c] = st[(size_t)(i * MT * n + t * n + c)];
+                else x[(size_t)c] = (double)cur[(size_t)(t * n + c)] +
+                                    (add ? (double)(*add)[(size_t)(t * n + c)] : 0.0);
+            }
+            double ms = 0;
+            for (double e : x) ms += e * e;
+            const double r = 1.0 / std::sqrt(ms / n + eps);
+            for (double& e : x) e *= r;
+            v.push_back(x);
+        }
+        for (int64_t qq = 0; qq < nQ; ++qq) {
+            std::vector<double> sc;
+            double mx = -1e300;
+            for (auto& x : v) {
+                double d = 0;
+                for (int64_t c = 0; c < n; ++c) d += x[(size_t)c] * q[(size_t)(qq * n + c)];
+                sc.push_back(d / std::sqrt((double)n));
+                mx = std::max(mx, sc.back());
+            }
+            double den = 0;
+            for (double& s : sc) { s = std::exp(s - mx); den += s; }
+            std::vector<double> m((size_t)n, 0.0);
+            for (size_t i = 0; i < v.size(); ++i)
+                for (int64_t c = 0; c < n; ++c) m[(size_t)c] += sc[i] / den * v[i][(size_t)c];
+            if (w) {
+                double ms = 0;
+                for (double e : m) ms += e * e;
+                const double r = 1.0 / std::sqrt(ms / n + eps);
+                for (int64_t c = 0; c < n; ++c)
+                    m[(size_t)c] = m[(size_t)c] * r * (*w)[(size_t)(qq * n + c)];
+            }
+            for (int64_t c = 0; c < n; ++c) y[(size_t)((qq * M + t) * n + c)] = m[(size_t)c];
+        }
+    }
+    return y;
+}
+
+TEST(op_attn_res_mix) {
+    const int64_t M = 3, n = 6, nS = 2, nQ = 3, MB = 4, MT = 5;
+    const double eps = 1e-6;
+    std::vector<float> st((size_t)(MB * MT * n)), cur((size_t)(M * n)), add((size_t)(M * n));
+    std::vector<float> q((size_t)(nQ * n)), w((size_t)(nQ * n));
+    for (size_t i = 0; i < st.size(); ++i) st[i] = std::sin(0.37f * (float)i) * (1.0f + (float)(i % 4));
+    for (size_t i = 0; i < cur.size(); ++i) { cur[i] = std::cos(0.91f * (float)i); add[i] = 0.1f * (float)i - 0.4f; }
+    for (size_t i = 0; i < q.size(); ++i) { q[i] = std::sin(1.3f * (float)i + 0.2f); w[i] = 1.0f + 0.05f * (float)i; }
+
+    T S(RAD_F32, { MB, MT, n }); S.f(st);
+    T C(RAD_F32, { M, n }); C.f(cur);
+    T AD(RAD_F32, { M, n }); AD.f(add);
+    T Q(RAD_F32, { nQ, n }); Q.f(q);
+    T W(RAD_F32, { nQ, n }); W.f(w);
+    T Y(RAD_F32, { nQ, M, n });
+
+    A a; a.t(S).t(C).t(AD).t(Q).t(W).t(Y).i("M", M).i("n", n).i("n_state", nS).i("n_query", nQ)
+          .s("dtype", "f32").d("eps", eps);
+    CHECK_OK(run("attn_res_mix", a));
+    auto want = attn_res_expect(st, MT, nS, cur, &add, q, &w, M, n, nQ, eps);
+    for (size_t i = 0; i < want.size(); ++i) CHECK_NEAR(Y.at((int64_t)i), want[i], 2e-5);
+
+    /* Without addend or w, and with no state planes: the depth is cur alone, so the mix is the
+     * rms-normed cur. */
+    T Y2(RAD_F32, { nQ, M, n }), Y0(RAD_F32, { nQ, M, n });
+    A b; b.t(S).t(C).tnull().t(Q).tnull().t(Y2).i("M", M).i("n", n).i("n_state", nS)
+          .i("n_query", nQ).s("dtype", "f32").d("eps", eps);
+    CHECK_OK(run("attn_res_mix", b));
+    auto want2 = attn_res_expect(st, MT, nS, cur, nullptr, q, nullptr, M, n, nQ, eps);
+    for (size_t i = 0; i < want2.size(); ++i) CHECK_NEAR(Y2.at((int64_t)i), want2[i], 2e-5);
+    A c; c.tnull().t(C).tnull().t(Q).tnull().t(Y0).i("M", M).i("n", n).i("n_state", 0)
+          .i("n_query", nQ).s("dtype", "f32").d("eps", eps);
+    CHECK_OK(run("attn_res_mix", c));
+    for (int64_t t = 0; t < M; ++t) {
+        double ms = 0;
+        for (int64_t k = 0; k < n; ++k) ms += (double)cur[(size_t)(t * n + k)] * cur[(size_t)(t * n + k)];
+        const double r = 1.0 / std::sqrt(ms / n + eps);
+        for (int64_t k = 0; k < n; ++k)
+            CHECK_NEAR(Y0.at((int64_t)(t * n + k)), cur[(size_t)(t * n + k)] * r, 2e-5);
+    }
+    /* A query row count of 0 and a state count beyond the buffer are refused. */
+    A z; z.t(S).t(C).tnull().t(Q).tnull().t(Y).i("M", M).i("n", n).i("n_state", nS).i("n_query", 0)
+          .s("dtype", "f32").d("eps", eps);
+    CHECK_EQ(run("attn_res_mix", z), RAD_E_SHAPE);
+    A z2; z2.t(S).t(C).tnull().t(Q).tnull().t(Y).i("M", M).i("n", n).i("n_state", MB + 1)
+           .i("n_query", nQ).s("dtype", "f32").d("eps", eps);
+    CHECK_EQ(run("attn_res_mix", z2), RAD_E_SHAPE);
 }
 
 /* Gemma's gated FFN, on paper: silu_mul's fused layout (gate the first half, up the second) but the
@@ -2216,6 +2526,195 @@ TEST(op_causal_conv1d) {
         CHECK_OK(run("causal_conv1d", d));
         CHECK_NEAR(y4.at(0), 459.0f, 1e-5);
     }
+}
+
+/* sconv_res against the formula over whole sequences: each sequence starts on zeros, so a row's
+ * taps reach back through `k - 1` earlier rows of its own sequence and no further. */
+static std::vector<float> sconv_ref(const std::vector<float>& x, int64_t L, int64_t n,
+                                    const std::vector<float>& w, const std::vector<float>& dyn,
+                                    int64_t heads, int64_t k) {
+    const bool has_dyn = !dyn.empty();
+    const double div = std::sqrt((double)((has_dyn ? 2 : 1) * k + 1));
+    std::vector<float> y((size_t)(L * n));
+    for (int64_t t = 0; t < L; ++t)
+        for (int64_t c = 0; c < n; ++c) {
+            double acc = x[t * n + c];
+            for (int64_t lag = 0; lag < k && t - lag >= 0; ++lag) {
+                double tap = w[c * k + (k - 1 - lag)];
+                if (has_dyn) tap += dyn[t * heads * k + (c / (n / heads)) * k + lag];
+                acc += tap * x[(t - lag) * n + c];
+            }
+            y[t * n + c] = (float)(acc / div);
+        }
+    return y;
+}
+
+/* The rows `idx` of a [*, width] table, in that order. */
+static std::vector<float> pick_rows(const std::vector<float>& v, const std::vector<int>& idx, int64_t width) {
+    std::vector<float> out;
+    for (int i : idx) out.insert(out.end(), v.begin() + i * width, v.begin() + (i + 1) * width);
+    return out;
+}
+
+/* sconv_res over a ragged prefill, then one sequence through a speculative verify with partial
+ * acceptance and the steps after it. `dyn` selects the input-dependent taps (heads 2); without it
+ * the op is the plain form with heads 0. The state is [slots, n, 5]: (k-1) + 3 drafts - 1. */
+static void sconv_steps(bool dyn) {
+    const int64_t n = 8, k = 4, S = 5, heads = dyn ? 2 : 0, dw = dyn ? heads * k : 0;
+    std::vector<float> w((size_t)(n * k));
+    for (size_t i = 0; i < w.size(); ++i) w[i] = 0.05f * (float)((i * 7) % 11) - 0.25f;
+    auto mk = [](size_t count, float seed) {
+        std::vector<float> v(count);
+        for (size_t i = 0; i < count; ++i) v[i] = std::sin(0.7f * (float)i + seed);
+        return v;
+    };
+    /* Token rows of one stream, and the same rows' input-dependent taps. */
+    const std::vector<float> X = mk(16 * n, 0.3f), D = dyn ? mk(16 * dw, 1.1f) : std::vector<float>();
+
+    /* Ragged prefill: sequence A (rows 0..2) in slot 1, B (rows 3..7) in slot 0, both cold. */
+    {
+        const std::vector<float> xa = pick_rows(X, { 0, 1, 2 }, n), xb = pick_rows(X, { 3, 4, 5, 6, 7 }, n);
+        const std::vector<float> da = dyn ? pick_rows(D, { 0, 1, 2 }, dw) : std::vector<float>();
+        const std::vector<float> db = dyn ? pick_rows(D, { 3, 4, 5, 6, 7 }, dw) : std::vector<float>();
+        std::vector<float> xs = xa; xs.insert(xs.end(), xb.begin(), xb.end());
+        std::vector<float> ds = da; ds.insert(ds.end(), db.begin(), db.end());
+        T x(RAD_F32, { 8, n }); x.f(xs);
+        T cu(RAD_I32, { 3 }); cu.n({ 0, 3, 8 });
+        T ci(RAD_I32, { 2 }); ci.n({ 1, 0 });
+        T hi(RAD_I32, { 2 }); hi.n({ 0, 0 });
+        T wt(RAD_F32, { n, k }); wt.f(w);
+        T cs(RAD_F32, { 2, n, S }); cs.f(std::vector<float>((size_t)(2 * n * S), 7.0f));
+        T dd(RAD_F32, { 8, dw ? dw : 1 }); if (dyn) dd.f(ds);
+        T y(RAD_F32, { 8, n });
+        A a; a.t(x).t(wt).t(cs).t(cu);
+        if (dyn) a.t(dd); else a.tnull();
+        a.t(ci).t(hi).tnull().t(y).i("M", 8).i("n", n).i("width", k).i("heads", heads).s("dtype", "f32");
+        CHECK_OK(run("sconv_res", a));
+        const std::vector<float> ya = sconv_ref(xa, 3, n, w, da, heads, k);
+        const std::vector<float> yb = sconv_ref(xb, 5, n, w, db, heads, k);
+        for (int64_t i = 0; i < 3 * n; ++i) CHECK_NEAR(y.at(i), ya[i], 1e-5);
+        for (int64_t i = 0; i < 5 * n; ++i) CHECK_NEAR(y.at(3 * n + i), yb[i], 1e-5);
+        /* The window left behind: the last k-1 inputs of each sequence, at offset zero. */
+        for (int64_t c = 0; c < n; ++c)
+            for (int64_t i = 0; i < k - 1; ++i) {
+                CHECK_NEAR(cs.at(1 * n * S + c * S + i), xa[i * n + c], 1e-6);
+                CHECK_NEAR(cs.at(0 * n * S + c * S + i), xb[(2 + i) * n + c], 1e-6);
+            }
+    }
+
+    /* One sequence in slot 0: a prefix of 3 rows (cold), a verify of drafts 3..5 with num_accepted
+     * 1, then a step after two of them were kept (num_accepted 2), then one more after one kept.
+     * Every step is checked against the formula over the sequence it has committed. */
+    const std::vector<int> prefix = { 0, 1, 2 }, drafts = { 3, 4, 5 };
+    T cs(RAD_F32, { 1, n, S }); cs.f(std::vector<float>((size_t)(n * S), 7.0f));
+    T ci(RAD_I32, { 1 }); ci.n({ 0 });
+    T wt(RAD_F32, { n, k }); wt.f(w);
+    std::vector<int> committed;
+    auto step = [&](const std::vector<int>& rows, int hinit, int nacc, const char* what) {
+        const int64_t M = (int64_t)rows.size();
+        const std::vector<float> xr = pick_rows(X, rows, n);
+        const std::vector<float> dr = dyn ? pick_rows(D, rows, dw) : std::vector<float>();
+        T x(RAD_F32, { M, n }); x.f(xr);
+        T cu(RAD_I32, { 2 }); cu.n({ 0, M });
+        T hi(RAD_I32, { 1 }); hi.n({ hinit });
+        T dd(RAD_F32, { M, dw ? dw : 1 }); if (dyn) dd.f(dr);
+        T y(RAD_F32, { M, n });
+        A a; a.t(x).t(wt).t(cs).t(cu);
+        if (dyn) a.t(dd); else a.tnull();
+        a.t(ci).t(hi);
+        T na(RAD_I32, { 1 });                      /* outlives the launch: the operand points into it */
+        if (nacc > 0) { na.n({ nacc }); a.t(na); } else a.tnull();
+        a.t(y).i("M", M).i("n", n).i("width", k).i("heads", heads).s("dtype", "f32");
+        CHECK_OK(run("sconv_res", a));
+        /* The formula over the committed history ending at this step's rows. */
+        std::vector<int> seq = committed;
+        seq.insert(seq.end(), rows.begin(), rows.end());
+        const size_t from = committed.size();
+        const std::vector<float> xs = pick_rows(X, seq, n);
+        const std::vector<float> ds = dyn ? pick_rows(D, seq, dw) : std::vector<float>();
+        const std::vector<float> ref = sconv_ref(xs, (int64_t)seq.size(), n, w, ds, heads, k);
+        for (int64_t i = 0; i < M; ++i)
+            for (int64_t c = 0; c < n; ++c) CHECK_NEAR(y.at(i * n + c), ref[(from + i) * n + c], 1e-5);
+        (void)what;
+    };
+    step(prefix, 0, 0, "prefix");                 /* cold, every token commits */
+    committed = prefix;
+    step(drafts, 1, 1, "verify");                 /* warm; the window read at offset 0 */
+    committed.push_back(drafts[0]);
+    committed.push_back(drafts[1]);               /* two of the three drafts are kept */
+    step({ 6 }, 1, 2, "after two kept");          /* read at offset 1: history ends at draft 2 */
+    committed.push_back(6);
+    step({ 7 }, 1, 1, "after one kept");          /* the row before it was kept: offset 0 */
+}
+
+TEST(op_sconv_res) {
+    sconv_steps(true);
+    sconv_steps(false);
+}
+
+/* l2_clip against the formula, in double: the scale before the norm, each group's norm, the
+ * position tau after the clip. */
+static std::vector<double> l2_ref(const std::vector<float>& x, int64_t M, int64_t n, int64_t g,
+                                  const std::vector<float>& w, bool has_w, const std::vector<int>& pos,
+                                  bool has_pos, double thr, double flr, double alpha) {
+    std::vector<double> y((size_t)(M * n));
+    for (int64_t r = 0; r < M; ++r) {
+        const double tau = has_pos ? 1.0 + alpha * std::log(std::max(1.0, (pos[r] + 1.0) / flr)) : 1.0;
+        for (int64_t g0 = 0; g0 < n; g0 += g) {
+            double ss = 0;
+            for (int64_t i = g0; i < g0 + g; ++i) {
+                const double v = (double)x[r * n + i] * (has_w ? (double)w[i] : 1.0);
+                ss += v * v;
+            }
+            const double f = std::min(1.0, thr / (std::sqrt(ss) + 1e-6));
+            for (int64_t i = g0; i < g0 + g; ++i)
+                y[r * n + i] = (double)x[r * n + i] * (has_w ? (double)w[i] : 1.0) * f * tau;
+        }
+    }
+    return y;
+}
+
+/* One launch with the scale and positions present or absent, the views pitched, and y either a
+ * separate tensor or x itself. The output is read through its own pitch. */
+static void l2_check(bool has_w, bool has_pos, bool pitched, bool inplace) {
+    const int64_t M = 5, n = 24, g = 8, P = pitched ? n + 5 : n;
+    std::vector<float> X((size_t)(M * n)), W((size_t)n);
+    for (size_t i = 0; i < X.size(); ++i) X[i] = 3.0f * std::sin(0.7 * (double)i + 0.3);
+    for (size_t i = 0; i < W.size(); ++i) W[i] = 0.5f + 0.5f * std::cos((double)i);
+    const std::vector<int> pos = { 0, 3, 10, 100, 1000 };
+    const double thr = 1.5, flr = 2.0, alpha = 0.3;
+
+    T x(RAD_F32, { M, P });
+    x.t.shape[1] = n; x.t.stride[0] = P; x.t.stride[1] = 1;
+    for (int64_t r = 0; r < M; ++r)
+        for (int64_t c = 0; c < n; ++c) st_dt(RAD_F32, x.t.data, r * P + c, X[r * n + c]);
+    T wt(RAD_F32, { n }); wt.f(W);
+    T pt(RAD_I32, { M }); pt.n(std::vector<int64_t>(pos.begin(), pos.end()));
+    T y(RAD_F32, { M, P });
+    y.t.shape[1] = n; y.t.stride[0] = P; y.t.stride[1] = 1;
+
+    A a;
+    a.t(x);
+    if (has_w) a.t(wt); else a.tnull();
+    if (has_pos) a.t(pt); else a.tnull();
+    if (inplace) a.t(x); else a.t(y);
+    a.i("M", M).i("n", n).i("group", g).d("threshold", thr).s("dtype", "f32");
+    a.d("floor", flr).d("alpha", alpha);
+    CHECK_OK(run("l2_clip", a));
+
+    const std::vector<double> ref = l2_ref(X, M, n, g, W, has_w, pos, has_pos, thr, flr, alpha);
+    const T& out = inplace ? x : y;
+    for (int64_t r = 0; r < M; ++r)
+        for (int64_t c = 0; c < n; ++c)
+            CHECK_NEAR(out.at(r * P + c), ref[r * n + c], 2e-5);
+}
+
+TEST(op_l2_clip) {
+    l2_check(true, true, false, false);    /* the model's shape: scale, positions */
+    l2_check(false, false, false, false);  /* the plain clip */
+    l2_check(true, true, true, false);     /* pitched views */
+    l2_check(true, true, false, true);     /* in place */
+    l2_check(false, true, true, true);     /* in place, pitched, positions only */
 }
 
 /* PLE's n-gram ids, on the real checkpoint constants.
@@ -2833,10 +3332,12 @@ TEST(op_quant_act_i8g) {
 }
 
 TEST(op_had_quant_act_i8) {
-    /* One rotation block of two: the butterfly is [a+b, a-b]. */
-    T x(RAD_F32, {1, 2}); x.f({1, 3});
-    T q(RAD_I8, {1, 2}), s(RAD_F32, {1});
-    A a; a.t(x).t(q).t(s).i("M", 1).i("n", 2).i("group", 2);
+    /* One rotation block of two: the butterfly is [a+b, a-b]. The row is padded to a whole step of
+     * sixteen; the zeros rotate to zeros and the block's two codes stay at columns 0 and 1, which
+     * the step order leaves in place. */
+    T x(RAD_F32, {1, 16}); x.f({1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    T q(RAD_I8, {1, 16}), s(RAD_F32, {1});
+    A a; a.t(x).t(q).t(s).i("M", 1).i("n", 16).i("group", 2);
     CHECK_OK(run("had_quant_act_i8", a));
     /* rotated [4, -2], amax 4, q = round(v * 127/4) = [127, -63.5 -> -64] */
     CHECK_EQ(q.iat(0), 127LL);
@@ -2845,46 +3346,72 @@ TEST(op_had_quant_act_i8) {
     CHECK_NEAR(s.at(0), 4.0f / 127.0f / 1.41421356f, 1e-9);
 }
 
+/* The card's step order, by hand. x = e_4 rotated over one block of sixteen is v_i = (-1)^bit2(i):
+ * -1 at columns 4..7 and 12..15, +1 elsewhere. amax 1, so the codes are +-127, and the step order
+ * (i8_step_pos swaps bits 2 and 3) sends column 4 to byte 8 and 12 to byte 12: bytes 0..7 hold +127
+ * and bytes 8..15 hold -127. Column order would put -127 at bytes 4..7 and 12..15. The scale is
+ * 1/127 / sqrt(16). Also: a row that is not whole steps is refused. */
+TEST(op_had_quant_act_i8_step_order) {
+    T x(RAD_F32, {1, 16}); x.f({0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    T q(RAD_I8, {1, 16}), s(RAD_F32, {1});
+    A a; a.t(x).t(q).t(s).i("M", 1).i("n", 16).i("group", 16);
+    CHECK_OK(run("had_quant_act_i8", a));
+    for (int i = 0; i < 8; ++i) CHECK_EQ(q.iat(i), 127LL);
+    for (int i = 8; i < 16; ++i) CHECK_EQ(q.iat(i), -127LL);
+    CHECK_NEAR(s.at(0), 1.0f / 127.0f / 4.0f, 1e-9);
+
+    T x8(RAD_F32, {1, 8}), q8(RAD_I8, {1, 8}), s8(RAD_F32, {1});
+    A b; b.t(x8).t(q8).t(s8).i("M", 1).i("n", 8).i("group", 8);
+    CHECK_EQ(run("had_quant_act_i8", b), RAD_E_SHAPE);
+}
+
 TEST(op_rmsnorm_had_quant_i8) {
-    /* Operand 1 is the optional `residual`; absent here, exercised below. */
-    T x(RAD_F32, {1, 2}); x.f({1, 1});
-    T w(RAD_F32, {2});    w.f({1, 1});
-    T q(RAD_I8, {1, 2}), s(RAD_F32, {1});
-    A a; a.t(x).tnull().t(w).t(q).t(s).i("M", 1).i("n", 2).d("eps", 0).i("group", 2);
+    /* Operand 1 is the optional `residual`; absent here, exercised below. Padded to a step: the
+     * sum of squares is 2 over sixteen, so the rms is sqrt(1/8); normed [s, s, 0...] with s =
+     * sqrt(8); rotated [2s, 0]. */
+    T x(RAD_F32, {1, 16}); x.f({1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    T w(RAD_F32, {16});    w.f({1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1});
+    T q(RAD_I8, {1, 16}), s(RAD_F32, {1});
+    A a; a.t(x).tnull().t(w).t(q).t(s).i("M", 1).i("n", 16).d("eps", 0).i("group", 2);
     CHECK_OK(run("rmsnorm_had_quant_i8", a));
-    /* rms 1, normed [1,1], rotated [2,0], amax 2 */
+    /* rotated [2*sqrt(8), 0], amax 2*sqrt(8) = 5.657 */
     CHECK_EQ(q.iat(0), 127LL);
     CHECK_EQ(q.iat(1), 0LL);
-    CHECK_NEAR(s.at(0), 2.0f / 127.0f / 1.41421356f, 1e-9);
+    CHECK_NEAR(s.at(0), 4.0f / 127.0f, 1e-6);
 }
 
 /* The fused_add_rms_norm form. The residual add happens first and is written back (which makes
  * `residual` inout and is what the next layer's shortcut reads), and `out_bf16` carries the
- * post-norm, pre-rotation tensor for a layer that also has a bf16 consumer of it. */
+ * post-norm, pre-rotation tensor for a layer that also has a bf16 consumer of it. Padded to a
+ * step as above: the residual sum is [2, 2, 0...], its sum of squares 8 over sixteen, so the
+ * norm is sqrt(2) and the normed values are 2*sqrt(2). */
 TEST(op_rmsnorm_had_quant_i8_residual) {
-    T x(RAD_F32, {1, 2});   x.f({1, 1});
-    T res(RAD_F32, {1, 2}); res.f({1, 1});
-    T w(RAD_F32, {2});      w.f({1, 1});
-    T q(RAD_I8, {1, 2}), s(RAD_F32, {1}), ob(RAD_F32, {1, 2});
-    A a; a.t(x).t(res).t(w).t(q).t(s).t(ob).i("M", 1).i("n", 2).d("eps", 0).i("group", 2);
+    T x(RAD_F32, {1, 16});   x.f({1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    T res(RAD_F32, {1, 16}); res.f({1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    T w(RAD_F32, {16});      w.f({1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1});
+    T q(RAD_I8, {1, 16}), s(RAD_F32, {1}), ob(RAD_F32, {1, 16});
+    A a; a.t(x).t(res).t(w).t(q).t(s).t(ob).i("M", 1).i("n", 16).d("eps", 0).i("group", 2);
     CHECK_OK(run("rmsnorm_had_quant_i8", a));
-    /* residual becomes [2, 2]; rms 2; normed [1, 1]; rotated [2, 0]. */
+    /* residual becomes [2, 2]; rms sqrt(2); normed [2 sqrt2, 2 sqrt2]; rotated [4 sqrt2, 0]. */
     CHECK_EQ(res.at(0), 2.0f);
     CHECK_EQ(res.at(1), 2.0f);
-    CHECK_NEAR(ob.at(0), 1.0f, 1e-6);
-    CHECK_NEAR(ob.at(1), 1.0f, 1e-6);
+    CHECK_NEAR(ob.at(0), 2.0f * std::sqrt(2.0f), 1e-5);
+    CHECK_NEAR(ob.at(1), 2.0f * std::sqrt(2.0f), 1e-5);
     CHECK_EQ(q.iat(0), 127LL);
     CHECK_EQ(q.iat(1), 0LL);
-    CHECK_NEAR(s.at(0), 2.0f / 127.0f / 1.41421356f, 1e-9);
+    CHECK_NEAR(s.at(0), 4.0f / 127.0f, 1e-6);
 }
 
 TEST(op_gated_had_quant_i8) {
-    /* `b` absent is the packed form: `a` is [M, 2n], gate first half, up second. */
-    T gu(RAD_F32, {1, 4}); gu.f({0, 0, 5, 7});     /* gate [0,0], up [5,7] */
-    T q(RAD_I8, {1, 2}), s(RAD_F32, {1});
-    A a; a.t(gu).tnull().t(q).t(s).i("M", 1).i("n", 2).i("group", 2).s("act", "sigmoid");
+    /* `b` absent is the packed form: `a` is [M, 2n], gate first half, up second. Padded to a step:
+     * the gate is zero, so sigmoid(0)*[5,7] = [2.5, 3.5] in columns 0 and 1 and zeros after. */
+    T gu(RAD_F32, {1, 32});
+    gu.f({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          5, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    T q(RAD_I8, {1, 16}), s(RAD_F32, {1});
+    A a; a.t(gu).tnull().t(q).t(s).i("M", 1).i("n", 16).i("group", 2).s("act", "sigmoid");
     CHECK_OK(run("gated_had_quant_i8", a));
-    /* sigmoid(0)*[5,7] = [2.5, 3.5]; rotated [6, -1]; amax 6 */
+    /* rotated [6, -1]; amax 6 */
     CHECK_EQ(q.iat(0), 127LL);
     CHECK_EQ(q.iat(1), (long long)std::nearbyintf(-1.0f * 127.0f / 6.0f));
     CHECK_NEAR(s.at(0), 6.0f / 127.0f / 1.41421356f, 1e-9);
@@ -2892,14 +3419,43 @@ TEST(op_gated_had_quant_i8) {
     /* The split form: the same numbers from two operands, with `mode` as libr4d's integer spelling
      * of the same activation. The two readings must agree, or the schema's union of them would
      * mean two different ops. */
-    T ga(RAD_F32, {1, 2}); ga.f({0, 0});
-    T up(RAD_F32, {1, 2}); up.f({5, 7});
-    T q2(RAD_I8, {1, 2}), s2(RAD_F32, {1});
-    A b; b.t(ga).t(up).t(q2).t(s2).i("M", 1).i("n", 2).i("group", 2).i("mode", 1);
+    T ga(RAD_F32, {1, 16}); ga.f({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    T up(RAD_F32, {1, 16}); up.f({5, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    T q2(RAD_I8, {1, 16}), s2(RAD_F32, {1});
+    A b; b.t(ga).t(up).t(q2).t(s2).i("M", 1).i("n", 16).i("group", 2).i("mode", 1);
     CHECK_OK(run("gated_had_quant_i8", b));
     CHECK_EQ(q2.iat(0), 127LL);
     CHECK_EQ(q2.iat(1), (long long)std::nearbyintf(-1.0f * 127.0f / 6.0f));
     CHECK_NEAR(s2.at(0), 6.0f / 127.0f / 1.41421356f, 1e-9);
+}
+
+TEST(op_gated_had_quant_i8_situ) {
+    /* One live element, so the rotation is the identity: the code is the sign and the scale is
+     * |v|/127, with v = gcap tanh(g/gcap) sigmoid(g) ucap tanh(u/ucap) at gate 1, up 2, caps 4 and
+     * 25. The other fifteen are zero in gate and up, so they contribute zero to the row. */
+    T gu(RAD_F32, {1, 32});
+    gu.f({1.0f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          2.0f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    T q(RAD_I8, {1, 16}), s(RAD_F32, {1});
+    A a; a.t(gu).tnull().t(q).t(s).i("M", 1).i("n", 16).i("group", 1).s("act", "situ")
+          .d("gate_cap", 4.0).d("up_cap", 25.0);
+    CHECK_OK(run("gated_had_quant_i8", a));
+    const double sig = 1.0 / (1.0 + std::exp(-1.0));
+    const double v = 4.0 * std::tanh(1.0 / 4.0) * sig * 25.0 * std::tanh(2.0 / 25.0);
+    CHECK_EQ(q.iat(0), 127LL);
+    CHECK_NEAR(s.at(0), v / 127.0, 1e-6);
+}
+
+TEST(op_gated_quant_i8) {
+    /* The unrotated form on the packed [1, 4] gate_up: sigmoid(0)*[5,7] = [2.5, 3.5], one group of
+     * 2, so one scale 3.5/127 and codes round(2.5*127/3.5) and 127. */
+    T gu(RAD_F32, {1, 4}); gu.f({0, 0, 5, 7});
+    T q(RAD_I8, {1, 2}), s(RAD_F32, {1, 1});
+    A a; a.t(gu).tnull().t(q).t(s).i("M", 1).i("n", 2).i("group", 2).s("act", "sigmoid");
+    CHECK_OK(run("gated_quant_i8", a));
+    CHECK_EQ(q.iat(0), (long long)std::nearbyintf(2.5f * 127.0f / 3.5f));
+    CHECK_EQ(q.iat(1), 127LL);
+    CHECK_NEAR(s.at(0), 3.5f / 127.0f, 1e-9);
 }
 
 TEST(op_dequant) {
@@ -3156,133 +3712,6 @@ TEST(op_gemm_nt_q_parts_read_their_own_activation_copy) {
     }
 }
 
-/* ParoQuant's activation quantiser, the rotation as dense per-group matrices. T[j][i] of a (part,
- * group) is the group's composed network applied to unit vector e_i, built here in double from the
- * same pairs and angles the device layout hook reads. The dequantised row is then the rotated row
- * to within the quantiser's grid (plus the f16 rounding of T), and the rotation preserves the
- * row's norm; both are checked per part against a double-precision rotation. With T the identity
- * and unit channel scales it is exactly quant_act_fp8. Run for both quantisers `out` names. */
-TEST(op_givens_dense_quant) {
-    const int64_t M = 3, n = 256, S = 3, P = 2, G = 128;
-    uint32_t rng = 99;
-    auto nxt = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
-    auto frand = [&](float lo, float hi) { return lo + (hi - lo) * (float)(nxt() % 10000) / 10000.0f; };
-    T x(RAD_BF16, {M, n});
-    std::vector<float> xv((size_t)(M * n));
-    for (auto& v : xv) v = frand(-3.0f, 3.0f);
-    for (int64_t m = 0; m < M; ++m) xv[(size_t)(m * n + 7)] = 0;      // a zero in the mix
-    x.f(xv);
-    // a pairing of each group of 128 per stage per part
-    std::vector<int32_t> pairs((size_t)(P * S * n));
-    for (int64_t ps = 0; ps < P * S; ++ps)
-        for (int64_t g = 0; g < n / G; ++g) {
-            std::vector<int32_t> perm((size_t)G);
-            for (int i = 0; i < G; ++i) perm[(size_t)i] = (int32_t)(g * G + i);
-            for (int i = (int)G - 1; i > 0; --i) std::swap(perm[(size_t)i], perm[nxt() % (i + 1)]);
-            for (int i = 0; i < G; ++i) pairs[(size_t)(ps * n + g * G + i)] = perm[(size_t)i];
-        }
-    std::vector<float> av((size_t)(P * S * n / 2)), sv((size_t)(P * n));
-    for (auto& v : av) v = frand(-3.0f, 3.0f);
-    for (auto& v : sv) v = frand(0.5f, 2.0f);
-    T rs(RAD_F32, {P, n});
-    rs.f(sv);
-
-    // the composed matrices, [P * n/G groups][G (j)][G (i)], as f16
-    auto compose = [&](const std::vector<float>& angles, std::vector<float>* tm) {
-        tm->assign((size_t)(P * (n / G) * G * G), 0.0f);
-        for (int64_t p = 0; p < P; ++p)
-            for (int64_t g = 0; g < n / G; ++g)
-                for (int64_t i = 0; i < G; ++i) {
-                    std::vector<double> v((size_t)G, 0.0);
-                    v[(size_t)i] = 1.0;
-                    for (int64_t st = 0; st < S; ++st)
-                        for (int64_t j = 0; j < G / 2; ++j) {
-                            const int64_t ia = pairs[(size_t)((p * S + st) * n + g * G + 2 * j)] - g * G;
-                            const int64_t ib = pairs[(size_t)((p * S + st) * n + g * G + 2 * j + 1)] - g * G;
-                            const double t = angles[(size_t)((p * S + st) * (n / 2) + g * (G / 2) + j)];
-                            const double c = std::cos(t), sn = std::sin(t);
-                            const double va = v[(size_t)ia], vb = v[(size_t)ib];
-                            v[(size_t)ia] = va * c + vb * sn;
-                            v[(size_t)ib] = vb * c - va * sn;
-                        }
-                    for (int64_t j = 0; j < G; ++j)
-                        (*tm)[(size_t)(((p * (n / G) + g) * G + j) * G + i)] = (float)v[(size_t)j];
-                }
-    };
-    std::vector<float> tmv;
-    compose(av, &tmv);
-    T tm(RAD_F16, {P * n, G});
-    tm.f(tmv);
-
-    for (int i8 = 0; i8 < 2; ++i8) {
-        const double qmax = i8 ? 127.0 : 448.0;
-        const uint32_t qdt = i8 ? RAD_I8 : RAD_F8E4M3;
-        T q(qdt, {M, P * n}), s(RAD_F32, {M, P * n / G});
-        A a; a.t(x).t(tm).t(rs).t(q).t(s)
-              .i("M", M).i("n", n).i("group", G).s("dtype", "bf16").i("parts", P).s("out", i8 ? "i8" : "fp8");
-        CHECK_OK(run("givens_dense_quant", a));
-        double worst = 0;
-        int bad_norm = 0;
-        for (int64_t m = 0; m < M; ++m)
-            for (int64_t p = 0; p < P; ++p) {
-                std::vector<double> b((size_t)n);
-                double n0 = 0;
-                for (int64_t k = 0; k < n; ++k) {
-                    b[(size_t)k] = (double)x.at(m * n + k) / (double)sv[(size_t)(p * n + k)];
-                    n0 += b[(size_t)k] * b[(size_t)k];
-                }
-                for (int64_t st = 0; st < S; ++st)
-                    for (int64_t j = 0; j < n / 2; ++j) {
-                        const int64_t ia = pairs[(size_t)((p * S + st) * n + 2 * j)];
-                        const int64_t ib = pairs[(size_t)((p * S + st) * n + 2 * j + 1)];
-                        const double t = av[(size_t)((p * S + st) * (n / 2) + j)], c = std::cos(t), sn = std::sin(t);
-                        const double va = b[(size_t)ia], vb = b[(size_t)ib];
-                        b[(size_t)ia] = va * c + vb * sn;
-                        b[(size_t)ib] = vb * c - va * sn;
-                    }
-                double n1 = 0;
-                for (int64_t k = 0; k < n; ++k) n1 += b[(size_t)k] * b[(size_t)k];
-                if (std::fabs(n1 - n0) > 1e-9 * n0) ++bad_norm;
-                for (int64_t g = 0; g < n / G; ++g) {
-                    double amax = 0;
-                    for (int64_t i = 0; i < G; ++i) amax = std::max(amax, std::fabs(b[(size_t)(g * G + i)]));
-                    const double sc = s.at(m * (P * n / G) + p * (n / G) + g);
-                    CHECK(std::fabs(sc - amax / qmax) < 2e-3 * amax / qmax + 1e-12);   // T is f16
-                    for (int64_t i = 0; i < G; ++i) {
-                        const double deq = (double)q.at(m * P * n + p * n + g * G + i) * sc;
-                        worst = std::max(worst, std::fabs(deq - b[(size_t)(g * G + i)]) / amax);
-                    }
-                }
-            }
-        CHECK_EQ(bad_norm, 0);
-        CHECK(worst < (i8 ? 0.006 : 0.04));   // half a step of the grid (int8: 1/254 of the maximum), and T's f16
-    }
-
-    // T the identity, unit scales: exactly quant_act_fp8
-    std::vector<float> eye((size_t)(P * (n / G) * G * G), 0.0f), ones((size_t)(P * n), 1.0f);
-    for (int64_t pg = 0; pg < P * (n / G); ++pg)
-        for (int64_t i = 0; i < G; ++i) eye[(size_t)((pg * G + i) * G + i)] = 1.0f;
-    T tid(RAD_F16, {P * n, G}), rs1(RAD_F32, {P, n});
-    tid.f(eye);
-    rs1.f(ones);
-    T q1(RAD_F8E4M3, {M, P * n}), s1(RAD_F32, {M, P * n / G});
-    A b; b.t(x).t(tid).t(rs1).t(q1).t(s1)
-          .i("M", M).i("n", n).i("group", G).s("dtype", "bf16").i("parts", P).s("out", "fp8");
-    CHECK_OK(run("givens_dense_quant", b));
-    T q2(RAD_F8E4M3, {M, n}), s2(RAD_F32, {M, n / G});
-    A c; c.t(x).t(q2).t(s2).i("M", M).i("n", n).i("group", G).s("dtype", "bf16");
-    CHECK_OK(run("quant_act_fp8", c));
-    int diff = 0;
-    for (int64_t m = 0; m < M; ++m)
-        for (int64_t p = 0; p < P; ++p) {
-            for (int64_t k = 0; k < n; ++k)
-                if (q1.mem[(size_t)(m * P * n + p * n + k)] != q2.mem[(size_t)(m * n + k)]) ++diff;
-            for (int64_t g = 0; g < n / G; ++g)
-                if (s1.at(m * (P * n / G) + p * (n / G) + g) != s2.at(m * (n / G) + g)) ++diff;
-        }
-    CHECK_EQ(diff, 0);
-}
-
 /* A block grid whose last block is partial, on both axes. K = 300 at 128 is scales over 128, 128
  * and 44 columns; N = 129 is two row blocks (the second of one row), N = 300 three. With every
  * code 1, output n is the sum over column groups of width times scale[n / 128][g]. The block is
@@ -3509,6 +3938,36 @@ TEST(op_attn_paged) {
     CHECK_NEAR(out2.at(5), 1.0f, 1e-6);
 }
 
+/* An image span split by a step cannot give its first rows keys not staged yet.
+ * Compare the exact same Q/K/V with full-span versus chunk-bounded key counts. This
+ * records the scheduler fallback's numerical limit; it is not a full-model parity test. */
+TEST(op_attn_paged_split_image_span_is_not_full_span_bidirectional_attention) {
+    T q_all(RAD_F32, {2, 1, 2}); q_all.f({0, 0, 0, 0});
+    T q_one(RAD_F32, {1, 1, 2}); q_one.f({0, 0});
+    T kv(RAD_F32, {1, 1, 2, 4});
+    kv.f({0, 0, 1, 0,  0, 0, 3, 0});
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T full_keys(RAD_I32, {1}); full_keys.n({2});
+    T first_keys(RAD_I32, {1}); first_keys.n({1});
+    T full(RAD_F32, {2, 1, 2}), first(RAD_F32, {1, 1, 2}), last(RAD_F32, {1, 1, 2});
+    auto attend = [&](const T& q, const T& used, const T& out, int n) {
+        A a; a.t(q).t(kv).t(bt).t(used).tnull().tnull().tnull().t(out)
+              .i("q_len", n).i("head_dim", 2).i("gqa", 1).i("block_size", 2)
+              .i("causal", 0).i("window", 2).s("q_dtype", "f32").s("kv_dtype", "f32");
+        return run("attn_paged", a);
+    };
+    REQUIRE_EQ(attend(q_all, full_keys, full, 2), RAD_OK);
+    REQUIRE_EQ(attend(q_one, first_keys, first, 1), RAD_OK);
+    REQUIRE_EQ(attend(q_one, full_keys, last, 1), RAD_OK);
+    CHECK_NEAR(full.at(0), 2.0f, 1e-6);
+    CHECK_NEAR(full.at(2), 2.0f, 1e-6);
+    CHECK_NEAR(first.at(0), 1.0f, 1e-6);
+    CHECK_NEAR(last.at(0), 2.0f, 1e-6);
+    const double diff = first.at(0) - full.at(0);
+    const double rel_l2 = std::sqrt(diff * diff / 8.0);
+    CHECK_NEAR(rel_l2, 0.3535533905932738, 1e-6);
+}
+
 TEST(op_attn_paged_sink) {
     /* op_attn_paged's cache and queries, non-causal, with a sink logit a head: token 0 now sees both
      * keys too, and each sink adds exp(sink) to the denominator only. Head 0, token 0, q = [1,0]:
@@ -3548,6 +4007,170 @@ TEST(op_attn_paged_sink) {
           .i("causal", 1).i("window", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
     CHECK_OK(run("attn_paged_sink", c));
     for (int i = 0; i < 8; ++i) CHECK_NEAR(o2.at(i), o1.at(i), 1e-7);
+}
+
+TEST(op_attn_paged_rel) {
+    /* Inkling 2's attention on one sequence of three keys at positions 0..2, decode at position 2,
+     * head_dim 2, one head, scale 1. K = [1,0] [0,1] [1,1], V = [1,0] [0,1] [2,2], q = [1,0].
+     * r = [1,0] against rel_proj rows [0.5, 0, 1] and [0, 0, 0] (extent 3): the bias is 0.5 at
+     * distance 0, 0 at distance 1 and 1 at distance 2. Logits 2, 0, 1.5 for keys 0, 1, 2. */
+    T q(RAD_F32, {1, 1, 2});   q.f({ 1, 0 });
+    T kv(RAD_F32, {2, 1, 2, 4});       /* two 2-slot blocks, K then V inside a slot */
+    kv.f({ 1,0,1,0,  0,1,0,1,          /* block 0: keys 0 and 1 */
+           1,1,2,2,  0,0,0,0 });       /* block 1: key 2 */
+    T bt(RAD_I32, {1, 2});   bt.n({ 0, 1 });
+    T su(RAD_I32, {1});      su.n({ 3 });
+    T r(RAD_F32, {1, 1, 2}); r.f({ 1, 0 });
+    T rp(RAD_F32, {2, 3});   rp.f({ 0.5f, 0, 1,  0, 0, 0 });
+    T sk(RAD_F32, {1, 1});   sk.f({ 0 });
+
+    /* One decode call; `rr` is r's operand so a case can pass a view of a wider buffer. */
+    auto go = [&](const RadTensor& rr, const T& proj, const T& sinks, const T& blocks, T& o,
+                  int window, int extent) {
+        A a;
+        a.t(q).t(kv).t(blocks).t(su).tnull().tnull().tnull();
+        a.ts.push_back(rr);
+        a.t(proj).t(sinks).t(o)
+         .i("q_len", 1).i("head_dim", 2).i("gqa", 1).i("block_size", 2).i("causal", 1)
+         .i("window", window).i("d_rel", 2).i("extent", extent)
+         .s("q_dtype", "f32").s("kv_dtype", "f32").d("scale", 1.0);
+        return run("attn_paged_rel", a);
+    };
+    const double e0 = 1.0, e1 = std::exp(1.0), e15 = std::exp(1.5), e2 = std::exp(2.0);
+
+    T out(RAD_F32, {1, 1, 2});
+    CHECK_OK(go(r.t, rp, sk, bt, out, 0, 3));
+    const double D = e2 + e0 + e15 + e0;                     /* keys 0..2 and the sink */
+    CHECK_NEAR(out.at(0), (e2 * 1 + e15 * 2) / D, 1e-6);
+    CHECK_NEAR(out.at(1), (e0 * 1 + e15 * 2) / D, 1e-6);
+
+    /* r as a column slice of a wider row: columns 2 and 3 of a [1, 4] buffer at q's pitch. */
+    T wide(RAD_F32, {1, 4});   wide.f({ 9, 9, 1, 0 });
+    RadTensor view = wide.t;
+    view.rank = 3; view.shape[0] = 1; view.shape[1] = 1; view.shape[2] = 2;
+    view.stride[0] = 4; view.stride[1] = 2; view.stride[2] = 1;
+    view.data = (uint8_t*)wide.t.data + 2 * sizeof(float);
+    T out2(RAD_F32, {1, 1, 2});
+    CHECK_OK(go(view, rp, sk, bt, out2, 0, 3));
+    CHECK_NEAR(out2.at(0), out.at(0), 1e-7);
+    CHECK_NEAR(out2.at(1), out.at(1), 1e-7);
+
+    /* Window 2 hides key 0 (distance 2): keys 1 and 2 remain against the sink's weight 1. */
+    T out3(RAD_F32, {1, 1, 2});
+    CHECK_OK(go(r.t, rp, sk, bt, out3, 2, 3));
+    const double D3 = 1 + e0 + e15;
+    CHECK_NEAR(out3.at(0), (e15 * 2) / D3, 1e-6);
+    CHECK_NEAR(out3.at(1), (e0 * 1 + e15 * 2) / D3, 1e-6);
+
+    /* Extent 2 zeroes the bias at distance 2 (key 0's logit is then 1), and key 2 keeps its 0.5. */
+    T rp2(RAD_F32, {2, 2});   rp2.f({ 0.5f, 0, 0, 0 });
+    T out4(RAD_F32, {1, 1, 2});
+    CHECK_OK(go(r.t, rp2, sk, bt, out4, 0, 2));
+    /* Logits 1, 0, 1.5 for keys 0, 1, 2 (key 0 at distance 2 takes no bias), and the sink. */
+    const double D4 = e1 + e0 + e15 + e0;
+    CHECK_NEAR(out4.at(0), (e1 * 1 + e15 * 2) / D4, 1e-6);
+    CHECK_NEAR(out4.at(1), (e0 * 1 + e15 * 2) / D4, 1e-6);
+
+    /* A sink far above every logit takes the row: the keys' weights are e^(logit - 40). */
+    T big(RAD_F32, {1, 1});   big.f({ 40 });
+    T out5(RAD_F32, {1, 1, 2});
+    CHECK_OK(go(r.t, rp, big, bt, out5, 0, 3));
+    CHECK_NEAR(out5.at(0), 0.0, 1e-12);
+    CHECK_NEAR(out5.at(1), 0.0, 1e-12);
+
+    /* A row whose keys are all unmapped (block -1) is a zero row, sink or not. */
+    T gone(RAD_I32, {1, 2});   gone.n({ -1, -1 });
+    T out6(RAD_F32, {1, 1, 2});  out6.f({ 7, 7 });
+    CHECK_OK(go(r.t, rp, sk, gone, out6, 0, 3));
+    CHECK_NEAR(out6.at(0), 0.0, 0.0);
+    CHECK_NEAR(out6.at(1), 0.0, 0.0);
+}
+
+TEST(op_attn_paged_rel_consistency) {
+    /* Two properties the single cases above do not reach, on a batch with real structure: a ragged
+     * batch (cu_seqlens, a verify block of 3 and a decode row) is each of its sequences run alone,
+     * and a gqa-3 call over one KV head is the three gqa-1 calls, each on its own query head. Head
+     * dim 4, extent 8 (below both contexts, so most keys take no bias), d_rel 4, window 0 or 16. */
+    const int HD = 4, BS = 16, DR = 4, E = 8, NH = 3, ROWS = 4, MB = 3;
+    const int qlen[2] = { 3, 1 }, ctx[2] = { 40, 20 }, cu[3] = { 0, 3, 4 };
+    auto fv = [](int i, float a) { return std::sin(0.37f * (float)i + a) * 1.3f; };
+    for (int window : { 0, 16 }) {
+        T q(RAD_F32, { ROWS, NH, HD });        q.f([&] { std::vector<float> v; for (int i = 0; i < ROWS * NH * HD; ++i) v.push_back(fv(i, 0.1f)); return v; }());
+        T kv(RAD_F32, { 5, 1, BS, 2 * HD });   kv.f([&] { std::vector<float> v; for (int i = 0; i < 5 * BS * 2 * HD; ++i) v.push_back(fv(i, 0.7f)); return v; }());
+        T bt(RAD_I32, { 2, MB });              bt.n({ 0, 1, 2, 3, 4, -1 });
+        T su(RAD_I32, { 2 });                  su.n({ ctx[0], ctx[1] });
+        T cus(RAD_I32, { 3 });                 cus.n({ cu[0], cu[1], cu[2] });
+        T r(RAD_F32, { ROWS, NH, DR });        r.f([&] { std::vector<float> v; for (int i = 0; i < ROWS * NH * DR; ++i) v.push_back(fv(i, 1.9f)); return v; }());
+        T rp(RAD_F32, { DR, E });              rp.f([&] { std::vector<float> v; for (int i = 0; i < DR * E; ++i) v.push_back(0.5f * fv(i, 2.3f)); return v; }());
+        T sk(RAD_F32, { ROWS, NH });           sk.f([&] { std::vector<float> v; for (int i = 0; i < ROWS * NH; ++i) v.push_back(fv(i, 3.1f)); return v; }());
+        T all(RAD_F32, { ROWS, NH, HD });
+        A a; a.t(q).t(kv).t(bt).t(su).tnull().tnull().t(cus).t(r).t(rp).t(sk).t(all)
+              .i("q_len", 3).i("head_dim", HD).i("gqa", NH).i("block_size", BS).i("causal", 1)
+              .i("window", window).i("d_rel", DR).i("extent", E).i("n_head", NH)
+              .s("q_dtype", "f32").s("kv_dtype", "f32").d("scale", 0.5);
+        CHECK_OK(run("attn_paged_rel", a));
+
+        /* Each sequence alone: no cu_seqlens, its own rows of q, r and sinks, its own block row. */
+        for (int s = 0; s < 2; ++s) {
+            const int n = qlen[s];
+            auto sub = [](const T& x, size_t elem_off, std::vector<int64_t> shape) {
+                RadTensor v = x.t;
+                v.data = (uint8_t*)x.t.data + elem_off * dt_bytes(x.t.dtype, 1);
+                v.rank = (uint32_t)shape.size();
+                int64_t st = 1;
+                for (int i = (int)shape.size() - 1; i >= 0; --i) { v.shape[i] = shape[i]; v.stride[i] = st; st *= shape[i]; }
+                return v;
+            };
+            T one(RAD_F32, { n, NH, HD });
+            A b;
+            b.ts.push_back(sub(q, (size_t)cu[s] * NH * HD, { n, NH, HD }));
+            b.t(kv);
+            b.ts.push_back(sub(bt, (size_t)s * MB, { 1, MB }));
+            b.ts.push_back(sub(su, (size_t)s, { 1 }));
+            b.tnull().tnull().tnull();
+            b.ts.push_back(sub(r, (size_t)cu[s] * NH * DR, { n, NH, DR }));
+            b.t(rp);
+            b.ts.push_back(sub(sk, (size_t)cu[s] * NH, { n, NH }));
+            b.t(one);
+            b.i("q_len", n).i("head_dim", HD).i("gqa", NH).i("block_size", BS).i("causal", 1)
+             .i("window", window).i("d_rel", DR).i("extent", E).i("n_head", NH)
+             .s("q_dtype", "f32").s("kv_dtype", "f32").d("scale", 0.5);
+            CHECK_OK(run("attn_paged_rel", b));
+            for (int k = 0; k < n * NH * HD; ++k)
+                CHECK_NEAR(one.at(k), all.at((size_t)cu[s] * NH * HD + k), 1e-7);
+        }
+
+        /* gqa 3 over one KV head against three gqa-1 calls, each with one query head's view of q,
+         * r and sinks (a view's row pitch is its head axis's, so the size-1 head axis takes the
+         * full row). */
+        T g3(RAD_F32, { ROWS, NH, HD });
+        A c; c.t(q).t(kv).t(bt).t(su).tnull().tnull().t(cus).t(r).t(rp).t(sk).t(g3)
+              .i("q_len", 3).i("head_dim", HD).i("gqa", NH).i("block_size", BS).i("causal", 1)
+              .i("window", window).i("d_rel", DR).i("extent", E).i("n_head", NH)
+              .s("q_dtype", "f32").s("kv_dtype", "f32").d("scale", 0.5);
+        CHECK_OK(run("attn_paged_rel", c));
+        for (int h = 0; h < NH; ++h) {
+            RadTensor qv = q.t; qv.data = (uint8_t*)q.t.data + h * HD * sizeof(float);
+            qv.rank = 3; qv.shape[0] = ROWS; qv.shape[1] = 1; qv.shape[2] = HD;
+            qv.stride[0] = NH * HD; qv.stride[1] = NH * HD; qv.stride[2] = 1;
+            RadTensor rv = r.t; rv.data = (uint8_t*)r.t.data + h * DR * sizeof(float);
+            rv.rank = 3; rv.shape[0] = ROWS; rv.shape[1] = 1; rv.shape[2] = DR;
+            rv.stride[0] = NH * DR; rv.stride[1] = NH * DR; rv.stride[2] = 1;
+            RadTensor sv = sk.t; sv.data = (uint8_t*)sk.t.data + h * sizeof(float);
+            sv.rank = 2; sv.shape[0] = ROWS; sv.shape[1] = 1;
+            sv.stride[0] = NH; sv.stride[1] = 1;
+            T one(RAD_F32, { ROWS, 1, HD });
+            A d; d.ts.push_back(qv); d.t(kv).t(bt).t(su).tnull().tnull().t(cus);
+            d.ts.push_back(rv); d.t(rp); d.ts.push_back(sv); d.t(one);
+            d.i("q_len", 3).i("head_dim", HD).i("gqa", 1).i("block_size", BS).i("causal", 1)
+             .i("window", window).i("d_rel", DR).i("extent", E).i("n_head", 1)
+             .s("q_dtype", "f32").s("kv_dtype", "f32").d("scale", 0.5);
+            CHECK_OK(run("attn_paged_rel", d));
+            for (int t = 0; t < ROWS; ++t)
+                for (int k = 0; k < HD; ++k)
+                    CHECK_NEAR(one.at((size_t)t * HD + k), g3.at(((size_t)t * NH + h) * HD + k), 1e-6);
+        }
+    }
 }
 
 TEST(op_attn_paged_ragged) {
@@ -4108,6 +4731,34 @@ TEST(op_kv_store) {
     CHECK_EQ(kv.at(0), 0.0f); CHECK_EQ(kv.at(3), 0.0f);
 }
 
+/* The int8 cache: each head's K and V as codes against its own f16 scale, the head's absmax / 127,
+ * after the codes; and attention reads a key back as code times scale. */
+TEST(op_kv_store_int8_and_the_attention_that_reads_it) {
+    T k(RAD_BF16, {1, 1, 2}); k.f({ 254, -64 });
+    T v(RAD_BF16, {1, 1, 2}); v.f({ 31.75f, 8 });
+    T sm(RAD_I32, {1});       sm.n({ 1 });
+    T kv(RAD_I8, {1, 1, 2, 8});
+    A a; a.t(k).t(v).t(sm).t(kv)
+          .i("M", 1).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2).s("kv_dtype", "i8");
+    CHECK_OK(run("kv_store", a));
+    /* Position 1: K scale 2.0 (f16 0x4000), V scale 0.25 (0x3400). */
+    const int want[8] = { 127, -32, 127, 32, 0x00, 0x40, 0x00, 0x34 };
+    for (int i = 0; i < 8; ++i) CHECK_EQ((int)kv.at(8 + i), want[i]);
+    for (int i = 0; i < 8; ++i) CHECK_EQ(kv.at(i), 0.0f);
+
+    /* One query over that one key: the output is the key's V, 127 * 0.25 and 32 * 0.25. */
+    T q(RAD_BF16, {1, 1, 2}); q.f({ 1, 1 });
+    T bt(RAD_I32, {1, 1});    bt.n({ 0 });
+    T su(RAD_I32, {1});       su.n({ 2 });
+    T out(RAD_BF16, {1, 1, 2});
+    /* a window of one: the query at position 1 sees the key at position 1 alone */
+    A b; b.t(q).t(kv).t(bt).t(su).tnull().tnull().tnull().t(out)
+          .i("q_len", 1).i("head_dim", 2).i("gqa", 1).i("block_size", 2).i("causal", 1)
+          .i("window", 1).s("q_dtype", "bf16").s("kv_dtype", "i8").d("scale", 1.0);
+    CHECK_OK(run("attn_paged", b));
+    CHECK_NEAR(out.at(0), 31.75f, 1e-3); CHECK_NEAR(out.at(1), 8.0f, 1e-3);
+}
+
 /* The engine hands k and v a column slice, not a dense plane. Without de-interleaving, the KV
  * halves are declared over the fused qkv buffer, [tokens, kv_heads * head_dim] with the whole
  * projection's row stride. Deriving the stride from the shape puts every token after the first
@@ -4139,14 +4790,6 @@ TEST(op_kv_store_reads_the_row_stride_and_not_the_shape) {
     CHECK_EQ(kv.at(12), 0.0f); CHECK_EQ(kv.at(15), 0.0f);
 }
 
-/* The E4M3 byte a value stores as. The mirror is a byte plane, so `T::at` on it reads the byte and
- * not the value; comparing a mirror byte to a ring element needs the byte both sides are. */
-static int e4m3_byte(float x) {
-    T t(RAD_F8E4M3, {1});
-    t.f({ x });
-    return (int)(uint8_t)t.mem[0];
-}
-
 /* kv_store_streamed: the group's host mirror is written for every token with a slot, and the ring
  * slot only when the residency map says the block is resident. The two planes are the same paged
  * layout, so a token's bytes land at the same offset in either.
@@ -4156,38 +4799,37 @@ static int e4m3_byte(float x) {
  * fall behind, and the resolve does not re-copy a resident block); block 0's must reach the mirror
  * only, leaving the ring untouched until a resolve copies the whole block in. */
 TEST(op_kv_store_streamed_writes_the_mirror_always_and_the_ring_when_resident) {
-    /* head_dim 2, one kv head, block_size 2: a block row is [kv_heads, block_size, 2 * head_dim]
-     * = 8 bytes, K then V inside a position. */
-    T k(RAD_BF16, {2, 1, 2}); k.f({ 1, 2, 5, 6 });
-    T v(RAD_BF16, {2, 1, 2}); v.f({ 3, 4, 7, 8 });
+    /* The int8 cache at head_dim 2, one kv head, block_size 2: a position is [K codes 2][V codes 2]
+     * [K scale f16][V scale f16] = 8 bytes, a block row 16. Each head's larger element is 127 times
+     * a power of two, so its scale is that power exactly and its codes the elements over it. */
+    T k(RAD_BF16, {2, 1, 2}); k.f({ 127, 64, 254, -2 });
+    T v(RAD_BF16, {2, 1, 2}); v.f({ -127, 2, 4, 508 });
     T sm(RAD_I32, {2});       sm.n({ 0, 3 });        /* block 0 offset 0, block 1 offset 1 */
     T res(RAD_I32, {2});      res.n({ -1, 0 });      /* block 0 absent, block 1 in ring slot 0 */
-    T host(RAD_U8, {2, 8});
-    T kv(RAD_F8E4M3, {1, 1, 2, 4});                  /* one ring slot, one block deep */
+    T host(RAD_U8, {2, 16});
+    T kv(RAD_I8, {1, 1, 2, 8});                      /* one ring slot, one block deep */
     A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
           .i("M", 2).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
-          .s("kv_dtype", "fp8_e4m3");
+          .s("kv_dtype", "i8");
     CHECK_OK(run("kv_store_streamed", a));
-    /* Token 0, block 0, position 0: K then V, mirror only. */
-    CHECK_EQ((int)host.at(0), e4m3_byte(1.0f)); CHECK_EQ((int)host.at(1), e4m3_byte(2.0f));
-    CHECK_EQ((int)host.at(2), e4m3_byte(3.0f)); CHECK_EQ((int)host.at(3), e4m3_byte(4.0f));
-    /* Token 1, block 1, position 1: both planes, at the same in-block offset, so the same bytes. */
-    CHECK_EQ((int)host.at(12), e4m3_byte(5.0f)); CHECK_EQ((int)host.at(13), e4m3_byte(6.0f));
-    CHECK_EQ((int)host.at(14), e4m3_byte(7.0f)); CHECK_EQ((int)host.at(15), e4m3_byte(8.0f));
-    CHECK_EQ((int)host.at(12), e4m3_byte(kv.at(4)));
-    CHECK_EQ((int)host.at(13), e4m3_byte(kv.at(5)));
-    CHECK_EQ((int)host.at(14), e4m3_byte(kv.at(6)));
-    CHECK_EQ((int)host.at(15), e4m3_byte(kv.at(7)));
+    /* Token 0, block 0, position 0, mirror only: scales 1.0 and 1.0 (f16 0x3C00). */
+    const int t0[8] = { 127, 64, 129 /* -127 */, 2, 0x00, 0x3C, 0x00, 0x3C };
+    for (int i = 0; i < 8; ++i) CHECK_EQ((int)host.at(i), t0[i]);
+    /* Token 1, block 1, position 1: scales 2.0 (0x4000) and 4.0 (0x4400); both planes, at the same
+     * in-block offset, so the same bytes. */
+    const int t1[8] = { 127, 255 /* -1 */, 1, 127, 0x00, 0x40, 0x00, 0x44 };
+    for (int i = 0; i < 8; ++i) {
+        CHECK_EQ((int)host.at(24 + i), t1[i]);
+        CHECK_EQ((int)(uint8_t)(int8_t)kv.at(8 + i), t1[i]);
+    }
     /* Nothing else: block 0 has no slot, so its ring stays as it was, and block 1's position 0 is
      * another token's. */
-    for (int i = 0; i < 4; ++i) CHECK_EQ(kv.at(i), 0.0f);
-    for (int i = 4; i < 12; ++i) CHECK_EQ(host.at(i), 0.0f);
+    for (int i = 0; i < 8; ++i) CHECK_EQ(kv.at(i), 0.0f);
+    for (int i = 8; i < 24; ++i) CHECK_EQ(host.at(i), 0.0f);
 }
 
 /* The bf16 streamed store: both planes hold the values themselves, two bytes an element, exactly
- * as kv_store_bf16 writes them. The descales are fp8-only, so a bf16 call with a non-1 k_scale
- * still stores the value (this is the difference from the E4M3 row, and the reason the fused bf16
- * fold passes the prologue's bf16 bytes straight through). */
+ * as kv_store_bf16 writes them. */
 TEST(op_kv_store_streamed_bf16_writes_the_values_into_both_planes) {
     T k(RAD_BF16, {2, 1, 2}); k.f({ 1, 2, 5, 6 });
     T v(RAD_BF16, {2, 1, 2}); v.f({ 3, 4, 7, 8 });
@@ -4219,20 +4861,19 @@ TEST(op_kv_store_streamed_bf16_writes_the_values_into_both_planes) {
 /* A block absent from the ring is written to the mirror alone, whatever the map holds: this is the
  * state every token of a block's first step is in, and the resolve copies the whole block in. */
 TEST(op_kv_store_streamed_a_block_with_no_slot_reaches_only_the_mirror) {
-    T k(RAD_BF16, {1, 1, 2}); k.f({ 2, 4 });
-    T v(RAD_BF16, {1, 1, 2}); v.f({ 6, 8 });
+    T k(RAD_BF16, {1, 1, 2}); k.f({ 127, 1 });
+    T v(RAD_BF16, {1, 1, 2}); v.f({ 2, -254 });
     T sm(RAD_I32, {1});       sm.n({ 3 });           /* block 1, position 1 */
     T res(RAD_I32, {2});      res.n({ -1, -1 });
-    T host(RAD_U8, {2, 8});
-    T kv(RAD_F8E4M3, {1, 1, 2, 4});
+    T host(RAD_U8, {2, 16});
+    T kv(RAD_I8, {1, 1, 2, 8});
     A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
           .i("M", 1).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
-          .s("kv_dtype", "fp8_e4m3").
-          d("k_scale", 0.5).d("v_scale", 2.0);      /* the store divides by the reader's descal */
+          .s("kv_dtype", "i8");
     CHECK_OK(run("kv_store_streamed", a));
-    CHECK_EQ((int)host.at(12), e4m3_byte(4.0f)); CHECK_EQ((int)host.at(13), e4m3_byte(8.0f));
-    CHECK_EQ((int)host.at(14), e4m3_byte(3.0f)); CHECK_EQ((int)host.at(15), e4m3_byte(4.0f));
-    for (int i = 0; i < 4; ++i) CHECK_EQ(kv.at(i), 0.0f);       /* the ring is untouched */
+    const int want[8] = { 127, 1, 1, 129 /* -127 */, 0x00, 0x3C, 0x00, 0x40 };
+    for (int i = 0; i < 8; ++i) CHECK_EQ((int)host.at(24 + i), want[i]);
+    for (int i = 0; i < 16; ++i) CHECK_EQ(kv.at(i), 0.0f);      /* the ring is untouched */
 }
 
 /* The refusals libref makes before its first write: a slot naming a block past the mirror, a
@@ -4246,37 +4887,37 @@ TEST(op_kv_store_streamed_refuses_a_state_fault_before_writing) {
     {
         T sm(RAD_I32, {1});  sm.n({ 0 });
         T res(RAD_I32, {2}); res.n({ 1, -1 });       /* slot 1 of a one-slot ring */
-        T host(RAD_U8, {2, 8});
-        T kv(RAD_F8E4M3, {1, 1, 2, 4});
+        T host(RAD_U8, {2, 16});
+        T kv(RAD_I8, {1, 1, 2, 8});
         A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
               .i("M", 1).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
-              .s("kv_dtype", "fp8_e4m3");
+              .s("kv_dtype", "i8");
         CHECK_EQ(run("kv_store_streamed", a), RAD_E_INVAL);
-        for (int i = 0; i < 8; ++i) CHECK_EQ(host.at(i), 0.0f);
+        for (int i = 0; i < 16; ++i) CHECK_EQ(host.at(i), 0.0f);
     }
     /* A slot naming a block past the mirror's extent. */
     {
         T sm(RAD_I32, {1});  sm.n({ 4 });            /* block 2 of a two-block mirror */
         T res(RAD_I32, {2}); res.n({ -1, -1 });
-        T host(RAD_U8, {2, 8});
-        T kv(RAD_F8E4M3, {1, 1, 2, 4});
+        T host(RAD_U8, {2, 16});
+        T kv(RAD_I8, {1, 1, 2, 8});
         A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
               .i("M", 1).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
-              .s("kv_dtype", "fp8_e4m3");
+              .s("kv_dtype", "i8");
         CHECK_EQ(run("kv_store_streamed", a), RAD_E_SHAPE);
-        for (int i = 0; i < 8; ++i) CHECK_EQ(host.at(i), 0.0f);
+        for (int i = 0; i < 16; ++i) CHECK_EQ(host.at(i), 0.0f);
     }
     /* A mirror row that is not the block's byte pitch: a copy into it would spill over the next
      * block. */
     {
         T sm(RAD_I32, {1});  sm.n({ 0 });
         T res(RAD_I32, {2}); res.n({ -1, -1 });
-        T host(RAD_U8, {2, 8});
-        host.t.stride[0] = 12;                       /* a padded row */
-        T kv(RAD_F8E4M3, {1, 1, 2, 4});
+        T host(RAD_U8, {2, 16});
+        host.t.stride[0] = 20;                       /* a padded row */
+        T kv(RAD_I8, {1, 1, 2, 8});
         A a; a.t(k).t(v).t(sm).t(kv).t(res).t(host)
               .i("M", 1).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2)
-              .s("kv_dtype", "fp8_e4m3");
+              .s("kv_dtype", "i8");
         CHECK_EQ(run("kv_store_streamed", a), RAD_E_STRIDE);
     }
 }
@@ -4668,6 +5309,160 @@ TEST(op_grid_embed) {
     CHECK_NEAR(x.at(4), want, 1e-4);
 }
 
+/* grid_embed_pad: the half-pixel resample with grid_sample's zeros padding. A side-4 table onto
+ * rows of an 8 x 8 grid: src(i) = i / 2 - 0.25, so row 0 keeps only the in-range tap 0 (weight
+ * 3/4, the tap -1 masked), row 7 only tap 3 at 3/4 (tap 4 masked), and interior rows blend two.
+ * Table row h * 4 + w holds (4h + w + 1) and (4h + w + 1) / 2 in its two channels. */
+TEST(op_grid_embed_pad_zeroes_taps_beyond_the_table) {
+    const int64_t side = 4, n = 2;
+    std::vector<float> tab((size_t)(side * side * n));
+    for (int64_t r = 0; r < side * side; ++r)
+        for (int64_t i = 0; i < n; ++i) tab[(size_t)(r * n + i)] = (float)(r + 1) * (i ? 0.5f : 1.0f);
+    T table(RAD_F32, { side * side, n }); table.f(tab);
+    /* Rows (0,0), (7,7), (1,3), (4,2), (7,0), (3,7) of the 8 x 8 grid. */
+    T x(RAD_F32, { 6, n }); x.f({ 100, 100, 100, 100, 100, 100,
+                                  100, 100, 100, 100, 100, 100 });
+    T crd(RAD_I32, { 4, 6 });
+    crd.n({ 0, 7, 1, 4, 7, 3,   0, 7, 3, 2, 0, 7,   8, 8, 8, 8, 8, 8,   8, 8, 8, 8, 8, 8 });
+    A a; a.t(x).t(table).t(crd).i("M", 6).i("n", n).i("side", side).s("dtype", "f32");
+    CHECK_OK(run("grid_embed_pad", a));
+    /* Hand-computed: joint weight = the product of the axes' in-range hat weights (the off-table
+     * tap contributes nothing), v(h,w) = 4h + w + 1; channel 1 holds v / 2, x starts at 100. */
+    /* (0,0): both axes tap 0 only, at 3/4 each -> 9/16 * 1 = 0.5625. */
+    /* (7,7): both axes tap 3 only at 3/4 -> 9/16 * 16 = 9. */
+    /* (1,3): rows 0,1 at 3/4, 1/4; cols 1,2 at 3/4, 1/4 -> 3.25.
+       (4,2): rows 1,2 at 1/4, 3/4; cols 0,1 at 1/4, 3/4 -> 8.75. */
+    /* (7,0): row tap 3 at 3/4 (tap 4 masked), col tap 0 at 3/4 (tap -1 masked) -> 9/16 * 13 = 7.3125. */
+    /* (3,7): rows 1,2; col tap 3 at 3/4 (tap 4 masked) -> 9/16 * 8 + 3/16 * 12 = 6.75. */
+    const float want[6] = { 0.5625f, 9.0f, 3.25f, 8.75f, 7.3125f, 6.75f };
+    for (int64_t m = 0; m < 6; ++m) {
+        CHECK_NEAR(x.at(m * n), 100.0f + want[m], 1e-5);
+        CHECK_NEAR(x.at(m * n + 1), 100.0f + want[m] * 0.5f, 1e-5);
+    }
+}
+
+/* A grid no larger than the table never masks a tap, and at scale 1 the half-pixel form reads
+ * each row whole: a 4 x 4 grid on the side-4 table is the table itself. */
+TEST(op_grid_embed_pad_in_range_reads_the_table) {
+    const int64_t side = 4, n = 1;
+    std::vector<float> tab((size_t)(side * side));
+    for (int64_t r = 0; r < side * side; ++r) tab[(size_t)r] = (float)(r + 1);
+    T table(RAD_F32, { side * side, n }); table.f(tab);
+    T x(RAD_F32, { 2, n }); x.f({ 0, 0 });
+    T crd(RAD_I32, { 4, 2 }); crd.n({ 2, 3,   1, 2,   4, 4,   4, 4 });
+    A a; a.t(x).t(table).t(crd).i("M", 2).i("n", n).i("side", side).s("dtype", "f32");
+    CHECK_OK(run("grid_embed_pad", a));
+    CHECK_NEAR(x.at(0), 10.0f, 1e-6);   /* table row 2 * 4 + 1 = 10 */
+    CHECK_NEAR(x.at(1), 15.0f, 1e-6);   /* table row 3 * 4 + 2 = 15 */
+}
+
+/* window_order: the permutation, its inverse, the rope positions and every cuw boundary, checked
+ * against an in-test reference that sorts the patches by (segment, window row, window column,
+ * raster) -- no arithmetic shared with the slot formula. The grids are laid out segment by
+ * segment, each a raster gh x gw block. */
+namespace {
+
+struct WinCase {
+    std::vector<std::pair<int64_t, int64_t>> grids;   /* (height, width) per segment */
+    int64_t window;
+};
+
+/* Builds the case, runs the op, checks the outputs against the sort reference and the hand-derived
+ * cuw boundaries. Returns the number of disagreements. */
+int64_t run_window_case(const char* name, const WinCase& c, const std::vector<int64_t>& cuw_want,
+                        std::vector<int64_t>* idx_out = nullptr) {
+    int64_t P = 0;
+    std::vector<int64_t> cu{ 0 };
+    for (const auto& g : c.grids) { P += g.first * g.second; cu.push_back((int64_t)P); }
+    std::vector<int64_t> crd(4 * (size_t)P, 0);
+    struct Ord { int64_t seg, wr, wc, r, cc, p; };
+    std::vector<Ord> ord;
+    for (size_t s = 0; s < c.grids.size(); ++s) {
+        const int64_t base = s ? cu[s] : 0;
+        for (int64_t r = 0; r < c.grids[s].first; ++r)
+            for (int64_t q = 0; q < c.grids[s].second; ++q) {
+                const int64_t p = base + r * c.grids[s].second + q;
+                crd[(size_t)p] = (int32_t)r;
+                crd[(size_t)P + (size_t)p] = (int32_t)q;
+                crd[2 * (size_t)P + (size_t)p] = (int32_t)c.grids[s].first;
+                crd[3 * (size_t)P + (size_t)p] = (int32_t)c.grids[s].second;
+                ord.push_back({ (int64_t)s, c.window > 0 ? r / c.window : 0,
+                                c.window > 0 ? q / c.window : 0, r, q, p });
+            }
+    }
+    std::stable_sort(ord.begin(), ord.end(), [](const Ord& l, const Ord& r) {
+        if (l.seg != r.seg) return l.seg < r.seg;
+        if (l.wr != r.wr) return l.wr < r.wr;
+        if (l.wc != r.wc) return l.wc < r.wc;
+        if (l.r != r.r) return l.r < r.r;
+        return l.cc < r.cc;
+    });
+    T crd_t(RAD_I32, { 4, P }); crd_t.n(crd);
+    T cu_t(RAD_I32, { 1, (int64_t)cu.size() }); cu_t.n(cu);
+    T idx(RAD_I32, { 1, P }); T inv(RAD_I32, { 1, P });
+    T pos(RAD_I32, { 2, P }); T cuw(RAD_I32, { 1, P + 1 });
+    A a; a.t(crd_t).t(cu_t).t(idx).t(inv).t(pos).t(cuw).i("M", P).i("window", c.window);
+    CHECK_OK(run("window_order", a));
+    int64_t bad = 0;
+    for (int64_t slot = 0; slot < P; ++slot) {
+        const int64_t src = idx.iat(slot), want = ord[(size_t)slot].p;
+        if (src != want) { ++bad; fprintf(stderr, "  %s: idx[%lld] %lld want %lld\n", name,
+                                          (long long)slot, (long long)src, (long long)want); }
+        if (inv.iat(want) != slot) ++bad;
+        if (idx.iat(inv.iat(slot)) != slot) ++bad;   /* idx and inv are inverses */
+        /* pos: (col + 1, row + 1) of the slot's source patch, read off the reference's order. */
+        if (pos.iat(slot) != ord[(size_t)slot].cc + 1) ++bad;
+        if (pos.iat(P + slot) != ord[(size_t)slot].r + 1) ++bad;
+    }
+    for (size_t i = 0; i < cuw_want.size(); ++i)
+        if (cuw.iat((int64_t)i) != cuw_want[i]) {
+            ++bad;
+            fprintf(stderr, "  %s: cuw[%zu] %lld want %lld\n", name, i,
+                    (long long)cuw.iat((int64_t)i), (long long)cuw_want[i]);
+        }
+    if (idx_out) for (int64_t i = 0; i < P; ++i) idx_out->push_back(idx.iat(i));
+    return bad;
+}
+
+}  /* namespace */
+
+/* One 48 x 40 segment, window 32: windows 32 x 32, 32 x 8, 16 x 32, 16 x 8 -- ragged right and
+ * bottom. The first patch of the second window is row 0, column 32, patch 256. */
+TEST(op_window_order_ragged_segment) {
+    std::vector<int64_t> gather;
+    const int64_t bad = run_window_case(
+        "48x40 w32", { { { 48, 40 } }, 32 }, { 0, 1024, 1280, 1792, 1920, 1920, 1920 }, &gather);
+    CHECK_EQ(bad, 0LL);
+    CHECK_EQ(gather[0], 0LL);
+    CHECK_EQ(gather[1024], 32LL);    /* window (0,1) starts at row 0, column 32: patch 32 */
+    CHECK_EQ(gather[1920 - 1], 48 * 40 - 1LL);
+}
+
+/* Video-style: two segments back to back, windows never across the segment boundary. */
+TEST(op_window_order_two_segments) {
+    const int64_t bad = run_window_case(
+        "two segments w16", { { { 32, 32 }, { 16, 16 } }, 16 },
+        { 0, 256, 512, 768, 1024, 1280, 1280, 1280, 1280 });
+    CHECK_EQ(bad, 0LL);
+}
+
+/* Window-divisible: every window exactly window x window. */
+TEST(op_window_order_divisible) {
+    const int64_t bad = run_window_case(
+        "16x24 w8", { { { 16, 24 } }, 8 }, { 0, 64, 128, 192, 256, 320, 384, 384 });
+    CHECK_EQ(bad, 0LL);
+}
+
+/* window 0: the identity, cuw = cu, the rope positions still swapped and offset by one. */
+TEST(op_window_order_window_zero_is_the_identity) {
+    const int64_t P = 9 * 7 + 5 * 5;
+    std::vector<int64_t> gather;
+    const int64_t bad = run_window_case("identity w0", { { { 9, 7 }, { 5, 5 } }, 0 },
+                                        { 0, 63, 88, 88 }, &gather);
+    CHECK_EQ(bad, 0LL);
+    for (int64_t i = 0; i < P; ++i) CHECK_EQ(gather[(size_t)i], i);
+}
+
 TEST(op_qk_norm_rope) {
     /* At position 0 the rotation is the identity, so this isolates the per-head RMS norm. */
     T qkv(RAD_F32, {1, 6}); qkv.f({3, 4,  3, 4,  7, 7});
@@ -4878,21 +5673,73 @@ TEST(op_moe_gemm_q_mod4) {
     }
 }
 
+/* w6nl64a8h through the grouped GEMM: two experts whose relaid u6 codes index one 64-entry table,
+ * each weight its level times an E4M3 scale per (row, 64 of K) and the f32 level above it. */
+TEST(op_moe_gemm_q_reads_six_bit_codebook_experts) {
+    constexpr int64_t N = 2, K = 128;
+    T codes0(RAD_U6, {N, K}), codes1(RAD_U6, {N, K});
+    T table(RAD_F32, {1, 64}), scale(RAD_F8E4M3, {N, 2}), level(RAD_F32, {1, 1});
+    std::vector<float> levels(64);
+    for (int c = 0; c < 64; ++c) levels[(size_t)c] = c < 32 ? (float)(c + 1) : (float)(31 - c);
+    table.f(levels); scale.f({ 1, 2, 2, 1 }); level.f({ 0.5f });
+    for (int64_t n = 0; n < N; ++n) for (int64_t k = 0; k < K; ++k) {
+        const int base = (int)((k % 32 + (k / 64) * 32 + n * 5) % 64);
+        rad_store_code(codes0.mem.data() + n * (K * 6 / 8), RAD_U6, k, base);
+        rad_store_code(codes1.mem.data() + n * (K * 6 / 8), RAD_U6, k, (base + 3) % 64);
+    }
+    RadEncoding enc{};
+    rad_enc_clear(&enc);
+    rad_enc_copy_str(enc.scheme, "affine");
+    rad_enc_copy_str(enc.transform, "fwht128");
+    rad_enc_add_plane(&enc, "codes", RAD_U6, 1, 1);
+    rad_enc_add_plane(&enc, "scale", RAD_F8E4M3, 1, 64);
+    rad_enc_add_plane(&enc, "scale.1", RAD_F32, 0, 0);
+    rad_enc_add_table(&enc, "table", RAD_F32, 1, 64);
+    const int cs[] = { 0, 3 }, ss[] = { 1, 2 };
+    RadTensor cp0[] = { codes0.t, table.t }, cp1[] = { codes1.t, table.t }, sp[] = { scale.t, level.t };
+    RadLayout cl{}, sl{};
+    REQUIRE_EQ(rad_planes_layout(&enc, cs, cp0, 2, &cl), RAD_OK);
+    REQUIRE_EQ(rad_planes_layout(&enc, ss, sp, 2, &sl), RAD_OK);
+    std::vector<uint8_t> even((size_t)cl.bytes), odd((size_t)cl.bytes), scales((size_t)sl.bytes);
+    REQUIRE_EQ(rad_planes_relayout(&enc, cs, cp0, 2, even.data(), cl.bytes), RAD_OK);
+    REQUIRE_EQ(rad_planes_relayout(&enc, cs, cp1, 2, odd.data(), cl.bytes), RAD_OK);
+    REQUIRE_EQ(rad_planes_relayout(&enc, ss, sp, 2, scales.data(), sl.bytes), RAD_OK);
+    T input(RAD_F32, {2, K}), as(RAD_F32, {2, 1}), sorted(RAD_I32, {2});
+    T off(RAD_I32, {3}), out(RAD_F32, {2, N});
+    T w0(RAD_U6, {1, N, K}), w1(RAD_U6, {1, N, K});
+    T s0(RAD_F8E4M3, {1, N, K}), s1(RAD_F8E4M3, {1, N, K});
+    input.f(std::vector<float>((size_t)(2 * K), 1.0f)); as.f({1, 1});
+    sorted.n({0, 1}); off.n({0, 1, 2});
+    A a;
+    a.t(input).t(as).t(w0).t(s0).t(sorted).t(off).t(w1).t(s1).t(out)
+     .i("M", 2).i("N", N).i("K", K).i("n_expert", 2).i("top_k", 1).i("group", 128)
+     .s("a_order", "token").s("dtype", "w6nl64a8h");
+    void* p0[] = { even.data() }, *p1[] = { odd.data() }, *ps[] = { scales.data() };
+    a.ts[2].data = p0; a.ts[3].data = ps; a.ts[6].data = p1; a.ts[7].data = ps;
+    for (int i : { 2, 3, 6, 7 }) a.ts[(size_t)i].stride[0] = 0;
+    REQUIRE_EQ(run("moe_gemm_q", a), RAD_OK);
+    for (int e = 0; e < 2; ++e) for (int n = 0; n < N; ++n) {
+        float want = 0;
+        for (int k = 0; k < K; ++k) {
+            const int code = ((k % 32 + (k / 64) * 32 + n * 5) + e * 3) % 64;
+            const float subscale = n == 0 ? (k < 64 ? 1.0f : 2.0f) : (k < 64 ? 2.0f : 1.0f);
+            want += levels[(size_t)code] * subscale * 0.5f;
+        }
+        CHECK_EQ(out.at(e * N + n), want);
+    }
+}
+
 /* The weight scale grid is the one the dtype names, in both grouped GEMMs: 128x128 tiles for block
  * fp8; for four-bit experts one scale per row per K group of 128 (w4a8/w4a8h/w4nla8h), 64
  * (w4nl64a8h/w5nl64a8h) or 32 (w4nl32a8h). The oracle inverts a relaid weight into exactly this
  * description (core/runtime/oracle.cpp). The final case is one last-class expert at K = 128 whose
  * 64-wide halves scale by 2 and 3 under one 0.5 activation scale; any other grid reads differently. */
 TEST(op_moe_gemm_q_scale_grid_by_dtype) {
-    struct Want { const char* dt; int64_t rows, cols; bool f16; };
-    /* N 256, K 512, group 128; the last class at N 128, K 256. The unrotated GGUF forms carry
-     * f16 scales: one per 32 of K for IQ4_NL and Q5_0, one per 64 for Q2_0. */
-    const Want wants[] = { { "fp8a8", 2, 4, false },      { "w4a8", 256, 4, false },
-                           { "w4a8h", 256, 4, false },    { "w4nla8h", 256, 4, false },
-                           { "w4nl64a8h", 256, 8, false }, { "w5nl64a8h", 256, 8, false },
-                           { "w4nl32a8h", 256, 16, false }, { "mxfp4a8", 256, 16, false },
-                           { "iq4nl32a16", 256, 16, true }, { "q50a16", 256, 16, true },
-                           { "q20a16", 256, 8, true } };
+    struct Want { const char* dt; int64_t rows, cols; };
+    /* N 256, K 512, group 128; the last class at N 128, K 256. */
+    const Want wants[] = { { "fp8a8", 2, 4 },      { "w4a8", 256, 4 },     { "w4a8h", 256, 4 },
+                           { "w4nla8h", 256, 4 },  { "w4nl64a8h", 256, 8 }, { "w5nl64a8h", 256, 8 },
+                           { "w6nl64a8h", 256, 8 }, { "w4nl32a8h", 256, 16 }, { "mxfp4a8", 256, 16 } };
     for (const char* op : { "moe_gemm_q", "moe_gemm_q_mod4" }) {
         const RadKernelInfo* k = kern(op);
         REQUIRE(k != nullptr && k->opd_shape != nullptr);
@@ -4908,8 +5755,7 @@ TEST(op_moe_gemm_q_scale_grid_by_dtype) {
             RadOpdDesc d{}, dl{};
             REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 3, &d), RAD_OK);
             REQUIRE_EQ(k->opd_shape(r->p, r->n_p, last, &dl), RAD_OK);
-            CHECK_EQ(d.dtype, !std::strcmp(w.dt, "mxfp4a8") ? (uint32_t)RAD_U8
-                             : w.f16 ? (uint32_t)RAD_F16 : (uint32_t)RAD_BF16);
+            CHECK_EQ(d.dtype, !std::strcmp(w.dt, "mxfp4a8") ? (uint32_t)RAD_U8 : (uint32_t)RAD_BF16);
             CHECK_EQ(d.rank, 3u);
             CHECK_EQ(d.shape[0], four ? 2LL : 4LL);
             if (d.shape[1] != w.rows || d.shape[2] != w.cols)
@@ -4993,257 +5839,6 @@ TEST(op_moe_gemm_q_scale_grid_by_dtype) {
                 CHECK_EQ(k->opd_shape(r->p, r->n_p, opd, &d), RAD_E_UNSUPPORTED);
             }
         }
-    }
-}
-
-/* The three unrotated GGUF expert encodings, host-side: libref must read the same planes libhalo
- * serves at W4 = 6/7/8. IQ4_NL's u4 codes index a sixteen-entry i8 table; Q5_0's signed i5 codes
- * name their level; Q2_0's u2 codes name level - 1. All carry f16 scales (per 32 of K, per 64 for
- * Q2_0) and bf16 activations, so there is no activation scale. The expected values are a host
- * decode of the same canonical planes, as libhalo's selftest computes them, summed in double. */
-TEST(op_moe_gemm_q_unrotated_codebooks) {
-    struct Form { const char* dtype; uint32_t cdt; uint32_t tdt; int bits; int64_t gs; };
-    const Form forms[] = {
-        { "iq4nl32a16", RAD_U4, RAD_I8, 4, 32 },
-        { "q50a16",     RAD_I5, 0,      5, 32 },
-        { "q20a16",     RAD_U2, 0,      2, 64 },
-    };
-    static const int8_t kIq4Nl[16] = { -127, -104, -83, -65, -49, -35, -22, -10,
-                                       1,    13,   25,  38,  53,  69,  89, 113 };
-    const RadKernelInfo* k = kern("moe_gemm_q");
-    REQUIRE(k != nullptr && k->layout != nullptr && k->relayout != nullptr);
-
-    const int64_t ne = 4, top_k = 2, M = 3, NT = M * top_k;
-    const int64_t Nc[2] = { 8, 8 }, Kc[2] = { 64, 64 };
-    const int64_t N = 8, K = 64, ne0 = ne / 2, ne1 = ne / 2;
-
-    /* The routing: slot (t, j) goes to expert (2t + j) % ne, sorted by expert as moe_scatter
-     * leaves it. */
-    std::vector<int64_t> sorted, offs;
-    auto expert_of = [&](int64_t i) { return (2 * (i / top_k) + i % top_k) % ne; };
-    for (int64_t e = 0; e < ne; ++e) {
-        offs.push_back((int64_t)sorted.size());
-        for (int64_t i = 0; i < NT; ++i)
-            if (expert_of(i) == e) sorted.push_back(i);
-    }
-    offs.push_back((int64_t)sorted.size());
-    while ((int64_t)sorted.size() < NT) sorted.push_back(-1);
-
-    /* The activation is bf16, exact in f32: small quarters. */
-    T act(RAD_BF16, { M, K });
-    for (int64_t i = 0; i < M * K; ++i)
-        st_dt(RAD_BF16, act.t.data, i, (float)(((i * 17 + 5) % 97) - 48) * 0.25f);
-
-    for (const Form& f : forms) {
-        RadEncoding enc;
-        rad_enc_clear(&enc);
-        rad_enc_copy_str(enc.scheme, "affine");
-        rad_enc_copy_str(enc.transform, "");
-        const int ic = rad_enc_add_plane(&enc, "codes", f.cdt, 1, 1);
-        const int is = rad_enc_add_plane(&enc, "scale", RAD_F16, 1, f.gs);
-        const int it = f.tdt ? rad_enc_add_table(&enc, "table", f.tdt, 1, 16) : -1;
-        const std::vector<int> sel_c = it >= 0 ? std::vector<int>{ ic, it } : std::vector<int>{ ic };
-        const std::vector<int> sel_s = { is };
-        const RadParam p[] = { RadParam{ "dtype", RAD_P_STR, 0, 0, f.dtype, 0 } };
-
-        /* The description the oracle and rad-kbench size the weight from: its codes dtype and
-         * the f16 scale plane's grid. */
-        {
-            A pa;
-            pa.i("M", M).i("N", Nc[0]).i("K", Kc[0]).i("N_odd", Nc[1]).i("K_odd", Kc[1])
-              .i("n_expert", ne).i("top_k", top_k).i("group", 128).s("a_order", "token")
-              .s("dtype", f.dtype);
-            const RadArgs* r = pa.get();
-            RadOpdDesc dw{}, ds{};
-            REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 2, &dw), RAD_OK);
-            CHECK_EQ(dw.dtype, f.cdt);
-            CHECK_EQ(dw.shape[0], ne0);
-            CHECK_EQ(dw.shape[1], Nc[0]);
-            CHECK_EQ(dw.shape[2], Kc[0]);
-            REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 3, &ds), RAD_OK);
-            CHECK_EQ(ds.dtype, (uint32_t)RAD_F16);
-            CHECK_EQ(ds.shape[1], Nc[0]);
-            CHECK_EQ(ds.shape[2], Kc[0] / f.gs);
-        }
-
-        struct Enc {
-            std::vector<uint8_t> codes, scale, table;
-            int64_t rbc = 0, rbs = 0;
-        };
-        std::vector<Enc> ex((size_t)ne);
-        std::vector<std::vector<uint8_t>> stored_c[2], stored_s[2];
-        std::vector<void*> cptr[2], sptr[2];
-        uint32_t cdt[2] = { 0, 0 };
-        const char* err = "";
-        for (int64_t e = 0; e < ne; ++e) {
-            const int c = (int)(e % 2);
-            const int64_t n = Nc[c], kk = Kc[c], ng = (kk + f.gs - 1) / f.gs;
-            Enc& E = ex[(size_t)e];
-            E.rbc = rad_enc_row_bytes(f.cdt, kk);
-            E.rbs = rad_enc_row_bytes(RAD_F16, ng);
-            E.codes.assign((size_t)(n * E.rbc), 0);
-            E.scale.assign((size_t)(n * E.rbs), 0);
-            if (f.tdt) { E.table.assign(16, 0); std::memcpy(E.table.data(), kIq4Nl, 16); }
-            const double base = f.bits == 4 ? 127.0 : f.bits == 5 ? 16.0 : 2.0;
-            for (int64_t r = 0; r < n; ++r)
-                for (int64_t g = 0; g < ng; ++g) {
-                    double amax = 0;
-                    for (int64_t j = 0; j < f.gs; ++j) {
-                        const double v = (double)(((e * 7 + r * 31 + (g * f.gs + j) * 17) % 61) - 30) /
-                                         37.0;
-                        amax = std::max(amax, std::fabs(v));
-                    }
-                    const double s = amax > 0 ? amax / base : 1.0;
-                    const int64_t so = r * E.rbs + g * 2;
-                    st_dt(RAD_F16, E.scale.data() + so, 0, (float)s);
-                    const float sf = ld_dt(RAD_F16, E.scale.data() + so, 0);
-                    for (int64_t j = 0; j < f.gs; ++j) {
-                        const float v = (float)(((e * 7 + r * 31 + (g * f.gs + j) * 17) % 61) - 30) /
-                                        37.0f;
-                        int code;
-                        if (f.bits == 4) {
-                            code = 0;
-                            for (int q = 1; q < 16; ++q)
-                                if (std::fabs(v / sf - (float)kIq4Nl[q]) <
-                                    std::fabs(v / sf - (float)kIq4Nl[code])) code = q;
-                        } else if (f.bits == 5) {
-                            code = (int)std::max(-16.0f, std::min(15.0f, std::nearbyint(v / sf)));
-                        } else {
-                            code = (int)std::max(-1.0f, std::min(2.0f, std::nearbyint(v / sf))) + 1;
-                        }
-                        rad_store_code(E.codes.data() + r * E.rbc, f.cdt, g * f.gs + j, code);
-                    }
-                }
-
-            /* Store each view the way the row's layout hooks ask. */
-            auto store = [&](int opd, const std::vector<int>& sel,
-                             const std::vector<std::vector<uint8_t>>& pl, int64_t cols,
-                             std::vector<uint8_t>* out, uint32_t* dt) {
-                std::vector<RadTensor> pt(sel.size());
-                for (size_t s = 0; s < sel.size(); ++s) {
-                    pt[s] = RadTensor{};
-                    pt[s].data = const_cast<uint8_t*>(pl[s].data());
-                    pt[s].dtype = enc.plane[sel[s]].dtype;
-                    pt[s].rank = 2;
-                    pt[s].shape[0] = s == 0 ? n : 1;
-                    pt[s].shape[1] = s == 0 ? cols : 16;
-                    pt[s].stride[0] = pt[s].shape[1];
-                    pt[s].stride[1] = 1;
-                }
-                RadLayout L{};
-                int rc = k->layout(p, 1, opd, &enc, sel.data(), pt.data(), (int)sel.size(), &L);
-                if (rc == RAD_E_UNSUPPORTED) {
-                    *out = pl[0];
-                    *dt = pt[0].dtype;
-                    return;
-                }
-                if (rc < 0) { err = "the layout hook refused a codebook view"; return; }
-                out->assign((size_t)L.bytes, 0);
-                if (k->relayout(p, 1, opd, &enc, sel.data(), pt.data(), (int)sel.size(),
-                                out->data(), L.bytes) != RAD_OK) {
-                    err = "the relayout hook refused a codebook view";
-                    return;
-                }
-                *dt = L.dtype;
-            };
-            const int ow = c ? 6 : 2, os = c ? 7 : 3;
-            std::vector<uint8_t> bc, bs;
-            uint32_t dtc = 0, dts = 0;
-            store(ow, sel_c, { E.codes, E.table }, kk, &bc, &dtc);
-            store(os, sel_s, { E.scale }, ng, &bs, &dts);
-            if (err[0]) break;
-            if (dts != RAD_F16) err = "the scale view is not the f16 plane";
-            /* IQ4_NL joins codes and table; Q5_0 and Q2_0 store the single code plane as it
-             * is; every one of the three stores the f16 scale plane as it is. */
-            if (f.tdt ? bc.size() <= E.codes.size() : bc.size() != E.codes.size())
-                err = "the codes view was not stored as the encoding asks";
-            if (bs.size() != E.scale.size()) err = "the scale view was not stored as it is";
-            if (err[0]) break;
-            stored_c[c].push_back(bc);
-            stored_s[c].push_back(bs);
-            cptr[c].push_back(stored_c[c].back().data());
-            sptr[c].push_back(stored_s[c].back().data());
-            cdt[c] = dtc;
-        }
-        if (err[0]) { CHECK(false); fprintf(stderr, "    %s: %s\n", f.dtype, err); continue; }
-
-        RadTensor w0{}, s0{}, w1{}, s1{};
-        auto wt = [](std::vector<void*>& ptr, uint32_t dt, int64_t rows, int64_t n, int64_t cols) {
-            RadTensor t{};
-            t.data = ptr.data();
-            t.dtype = dt;
-            t.rank = 3;
-            t.shape[0] = rows; t.shape[1] = n; t.shape[2] = cols;
-            t.stride[0] = 0; t.stride[1] = cols; t.stride[2] = 1;
-            return t;
-        };
-        w0 = wt(cptr[0], cdt[0], ne0, Nc[0], Kc[0]);
-        s0 = wt(sptr[0], RAD_F16, ne0, Nc[0], Kc[0] / f.gs);
-        w1 = wt(cptr[1], cdt[1], ne1, Nc[1], Kc[1]);
-        s1 = wt(sptr[1], RAD_F16, ne1, Nc[1], Kc[1] / f.gs);
-
-        T sorted_t(RAD_I32, { NT }); sorted_t.n(sorted);
-        T off_t(RAD_I32, { ne + 1 }); off_t.n(offs);
-        T y(RAD_BF16, { NT, N });
-        A a;
-        a.ts.push_back(act.t);
-        a.ts.push_back(RadTensor{});
-        a.ts.push_back(w0);
-        a.ts.push_back(s0);
-        a.ts.push_back(sorted_t.t);
-        a.ts.push_back(off_t.t);
-        a.ts.push_back(w1);
-        a.ts.push_back(s1);
-        a.ts.push_back(y.t);
-        a.i("M", M).i("N", Nc[0]).i("K", Kc[0]).i("N_odd", Nc[1]).i("K_odd", Kc[1])
-         .i("n_expert", ne).i("top_k", top_k).i("group", 128).s("a_order", "token")
-         .s("dtype", f.dtype);
-        const int rc = run("moe_gemm_q", a);
-        if (rc != RAD_OK) {
-            fprintf(stderr, "    %s: launch %d\n", f.dtype, rc);
-            CHECK_EQ(rc, RAD_OK);
-            continue;
-        }
-
-        /* The host decode of the same planes, summed in double. */
-        double worst = 0;
-        for (int64_t i = 0; i < NT; ++i) {
-            const int64_t flat = sorted[(size_t)i];
-            int64_t e = 0;
-            while (e + 1 < ne && offs[(size_t)(e + 1)] <= i) ++e;
-            const int c = (int)(e % 2);
-            const int64_t n = Nc[c], kk = Kc[c], ng = kk / f.gs;
-            const int64_t tok = flat < 0 ? -1 : flat / top_k;
-            const Enc& E = ex[(size_t)e];
-            for (int64_t col = 0; col < N; ++col) {
-                double want = 0.0;
-                if (tok >= 0 && col < n) {
-                    const int64_t r = col;
-                    for (int64_t g = 0; g < ng; ++g) {
-                        double part = 0.0;
-                        for (int64_t j = 0; j < f.gs; ++j) {
-                            const int64_t kk2 = g * f.gs + j;
-                            const int code = (int)rad_load_f32(E.codes.data() + r * E.rbc,
-                                                              f.cdt, kk2);
-                            const double lv = f.tdt == RAD_I8
-                                                  ? (double)((const int8_t*)E.table.data())[code]
-                                              : f.bits == 2 ? (double)(code - 1)
-                                                            : (double)code;
-                            part += lv * (double)rad_load_f32(act.t.data, RAD_BF16,
-                                                              tok * K + kk2);
-                        }
-                        want += part * (double)rad_load_f32(E.scale.data() + r * E.rbs,
-                                                            RAD_F16, g);
-                    }
-                }
-                const double got = y.at(i * N + col);
-                const double d = std::fabs(got - want) / (1.0 + std::fabs(want));
-                if (d > worst) worst = d;
-                CHECK(d <= 1e-2);
-            }
-        }
-        if (worst > 1e-2)
-            std::fprintf(stderr, "    %s: worst relative error %.3e\n", f.dtype, worst);
     }
 }
 
@@ -6548,6 +7143,64 @@ TEST(errors_are_values) {
     CHECK_EQ(run("had_quant_act_i8", c), RAD_E_UNSUPPORTED);
 }
 
+TEST(op_attn_umt5_preserves_direction_and_packed_sequence_boundaries) {
+    constexpr int64_t width = 128, pitch = 131;
+    T q(RAD_BF16, {3, pitch}), k(RAD_BF16, {3, pitch}), v(RAD_BF16, {3, pitch});
+    T cu(RAD_I32, {3}), bias(RAD_BF16, {32, 2}), out(RAD_BF16, {3, pitch});
+    for (T* matrix : { &q, &k, &v, &out }) matrix->t.shape[1] = width;
+    auto put = [](T& t, int64_t off, float value) {
+        st_dt(t.t.dtype, t.t.data, off, value);
+    };
+    for (int h = 0; h < 2; ++h) {
+        const int64_t col = h * 64;
+        put(q, col, 1.0f); put(q, pitch + col, .5f);
+        put(k, col, .75f); put(k, pitch + col, .25f);
+        put(v, col, h == 0 ? 1.0f : 3.0f);
+        put(v, pitch + col, h == 0 ? 3.0f : 1.0f);
+        put(v, 2 * pitch + col, 16.0f);
+    }
+    put(bias, 17 * 2, .75f); put(bias, 1 * 2, -.125f);
+    put(bias, 17 * 2 + 1, -.125f); put(bias, 1 * 2 + 1, .75f);
+    put(out, pitch - 1, 21.0f);
+    cu.n({0, 2, 3});
+    A a; a.t(q).t(k).t(v).t(cu).t(bias).t(out).i("M", 3).i("heads", 2).s("dtype", "bf16");
+    CHECK_OK(run("attn_umt5", a));
+    // The pinned UMT5 attention expression in PyTorch BF16, no qk scaling.
+    CHECK_EQ(out.at(0), 2.125f);
+    CHECK_EQ(out.at(pitch), 1.9375f);
+    CHECK_EQ(out.at(64), 2.3125f);
+    CHECK_EQ(out.at(pitch + 64), 2.46875f);
+    CHECK_EQ(out.at(2 * pitch), 16.0f);
+    CHECK_EQ(out.at(pitch - 1), 21.0f);
+    cu.n({0, 0, 3});
+    CHECK_EQ(run("attn_umt5", a), RAD_E_SHAPE);
+}
+
+TEST(umt5_relative_buckets_match_the_reference_distance_thresholds) {
+    const int starts[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 23, 32, 46, 64, 91 };
+    for (int i = 1; i < 16; ++i) {
+        CHECK_EQ(rad_umt5::bucket(-starts[i]), i);
+        CHECK_EQ(rad_umt5::bucket(starts[i]), 16 + i);
+        CHECK_EQ(rad_umt5::bucket(1 - starts[i]), i - 1);
+    }
+    CHECK_EQ(rad_umt5::bucket(-511), 15);
+    CHECK_EQ(rad_umt5::bucket(511), 31);
+}
+
+TEST(gelu_umt5_preserves_wan_bf16_rounding) {
+    const std::vector<float> input = {-4, -3.125f, -2.5f, -1.75f, -1.25f, -.875f, -.375f, 0,
+                                      .125f, .625f, 1.25f, 2.5f, 3.125f, 4};
+    // Official Wan GELU.forward on PyTorch 2.8.0 with BF16 input.
+    const std::vector<float> expected = {-0.0f, -0.0f, -.0146484375f, -.07177734375f, -.134765625f,
+                                         -.16796875f, -.1328125f, 0, .06884765625f, .458984375f,
+                                         1.109375f, 2.484375f, 3.125f, 4};
+    T x(RAD_BF16, {2, 7}); x.f(input);
+    T y(RAD_BF16, {2, 7});
+    A a; a.t(x).t(y).i("M", 2).i("n", 7).s("dtype", "bf16");
+    CHECK_OK(run("gelu_umt5", a));
+    for (size_t i = 0; i < expected.size(); ++i) CHECK_EQ(y.at(i), expected[i]);
+}
+
 RAD_TEST_MAIN()
 
 /* scatter_rows: the three rules that distinguish it from the gather it mirrors, each because the
@@ -6774,9 +7427,9 @@ TEST(hc_project_removes_the_direction_per_stream_and_skips_off_rows) {
     CHECK_EQ(h.at(7), 5.0f);
 }
 
-/* With `group`, hc_read also emits x as block-scaled fp8 taken over the stored (narrowed) x, and
- * with `rotate` the Hadamard-rotated twin: byte for byte what quant_act_fp8 and had_quant_act_fp8
- * produce from the stored x. */
+/* With `group`, hc_read also emits x as block-scaled fp8 taken over the stored (narrowed) x: byte
+ * for byte what quant_act_fp8 produces from the stored x. `rotate` adds the Hadamard-rotated twin
+ * beside it and leaves the plain pair as it is. */
 TEST(hc_read_fp8_forms_are_the_quantisers_of_the_stored_x) {
     const HcCase c;
     const int64_t hn = c.hc * c.n, g = 2;
@@ -6795,13 +7448,8 @@ TEST(hc_read_fp8_forms_are_the_quantisers_of_the_stored_x) {
     T q2(RAD_F8E4M3, {c.rows, c.n}), s2(RAD_F32, {c.rows, c.n / g});
     A b; b.t(x).t(q2).t(s2).i("M", c.rows).i("n", c.n).i("group", g).s("dtype", "bf16");
     CHECK_OK(run("quant_act_fp8", b));
-    T rq2(RAD_F8E4M3, {c.rows, c.n}), rs2(RAD_F32, {c.rows, c.n / g});
-    A d; d.t(x).t(rq2).t(rs2).i("M", c.rows).i("n", c.n).i("group", g).s("dtype", "bf16");
-    CHECK_OK(run("had_quant_act_fp8", d));
     CHECK(std::memcmp(q.t.data, q2.t.data, (size_t)(c.rows * c.n)) == 0);
     CHECK(std::memcmp(s.t.data, s2.t.data, (size_t)(c.rows * c.n / g * 4)) == 0);
-    CHECK(std::memcmp(rq.t.data, rq2.t.data, (size_t)(c.rows * c.n)) == 0);
-    CHECK(std::memcmp(rs.t.data, rs2.t.data, (size_t)(c.rows * c.n / g * 4)) == 0);
 }
 
 /* mtp_enter with `ngroup` hc (one rsqrt per sub-stream) and 1 (one over the wide row), on streams
@@ -6898,39 +7546,6 @@ TEST(gate_add_act_none_adds_through_the_gate_itself) {
 
     A c; c.t(y1).t(g1).t(cu1).t(x1).i("M", 1).i("n", 1).s("dtype", "bf16").s("act", "silu");
     CHECK_EQ(run("gate_add", c), RAD_E_INVAL);
-}
-
-/* ln_mod_quant_fp8 with `gated` is gate_add, ln_mod and quant_act_fp8 in one pass: the same bytes
- * in x, z, the codes and the scales as the three ops. */
-TEST(ln_mod_quant_fp8_is_the_three_ops_byte_for_byte) {
-    const std::vector<float> yv = { 5, 6, 7, 8, 0.3f, -0.7f, 0.1f, 1.9f };
-    const std::vector<float> gv = { 0, 0, 20, -20, 0.5f, 1, -1, 2 };
-    const std::vector<float> xv = { 1, 2, 3, 4, -0.25f, 0.5f, 3, -2 };
-    const std::vector<float> sv = { 0.5f, -0.5f, 1, 0, 0.25f, 0.125f, -0.75f, 2 };
-    const int64_t n = 4;
-    T cu(RAD_I32, {3}); cu.n({0, 1, 2});
-    T y(RAD_BF16, {2, n}); y.f(yv);
-    T g(RAD_BF16, {2, n}); g.f(gv);
-    T s(RAD_BF16, {2, n}); s.f(sv);
-    T x1(RAD_BF16, {2, n}); x1.f(xv);
-    T q1(RAD_F8E4M3, {2, n}), sc1(RAD_F32, {2, 2}), z1(RAD_BF16, {2, n});
-    A a; a.t(y).t(g).t(s).t(cu).t(x1).t(q1).t(sc1).t(z1)
-          .i("M", 2).i("n", n).d("eps", 1e-6).i("group", 2).i("gated", 1).s("dtype", "bf16");
-    CHECK_OK(run("ln_mod_quant_fp8", a));
-
-    T x2(RAD_BF16, {2, n}); x2.f(xv);
-    A b; b.t(y).t(g).t(cu).t(x2).i("M", 2).i("n", n).s("dtype", "bf16");
-    CHECK_OK(run("gate_add", b));
-    T z2(RAD_BF16, {2, n});
-    A c; c.t(x2).t(s).t(cu).t(z2).i("M", 2).i("n", n).d("eps", 1e-6).s("dtype", "bf16");
-    CHECK_OK(run("ln_mod", c));
-    T q2(RAD_F8E4M3, {2, n}), sc2(RAD_F32, {2, 2});
-    A d; d.t(z2).t(q2).t(sc2).i("M", 2).i("n", n).i("group", 2).s("dtype", "bf16");
-    CHECK_OK(run("quant_act_fp8", d));
-    CHECK(x1.mem == x2.mem);
-    CHECK(z1.mem == z2.mem);
-    CHECK(q1.mem == q2.mem);
-    CHECK(sc1.mem == sc2.mem);
 }
 
 /* timestep_embed: [cos | sin] of t' f_i, f_i = exp(-ln(max_period) i / (n/2)); with `round`, t' is
@@ -7641,77 +8256,6 @@ TEST(rms_mod_column_map_redirects_sequences_to_table_columns) {
     A g; g.t(y).t(gA).t(sA).t(w).t(cu).t(x4).t(z4).t(cms).i("M", 3).i("n", 2).d("eps", 0)
           .i("gated", 1).s("dtype", "bf16");
     CHECK_EQ(run("rms_mod", g), RAD_E_SHAPE);
-}
-
-/* rms_mod_quant_fp8 is rms_mod with its chain in bf16 and quant_act_fp8 over that row: the same
- * bytes in x, z, the codes and the scales as the pair. */
-TEST(rms_mod_quant_fp8_is_rms_mod_then_quant_act_fp8) {
-    const std::vector<float> yv = { 5, 6, 7, 8, 0.3f, -0.7f, 0.1f, 1.9f };
-    const std::vector<float> gv = { 0, 0.5f, 2, -1, 0.5f, 1, -1, 2 };
-    const std::vector<float> xv = { 1, 2, 3, 4, -0.25f, 0.5f, 3, -2 };
-    const std::vector<float> sv = { 0.5f, -0.5f, 1, 0, 0.25f, 0.125f, -0.75f, 2,
-                                    0, 1, -1, 0.5f, 0.125f, 0.25f, 0.5f, 1 };
-    const int64_t n = 4;
-    T cu(RAD_I32, {3}); cu.n({0, 1, 2});
-    T y(RAD_BF16, {2, n}); y.f(yv);
-    T g(RAD_BF16, {2, n}); g.f(gv);
-    T s(RAD_BF16, {2, 2 * n}); s.f(sv);
-    T w(RAD_BF16, {n}); w.f({1, 0.5f, 2, 0.75f});
-    T x1(RAD_BF16, {2, n}); x1.f(xv);
-    T q1(RAD_F8E4M3, {2, n}), sc1(RAD_F32, {2, 2}), z1(RAD_BF16, {2, n});
-    A a; a.t(y).t(g).t(s).t(w).t(cu).t(x1).t(q1).t(sc1).t(z1)
-          .i("M", 2).i("n", n).d("eps", 1e-5).i("group", 2).i("gated", 1).s("dtype", "bf16");
-    CHECK_OK(run("rms_mod_quant_fp8", a));
-
-    T x2(RAD_BF16, {2, n}); x2.f(xv);
-    T z2(RAD_BF16, {2, n});
-    A b; b.t(y).t(g).t(s).t(w).t(cu).t(x2).t(z2).i("M", 2).i("n", n).d("eps", 1e-5)
-          .i("gated", 1).s("dtype", "bf16");
-    CHECK_OK(run("rms_mod", b));
-    T q2(RAD_F8E4M3, {2, n}), sc2(RAD_F32, {2, 2});
-    A d; d.t(z2).t(q2).t(sc2).i("M", 2).i("n", n).i("group", 2).s("dtype", "bf16");
-    CHECK_OK(run("quant_act_fp8", d));
-    CHECK(x1.mem == x2.mem);
-    CHECK(z1.mem == z2.mem);
-    CHECK(q1.mem == q2.mem);
-    CHECK(sc1.mem == sc2.mem);
-}
-
-/* The quant form takes the column map at its own trailing slot (9): the same run, both per-column
- * operands' rows swapped, the sequences redirected to each other's column, matches byte for byte. */
-TEST(rms_mod_quant_fp8_takes_the_column_map_too) {
-    const std::vector<float> yv = { 5, 6, 7, 8, 0.3f, -0.7f, 0.1f, 1.9f };
-    const std::vector<float> gv = { 0, 0.5f, 2, -1, 0.5f, 1, -1, 2 };
-    const std::vector<float> xv = { 1, 2, 3, 4, -0.25f, 0.5f, 3, -2 };
-    const std::vector<float> sv = { 0.5f, -0.5f, 1, 0, 0.25f, 0.125f, -0.75f, 2,
-                                    0, 1, -1, 0.5f, 0.125f, 0.25f, 0.5f, 1 };
-    const int64_t n = 4;
-    T cu(RAD_I32, {3}); cu.n({0, 1, 2});
-    T y(RAD_BF16, {2, n}); y.f(yv);
-    T g(RAD_BF16, {2, n}); g.f(gv);
-    T s(RAD_BF16, {2, 2 * n}); s.f(sv);
-    T w(RAD_BF16, {n}); w.f({1, 0.5f, 2, 0.75f});
-    T x1(RAD_BF16, {2, n}); x1.f(xv);
-    T q1(RAD_F8E4M3, {2, n}), sc1(RAD_F32, {2, 2}), z1(RAD_BF16, {2, n});
-    A a; a.t(y).t(g).t(s).t(w).t(cu).t(x1).t(q1).t(sc1).t(z1)
-          .i("M", 2).i("n", n).d("eps", 1e-5).i("group", 2).i("gated", 1).s("dtype", "bf16");
-    CHECK_OK(run("rms_mod_quant_fp8", a));
-
-    T gs(RAD_BF16, {2, n});
-    gs.f({ gv[4], gv[5], gv[6], gv[7], gv[0], gv[1], gv[2], gv[3] });
-    T ss(RAD_BF16, {2, 2 * n});
-    ss.f({ sv[8], sv[9], sv[10], sv[11], sv[12], sv[13], sv[14], sv[15],
-           sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7] });
-    T cm(RAD_I32, {2}); cm.n({1, 0});
-    T x2(RAD_BF16, {2, n}); x2.f(xv);
-    T q2(RAD_F8E4M3, {2, n}), sc2(RAD_F32, {2, 2}), z2(RAD_BF16, {2, n});
-    A b; b.t(y).t(gs).t(ss).t(w).t(cu).t(x2).t(q2).t(sc2).t(z2).t(cm)
-          .i("M", 2).i("n", n).d("eps", 1e-5).i("group", 2).i("gated", 1).s("dtype", "bf16");
-    CHECK_OK(run("rms_mod_quant_fp8", b));
-    CHECK(x1.mem == x2.mem);
-    CHECK(z1.mem == z2.mem);
-    CHECK(q1.mem == q2.mem);
-    CHECK(sc1.mem == sc2.mem);
 }
 
 /* flow_x0_step in f32 steps: st = 1 - 0.3f, r = 0.4f / 0.7f, d = x + st v, x' = r x + (1 - r) d.
@@ -9036,6 +9580,45 @@ TEST(vq_encode_takes_the_nearest_code_by_cosine_and_leaves_the_residual) {
     CHECK_EQ(run("vq_encode", b), RAD_E_SHAPE);
 }
 
+TEST(breeze_euclidean_quantisation_preserves_distance_and_tie_order) {
+    T x(RAD_F32, {3, 2}); x.f({4, 0, 2, 0, 0, 3});
+    T cb(RAD_F32, {3, 2}); cb.f({1, 0, 3, 0, 0, 2});
+    T codes(RAD_I32, {3});
+    A a; a.t(x).t(cb).t(codes).i("M", 3).i("n", 2).i("bins", 3).s("dtype", "f32");
+    CHECK_OK(run("vq_euclidean", a));
+    /* Cosine would choose 0 for [4, 0]; Euclidean must choose the longer centroid 1.
+     * [2, 0] is exactly equidistant from 0 and 1 and chooses the lower index. */
+    CHECK_EQ(codes.iat(0), 1); CHECK_EQ(codes.iat(1), 0); CHECK_EQ(codes.iat(2), 2);
+    CHECK_EQ(x.at(0), 1.0f); CHECK_EQ(x.at(1), 0.0f);
+    CHECK_EQ(x.at(2), 1.0f); CHECK_EQ(x.at(3), 0.0f);
+    CHECK_EQ(x.at(4), 0.0f); CHECK_EQ(x.at(5), 1.0f);
+    CHECK_OK(run("vq_euclidean", a));  /* next residual step, not the original vector */
+    CHECK_EQ(codes.iat(0), 0); CHECK_EQ(codes.iat(1), 0); CHECK_EQ(codes.iat(2), 2);
+    A bad; bad.t(x).t(cb).t(codes).i("M", 3).i("n", 2).i("bins", 4).s("dtype", "f32");
+    CHECK_EQ(run("vq_euclidean", bad), RAD_E_SHAPE);
+}
+
+TEST(breeze_elu_has_unit_alpha_and_works_in_place) {
+    T x(RAD_F32, {4, 1}); x.f({-1, 0, 2, -100});
+    A a; a.t(x).t(x).i("M", 4).i("n", 1).s("dtype", "f32");
+    CHECK_OK(run("elu", a));
+    CHECK(std::abs(x.at(0) - (-0.6321205588f)) < 1e-7f);
+    CHECK_EQ(x.at(1), 0.0f); CHECK_EQ(x.at(2), 2.0f); CHECK_EQ(x.at(3), -1.0f);
+}
+
+TEST(breeze_downsample_replication_is_a_prefix_and_crop) {
+    /* Original [1, 2, 3, 4], replicate left pad of 2 -> [1, 1, 1, 2, 3, 4].
+     * An ordinary causal conv on the prefixed input gives one extra leading row. */
+    T x(RAD_F32, {6, 1}); x.f({1, 1, 1, 2, 3, 4});
+    T w(RAD_F32, {1, 1, 4}); w.f({1, 10, 100, 1000});
+    T cu(RAD_I32, {2}); cu.n({0, 6});
+    T y(RAD_F32, {3, 1});
+    A a; a.t(x).t(w).t(cu).tnull().t(y).i("M", 6).i("cin", 1).i("cout", 1).i("k", 4)
+          .i("dil", 1).i("causal", 1).i("stride", 2).s("dtype", "f32");
+    CHECK_OK(run("conv1d", a));
+    CHECK_EQ(y.at(1), 2111.0f); CHECK_EQ(y.at(2), 4321.0f);
+}
+
 /* snake_aa's paddings, with the activation the identity (alpha 0: sin(0 u) = 0). Ratio 2, filters
  * of 4: P = 1. Sequence [10, 20, 40] pads to [10, 10, 20, 40, 40]; the transposed f_up [1, 2, 3, 4]
  * gives [10, 20, 40, 60, 50, 80, 100, 160, 160, 240, 120, 160], doubled and cropped by 3 a side:
@@ -9154,6 +9737,72 @@ TEST(qsa_select_orders_above_then_ties_and_appends_the_partial_page) {
     CHECK_EQ(r.sel[2], -1LL); CHECK_EQ(r.sel[4], -1LL);
     CHECK_EQ(r.nsel[0], 2LL);
     CHECK_EQ(r.su[0], 1LL * 4 + 3 + 1);
+}
+
+/* At or below the exactness bound (every complete block fits in topk) a row at the end of its
+ * sequence's context selects the head of the block table, in table order, then the partial page,
+ * and its seqused is the context's length, whatever the blocks score. The attention block issues
+ * such a row over the sequence's own table and length and the indexer selects nothing
+ * (AttnGatedFP8::qsa_use, docs/QSA.md "Below the bound"); this is the equality that rests on. */
+TEST(qsa_select_below_the_bound_is_the_block_table_and_the_context_length) {
+    const int64_t ratio = 4, topk = 8, nb = 12;
+    std::vector<int64_t> bt;
+    for (int64_t b = 0; b < nb; ++b) bt.push_back(100 + 7 * ((b * 5) % nb));   /* scattered pages */
+    uint32_t g = 12345;
+    for (int64_t p = 0; p <= topk * ratio + ratio - 2; ++p) {       /* every position up to the bound */
+        for (int variant = 0; variant < 3; ++variant) {
+            std::vector<float> sc((size_t)nb);
+            for (int64_t b = 0; b < nb; ++b) {
+                g = g * 1664525u + 1013904223u;
+                /* scores as they come: positive, equal ones, and exact zeros (a relu's) */
+                sc[(size_t)b] = variant == 0 ? (float)((g >> 20) % 7) * 0.25f
+                              : variant == 1 ? 0.0f : 3.5f;
+            }
+            const int64_t n = (p + 1) / ratio;                      /* complete blocks, this row's */
+            const Sel r = qsa_select_run(sc, nb, bt, n, { p }, topk, ratio);
+            REQUIRE_EQ(r.sel.size(), (size_t)(topk + 1));
+            const int64_t pages = (p + ratio) / ratio;              /* ceil((p + 1) / ratio) */
+            CHECK_EQ(r.nsel[0], pages);
+            CHECK_EQ(r.su[0], p + 1);
+            for (int64_t i = 0; i <= topk; ++i)
+                CHECK_EQ(r.sel[(size_t)i], i < pages ? bt[(size_t)i] : -1LL);
+        }
+    }
+}
+
+/* The rows of a chain verify or a prefill chunk at or below the bound select the same bytes
+ * whatever they score -- here over a plane of zeros against random scores: every row its own
+ * complete blocks in table order, the partial page, the count and seqused. The sparse attention of
+ * such a step (between 1025 and 2047 tokens of context a multi-row step is the sparse row a query)
+ * therefore reads, at every layer, the selection the pass's first full-attention layer issued
+ * (QsaIndexer::step, kQsaOnce). The last positions put a row on exactly `topk` blocks plus a
+ * partial page. */
+TEST(qsa_select_of_a_chains_rows_over_a_constant_plane_is_the_scored_selection_below_the_bound) {
+    const int64_t ratio = 4, topk = 8, nb = 16, M = 4;
+    std::vector<int64_t> bt;
+    for (int64_t b = 0; b < nb; ++b) bt.push_back(200 + 3 * ((b * 7) % nb));   /* scattered pages */
+    uint32_t g = 777;
+    int partial_at_topk = 0;
+    for (int64_t p0 = 0; p0 + M - 1 <= topk * ratio + ratio - 2; ++p0) {
+        std::vector<int64_t> pos;
+        for (int64_t j = 0; j < M; ++j) pos.push_back(p0 + j);
+        const int64_t nc = (pos.back() + 1) / ratio;                /* the sequence's, after the step */
+        std::vector<float> sc((size_t)(M * nb));
+        for (auto& v : sc) { g = g * 1664525u + 1013904223u; v = (float)((g >> 20) % 5) * 0.5f; }
+        const Sel scored = qsa_select_run(sc, nb, bt, nc, pos, topk, ratio);
+        const Sel flat = qsa_select_run(std::vector<float>((size_t)(M * (topk + 1)), 0.0f), topk + 1,
+                                        bt, nc, pos, topk, ratio);
+        REQUIRE_EQ(scored.sel.size(), (size_t)(M * (topk + 1)));
+        REQUIRE_EQ(flat.sel.size(), scored.sel.size());
+        CHECK(flat.sel == scored.sel);
+        CHECK(flat.nsel == scored.nsel);
+        CHECK(flat.su == scored.su);
+        for (int64_t j = 0; j < M; ++j) {
+            CHECK_EQ(flat.su[(size_t)j], pos[(size_t)j] + 1);
+            if ((pos[(size_t)j] + 1) / ratio == topk && flat.nsel[(size_t)j] == topk + 1) ++partial_at_topk;
+        }
+    }
+    CHECK(partial_at_topk > 0);
 }
 
 /* ================================================================== kv_resolve
@@ -9955,18 +10604,6 @@ TEST(fill_writes_its_value_at_the_row_pitch_only) {
     CHECK_EQ(buf.at(0), 0.0f); CHECK_EQ(buf.at(3), 9.0f);
 }
 
-/* had_quant_act_fp8 rotates each group by an unnormalised Hadamard before the absmax: [1, 1]
- * becomes [2, 0] and [1, -1] becomes [0, 2]; the scale is amax / 448 with no 1/sqrt(group). */
-TEST(had_quant_act_fp8_rotates_before_the_absmax) {
-    T x(RAD_F32, {1, 4}); x.f({1, 1, 1, -1});
-    T q(RAD_F8E4M3, {1, 4}), s(RAD_F32, {1, 2});
-    A a; a.t(x).t(q).t(s).i("M", 1).i("n", 4).i("group", 2).s("dtype", "f32");
-    CHECK_OK(run("had_quant_act_fp8", a));
-    CHECK_EQ(s.at(0), 2.0f / 448.0f); CHECK_EQ(s.at(1), 2.0f / 448.0f);
-    CHECK_EQ(q.at(0), 448.0f); CHECK_EQ(q.at(1), 0.0f);
-    CHECK_EQ(q.at(2), 0.0f); CHECK_EQ(q.at(3), 448.0f);
-}
-
 /* had_quant_act_i8g is the same at int8 codes: amax / 127, nothing folded either. */
 TEST(had_quant_act_i8g_rotates_before_the_absmax) {
     T x(RAD_F32, {1, 4}); x.f({1, 1, 1, -1});
@@ -10294,29 +10931,6 @@ TEST(gemm_nt_q_bias_adds_a_bias_per_column) {
     CHECK_EQ(y.at(1), 21.0f);
 }
 
-/* givens_rotate divides by the channel scale, then turns each pair (a, b) into
- * (a cos t + b sin t, b cos t - a sin t), per part; a pair index outside the row is refused. */
-TEST(givens_rotate_scales_then_rotates_each_part) {
-    T x(RAD_F32, {1, 2}); x.f({1, 4});
-    T pr(RAD_I32, {2, 2}); pr.n({0, 1, 1, 0});          /* part 1 pairs (1, 0) */
-    T an(RAD_F32, {2, 1}); an.f({0.5f, 0.25f});
-    T sc(RAD_F32, {2, 2}); sc.f({1, 2, 2, 1});
-    T y(RAD_F32, {1, 4});
-    A a; a.t(x).t(pr).t(an).t(sc).t(y).i("M", 1).i("n", 2).i("group", 2).s("dtype", "f32")
-          .i("stages", 1).i("parts", 2);
-    CHECK_OK(run("givens_rotate", a));
-    const double c0 = std::cos(0.5f), s0 = std::sin(0.5f), c1 = std::cos(0.25f), s1 = std::sin(0.25f);
-    CHECK_NEAR(y.at(0), 1 * c0 + 2 * s0, 1e-6);         /* part 0: x / [1, 2] = [1, 2] */
-    CHECK_NEAR(y.at(1), 2 * c0 - 1 * s0, 1e-6);
-    /* Part 1: x / [2, 1] = [0.5, 4], pair (a, b) = (lane 1, lane 0). */
-    CHECK_NEAR(y.at(3), 4 * c1 + 0.5 * s1, 1e-6);
-    CHECK_NEAR(y.at(2), 0.5 * c1 - 4 * s1, 1e-6);
-    T bad(RAD_I32, {2, 2}); bad.n({0, 2, 1, 0});
-    A b; b.t(x).t(bad).t(an).t(sc).t(y).i("M", 1).i("n", 2).i("group", 2).s("dtype", "f32")
-          .i("stages", 1).i("parts", 2);
-    CHECK_EQ(run("givens_rotate", b), RAD_E_INVAL);
-}
-
 /* gram_accum adds x^T x into h (twice is twice once); with a scale, x is dequantised per group. */
 TEST(gram_accum_accumulates_the_dequantised_gram) {
     T a_(RAD_BF16, {2, 2}); a_.f({1, 2, 3, 4});
@@ -10611,6 +11225,31 @@ struct Geo {
 #define G(op, key, r, body) { op, key, r, [](A& a, int64_t R) { body; } }
 std::vector<Geo> geometries() {
     return {
+        G("flow_unipc_step", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
+
+        G("timestep_embed_f64", "M", 3, a.i("M", R).i("n", 8).d("max_period", 10000.0)
+                                        .s("dtype", "f32")),
+
+        G("wan_rope", "M", 8, a.i("M", R).i("heads", 2).s("dtype", "bf16")),
+
+        G("wan_rope_table", "M", 16, a.i("M", R).s("dtype", "f32")),
+
+        G("wan_gated_add", "M", 4, a.i("M", R).i("n", 8).i("gate", 5).s("dtype", "f32")),
+
+        G("wan_mod_norm", "M", 4, a.i("M", R).i("n", 8).i("group", 3).s("dtype", "bf16")),
+
+        G("wan_unpatch", "M", 16, a.i("M", R).i("n", 2).s("dtype", "bf16")),
+
+        G("wan_vae_expand", "M", 8, a.i("M", R).i("cin", 8).i("cout", 8).i("st", 2)
+                                       .i("s", 2).i("drop", 1).i("temporal", 0).s("dtype", "bf16")),
+
+        G("wan_vae_history", "M", 4, a.i("M", R).i("temporal", 1).i("reset", 0).s("dtype", "bf16")),
+
+        G("wan_vae_frame_cu", "M", 3, a.i("M", R)),
+
+        G("attn_umt5", "M", 6, a.i("M", R).i("heads", 2).s("dtype", "bf16")),
+        G("gelu_umt5", "M", 3, a.i("M", R).i("n", 8).s("dtype", "bf16")),
+
         G("position_scale", "M", 3, a.i("M", R).i("n", 8).i("original", 16384)
                                        .d("beta", 0.1).s("dtype", "f32")),
         G("embed_attn", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("gqa", 2)
@@ -10631,6 +11270,8 @@ std::vector<Geo> geometries() {
         G("hc_project", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).d("scale", 1.0).s("dtype", "f32")),
         G("mtp_enter", "M", 2, a.i("M", R).i("n", 8).i("hc", 2).d("eps", 1e-6).s("dtype", "f32")),
         G("grid_embed", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
+        G("grid_embed_pad", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
+        G("window_order", "M", 12, a.i("M", R).i("window", 4)),
         G("grid_embed_aa", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
         G("grid_embed_cpe", "M", 3, a.i("M", R).i("n", 8).i("side", 4).s("dtype", "f32")),
         G("lili_cand", "M", 3, a.i("M", R).i("k", 4).i("world", 1).i("steps", 3).i("n", 8)
@@ -10638,6 +11279,10 @@ std::vector<Geo> geometries() {
         G("lili_attn", "M", 8, a.i("M", R).i("steps", 2).i("k", 2).i("n_head", 2).i("head_dim", 4)
                                 .s("dtype", "f32")),
         G("lili_factor", "M", 8, a.i("M", R).i("L", 4).i("n", 8).s("dtype", "f32")),
+        G("situ_mul", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32").d("gate_cap", 4.0)
+                               .d("up_cap", 25.0)),
+        G("attn_res_mix", "M", 3, a.i("M", R).i("n", 8).i("n_state", 2).i("n_query", 2)
+                                   .s("dtype", "f32").d("eps", 1e-6)),
         G("lili_walk", "M", 2, a.i("M", R).i("steps", 3).i("k", 2).i("n", 8).s("dtype", "f32")
                                 .d("eps", 1e-4).d("scale", 8.0)),
         G("layernorm", "M", 3, a.i("M", R).i("n", 8).d("eps", 1e-6).s("dtype", "f32")),
@@ -10678,23 +11323,21 @@ std::vector<Geo> geometries() {
         G("ple_conv_bias", "M", 6, a.i("M", R).i("n", 8).i("width", 4).i("dilation", 1)
                                     .s("dtype", "f32")),
         G("causal_conv1d", "M", 6, a.i("M", R).i("n", 8).i("width", 4).s("dtype", "f32")),
+        G("sconv_res", "M", 6, a.i("M", R).i("n", 8).i("width", 4).i("heads", 2).s("dtype", "f32")),
+        G("l2_clip", "M", 3, a.i("M", R).i("n", 8).i("group", 4).d("threshold", 2.0).s("dtype", "f32")),
         G("ngram_ids", "M", 4, a.i("M", R).i("heads", 2).i("ngram", 3).i("eos", 1)),
         G("cast", "M", 3, a.i("M", R).i("n", 8).s("from", "f32").s("to", "bf16")),
         G("quant_act_i8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("quant_act_i8g", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("quant_act_fp8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("quant_cols_fp8", "M", 3, a.i("M", R).i("n", 32).s("dtype", "f32")),
-        G("had_quant_act_fp8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("had_quant_act_i8g", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("had_quant_act_i8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("rmsnorm_had_quant_i8", "M", 3, a.i("M", R).i("n", 32).d("eps", 1e-6).i("group", 16)
                                           .s("dtype", "f32")),
         G("gated_had_quant_i8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
+        G("gated_quant_i8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("gram_accum", "M", 3, a.i("M", R).i("n", 16).i("group", 8).s("dtype", "fp8a8")),
-        G("givens_dense_quant", "M", 3, a.i("M", R).i("n", 128).i("group", 128).s("dtype", "f32")
-                                        .i("parts", 1).s("out", "fp8")),
-        G("givens_rotate", "M", 3, a.i("M", R).i("n", 8).i("group", 8).s("dtype", "f32")
-                                   .i("stages", 2).i("parts", 1)),
         G("dequant", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("dequant_w4", "N", 16, a.i("N", R).i("K", 64).i("group", 64).i("twos", 1)
                                    .s("dtype", "w4a8")),
@@ -10705,8 +11348,6 @@ std::vector<Geo> geometries() {
         G("gated_quant_fp8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "bf16")
                                      .s("act", "silu")),
         G("gemm_nt_q_gated", "M", 3, a.i("M", R).i("N", 32).i("K", 128).i("group", 128)
-                                     .s("dtype", "fp8a8").s("act", "silu")),
-        G("gemm_nt_q_gated_wide", "M", 3, a.i("M", R).i("N", 32).i("K", 128).i("group", 128)
                                      .s("dtype", "fp8a8").s("act", "silu")),
         G("dflash_select", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
                                    .i("n_vocab", 30).s("dtype", "bf16")),
@@ -10721,7 +11362,6 @@ std::vector<Geo> geometries() {
         G("gemm_nt", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
         G("gemm_nt_bias", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
         G("gemm_nt_q", "M", 3, a.i("M", R).i("N", 20).i("K", 256).i("group", 128).s("dtype", "fp8a8")),
-        G("gemm_nt_q_short", "M", 3, a.i("M", R).i("N", 20).i("K", 256).i("group", 128).s("dtype", "fp8a8")),
         G("gemm_nt_q_bias", "M", 3, a.i("M", R).i("N", 20).i("K", 256).i("group", 128)
                                     .s("dtype", "fp8a8")),
         G("lora_shrink", "M", 3, a.i("M", R).i("K", 40).i("R", 8).i("S", 2).s("dtype", "f32")),
@@ -10741,6 +11381,10 @@ std::vector<Geo> geometries() {
                                          .i("block_size", 4).i("causal", 0).i("window", 0)
                                          .s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4)
                                          .i("ctx", 9)),
+        G("attn_paged_rel", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
+                                         .i("block_size", 4).i("causal", 1).i("window", 0)
+                                         .s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4)
+                                         .i("ctx", 9).i("d_rel", 4).i("extent", 8)),
         G("attn_dense", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 1)
                                 .s("dtype", "f32").i("n_head", 4)),
         /* One-row segments, so M is also the segment count (n_seq, the description's hint for
@@ -10752,7 +11396,7 @@ std::vector<Geo> geometries() {
                               .s("kv_dtype", "f32")),
         G("kv_store_streamed", "M", 3,
           a.i("M", R).i("head_dim", 8).i("n_head_kv", 2).i("block_size", 8)
-           .s("kv_dtype", "fp8_e4m3")),
+           .s("kv_dtype", "i8")),
         G("rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("n_head_kv", 1)
                           .d("theta", 1e4).d("scale", 1.0).s("mode", "neox")),
         G("rope_rows", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("n_head_kv", 1)
@@ -10845,8 +11489,6 @@ std::vector<Geo> geometries() {
         G("sample_argmax", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_logprobs", "M", 2, a.i("M", R).i("n_vocab", 64).i("k", 4)),
         G("ln_mod", "M", 4, a.i("M", R).i("n", 8).d("eps", 1e-6).s("dtype", "bf16")),
-        G("ln_mod_quant_fp8", "M", 4, a.i("M", R).i("n", 32).d("eps", 1e-6).i("group", 16)
-                                      .i("gated", 1).s("dtype", "bf16")),
         G("gate_add", "M", 4, a.i("M", R).i("n", 8).s("dtype", "bf16")),
         G("timestep_embed", "M", 3, a.i("M", R).i("n", 8).d("scale", 1000.0)
                                     .d("max_period", 10000.0).d("clamp_min", 0.3).s("dtype", "f32")),
@@ -10924,6 +11566,8 @@ std::vector<Geo> geometries() {
         G("ras_pick", "M", 2, a.i("M", R).i("win", 4).i("lo", 1).i("hi", 9).i("rep", 1)),
         G("vq_encode", "M", 3, a.i("M", R).i("n", 16).i("dim", 4).i("bins", 24)
                                 .s("dtype", "f32")),
+        G("vq_euclidean", "M", 3, a.i("M", R).i("n", 16).i("bins", 24).s("dtype", "f32")),
+        G("elu", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("resample_nearest", "M", 6, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("fourier_embed", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("win_input", "M", 8, a.i("M", R).i("n_lat", 4).i("n_zero", 2).i("n_cond", 3)
@@ -10940,8 +11584,6 @@ std::vector<Geo> geometries() {
         G("frame_store", "M", 2, a.i("M", R).i("n_codes", 4).i("stride", 6).i("rep", 2)
                                  .i("skip", 0)),
         G("rms_mod", "M", 4, a.i("M", R).i("n", 8).d("eps", 1e-6).i("gated", 1).s("dtype", "bf16")),
-        G("rms_mod_quant_fp8", "M", 4, a.i("M", R).i("n", 32).d("eps", 1e-6).i("group", 16)
-                                       .i("gated", 1).s("dtype", "bf16")),
         G("flow_x0_step", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("flow_res_multistep", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("patch_unfold", "M", 32, a.i("M", R).i("C", 3).i("pt", 1).i("ph", 2).i("pw", 2)
@@ -11021,11 +11663,13 @@ std::vector<Geo> geometries() {
  * them. */
 bool undrawable(const char* op) {
     // Complete raster grids need the hand-built cases in nemotron35_test, not random indices.
-    return !std::strcmp(op, "givens_dense_quant") || !std::strcmp(op, "givens_rotate") ||
-           !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2") ||
+    return !std::strcmp(op, "sample_merge_topk") || !std::strcmp(op, "gather_rows2") ||
            !std::strcmp(op, "pixtral_merge") ||
            /* sample_logprobs rows (sorted pairs, positive sums): avx_check_hand.cpp builds them */
-           !std::strcmp(op, "lili_cand");
+           !std::strcmp(op, "lili_cand") ||
+           /* Whole raster grids with segment boundaries: the window_order cases here and in
+            * avx_check_hand.cpp build them. */
+           !std::strcmp(op, "window_order");
 }
 
 uint32_t lcg(uint32_t* s) { *s = *s * 1664525u + 1013904223u; return *s >> 8; }
@@ -11802,4 +12446,338 @@ TEST(op_sam_attn_refuses_malformed_geometry) {
           .i("M", M).i("head_dim", 0).i("n_head", in.nh).i("grid_h", in.gh)
           .i("grid_w", in.gw).i("window", 0).d("scale", 0.5).s("dtype", "bf16");
     CHECK_EQ(run("sam_attn", a5), (int)RAD_E_SHAPE);
+}
+
+
+TEST(wan_rotary_resets_the_frequency_ladder_on_each_axis) {
+    T geom(RAD_I32, {3}); geom.n({2, 4, 6});
+    T table(RAD_F32, {12, 128});
+    A make; make.t(geom).t(table).i("M", 12).s("dtype", "f32");
+    CHECK_OK(run("wan_rope_table", make));
+    // Row 11 is patch (1, 1, 2). Pair zero of each axis has frequency 1.
+    CHECK_EQ(table.at(11 * 128), static_cast<float>(std::cos(1.0)));
+    CHECK_EQ(table.at(11 * 128 + 44), static_cast<float>(std::cos(1.0)));
+    CHECK_EQ(table.at(11 * 128 + 86), static_cast<float>(std::cos(2.0)));
+    CHECK_NEAR(table.at(11 * 128 + 2), std::cos(std::pow(10000.0, -1.0 / 22.0)), 1e-7);
+    CHECK_NEAR(table.at(11 * 128 + 46), std::cos(std::pow(10000.0, -1.0 / 21.0)), 1e-7);
+
+    std::vector<float> qv(12 * 128), kv(qv);
+    for (size_t i = 0; i < qv.size(); i += 2) { qv[i] = 1.0f; kv[i + 1] = 1.0f; }
+    T q(RAD_BF16, {12, 128}); q.f(qv);
+    T k(RAD_BF16, {12, 128}); k.f(kv);
+    A rotate; rotate.t(q).t(k).t(table).i("M", 12).i("heads", 1).s("dtype", "bf16");
+    CHECK_OK(run("wan_rope", rotate));
+    CHECK_EQ(q.at(0), 1.0f); CHECK_EQ(q.at(1), 0.0f);
+    CHECK_EQ(q.at(11 * 128 + 44), .5390625f);
+    CHECK_EQ(q.at(11 * 128 + 45), .83984375f);
+    CHECK_EQ(k.at(11 * 128 + 86), -.91015625f);
+    CHECK_EQ(k.at(11 * 128 + 87), -.416015625f);
+}
+
+
+TEST(wan_block_modulation_and_gates_select_the_first_frame_row) {
+    T x(RAD_F32, {2, 2}); x.f({1, -1, 1, -1});
+    T time(RAD_F32, {2, 12}); time.f({1, 1, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0,
+                                      2, 2, 1, 1, 3, 4, 0, 0, 0, 0, 0, 0});
+    T table(RAD_F32, {1, 6, 2}); table.f({0, 0, 0, 0, .5f, -.5f, 0, 0, 0, 0, 0, 0});
+    T split(RAD_I32, {1}); split.n({1});
+    T bf(RAD_BF16, {2, 2});
+    A norm; norm.t(x).t(time).t(table).t(split).t(bf).i("M", 2).i("n", 2)
+        .i("group", 0).d("eps", 1e-6).i("round_norm", 1).s("dtype", "bf16");
+    CHECK_OK(run("wan_mod_norm", norm));
+    CHECK_EQ(bf.at(0), 2.0f); CHECK_EQ(bf.at(1), 0.0f);
+    CHECK_EQ(bf.at(2), 4.0f); CHECK_EQ(bf.at(3), 0.0f);
+    T update(RAD_BF16, {2, 2}); update.f({.25f, .5f, .25f, .5f});
+    A gated; gated.t(x).t(update).t(time).t(table).t(split).i("M", 2).i("n", 2)
+        .i("gate", 2).s("dtype", "f32");
+    CHECK_OK(run("wan_gated_add", gated));
+    CHECK_EQ(x.at(0), 1.375f); CHECK_EQ(x.at(1), -.25f);
+    CHECK_EQ(x.at(2), 1.875f); CHECK_EQ(x.at(3), .75f);
+
+    T head_time(RAD_F32, {1, 2}); head_time.f({1, 2});
+    T head_table(RAD_F32, {1, 2, 2}); head_table.f({3, 4, 5, 6});
+    T state(RAD_F32, {1, 2}); state.f({3, 3});
+    T head(RAD_F32, {1, 2});
+    A out; out.t(state).t(head_time).t(head_table).tnull().t(head).i("M", 1).i("n", 2)
+        .i("group", -1).s("dtype", "f32");
+    CHECK_OK(run("wan_mod_norm", out));
+    CHECK_EQ(head.at(0), 4.0f); CHECK_EQ(head.at(1), 6.0f);
+}
+
+
+TEST(wan_unpatch_preserves_spatial_order_and_emits_float_velocity) {
+    T geom(RAD_I32, {3}); geom.n({2, 2, 4});
+    T x(RAD_BF16, {4, 8}); x.f({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                               16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31});
+    T y(RAD_F32, {16, 2});
+    A a; a.t(x).t(geom).t(y).i("M", 4).i("n", 2).s("dtype", "bf16");
+    CHECK_OK(run("wan_unpatch", a));
+    const float expected[] = {0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15,
+                              16, 17, 18, 19, 24, 25, 26, 27, 20, 21, 22, 23, 28, 29, 30, 31};
+    for (int i = 0; i < 32; ++i) CHECK_EQ(y.at(i), expected[i]);
+    geom.n({2, 3, 4});
+    CHECK_EQ(run("wan_unpatch", a), RAD_E_SHAPE);
+}
+
+
+TEST(wan_vae_frame_cu_separates_each_spatial_plane) {
+    T dims(RAD_I32, {3}); dims.n({2, 2, 3});
+    T offsets(RAD_I32, {3});
+    A a; a.t(dims).t(offsets).i("M", 3);
+    CHECK_OK(run("wan_vae_frame_cu", a));
+    const auto* cu = static_cast<const int32_t*>(offsets.t.data);
+    CHECK_EQ(cu[0], 0); CHECK_EQ(cu[1], 6); CHECK_EQ(cu[2], 12);
+}
+
+
+TEST(wan_vae_decoder_history_tracks_short_and_long_chunks) {
+    T x(RAD_BF16, {2, 2}); x.f({1, 2, 3, 4});
+    T history(RAD_BF16, {4, 2}); history.f({33, 33, 33, 33, 33, 33, 33, 33});
+    T windows(RAD_BF16, {2, 6});
+    A reset; reset.t(x).t(history).t(windows).i("M", 2).i("temporal", 1).i("reset", 1).s("dtype", "bf16");
+    CHECK_OK(run("wan_vae_history", reset));
+    const float expected_windows[] = {0, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 4};
+    for (int i = 0; i < 12; ++i) CHECK_EQ(windows.at(i), expected_windows[i]);
+    CHECK_EQ(history.at(0), 0.0f); CHECK_EQ(history.at(4), 1.0f);
+
+    T next(RAD_BF16, {4, 2}); next.f({5, 6, 7, 8, 9, 10, 11, 12});
+    T volume(RAD_BF16, {8, 2});
+    A reuse; reuse.t(next).t(history).t(volume).i("M", 4).i("temporal", 0).i("reset", 0).s("dtype", "bf16");
+    CHECK_OK(run("wan_vae_history", reuse));
+    for (int i = 0; i < 4; ++i) CHECK_EQ(volume.at(i), 0.0f);
+    for (int i = 4; i < 16; ++i) CHECK_EQ(volume.at(i), static_cast<float>(i - 3));
+    for (int i = 0; i < 8; ++i) CHECK_EQ(history.at(i), static_cast<float>(i + 5));
+}
+
+
+TEST(wan_vae_temporal_shuffle_and_shortcut_keep_reference_order) {
+    T grid(RAD_I32, {3}); grid.n({2, 1, 2});
+    T x(RAD_BF16, {4, 4}); x.f({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15});
+    T y(RAD_BF16, {8, 2});
+    A shuffle; shuffle.t(x).t(grid).t(y).i("M", 4).i("cin", 4).i("cout", 2)
+        .i("st", 2).i("s", 1).i("drop", 0).i("temporal", 1).s("dtype", "bf16");
+    CHECK_OK(run("wan_vae_expand", shuffle));
+    const float expected[] = {0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15};
+    for (int i = 0; i < 16; ++i) CHECK_EQ(y.at(i), expected[i]);
+
+    T shortcut_grid(RAD_I32, {3}); shortcut_grid.n({1, 1, 1});
+    T input(RAD_BF16, {1, 4}); input.f({1, 2, 3, 4});
+    T cropped(RAD_BF16, {4, 1});
+    A shortcut; shortcut.t(input).t(shortcut_grid).t(cropped).i("M", 1).i("cin", 4).i("cout", 1)
+        .i("st", 2).i("s", 2).i("drop", 1).i("temporal", 0).s("dtype", "bf16");
+    CHECK_OK(run("wan_vae_expand", shortcut));
+    CHECK_EQ(cropped.at(0), 3.0f); CHECK_EQ(cropped.at(1), 3.0f);
+    CHECK_EQ(cropped.at(2), 4.0f); CHECK_EQ(cropped.at(3), 4.0f);
+}
+
+
+TEST(timestep_embed_f64_matches_pinned_wan_sinusoidal_embedding) {
+    T t(RAD_F32, {2}); t.f({0, 999});
+    T y(RAD_F32, {2, 256});
+    A a; a.t(t).t(y).i("M", 2).i("n", 256).d("max_period", 10000.0).s("dtype", "f32");
+    CHECK_OK(run("timestep_embed_f64", a));
+    for (int i = 0; i < 128; ++i) {
+        CHECK_EQ(y.at(i), 1.0f);
+        CHECK_EQ(y.at(128 + i), 0.0f);
+    }
+    // Wan's FP64 sinusoidal_embedding_1d, then narrowed to FP32 for the MLP.
+    CHECK_EQ(y.at(256 + 3), 0x1.68de3cp-1f);
+    CHECK_EQ(y.at(256 + 63), -0x1.077d74p-2f);
+    CHECK_EQ(y.at(256 + 131), 0x1.6b349ap-1f);
+    CHECK_EQ(y.at(256 + 191), -0x1.eec282p-1f);
+    y.t.stride[0] = 255;
+    A overlap; overlap.t(t).t(y).i("M", 2).i("n", 256).d("max_period", 10000.0).s("dtype", "f32");
+    CHECK_EQ(run("timestep_embed_f64", overlap), RAD_E_STRIDE);
+    T wrong_rank(RAD_F32, {1, 2, 256});
+    A rank; rank.t(t).t(wrong_rank).i("M", 2).i("n", 256).d("max_period", 10000.0).s("dtype", "f32");
+    CHECK_EQ(run("timestep_embed_f64", rank), RAD_E_SHAPE);
+}
+
+
+TEST(flow_unipc_step_updates_two_inout_views_and_refuses_overlapping_rows) {
+    T v(RAD_BF16, { 2, 1 }), coeff(RAD_F32, { 8 });
+    T history(RAD_F32, { 2, 5 }), x(RAD_F32, { 2, 2 });
+    history.t.shape[1] = 3;
+    x.t.shape[1] = 1;
+    x.f({ 1, 9, 1, 9 });
+    history.f({ 0, 0, 0, 8, 8, 0, 0, 0, 8, 8 });
+    auto step = [&] {
+        A a;
+        a.t(v).t(coeff).t(history).t(x).i("M", 2).i("n", 1).s("dtype", "f32");
+        return run("flow_unipc_step", a);
+    };
+    v.f({ .5f, .5f });
+    coeff.f({ .5f, 0, 0, 0, 0, .5f, .5f, 0 });
+    CHECK_OK(step());
+    CHECK_EQ(x.at(0), .875f);
+    CHECK_EQ(history.at(0), 1.0f);
+    CHECK_EQ(history.at(1), .75f);
+    v.f({ 1, 1 });
+    coeff.f({ .25f, .5f, .5f, 0, .25f, .25f, .75f, -.125f });
+    CHECK_OK(step());
+    for (int row = 0; row < 2; ++row) {
+        CHECK_EQ(x.at(2 * row), .6640625f);
+        CHECK_EQ(x.at(2 * row + 1), 9.0f);
+        CHECK_EQ(history.at(5 * row), .84375f);
+        CHECK_EQ(history.at(5 * row + 1), .625f);
+        CHECK_EQ(history.at(5 * row + 2), .75f);
+        CHECK_EQ(history.at(5 * row + 3), 8.0f);
+        CHECK_EQ(history.at(5 * row + 4), 8.0f);
+    }
+    history.t.stride[0] = 2;
+    CHECK_EQ(step(), RAD_E_STRIDE);
+    history.t.rank = 3;
+    CHECK_EQ(step(), RAD_E_SHAPE);
+}
+
+
+TEST(flow_unipc_step_blends_classifier_free_guidance_before_updating_history) {
+    T v(RAD_F32, {1, 1}), coeff(RAD_F32, {8}), history(RAD_F32, {1, 3});
+    T x(RAD_F32, {1, 1}), negative(RAD_F32, {1, 1}), guidance(RAD_F32, {1});
+    v.f({1.0f});
+    negative.f({.5f});
+    guidance.f({3.0f});
+    coeff.f({.5f, 0, 0, 0, 0, .5f, .5f, 0});
+    history.f({0, 0, 0});
+    x.f({3.0f});
+    A incomplete;
+    incomplete.t(v).t(coeff).t(history).t(x).t(negative).i("M", 1).i("n", 1).s("dtype", "f32");
+    CHECK_EQ(run("flow_unipc_step", incomplete), RAD_E_INVAL);
+    A guided;
+    guided.t(v).t(coeff).t(history).t(x).t(negative).t(guidance)
+        .i("M", 1).i("n", 1).s("dtype", "f32");
+    CHECK_OK(run("flow_unipc_step", guided));
+    CHECK_EQ(x.at(0), 2.5f);
+    CHECK_EQ(history.at(1), 2.0f);
+}
+
+
+TEST(wan_vae_norm_rounds_length_before_division) {
+    T x(RAD_BF16, {1, 8}); x.f({6, 1, 0, 0, 0, 0, 0, 0});
+    T gain(RAD_BF16, {8, 1, 1, 1}); gain.f(std::vector<float>(8, 1.0f));
+    T y(RAD_BF16, {1, 8});
+    A a; a.t(x).t(gain).t(y).i("M", 1).i("n", 8).i("round_length", 1)
+        .s("act", "none").s("dtype", "bf16");
+    CHECK_OK(run("l2norm_chan", a));
+    CHECK_EQ(y.at(0), 2.78125f); CHECK_EQ(y.at(1), 0.46484375f);
+}
+
+/* NVFP4 experts (moe_gemm_q at nvfp4a8i8): e2m1 codes, an E4M3 scale per (row, 16 of K) and the
+ * expert's f32 level, value = e2m1 * e4m3 * level, against an int8 activation with one f32 scale
+ * per (row, 64 of K). Two forms are read: the stored one, a joined `scale,scale.1` blob per expert
+ * beside a plain e2m1 plane, and the logical one, a plain f32 product per (row, 16). Every scale
+ * and level is exact in f32, so the only rounding is the bf16 output's. */
+TEST(op_moe_gemm_q_nvfp4a8i8_matches_the_oracle) {
+    constexpr int64_t M = 3, N = 8, K = 64, NE = 2, G = 64;
+    const float kSc[6] = { 0.25f, 0.5f, 1.0f, 2.0f, 3.0f, 4.0f };
+    const float kLv[2] = { 0.75f, 1.5f };
+    const double kE2m1[8] = { 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 };
+    uint32_t seed = 12345;
+    auto rnd = [&seed]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+
+    std::vector<uint8_t> codes((size_t)(NE * N * K));           /* [expert][n][k], 0..15 */
+    std::vector<float>   scales((size_t)(NE * N * (K / 16)));   /* [expert][n][k / 16] */
+    std::vector<float>   act((size_t)(M * K));                  /* int8 codes */
+    std::vector<float>   sa((size_t)M);
+    for (auto& c : codes) c = (uint8_t)(rnd() & 15);
+    for (auto& s : scales) s = kSc[rnd() % 6];
+    for (auto& a : act) a = (float)((int)(rnd() % 255) - 127);
+    for (auto& s : sa) s = 0.0625f * (float)(1 + rnd() % 4);
+    /* expert 0 owns sorted rows 0 and 1 (tokens 0 and 2), expert 1 row 2 (token 1) */
+    const int32_t sorted_tok[M] = { 0, 2, 1 };
+    const int32_t off[NE + 1] = { 0, 2, 3 };
+
+    std::vector<double> want((size_t)(M * N));
+    for (int64_t i = 0; i < M; ++i) {
+        const int64_t e = i < 2 ? 0 : 1, tok = sorted_tok[i];
+        for (int64_t n = 0; n < N; ++n) {
+            double acc = 0.0;
+            for (int64_t k = 0; k < K; ++k) {
+                const uint8_t c = codes[(size_t)((e * N + n) * K + k)];
+                const double lv = (c & 8 ? -kE2m1[c & 7] : kE2m1[c & 7]) * kLv[e];
+                const double ws = scales[(size_t)((e * N + n) * (K / 16) + k / 16)];
+                acc += lv * ws * act[(size_t)(tok * K + k)] * sa[(size_t)tok];
+            }
+            want[(size_t)(i * N + n)] = acc;
+        }
+    }
+
+    for (int form = 0; form < 2; ++form) {
+        T w0(RAD_FP4E2M1, { 1, N, K }), w1(RAD_FP4E2M1, { 1, N, K });
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t k = 0; k < K; ++k) {
+                rad_store_code(w0.t.data, RAD_FP4E2M1, n * K + k, codes[(size_t)(n * K + k)]);
+                rad_store_code(w1.t.data, RAD_FP4E2M1, n * K + k, codes[(size_t)((N + n) * K + k)]);
+            }
+        T a(RAD_I8, { M, K }), asc(RAD_F32, { M, K / G }), y(RAD_BF16, { M, N });
+        T sorted(RAD_I32, { M }), offt(RAD_I32, { NE + 1 });
+        a.f(act);
+        asc.f(sa);
+        sorted.n({ sorted_tok[0], sorted_tok[1], sorted_tok[2] });
+        offt.n({ off[0], off[1], off[2] });
+
+        /* The two scale operands of the classes: each expert's own scale blob. */
+        std::vector<std::vector<uint8_t>> blobs;
+        std::deque<T> plain;
+        std::vector<RadTensor> tabs;
+        std::vector<void*> ptr;
+        ptr.reserve(NE);
+        for (int e = 0; e < NE; ++e) {
+            if (form == 0) {
+                RadEncoding enc = rad_enc_affine(RAD_FP4E2M1, RAD_F8E4M3, 1, 16);
+                rad_enc_add_plane(&enc, "scale.1", RAD_F32, 0, 0);
+                T sp(RAD_F8E4M3, { N, K / 16 }), lv(RAD_F32, { 1, 1 });
+                for (int64_t n = 0; n < N; ++n)
+                    for (int64_t g = 0; g < K / 16; ++g)
+                        st_dt(RAD_F8E4M3, sp.t.data, n * (K / 16) + g,
+                              scales[(size_t)((e * N + n) * (K / 16) + g)]);
+                lv.f({ kLv[e] });
+                const int selected[] = { 1, 2 };
+                RadTensor planes[] = { sp.t, lv.t };
+                RadLayout layout{};
+                REQUIRE_EQ(rad_planes_layout(&enc, selected, planes, 2, &layout), RAD_OK);
+                blobs.emplace_back((size_t)layout.bytes);
+                REQUIRE_EQ(rad_planes_relayout(&enc, selected, planes, 2, blobs.back().data(),
+                                               layout.bytes), RAD_OK);
+                /* a one-entry pointer table: rank 2, stride 0 on the expert axis */
+                RadTensor tab{};
+                tab.data = nullptr;
+                tab.dtype = RAD_U8; tab.rank = 2;
+                /* the entry is the joined blob: its shape must cover the blob's bytes */
+                tab.shape[0] = 1; tab.shape[1] = (int64_t)layout.bytes; tab.stride[0] = 0; tab.stride[1] = 1;
+                tabs.push_back(tab);
+            } else {
+                T sc(RAD_F32, { 1, N, K / 16 });
+                for (int64_t n = 0; n < N; ++n)
+                    for (int64_t g = 0; g < K / 16; ++g)
+                        st_dt(RAD_F32, sc.t.data, n * (K / 16) + g,
+                              scales[(size_t)((e * N + n) * (K / 16) + g)] * kLv[e]);
+                plain.push_back(std::move(sc));
+            }
+        }
+        if (form == 0) {
+            for (int e = 0; e < NE; ++e) {
+                ptr.push_back(blobs[(size_t)e].data());
+                tabs[(size_t)e].data = &ptr[(size_t)e];
+            }
+        }
+        /* The two classes' scale tensors: the logical form is a stacked F32 per class, the
+         * stored form a pointer table of one blob each. */
+        RadTensor t0 = form == 0 ? tabs[0] : plain[0].t;
+        RadTensor t1 = form == 0 ? tabs[1] : plain[1].t;
+        A x;
+        x.t(a).t(asc).t(w0).ts.push_back(t0);
+        x.t(sorted).t(offt).t(w1).ts.push_back(t1);
+        x.t(y);
+        x.i("M", M).i("N", N).i("K", K).i("n_expert", NE).i("top_k", 1).i("group", G)
+         .s("a_order", "token").s("dtype", "nvfp4a8i8");
+        CHECK_OK(run("moe_gemm_q", x));
+        for (int64_t i = 0; i < M * N; ++i) {
+            const double got = y.at(i), w = want[(size_t)i];
+            if (std::fabs(got - w) > 0.01 * std::fabs(w) + 1e-3)
+                std::fprintf(stderr, "    form %d row %lld col %lld: %g, want %g\n", form,
+                             (long long)(i / N), (long long)(i % N), got, w);
+            CHECK(std::fabs(got - w) <= 0.01 * std::fabs(w) + 1e-3);
+        }
+    }
 }

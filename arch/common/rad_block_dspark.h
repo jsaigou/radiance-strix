@@ -93,12 +93,15 @@
  *
  * ============================== PRECISION ==============================
  *
- *   E4M3 + a bf16 [N/128][K/128] plane   fc, q/k/v/o, gate_up, down -- every linear
+ *   what the recipe made them            fc, q/k/v/o, gate_up, down -- every linear
  *   bf16, no plane                       every norm, and both Markov codebooks
  *
  * The checkpoint is dense bf16; the linears are rad_fp8.h's DenseFP8 over weights the recipe
  * quantises, because the drafter is read whole every decode step (324M parameters: 648 MB at
- * bf16, 324 MB at fp8). This can only change acceptance.
+ * bf16, 324 MB at eight bits). DenseFP8 reads block fp8 or MXFP4 against E4M3 activations, or a
+ * rotated int8 form (IQ8R and the narrower grids under the same rotation) against int8 ones
+ * (Config::act_i8); one format for all of them, since they share the activation pairs. This can
+ * only change acceptance.
  *
  * The codebooks are bf16 and replicated: they are gathered by global token id from a merged
  * candidate set. 66.8 MiB each; only K rows are read per position, so the cost is residency.
@@ -135,6 +138,14 @@ struct Dspark {
         int64_t top_k  = 0;     /* candidates the Markov walk re-ranks */
         int64_t window = 0;     /* sliding attention width, 0 for none */
         int     causal = 0;
+        /* The drafter's linears are served at i8a8h (DenseFP8::w8h: IQ8R, or a rotated int8 or
+         * narrower form at group 128), learned by the plugin from `probe_i8` before it declares the
+         * activation pairs: they are then int8 codes with one f32 scale per (row, act_g8), written
+         * by had_quant_act_i8g and the rotating norm. Every linear must agree. `fc_mapped`:
+         * probe_i8 made `dspark.fc.weight`'s name map. */
+        bool    act_i8    = false;
+        int64_t act_g8    = RAD_FP8_BLOCK;
+        bool    fc_mapped = false;
         /* Every row predicts, so `block`, not `block - 1` (see ROW ALIGNMENT). */
         int64_t steps() const { return block; }
     };
@@ -149,7 +160,10 @@ struct Dspark {
          * rows_pitch). */
         rad_buf ck  = 0;   /* [max_tok, kv_dim]           one layer's K, reused across layers */
         rad_buf cv  = 0;   /* [max_tok, kv_dim]           one layer's V, reused across layers */
-        rad_buf srcq = 0, srcs = 0;   /* fp8 codes and scales: e4m3 | f32 [.., /128] */
+        /* The codes and scales the linears read: e4m3 | f32 [.., /128], or with Config::act_i8
+         * i8 | f32 [.., /act_g8]. The same holds for the three ActFP8 pairs below, whose `q` and
+         * `s` are then the int8 pair. */
+        rad_buf srcq = 0, srcs = 0;
         rad_buf cq   = 0, cs   = 0;
 
         /* ---- the query pass, `block` rows per sequence */
@@ -235,6 +249,18 @@ struct Dspark {
     rad_op op_dgather = 0, op_dmerge = 0;   /* the vocab-parallel pair; 0 when the head is whole */
     rad_op op_sel = 0;
 
+    /* Whether the container's drafter is served at i8a8h and at which scale group, from its `fc`,
+     * whose name map this makes (set Config::fc_mapped). Asked before the activation pairs are
+     * declared, since it decides their dtype and scale grid. */
+    static int probe_i8(RadBuilder* b, Names& nm, const char* ck, bool* i8, int64_t* g8) {
+        const char* fwn = nm.f("dspark.fc.weight");
+        RAD_ARCH_TRY(map_linear(b, fwn, { nm.ckpt("%s.fc.weight", ck) }));
+        RadEncoding fe{};
+        *i8 = weight_enc(b, fwn, &fe) && linear_is_w8h(fe);
+        *g8 = *i8 ? linear_w8h_group(fe) : (int64_t)RAD_FP8_BLOCK;
+        return RAD_OK;
+    }
+
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, const Config& c, int base_layer,
                  rad_kvgroup group, rad_weight tok_embd, const char* ck_prefix,
                  const char* ck_lm, const char* ck_lm_alt, const Wire& wire);
@@ -274,10 +300,17 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
     srows = g.max_seqs * cfg.steps();
     if (qrows <= 0 || srows <= 0) return RAD_E_INVAL;
 
+    /* The linears read the activation pairs the plugin declared: int8 ones take rotated int8
+     * weights (cfg.act_i8), E4M3 ones block fp8 or MXFP4. */
+    w_fc.w8h_ok = cfg.act_i8;
+    for (int i = 0; i < MAX_LAYERS; ++i)
+        w_q[i].w8h_ok = w_k[i].w8h_ok = w_v[i].w8h_ok = w_o[i].w8h_ok = w_gu[i].w8h_ok =
+            w_dn[i].w8h_ok = cfg.act_i8;
+
     /* ---------------------------------------------------------------- model-scope weights */
     RAD_ARCH_TRY(w_fc.declare(b, nm, nm.f("dspark.fc"), g.n_embd, cfg.n_taps * g.n_embd,
                               RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model(),
-                              { nm.ckpt("%s.fc.weight", ck) }));
+                              { nm.ckpt("%s.fc.weight", ck) }, {}, cfg.fc_mapped));
     RAD_ARCH_TRY(map_copy(b, nm.f("dspark.hidden_norm.weight"),
                           nm.ckpt("%s.hidden_norm.weight", ck)));
     RAD_ARCH_TRY(map_copy(b, nm.f("dspark.norm.weight"), nm.ckpt("%s.norm.weight", ck)));
@@ -379,19 +412,34 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
 
     /* ---------------------------------------------------------------- the context pass
      *
-     * Every linear is `fp8a8`, fed by a `quant_act_fp8`. There is no `fp8a16` band: that kernel is
-     * M <= 1, and neither pass runs at one row. */
-    op_qsrc = rw(b, RAD_OP(b, "quant_act_fp8",
+     * Every linear is a DenseFP8 GEMM over the pair its quantiser writes: `quant_act_fp8` codes
+     * for block fp8 or MXFP4, had_quant_act_i8g's at the weights' scale group for a rotated int8
+     * drafter (cfg.act_i8). The linears read one activation pair, so they are all i8a8h forms at
+     * one group or none is. There is no `fp8a16` band: that kernel is M <= 1, and neither pass
+     * runs at one row. */
+    const char* const qop = cfg.act_i8 ? "had_quant_act_i8g" : "quant_act_fp8";
+    const int64_t     qgr = cfg.act_i8 ? cfg.act_g8 : (int64_t)RAD_FP8_BLOCK;
+    {
+        auto fits = [&](const DenseFP8& d) {
+            return d.w8h == cfg.act_i8 && (!d.w8h || d.g8 == cfg.act_g8);
+        };
+        bool same = fits(w_fc);
+        for (int64_t l = 0; l < g.n_layer; ++l)
+            same = same && fits(w_q[l]) && fits(w_k[l]) && fits(w_v[l]) && fits(w_o[l]) &&
+                   fits(w_gu[l]) && fits(w_dn[l]);
+        if (!same) {
+            fprintf(stderr, "radiance: the drafter's linears are not all rotated int8 at one scale "
+                            "group or all block fp8 / MXFP4; they read one activation pair, so the "
+                            "recipe must give them one format\n");
+            return RAD_E_DTYPE;
+        }
+    }
+    op_qsrc = rw(b, RAD_OP(b, qop,
                     RAD_PARAMS(RAD_RANGE("M", 1, crows), RAD_INT("n", cfg.n_taps * g.n_embd),
-                               RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                               RAD_INT("group", qgr), RAD_STR("dtype", g.dtype)),
                     RAD_NOWEIGHTS),
                 {w.src}, {w.srcq, w.srcs});
-    op_cfc = rw(b, RAD_OP(b, "gemm_nt_q",
-                   RAD_PARAMS(RAD_RANGE("M", 1, crows), RAD_INT("N", g.n_embd),
-                              RAD_INT("K", cfg.n_taps * g.n_embd),
-                              RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "fp8a8")),
-                   RAD_WEIGHTS(w_fc.w, w_fc.s)),
-               {w.srcq, w.srcs}, {w.c});
+    op_cfc = w_fc.gemm(b, crows, g.n_embd, cfg.n_taps * g.n_embd, {w.srcq, w.srcs}, {w.c});
     /* In place, like the per-head q/k norms below: a row's scale is computed before the row is
      * written. */
     op_cnorm = rw(b, RAD_OP(b, "rmsnorm",
@@ -401,27 +449,17 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                      RAD_WEIGHTS(w_hnorm)),
                  {w.c}, {w.c});
     /* One quantise for all layers: every layer's k and v read the same `c`. */
-    op_qc = rw(b, RAD_OP(b, "quant_act_fp8",
+    op_qc = rw(b, RAD_OP(b, qop,
                   RAD_PARAMS(RAD_RANGE("M", 1, crows), RAD_INT("n", g.n_embd),
-                             RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                             RAD_INT("group", qgr), RAD_STR("dtype", g.dtype)),
                   RAD_NOWEIGHTS),
               {w.c}, {w.cq, w.cs});
     for (int64_t l = 0; l < g.n_layer; ++l) {
         const int i = (int)l;
         /* One op per weight: an op's declared weight list gives each weight its prefetch interval
          * and residency class. */
-        op_ck[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, crows), RAD_INT("N", kvd),
-                                    RAD_INT("K", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_k[i].w, w_k[i].s)),
-                     {w.cq, w.cs}, {w.ck});
-        op_cv[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, crows), RAD_INT("N", kvd),
-                                    RAD_INT("K", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_v[i].w, w_v[i].s)),
-                     {w.cq, w.cs}, {w.cv});
+        op_ck[i] = w_k[i].gemm(b, crows, kvd, g.n_embd, {w.cq, w.cs}, {w.ck});
+        op_cv[i] = w_v[i].gemm(b, crows, kvd, g.n_embd, {w.cq, w.cs}, {w.cv});
         op_cknorm[i] = rw(b, RAD_OP(b, "rmsnorm",
                              RAD_PARAMS(RAD_RANGE("M", 1, crows * g.n_head_kv),
                                         RAD_INT("n", g.head_dim), RAD_F64("eps", g.eps),
@@ -468,7 +506,8 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                         {w.x}, {w.x});
 
     /* Norm, residual add and quantise are one op, `rmsnorm_quant_fp8` (what rad_fp8.h's
-     * NormQuantFP8 wraps). Layer 0 has no delta to fold, each later norm folds the previous
+     * NormQuantFP8 wraps), or its rotating int8 twin `rmsnorm_had_quant_i8g` for a rotated int8
+     * drafter, which takes the same operands. Layer 0 has no delta to fold, each later norm folds the previous
      * block's delta, and op_outnorm folds the last into the final norm, so there is no `add` op.
      * The final norm's fp8 output is unused (the head runs its own i8 quantiser), a few KiB of
      * waste that saves a launch: libr4d has no plain `rmsnorm_add` row.
@@ -478,9 +517,9 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
      * stream as `x` and no residual. `residual` is INOUT, so it is in both the read and write sets;
      * otherwise the planner could reorder a reader in front of it. */
     auto decl_norm = [&](rad_weight gain, bool fold) -> rad_op {
-        rad_op h = RAD_OP(b, "rmsnorm_quant_fp8",
+        rad_op h = RAD_OP(b, cfg.act_i8 ? "rmsnorm_had_quant_i8g" : "rmsnorm_quant_fp8",
                           RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", g.n_embd),
-                                     RAD_F64("eps", g.eps), RAD_INT("group", RAD_FP8_BLOCK),
+                                     RAD_F64("eps", g.eps), RAD_INT("group", qgr),
                                      RAD_STR("dtype", g.dtype), RAD_F64("wadd", g.wadd)),
                           RAD_WEIGHTS(gain));
         if (!h) return 0;
@@ -490,9 +529,9 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
         rad_op_writes(b, h, wr, fold ? 4 : 3);
         return h;
     };
-    op_qat = rw(b, RAD_OP(b, "quant_act_fp8",
+    op_qat = rw(b, RAD_OP(b, qop,
                    RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", qd),
-                              RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                              RAD_INT("group", qgr), RAD_STR("dtype", g.dtype)),
                    RAD_NOWEIGHTS),
                {w.attn.x}, {w.attn.q, w.attn.s});
     if (!op_qat) return RAD_E_INVAL;
@@ -508,24 +547,9 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
         const int i = (int)l;
         op_anorm[i] = decl_norm(w_anorm[i], i != 0);
         if (!op_anorm[i]) return RAD_E_INVAL;
-        op_qp[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("N", qd),
-                                    RAD_INT("K", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_q[i].w, w_q[i].s)),
-                     {w.h.q, w.h.s}, {w.q});
-        op_kp[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("N", kvd),
-                                    RAD_INT("K", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_k[i].w, w_k[i].s)),
-                     {w.h.q, w.h.s}, {w.k});
-        op_vp[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("N", kvd),
-                                    RAD_INT("K", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_v[i].w, w_v[i].s)),
-                     {w.h.q, w.h.s}, {w.v});
+        op_qp[i] = w_q[i].gemm(b, qrows, qd, g.n_embd, {w.h.q, w.h.s}, {w.q});
+        op_kp[i] = w_k[i].gemm(b, qrows, kvd, g.n_embd, {w.h.q, w.h.s}, {w.k});
+        op_vp[i] = w_v[i].gemm(b, qrows, kvd, g.n_embd, {w.h.q, w.h.s}, {w.v});
         op_qn[i] = rw(b, RAD_OP(b, "rmsnorm",
                          RAD_PARAMS(RAD_RANGE("M", 1, qrows * g.n_head), RAD_INT("n", g.head_dim),
                                     RAD_F64("eps", g.eps), RAD_F64("wadd", g.wadd_qk),
@@ -538,28 +562,15 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                                     RAD_F64("wadd", g.wadd_qk), RAD_STR("dtype", g.dtype)),
                          RAD_WEIGHTS(w_kn[i])),
                      {w.k}, {w.k});
-        op_op[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("N", g.n_embd),
-                                    RAD_INT("K", qd), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_o[i].w, w_o[i].s)),
-                     {w.attn.q, w.attn.s}, {w.h.x});
+        op_op[i] = w_o[i].gemm(b, qrows, g.n_embd, qd, {w.attn.q, w.attn.s}, {w.h.x});
         op_fnorm[i] = decl_norm(w_fnorm[i], true);
         if (!op_fnorm[i]) return RAD_E_INVAL;
-        op_gu[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("N", 2 * g.n_ff),
-                                    RAD_INT("K", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_gu[i].w, w_gu[i].s)),
-                     {w.h.q, w.h.s}, {w.gate_up});
-        op_gug[i] = decl_gated_fold(b, qrows, 2 * g.n_ff, g.n_embd, w_gu[i].w, w_gu[i].s,
-                                    {w.h.q, w.h.s}, {w.ffn.q, w.ffn.s}, &gated_rows);
-        op_dn[i] = rw(b, RAD_OP(b, "gemm_nt_q",
-                         RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("N", g.n_embd),
-                                    RAD_INT("K", g.n_ff), RAD_INT("group", RAD_FP8_BLOCK),
-                                    RAD_STR("dtype", "fp8a8")),
-                         RAD_WEIGHTS(w_dn[i].w, w_dn[i].s)),
-                     {w.ffn.q, w.ffn.s}, {w.h.x});
+        op_gu[i] = w_gu[i].gemm(b, qrows, 2 * g.n_ff, g.n_embd, {w.h.q, w.h.s}, {w.gate_up});
+        /* The fold is an fp8a8 tile, so any other gate_up takes the pair. */
+        if (!w_gu[i].mx && !w_gu[i].m2x && !w_gu[i].w8h)
+            op_gug[i] = decl_gated_fold(b, qrows, 2 * g.n_ff, g.n_embd, w_gu[i].w, w_gu[i].s,
+                                        {w.h.q, w.h.s}, {w.ffn.q, w.ffn.s}, &gated_rows);
+        op_dn[i] = w_dn[i].gemm(b, qrows, g.n_embd, g.n_ff, {w.ffn.q, w.ffn.s}, {w.h.x});
     }
 
     op_qrope = rw(b, decl_rotary(b, g, "rope",
@@ -588,9 +599,9 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                               RAD_STR("dtype", g.dtype)),
                    RAD_NOWEIGHTS),
                {w.gate_up}, {w.ffn.x});
-    op_qff = rw(b, RAD_OP(b, "quant_act_fp8",
+    op_qff = rw(b, RAD_OP(b, qop,
                    RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", g.n_ff),
-                              RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                              RAD_INT("group", qgr), RAD_STR("dtype", g.dtype)),
                    RAD_NOWEIGHTS),
                {w.ffn.x}, {w.ffn.q, w.ffn.s});
     /* One collective, issued after both the out and the down projection (same shape, same buffer).
@@ -687,16 +698,16 @@ inline void Dspark::context(RadCtx* c, const RadBatch* batch) const {
 
     RAD_ISSUE_N(c, op_qsrc, T, brows(w.src, T), brows(w.srcq, T), brows(w.srcs, T));
     RAD_ISSUE_N(c, op_cfc, T, brows(w.srcq, T), brows(w.srcs, T), RAD_W(w_fc.w), RAD_W(w_fc.s),
-                brows(w.c, T), RAD_NONE, RAD_NONE);
+                brows(w.c, T), RAD_NONE, w_fc.bref());
     RAD_ISSUE_N(c, op_cnorm, T, brows(w.c, T), RAD_W(w_hnorm), brows(w.c, T));
     RAD_ISSUE_N(c, op_qc, T, brows(w.c, T), brows(w.cq, T), brows(w.cs, T));
 
     for (int64_t l = 0; l < g.n_layer; ++l) {
         const int i = (int)l;
         RAD_ISSUE_N(c, op_ck[i], T, brows(w.cq, T), brows(w.cs, T),
-                    RAD_W(w_k[i].w), RAD_W(w_k[i].s), brows(w.ck, T), RAD_NONE, RAD_NONE);
+                    RAD_W(w_k[i].w), RAD_W(w_k[i].s), brows(w.ck, T), RAD_NONE, w_k[i].bref());
         RAD_ISSUE_N(c, op_cv[i], T, brows(w.cq, T), brows(w.cs, T),
-                    RAD_W(w_v[i].w), RAD_W(w_v[i].s), brows(w.cv, T), RAD_NONE, RAD_NONE);
+                    RAD_W(w_v[i].w), RAD_W(w_v[i].s), brows(w.cv, T), RAD_NONE, w_v[i].bref());
         RAD_ISSUE_N(c, op_cknorm[i], T * g.n_head_kv,
                     brows(w.ck, T), RAD_W(w_kn[i]), brows(w.ck, T));
         RAD_ISSUE_N(c, op_crope, T, brows(w.ck, T), praw(batch->positions, RAD_I32, T));
@@ -735,11 +746,11 @@ inline void Dspark::step(RadCtx* c, const RadBatch* batch) const {
          * quantises; at layer 0 it norms the embedding. */
         issue_norm(op_anorm[i], i != 0, w_anorm[i], T);
         RAD_ISSUE_N(c, op_qp[i], T, brows(w.h.q, T), brows(w.h.s, T),
-                    RAD_W(w_q[i].w), RAD_W(w_q[i].s), brows(w.q, T), RAD_NONE, RAD_NONE);
+                    RAD_W(w_q[i].w), RAD_W(w_q[i].s), brows(w.q, T), RAD_NONE, w_q[i].bref());
         RAD_ISSUE_N(c, op_kp[i], T, brows(w.h.q, T), brows(w.h.s, T),
-                    RAD_W(w_k[i].w), RAD_W(w_k[i].s), brows(w.k, T), RAD_NONE, RAD_NONE);
+                    RAD_W(w_k[i].w), RAD_W(w_k[i].s), brows(w.k, T), RAD_NONE, w_k[i].bref());
         RAD_ISSUE_N(c, op_vp[i], T, brows(w.h.q, T), brows(w.h.s, T),
-                    RAD_W(w_v[i].w), RAD_W(w_v[i].s), brows(w.v, T), RAD_NONE, RAD_NONE);
+                    RAD_W(w_v[i].w), RAD_W(w_v[i].s), brows(w.v, T), RAD_NONE, w_v[i].bref());
         RAD_ISSUE_N(c, op_qn[i], T * g.n_head, brows(w.q, T), RAD_W(w_qn[i]), brows(w.q, T));
         RAD_ISSUE_N(c, op_kn[i], T * g.n_head_kv, brows(w.k, T), RAD_W(w_kn[i]), brows(w.k, T));
         RAD_ISSUE_N(c, op_qrope, T, brows(w.q, T), praw(batch->positions, RAD_I32, T));
@@ -757,7 +768,7 @@ inline void Dspark::step(RadCtx* c, const RadBatch* batch) const {
                     brows(w.attn.x, T));
         RAD_ISSUE_N(c, op_qat, T, brows(w.attn.x, T), brows(w.attn.q, T), brows(w.attn.s, T));
         RAD_ISSUE_N(c, op_op[i], T, brows(w.attn.q, T), brows(w.attn.s, T),
-                    RAD_W(w_o[i].w), RAD_W(w_o[i].s), brows(w.h.x, T), RAD_NONE, RAD_NONE);
+                    RAD_W(w_o[i].w), RAD_W(w_o[i].s), brows(w.h.x, T), RAD_NONE, w_o[i].bref());
         if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h.x, T), RAD_NONE);
 
         /* ---- the feed-forward, behind the same fused norm-add-quantise */
@@ -769,12 +780,12 @@ inline void Dspark::step(RadCtx* c, const RadBatch* batch) const {
         } else {
             RAD_ISSUE_N(c, op_gu[i], T, brows(w.h.q, T), brows(w.h.s, T),
                         RAD_W(w_gu[i].w), RAD_W(w_gu[i].s), brows(w.gate_up, T), RAD_NONE,
-                        RAD_NONE);
+                        w_gu[i].bref());
             RAD_ISSUE_N(c, op_act, T, brows(w.gate_up, T), brows(w.ffn.x, T));
             RAD_ISSUE_N(c, op_qff, T, brows(w.ffn.x, T), brows(w.ffn.q, T), brows(w.ffn.s, T));
         }
         RAD_ISSUE_N(c, op_dn[i], T, brows(w.ffn.q, T), brows(w.ffn.s, T),
-                    RAD_W(w_dn[i].w), RAD_W(w_dn[i].s), brows(w.h.x, T), RAD_NONE, RAD_NONE);
+                    RAD_W(w_dn[i].w), RAD_W(w_dn[i].s), brows(w.h.x, T), RAD_NONE, w_dn[i].bref());
         if (op_ar) RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h.x, T), RAD_NONE);
     }
 

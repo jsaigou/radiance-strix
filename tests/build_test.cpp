@@ -11,7 +11,7 @@
 #include "rad_test.h"
 #include "rad_planes.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 #include "build/rad_build.h"
 #include "build/startup.h"
@@ -27,7 +27,7 @@
 #include <unistd.h>
 
 using namespace rad;
-using json = nlohmann::ordered_json;
+using json = Json;
 
 namespace {
 
@@ -374,6 +374,66 @@ TEST(host_and_device_buffers_get_separate_offset_spaces) {
     CHECK_EQ(p.arena_bytes, 4096);
     CHECK_EQ(p.host_arena_bytes, 4096 + 2048);
     CHECK_EQ(rep.host_bytes, 4096 + 2048);
+}
+
+TEST(a_video_only_declaration_requires_consistent_soundtrack_fields) {
+    RadVideoGenDecl d{};
+    d.max_text = 8;
+    d.fps_num = 24;
+    d.fps_den = 1;
+    d.frames_per_chunk = 4;
+    d.frames_tail = 1;
+    d.latents_per_chunk = 1;
+    d.latents_tail = 1;
+    d.dec_latents = 2;
+    d.min_chunks = d.default_chunks = 1;
+    d.max_chunks = 3;
+    d.latent_scale = 16;
+    d.latent_channels = 48;
+    d.patch = 2;
+    d.size_multiple = d.min_side = 32;
+    d.max_area = 64 * 64;
+    d.max_aspect = 2;
+    d.default_width = 64;
+    d.default_height = 32;
+    d.default_steps = d.max_steps = 4;
+    d.shift_video = 5.0;
+    d.max_lanes = 1;
+    d.name = "video-only";
+    d.tmpl = "{prompt}";
+
+    auto declare = [](RadVideoGenDecl decl) {
+        Registry registry;
+        RadModelMeta meta{};
+        RadBuildCtx ctx{};
+        Builder builder(registry, meta, ctx);
+        RadBufDecl frames{};
+        frames.dtype = RAD_U8;
+        frames.rank = 1;
+        frames.shape[0] = (decl.frames_per_chunk + std::max<int64_t>(0, decl.frames_tail)) * decl.max_area * 3;
+        frames.kind = RAD_BUF_PERSIST;
+        frames.domain = RAD_DOMAIN_DEVICE;
+        decl.frames_out = builder.decl_buffer("frames", &frames);
+        return builder.declare_video_generator(&decl);
+    };
+
+    CHECK_EQ(declare(d), RAD_OK);
+    RadVideoGenDecl incomplete = d;
+    incomplete.audio_rate = 40;
+    CHECK_EQ(declare(incomplete), RAD_E_INVAL);
+    incomplete = d;
+    incomplete.audio_out = 1;
+    CHECK_EQ(declare(incomplete), RAD_E_INVAL);
+    incomplete = d;
+    incomplete.audio_streams = 1;
+    CHECK_EQ(declare(incomplete), RAD_E_INVAL);
+
+    incomplete = d;
+    incomplete.max_ref_audios = 1;
+    CHECK_EQ(declare(incomplete), RAD_E_INVAL);
+    incomplete = d;
+    incomplete.max_enc_samples = 1;
+    CHECK_EQ(declare(incomplete), RAD_E_INVAL);
 }
 
 TEST(buffer_uses_drive_liveness) {
@@ -1106,6 +1166,35 @@ TEST(the_drafter_name_survives_the_program_leaving_the_builder) {
     CHECK_EQ(p.drafter.depth, 3);
 }
 
+TEST(calibration_history_declares_no_draft_depth_or_proposal) {
+    Registry reg;
+    RadBuildCtx ctx = make_ctx();
+    ctx.max_spec = 0;
+    ctx.calib_dir = "/tmp/calibration";
+    ctx.calib_tokens = 16;
+
+    RadDrafterDecl d{};
+    d.name = "mtp";
+    d.kind = RAD_DRAFT_HISTORY;
+    Builder b(reg, make_meta(), ctx);
+    CHECK_OK(rad_declare_drafter(&b, &d));
+    CHECK_EQ(b.program().drafter.depth, 0);
+    CHECK_EQ(b.program().drafter.proposal, RAD_NULL_HANDLE);
+    CHECK_EQ(b.program().drafter.proposal_pitch, 0);
+
+    Builder proposed(reg, make_meta(), ctx);
+    d.proposal_pitch = 1;
+    CHECK_EQ(rad_declare_drafter(&proposed, &d), RAD_E_INVAL);
+    d.proposal_pitch = 0;
+    ctx.max_spec = 1;
+    Builder speculative(reg, make_meta(), ctx);
+    CHECK_EQ(rad_declare_drafter(&speculative, &d), RAD_E_INVAL);
+    ctx.max_spec = 0;
+    ctx.calib_dir = nullptr;
+    Builder serving(reg, make_meta(), ctx);
+    CHECK_EQ(rad_declare_drafter(&serving, &d), RAD_E_INVAL);
+}
+
 /* rad_drafter_short_block applies only to a declared block drafter, and only to a block shorter
  * than its own that still proposes a token; anything else is refused at declare, since the core
  * would stage a block the plugin has no ops for. */
@@ -1168,6 +1257,27 @@ TEST(a_tree_drafter_takes_a_short_block) {
     CHECK_OK(rad_drafter_tree(&b7, par7));
     CHECK_OK(rad_drafter_short_block(&b7, 8));
     CHECK_EQ(b7.program().drafter_short_block, 8);
+}
+
+/* The routing table (rad_route_table) is an i32 persistent device buffer, named once: the core
+ * reads its rows between passes, where a transient's bytes may be another buffer's. */
+TEST(a_routing_table_is_a_persistent_i32_buffer) {
+    Registry reg;
+    Builder b(reg, make_meta(), make_ctx());
+    RadBufDecl bd{};
+    bd.dtype = RAD_I32; bd.rank = 2; bd.shape[0] = 4; bd.shape[1] = 8;
+    const rad_buf transient = rad_decl_buffer(&b, "t", &bd);
+    bd.kind = RAD_BUF_PERSIST;
+    const rad_buf tab = rad_decl_buffer(&b, "tab", &bd);
+    const rad_buf tab2 = rad_decl_buffer(&b, "tab2", &bd);
+    bd.dtype = RAD_BF16;
+    const rad_buf half = rad_decl_buffer(&b, "half", &bd);
+    CHECK_EQ(rad_route_table(&b, 0), RAD_E_INVAL);
+    CHECK_EQ(rad_route_table(&b, transient), RAD_E_INVAL);
+    CHECK_EQ(rad_route_table(&b, half), RAD_E_DTYPE);
+    CHECK_OK(rad_route_table(&b, tab));
+    CHECK_EQ(b.program().route_table, tab);
+    CHECK_EQ(rad_route_table(&b, tab2), RAD_E_STATE);
 }
 
 /* A block drafter's proposal pitch is its row pitch, which the engine reads row s at: left at 0 it
@@ -2368,4 +2478,137 @@ TEST(the_architecture_plugin_is_picked_by_id_and_quantisation) {
     rad_tools_registry().close();
 }
 
+TEST(a_unipc_declaration_rejects_unsupported_schedule_combinations) {
+    RadVideoGenDecl d{};
+    d.max_text = 8;
+    d.fps_num = 24;
+    d.fps_den = 1;
+    d.frames_per_chunk = 4;
+    d.frames_tail = 1;
+    d.latents_per_chunk = 1;
+    d.latents_tail = 1;
+    d.dec_latents = 2;
+    d.min_chunks = d.default_chunks = 1;
+    d.max_chunks = 3;
+    d.latent_scale = 16;
+    d.latent_channels = 48;
+    d.patch = 2;
+    d.size_multiple = d.min_side = 32;
+    d.max_area = 64 * 64;
+    d.max_aspect = 2;
+    d.default_width = 64;
+    d.default_height = 32;
+    d.default_steps = d.max_steps = 4;
+    d.shift_video = 5.0;
+    d.max_lanes = 1;
+    d.name = "video-only";
+    d.tmpl = "{prompt}";
+
+    auto declare = [](RadVideoGenDecl decl) {
+        Registry registry;
+        RadModelMeta meta{};
+        RadBuildCtx ctx{};
+        Builder builder(registry, meta, ctx);
+        RadBufDecl frames{};
+        frames.dtype = RAD_U8;
+        frames.rank = 1;
+        frames.shape[0] = (decl.frames_per_chunk + std::max<int64_t>(0, decl.frames_tail)) * decl.max_area * 3;
+        frames.kind = RAD_BUF_PERSIST;
+        frames.domain = RAD_DOMAIN_DEVICE;
+        decl.frames_out = builder.decl_buffer("frames", &frames);
+        return builder.declare_video_generator(&decl);
+    };
+
+    CHECK_EQ(declare(d), RAD_OK);
+    RadVideoGenDecl incomplete = d;
+    incomplete.audio_rate = 40;
+    CHECK_EQ(declare(incomplete), RAD_E_INVAL);
+    incomplete = d;
+    incomplete.audio_out = 1;
+    CHECK_EQ(declare(incomplete), RAD_E_INVAL);
+    incomplete = d;
+    incomplete.audio_streams = 1;
+    CHECK_EQ(declare(incomplete), RAD_E_INVAL);
+
+    d.sched_kind = RAD_VIDEO_SCHEDULE_UNIPC;
+    RadVideoGenDecl negative_tail = d;
+    negative_tail.frames_tail = -negative_tail.frames_per_chunk;
+    CHECK_EQ(declare(negative_tail), RAD_E_INVAL);
+    CHECK_EQ(declare(d), RAD_OK);
+    RadVideoGenDecl unsupported = d;
+    unsupported.max_steps = 1001;
+    CHECK_EQ(declare(unsupported), RAD_E_INVAL);
+    unsupported = d;
+    unsupported.dyn_shift = 1;
+    CHECK_EQ(declare(unsupported), RAD_E_INVAL);
+    unsupported = d;
+    unsupported.upscale_max = 2.0;
+    CHECK_EQ(declare(unsupported), RAD_E_INVAL);
+    unsupported = d;
+    unsupported.audio_channels = unsupported.audio_latent_channels = 1;
+    unsupported.sample_rate = 48000;
+    unsupported.audio_rate = 100;
+    CHECK_EQ(declare(unsupported), RAD_E_INVAL);
+}
+
 RAD_TEST_MAIN()
+
+
+TEST(a_causal_video_declaration_bounds_the_trim_and_largest_chunk) {
+    RadVideoGenDecl d{};
+    d.max_text = 8;
+    d.fps_num = 24;
+    d.fps_den = 1;
+    d.frames_per_chunk = 4;
+    d.frames_tail = 1;
+    d.latents_per_chunk = 1;
+    d.latents_tail = 1;
+    d.dec_latents = 2;
+    d.min_chunks = d.default_chunks = 1;
+    d.max_chunks = 3;
+    d.latent_scale = 16;
+    d.latent_channels = 48;
+    d.patch = 2;
+    d.size_multiple = d.min_side = 32;
+    d.max_area = 64 * 64;
+    d.max_aspect = 2;
+    d.default_width = 64;
+    d.default_height = 32;
+    d.default_steps = d.max_steps = 4;
+    d.shift_video = 5.0;
+    d.max_lanes = 1;
+    d.sample_rate = 32000;
+    d.audio_rate = 40;
+    d.audio_channels = 2;
+    d.audio_latent_channels = 8;
+    d.shift_audio = 5;
+    d.name = "causal-video";
+    d.tmpl = "{prompt}";
+
+    auto declare = [](RadVideoGenDecl decl, bool full_buffer) {
+        Registry registry;
+        RadModelMeta meta{};
+        RadBuildCtx ctx{};
+        Builder builder(registry, meta, ctx);
+        RadBufDecl frames{};
+        frames.dtype = RAD_U8;
+        frames.rank = 1;
+        frames.shape[0] = (full_buffer ? decl.frames_per_chunk : 1) * decl.max_area * 3;
+        frames.kind = RAD_BUF_PERSIST;
+        frames.domain = RAD_DOMAIN_DEVICE;
+        decl.frames_out = builder.decl_buffer("frames", &frames);
+        RadBufDecl audio = frames;
+        audio.dtype = RAD_F32;
+        audio.shape[0] = 100000;
+        decl.audio_out = builder.decl_buffer("audio", &audio);
+        return builder.declare_video_generator(&decl);
+    };
+
+    d.frames_tail = -3;
+    CHECK_EQ(declare(d, true), RAD_OK);
+    CHECK_EQ(declare(d, false), RAD_E_INVAL);
+    d.max_chunks = 1;
+    CHECK_EQ(declare(d, false), RAD_OK);
+    d.frames_tail = -d.frames_per_chunk;
+    CHECK_EQ(declare(d, true), RAD_E_INVAL);
+}

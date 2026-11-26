@@ -221,6 +221,12 @@ int Driver::submit(std::unique_ptr<Request> r, std::string* why) {
                   " pixels");
     const int64_t tokens = (int64_t)(r->width / d.latent_scale) * (r->height / d.latent_scale);
     const int nb = r->has_neg ? 2 : 1;
+    // Guidance branches must run together. Waiting cannot make an undersized
+    // deployment schedulable; reject it without changing its memory budget.
+    if (nb > max_seqs_)
+        return no("this request needs " + std::to_string(nb) +
+                  " simultaneous image branches (--max-num-seqs must be at least " +
+                  std::to_string(nb) + ")");
     if (tokens > d.max_tokens)
         return no("the image is " + std::to_string(r->width) + "x" + std::to_string(r->height) +
                   "; the largest this model makes is " + std::to_string(d.max_tokens) +
@@ -399,9 +405,15 @@ int Driver::admit_locked() {
         }
         if (j.failed) continue;
         if (!ok) {
-            /* KV is short: release what this request took and wait. */
+            /* KV is short: release what this request took and wait, unless nothing is running
+             * that would free any. */
             release_kv_locked(j);
-            break;
+            bool running = false;
+            for (const auto& o : jobs_) running = running || o->admitted;
+            if (running) break;
+            fail_locked(j, RAD_E_FULL, "the KV cache cannot hold this prompt, and nothing is running "
+                                       "that would free it; try a shorter prompt");
+            continue;
         }
         if (discrete()) {
             j.sigmas = schedule_discrete(decl_, table_, r.scheduler, r.steps);

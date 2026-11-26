@@ -51,8 +51,8 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         b.arena      = std::max(b.arena, f.arena);
         b.staging    = std::max(b.staging, f.staging);
         b.prefetch   = std::max(b.prefetch, f.prefetch);
-        if ((int64_t)f.n_queues * f.queue_bytes > b.queues) {
-            b.queues      = (int64_t)f.n_queues * f.queue_bytes;
+        if ((int64_t)f.n_queues * f.queue_bytes + f.queue_scratch > b.queues) {
+            b.queues      = (int64_t)f.n_queues * f.queue_bytes + f.queue_scratch;
             b.n_queues    = f.n_queues;
             b.queue_bytes = f.queue_bytes;
         }
@@ -79,7 +79,23 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     /* --gpu-memory-mib is the inverse of --gpu-headroom-mib: N + headroom = the card, in MiB.
      * Convert once the smallest rank capacity is known. A device that reports no capacity has
      * nothing to claim, so the flag does not apply. */
-    if (b.capacity > 0 && cfg.gpu_memory_mib > 0) {
+    /* A model in a fleet of several (docs/MULTIMODEL.md §6.3) is granted its part of each card by
+     * the fleet, which keeps the headroom and knows what the other models hold. The grant is the
+     * card as far as this split is concerned: nothing in it is already held, and no headroom comes
+     * out of it. It must be free now; the fleet made room before granting it. */
+    const bool claimed = b.capacity > 0 && cfg.vram_claim > 0;
+    if (claimed) {
+        if (cfg.vram_claim > freeb) {
+            b.report = fmt("the fleet granted %s of the card, but only %s is free",
+                           humanb(cfg.vram_claim).c_str(), humanb(freeb).c_str());
+            if (log) RAD_ERR("%s", b.report.c_str());
+            if (out) *out = b;
+            return RAD_E_NOMEM;
+        }
+        b.capacity = cfg.vram_claim;
+        freeb = cfg.vram_claim;
+    }
+    if (!claimed && b.capacity > 0 && cfg.gpu_memory_mib > 0) {
         const int64_t cap_mib = b.capacity / kMiB;
         if (cfg.gpu_memory_mib > cap_mib) {
             b.report = fmt("--gpu-memory-mib %lld is above this card's %lld MiB",
@@ -91,10 +107,10 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         cfg.gpu_headroom_mib = cap_mib - cfg.gpu_memory_mib;
         cfg.given["--gpu-headroom-mib"] = "derived from --gpu-memory-mib";
     }
-    b.headroom = std::max<int64_t>(cfg.gpu_headroom_mib, 0) * kMiB;
+    b.headroom = claimed ? 0 : std::max<int64_t>(cfg.gpu_headroom_mib, 0) * kMiB;
     int64_t host_reserve = 0;
     for (const VramFacts& f : per_rank) host_reserve = std::max(host_reserve, f.host_reserve);
-    const bool shared = host_reserve > b.headroom;
+    const bool shared = !claimed && host_reserve > b.headroom;
     if (shared) b.headroom = host_reserve;
 
     /* A device that reports no capacity has nothing to split, and inventing one is the inference
@@ -136,6 +152,14 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
               "or free the card.\n"
             : "Lower --gpu-headroom-mib, lower --max-num-batched-tokens (the arena scales with it), "
               "or free the card.\n";
+        /* KL mode holds a whole-vocabulary row for every scored token and lends no pool back, so
+         * its fixed cost sits far above a serve's at the same flags. Without naming the split, the
+         * operator has no way to know which knob to turn. */
+        const char* kld_hint = cfg.kld()
+            ? "KL mode holds a full-vocabulary logits row for every scored token and lends no pool "
+              "back: pass --gpu-headroom-mib and --host-pool-mib explicitly, and lower "
+              "--max-num-batched-tokens (the logits rows scale with it).\n"
+            : "";
         b.report = fmt(
             "VRAM does not cover the fixed costs before a single pool is sized:\n"
             "  card total         %10s\n"
@@ -144,7 +168,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             "  --gpu-headroom-mib %10s\n"
             "  activation arena   %10s   (buffer plan + kernel scratch)\n"
             "  step staging       %10s   (block tables, media and KV tier staging)\n"
-            "  hardware queues    %10s   (%d at %s each, measured)\n"
+            "  hardware queues    %10s   (%d at %s each, measured, + resident queue scratch)\n"
             "  expert prefetch    %10s   (its ring of expert units and buffers)\n"
             "  ------------------------------\n"
             "  short by           %10s\n"
@@ -153,6 +177,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             humanb(b.headroom).c_str(), humanb(b.arena).c_str(), humanb(b.staging).c_str(),
             humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(),
             humanb(b.prefetch).c_str(), humanb(-b.claimable).c_str(), how);
+        if (*kld_hint) b.report += kld_hint;
         if (log) RAD_ERR("%s", b.report.c_str());
         if (out) *out = b;
         return RAD_E_NOMEM;
@@ -425,6 +450,29 @@ RankSplit vram_budget_rank_split(int64_t common_weights_mib, int64_t common_kv_m
     s.unusable_mib = saved - (grown - common_weights_mib);
     s.resplit      = true;
     return s;
+}
+
+/* What a fleet grants against (docs/MULTIMODEL.md §6.3): the same fixed terms resolve() charges,
+ * plus the floor or the ceiling of the two elastic shares. */
+void vram_budget_need(const std::vector<VramFacts>& per_rank, int64_t* need, int64_t* want) {
+    int64_t arena = 0, staging = 0, prefetch = 0, queues = 0, statics = 0, floor = 0, kv_one = 0,
+            experts = 0, kv_ceiling = 0, host_pinned = 0;
+    for (const VramFacts& f : per_rank) {
+        arena = std::max(arena, f.arena);
+        staging = std::max(staging, f.staging);
+        prefetch = std::max(prefetch, f.prefetch);
+        queues = std::max(queues, (int64_t)f.n_queues * f.queue_bytes + f.queue_scratch);
+        statics = std::max(statics, f.statics);
+        floor = std::max(floor, f.expert_floor);
+        kv_one = std::max(kv_one, f.kv_one);
+        experts = std::max(experts, f.experts);
+        kv_ceiling = std::max(kv_ceiling, f.kv_ceiling);
+        if (f.unified) host_pinned = std::max(host_pinned, f.host_pinned);
+    }
+    const int64_t fixed = kDriverDrift + arena + staging + prefetch + queues + host_pinned + statics;
+    /* MiB of rounding on each pool, as resolve() rounds them up out of the claim. */
+    *need = fixed + std::min(floor, experts) + kv_one + 2 * kMiB;
+    *want = fixed + experts + std::max(kv_ceiling, kv_one) + 2 * kMiB;
 }
 
 }  /* namespace rad */

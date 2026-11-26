@@ -267,8 +267,10 @@ int run(Fix& f, Form form) {
                        : "qsa_select_kernel";
     const char* fn = kFormName[form];
     if (rc != RAD_OK) { std::printf("FAIL %-48s %-6s launch returned %d\n", f.name.c_str(), fn, rc); return 1; }
-    /* The launch site names the template, `kernel<Signed>`: the name is what precedes it. */
-    const std::string ran(emu_last_kernel, std::strcspn(emu_last_kernel, "<"));
+    /* The launch site names the template in parentheses, `(kernel<Signed, form>)`: the name is
+     * what stands between the parenthesis and the arguments. */
+    const char* const kname = emu_last_kernel + (emu_last_kernel[0] == '(' ? 1 : 0);
+    const std::string ran(kname, std::strcspn(kname, "<"));
     if (ran != expect || grids != (split ? 2 : 1)) {
         std::printf("FAIL %-48s %-6s ran %s in %d grid(s), expected %s in %d\n", f.name.c_str(), fn,
                     emu_last_kernel, grids, expect, split ? 2 : 1);

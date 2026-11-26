@@ -46,6 +46,50 @@ inline int64_t ldi(const RadTensor* t, int64_t i) {
 }  /* namespace */
 
 /* ------------------------------------------------------------------ conv1d */
+int ref_elu(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *y = &a->t[1];
+    if (numel(y) <= 0 || numel(x) < numel(y)) return RAD_E_SHAPE;
+    REF_PAR_FOR(numel(y))
+    for (int64_t i = 0; i < numel(y); ++i) {
+        const float v = ldt(x, offlin(x, i));
+        stt(y, offlin(y, i), v >= 0 ? v : std::expm1(v));
+    }
+    return RAD_OK;
+}
+
+/* Mimi's Euclidean RVQ, not the cosine quantiser used by drama-3. Projections belong to
+ * the enclosing split quantiser; each step subtracts its centroid in the projected space. */
+int ref_vq_euclidean(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *cb = &a->t[1], *codes = &a->t[2];
+    const int64_t n = p_int(a, "n", 0), bins = p_int(a, "bins", 0);
+    if (n <= 0 || bins <= 0 || numel(cb) != bins * n || codes->dtype != RAD_I32)
+        return RAD_E_SHAPE;
+    const int64_t rows = rows_of(x, n);
+    if (rows < 1 || numel(codes) < rows) return RAD_E_SHAPE;
+    REF_PAR_FOR(rows * bins * n)
+    for (int64_t r = 0; r < rows; ++r) {
+        float best = INFINITY;
+        int64_t pick = 0;
+        for (int64_t k = 0; k < bins; ++k) {
+            float d = 0;
+            for (int64_t j = 0; j < n; ++j) {
+                const float delta = ldt(x, rowoff(x, r, n) + j * laststride(x)) -
+                                    ldt(cb, rowoff(cb, k, n) + j * laststride(cb));
+                d += delta * delta;
+            }
+            if (d < best) { best = d; pick = k; }
+        }
+        st_int(codes->dtype, codes->data, offlin(codes, r), pick);
+        for (int64_t j = 0; j < n; ++j) {
+            const int64_t at = rowoff(x, r, n) + j * laststride(x);
+            stt(x, at, ldt(x, at) - ldt(cb, rowoff(cb, pick, n) + j * laststride(cb)));
+        }
+    }
+    return RAD_OK;
+}
+
 /* A 1-D convolution over sequences of rows, channels innermost: x [rows, cin], y [rows, cout],
  * `cu_seqlens` bounding each sequence (row indices of both operands, as every sequenced op reads
  * them), outside of which the input reads zero (each sequence is padded on its own). w is

@@ -67,7 +67,7 @@ Five more exports are optional, each looked up by exactly this name:
 | `void rad_plugin_close(void)` | called once at shutdown |
 | `int rad_kernel_concurrent(int i)` | nonzero: kernel `i` touches nothing but its operands and scratch, so independent launches may overlap |
 | `int rad_kernel_collective(int i)` | nonzero: kernel `i` exchanges data with the other ranks' cards, so the engine keeps its own bulk link traffic away while it runs. 2: each launch ends that hold itself once the other ranks' bytes have landed, through the `link_gate` parameter (`rad_abi.h`). Without this export only the `all_reduce` op is a collective |
-| `int rad_plugin_reference(void)` | nonzero: a **reference implementation**, ranked below every unnamed library, refused for serving unless `--debug-accept-reference-kernels`, and what `rad-kbench` checks the others against. libref declares itself this way |
+| `int rad_plugin_reference(void)` | nonzero: a **reference implementation**, ranked below every unnamed library, refused for serving unless `server.debug-accept-reference-kernels`, and what `rad-kbench` checks the others against. libref declares itself this way |
 | `int rad_kernel_reference(int i)` | per row: nonzero marks kernel `i` as a reference implementation and 0 as a production one, overriding `rad_plugin_reference` for that library. For a plugin that ships a device row and its host oracle side by side (`plugin/spechub`) |
 
 ---
@@ -113,7 +113,7 @@ machine. A machine fact changes no tuning key. A tool selecting without an engin
 nothing, so such a kernel is not selected there.
 
 **Priority.** `priority` breaks ties within one plugin, highest first, then declaration order.
-Between plugins the hierarchy is absolute: the first plugin in `--kernels` order with any matching
+Between plugins the hierarchy is absolute: the first plugin in `server.kernels` order with any matching
 kernel supplies it, however specialised a later plugin's kernel is. That makes a user's library an
 override rather than a competitor.
 
@@ -278,11 +278,11 @@ It also checks:
 A skipped kernel is reported with the reason, usually a missing `opd_shape` (§4). Other
 diagnostics:
 
-- `--debug-selection` prints the selection table: which kernel took each band, and the constraint
+- `debug-selection: true` prints the selection table: which kernel took each band, and the constraint
   that refused each other candidate;
 - `/graph` on a running server returns the declared graph and which declarations the run phase has
   issued, which finds a band resolved for nothing;
-- `--debug-accept-reference-kernels` is required to serve with a reference fallback; without it a
+- `server.debug-accept-reference-kernels: true` is required to serve with a reference fallback; without it a
   fallback is fatal, because a reference kernel in production would look like a performance
   problem;
 - `rad-info --plugins` prints every plugin on the search path as the engine loads it: kind, version,
@@ -318,13 +318,14 @@ what the host has available and leaves an eighth of host memory to the host.
 The core assumes nothing about a card's wave size, LDS, fp8 hardware or links. Three points matter:
 
 - **The vocabulary is what you implement.** A model runs on your library when every op its
-  architecture issues has a row there (`docs/OPS.md`; `--debug-graph` lists them). The bf16 models
+  architecture issues has a row there (`docs/OPS.md`; `debug-graph: true` lists them). The bf16 models
   in the tree issue only ops libref implements (MiniCPM5-2B: 13 model ops and 11 sampler ops), so
   libref's host code is the specification and `rad-kbench` the check. Ops `docs/OPS.md` marks
-  **device-only** are libr4d's and have no reference; the fp8 models and a drafter with a 2-bit
-  head issue some.
+  **device-only** are libr4d's and have no reference; the quantised models and a drafter with a
+  2-bit head issue some.
 - **fp8 bytes are OCP E4M3** (`e4m3fn`, bias 7, max 448) wherever the engine reads them: container
-  weights, the KV cache at `--kv-cache-dtype fp8`, activations between ops. A card whose fp8 is
+  weights (Flash-Next's mixing matrices, its n-gram table, the codebook experts' scales), GLM-5.3's
+  latent cache at `kv-cache-dtype: fp8`, activations between ops. A card whose fp8 is
   `e4m3fnuz` (gfx942) converts weights in its `relayout` hook (the codes keep their bits except
   0x80 and decode to half the value, so the scale doubles) and keeps activations and KV in OCP
   bytes, or converts at its own boundaries.
@@ -359,8 +360,9 @@ underscores; `rad-convert --arch ID` overrides it. Every configuration key reach
 `RadModelMeta`, and the plugin's name map says which checkpoint tensor each declared weight comes
 from, so `rad-convert` needs no knowledge of the model.
 
-A checkpoint whose quantisation was imported weight by weight (GUIDE §3.2: Quark, ParoQuant, GPTQ,
-NVFP4) names its producing tool, which no plugin claims; it goes to the family's one quantised
+A checkpoint whose quantisation was imported weight by weight (GUIDE §3.2: GPTQ, AutoRound,
+compressed-tensors, and the Quark, ParoQuant and NVFP4 releases a recipe re-quantises) names its
+producing tool, which no plugin claims; it goes to the family's one quantised
 plugin, and two are refused by name. A second quantised plugin that reads only its own containers
 says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep their plugin.
 
@@ -402,7 +404,7 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   at either; the short block proposes `block - (RadDrafterDecl::block - depth)` tokens. A tree
   drafter (`rad_drafter_tree`, called first) grows a tree of its own over the shorter pass, at most
   `block - 1` nodes, and its short block needs only 2 rows. The builder refuses it without a block
-  drafter, at or above the drafter's own block, and where it would propose nothing. The engine runs it under `--draft-short-from` (GUIDE §4.6) and reads row `s` of
+  drafter, at or above the drafter's own block, and where it would propose nothing. The engine runs it under `draft-short-from` (GUIDE §4.6) and reads row `s` of
   the proposals at `s * proposal_pitch`; a block drafter's `proposal_pitch` defaults to its
   depth (a row holds the whole block's proposals and a short block fills its front) and is refused
   below it. The pass's block is `n_tok / n_seq`; a block the plugin has no ops for should fail the
@@ -440,7 +442,7 @@ const RadQuantizerInfo* rad_quant_at(int i);   /* name, doc, options, encoding, 
 ```
 # PATTERN                    QUANTISER  OPTIONS
 blk.*.ffn_*_exps.*.weight    myquant    bits=3 group=64
-*                            rtn        codes=fp8_e4m3 block=128x128 scale=bf16
+*                            rtn        codes=i8 group=128 scale=bf16 clamp=sym
 ```
 
 `rad-convert --list-quantizers` prints every loaded quantiser and its options. A recipe option the
@@ -491,17 +493,20 @@ built against; `RAD_PLUGIN_INSTALL_HOME` overrides that. Before installing, the 
 the same name later. Your plugins go ahead of an installation without copying it:
 
 ```sh
-RADIANCE_HOME=$HOME/radiance-plugins:/opt/radiance/share/radiance radiance --model ...
+RADIANCE_HOME=$HOME/radiance-plugins:/opt/radiance/share/radiance radiance --config radiance.yaml
 ```
+
+The same path can be set as `server.radiance-home` in the YAML file instead.
 
 The container image takes one the same way, mounted:
 `-v /my/plugins:/plugins -e RADIANCE_HOME=/plugins:/opt/radiance/share/radiance`.
 
-**The kernel hierarchy** is `--kernels` (or `$RADIANCE_KERNELS`), an ordered list of the kernel
-libraries to use: `--kernels mykernels,libr4d` puts yours before libr4d. An entry matches a
+**The kernel hierarchy** is `server.kernels` in the server's YAML file, `--kernels` on a tool (or
+`$RADIANCE_KERNELS` for both), an ordered list of the kernel libraries to use:
+`kernels: mykernels,libr4d` puts yours before libr4d. An entry matches a
 plugin's name or its file (`libr4d`, `r4d`, `libr4d.so` and a path to it are one library); an entry
 matching nothing is warned about by name. Separate entries with commas or colons
-(`mykernels:libr4d` is the same list); the engine and every tool read `--kernels` and
-`$RADIANCE_KERNELS` by this one rule, and an empty `$RADIANCE_KERNELS` counts as unset. A kernel library the list does not
+(`mykernels:libr4d` is the same list); the engine's `kernels` key, every tool's `--kernels` and
+`$RADIANCE_KERNELS` follow this one rule, and an empty `$RADIANCE_KERNELS` counts as unset. A kernel library the list does not
 name is not loaded, so name every library you want, including the host library (`libavx`) and the
 reference (`libref`). With no list every library found loads, a reference library (§1) last.

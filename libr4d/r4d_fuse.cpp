@@ -317,39 +317,6 @@ extern "C" int r4d_fuse_gated_quant_fp8(const RadParam* p, int n_p, uint64_t pre
 }
 
 /* ==========================================================================================
- * swiglu_clamped_quant_fp8 -- GLM's clipped SwiGLU and the fp8 quantiser in one pass.
- * (kernel: libr4d/r4d_glm.hip, swiglu_clamped_quant_kernel)
- *
- * Operands: [0] gate_up  [1] q  [2] scale  [3] out_bf16?
- *
- * Each element is `swiglu_clamped_bf16`'s expression, rounded to bf16 once, and the codes are
- * quant_act_fp8's over that rounded value, so the chain is the two rows with the product between.
- */
-extern "C" int r4d_fuse_swiglu_clamped_quant_fp8(const RadParam* p, int n_p, uint64_t present,
-                                                 int step, RadFuseStep* out) {
-
-    if (!out) return RAD_E_INVAL;
-    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
-    if (!fp8_geometry_ok(p, n_p, M, n)) return RAD_E_UNSUPPORTED;
-    const int16_t mid = RAD_FUSE_HAS(present, 3) ? (int16_t)3 : RAD_FUSE_TMP(0);
-
-    switch (step) {
-    case 0: {
-        Step s(out, "swiglu_clamped");
-        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "limit").mirror(p, n_p, "dtype");
-        return s.wire({ 0, mid });                  /* gate_up, y */
-    }
-    case 1: {
-        Step s(out, "quant_act_fp8");
-        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "group").mirror(p, n_p, "dtype");
-        return s.wire({ mid, 1, 2 });               /* x, q, scale */
-    }
-    default:
-        return RAD_E_NOTFOUND;
-    }
-}
-
-/* ==========================================================================================
  * router_sigmoid_topk_scatter -- GLM's selection, the sort over its ids and the shared gate's fill.
  * (kernel: libr4d/r4d_glm.hip, router_sigmoid_scatter_kernel)
  *
@@ -465,129 +432,6 @@ extern "C" int r4d_fuse_gate_quant_fp8(const RadParam* p, int n_p, uint64_t pres
         Step s(out, "quant_act_fp8");
         s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "group").mirror(p, n_p, "dtype");
         return s.wire({ 4, 2, 3 });                 /* x, q, scale */
-    }
-    default:
-        return RAD_E_NOTFOUND;
-    }
-}
-
-/* ==========================================================================================
- * gemm_nt_q_gated -- the narrow fp8 GEMM with the SwiGLU and the quantiser in its epilogue.
- * (row: gemm_fp8a8_gated_nt_m16; shim: r4d_gemm_fp8a8.hip)
- *
- * Operands: [0] a  [1] a_scale  [2] b  [3] b_scale  [4] q  [5] scale  [6] out_bf16?
- *
- * Byte-identical to gemm_nt_q followed by gated_quant_fp8: the accumulator is rounded to bf16
- * before the gate and the multiply, and the amax is an fmaxf reduction, exact under any regrouping
- * across waves. Both steps are libr4d rows.
- *
- * TMP(0) is the [M, N] bf16 plane between the GEMM and the quantiser, which the fusion never
- * writes. Its extents come from step 0's `opd_shape` (the ABI rule for temporaries):
- * r4d_shape_gemm_nt_q gives [M, N] for operand 4 and r4d_shape_gated_quant_fp8 gives [M, 2n] for
- * operand 0, the same plane since `n` = N/2.
- *
- * Two parameters are not copies:
- *
- *   `n`      is N/2. The fused `N` is the weight's rows, gate then up, twice the output width
- *            (hence a schema of its own rather than a flag on `gemm_nt_q`).
- *
- *   `dtype`  is "fp8a8" on the GEMM step and "bf16" on the quantiser step. For a GEMM it names the
- *            operand combination, for an activation op the width of its input: cGemmNtQGatedFp8
- *            has `C_IN("dtype", "fp8a8")`, cGatedQuantFp8 `C_IN("dtype", "bf16")`. Copying the
- *            fused value fails to resolve only because no other row declares that combination.
- *
- * `a_sum` (asymmetric integer grids) and `b_ref` (mxfp4) follow `gemm_nt_q`'s `y`; an fp8 grid has
- * neither, and r4d_shape_gemm_nt_q describes both as absent. They are wired RAD_FUSE_NONE, not
- * omitted, to keep one entry per schema operand.
- */
-extern "C" int r4d_fuse_gemm_nt_q_gated(const RadParam* p, int n_p, uint64_t present, int step,
-                                        RadFuseStep* out) {
-
-    if (!out) return RAD_E_INVAL;
-    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
-    const char* dt = r4d_pgets(p, n_p, "dtype");
-    if (M <= 0 || N <= 0 || K <= 0 || N % 2) return RAD_E_UNSUPPORTED;
-    if (pi(p, n_p, "group", R4D_FP8_BLOCK) != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
-    if (!dt || std::strcmp(dt, "fp8a8")) return RAD_E_UNSUPPORTED;
-    /* Required on this op, unlike on the quantiser, because only silu is compiled; an optional
-     * parameter would let the row resolve for a gate it cannot serve. */
-    if (!act_is(p, n_p, "silu", "silu")) return RAD_E_UNSUPPORTED;
-
-    switch (step) {
-    case 0: {
-        /* The GEMM over the whole [N, K] gate_up weight, into the temporary plane. */
-        Step s(out, "gemm_nt_q");
-        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K")
-         .mirror(p, n_p, "group").mirror(p, n_p, "dtype");
-        /* a, a_scale, b, b_scale, y, a_sum, b_ref */
-        return s.wire({ 0, 1, 2, 3, RAD_FUSE_TMP(0), RAD_FUSE_NONE, RAD_FUSE_NONE });
-    }
-    case 1: {
-        /* Gate, multiply and codes over the accumulator plane, at half its width. */
-        Step s(out, "gated_quant_fp8");
-        s.mirror(p, n_p, "M").pint("n", (long long)(N / 2)).mirror(p, n_p, "group")
-         .pstr("dtype", "bf16").mirror(p, n_p, "act");
-        return s.wire({ RAD_FUSE_TMP(0), 4, 5, 6 });   /* gate_up, q, scale, out_bf16 */
-    }
-    default:
-        return RAD_E_NOTFOUND;
-    }
-}
-
-/* ==========================================================================================
- * gemm_nt_q_gated_mx -- the same fold over an OCP-MXFP4 weight.
- * (rows: gemm_mxfp4a8_gated_gemv, M <= 8, and gemm_mxfp4a8_gated_gemv_wide, 9..64; kernels:
- * libr4d/r4d_gemm_mxfp4a8_gemv.hip, the gated forms. The chain's gemm_nt_q resolves to gemv and
- * gemv_wide in those bands, the rows each form is byte-identical to.)
- *
- * Operands: [0] a  [1] a_scale  [2] b  [3] b_scale  [4] b_ref  [5] q  [6] scale  [7] out_bf16
- *
- * The GEMM step is gemm_nt_q at dtype mxfp4a8 with `b_ref` in its last operand. `group` is the
- * weight's 32 on the GEMM and the activation's 128 on the quantiser, so the quantiser's is set, not
- * mirrored. At act gelu_tanh the chain is three steps, gelu_mul into a second temporary and
- * quant_act_fp8 over it; that form refuses `out_bf16` (the shim), so operand 7 is not wired.
- */
-extern "C" int r4d_fuse_gemm_nt_q_gated_mx(const RadParam* p, int n_p, uint64_t present, int step,
-                                           RadFuseStep* out) {
-    if (!out) return RAD_E_INVAL;
-    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
-    const char* dt = r4d_pgets(p, n_p, "dtype");
-    if (M <= 0 || N <= 0 || K <= 0 || N % 2) return RAD_E_UNSUPPORTED;
-    if (pi(p, n_p, "group", 32) != 32) return RAD_E_UNSUPPORTED;
-    if (!dt || std::strcmp(dt, "mxfp4a8")) return RAD_E_UNSUPPORTED;
-    const bool gelu = act_is(p, n_p, "silu", "gelu_tanh");
-    if (!gelu && !act_is(p, n_p, "silu", "silu")) return RAD_E_UNSUPPORTED;
-    /* The GeGLU chain leaves its bf16 plane in a temporary, so a caller asking for out_bf16 there
-     * has no chain (the shim refuses the operand too). */
-    if (gelu && RAD_FUSE_HAS(present, 7)) return RAD_E_UNSUPPORTED;
-
-    if (step == 0) {
-        Step s(out, "gemm_nt_q");
-        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K")
-         .mirror(p, n_p, "group").mirror(p, n_p, "dtype");
-        /* a, a_scale, b, b_scale, y, a_sum, b_ref */
-        return s.wire({ 0, 1, 2, 3, RAD_FUSE_TMP(0), RAD_FUSE_NONE, 4 });
-    }
-    if (gelu) {
-        if (step == 1) {
-            Step s(out, "gelu_mul");
-            s.mirror(p, n_p, "M").pint("n", (long long)(N / 2)).pstr("dtype", "bf16");
-            return s.wire({ RAD_FUSE_TMP(0), RAD_FUSE_TMP(1) });   /* gate_up, y */
-        }
-        if (step == 2) {
-            Step s(out, "quant_act_fp8");
-            s.mirror(p, n_p, "M").pint("n", (long long)(N / 2)).pint("group", 128)
-             .pstr("dtype", "bf16");
-            return s.wire({ RAD_FUSE_TMP(1), 5, 6 });               /* x, q, scale */
-        }
-        return RAD_E_NOTFOUND;
-    }
-    switch (step) {
-    case 1: {
-        Step s(out, "gated_quant_fp8");
-        s.mirror(p, n_p, "M").pint("n", (long long)(N / 2)).pint("group", 128)
-         .pstr("dtype", "bf16").mirror(p, n_p, "act");
-        return s.wire({ RAD_FUSE_TMP(0), 5, 6, 7 });   /* gate_up, q, scale, out_bf16 */
     }
     default:
         return RAD_E_NOTFOUND;
@@ -824,8 +668,8 @@ extern "C" int r4d_fuse_add_rmsnorm(const RadParam* p, int n_p, uint64_t present
  * in-place pair the fold replaces. Its rows are attn_paged's (token, head) pairs, so its `M` is the
  * band's query rows times the head count (a bound, which is how its shim reads it) and its `n` is
  * `head_dim`. */
-extern "C" int r4d_fuse_attn_paged_gate_quant(const RadParam* p, int n_p, uint64_t present,
-                                              int step, RadFuseStep* out) {
+static int fuse_attn_paged_gate(const RadParam* p, int n_p, uint64_t present, int step,
+                                RadFuseStep* out, const char* gate_op) {
     if (!out) return RAD_E_INVAL;
     auto opt = [present](int i) { return opt_opd(present, i); };
     const int64_t q_len = pi(p, n_p, "q_len"), nh = pi(p, n_p, "n_head");
@@ -842,7 +686,7 @@ extern "C" int r4d_fuse_attn_paged_gate_quant(const RadParam* p, int n_p, uint64
         return s.wire({ 0, 1, 2, 3, opt(4), opt(5), opt(6), 7 });
     }
     case 1: {
-        Step s(out, "gate_quant_fp8");
+        Step s(out, gate_op);
         s.pint("M", (long long)(seqs * q_len * nh)).pint("n", (long long)hd)
          .mirror(p, n_p, "group").pstr("dtype", "bf16").mirror(p, n_p, "act");
         return s.wire({ 8, 7, 9, 10, 7 });   /* gate, x, q, scale, out_bf16 */
@@ -850,6 +694,15 @@ extern "C" int r4d_fuse_attn_paged_gate_quant(const RadParam* p, int n_p, uint64
     default:
         return RAD_E_NOTFOUND;
     }
+}
+extern "C" int r4d_fuse_attn_paged_gate_quant(const RadParam* p, int n_p, uint64_t present,
+                                              int step, RadFuseStep* out) {
+    return fuse_attn_paged_gate(p, n_p, present, step, out, "gate_quant_fp8");
+}
+/* attn_paged_gate_had_quant -- the same two steps with gate_had_quant_i8g as the second. */
+extern "C" int r4d_fuse_attn_paged_gate_had_quant(const RadParam* p, int n_p, uint64_t present,
+                                                  int step, RadFuseStep* out) {
+    return fuse_attn_paged_gate(p, n_p, present, step, out, "gate_had_quant_i8g");
 }
 
 /* ==========================================================================================
@@ -945,6 +798,50 @@ extern "C" int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, uint64_
         s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps")
          .mirror(p, n_p, "group").mirror(p, n_p, "dtype").mirror_opt(p, n_p, "wadd");
         return s.wire({ 0, 1, 2, 3, 4, 5 });        /* x, residual, w, q, scale, out_bf16 */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
+ * ar_rmsnorm -- ar_rmsnorm_quant_fp8 without the quantiser, for the bf16 blocks.
+ * (kernel: the same, at QZ false; shim: r4d_ar_entry.hip)
+ *
+ * Operands: [0] x (inout)  [1] residual?  [2] w  [3] y
+ *
+ * The exact wire's reduce as above, then rmsnorm_quant_fp8's chain without its last step: `add`
+ * (the sum rounded to bf16 and stored in the residual) and `rmsnorm` of the stored sum, at the
+ * same `r4d_act_threads` width, into `y`. The bf16 blocks issue exactly these three today.
+ */
+extern "C" int r4d_fuse_ar_rmsnorm(const RadParam* p, int n_p, uint64_t present, int step,
+                                   RadFuseStep* out) {
+
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const int64_t world = pi(p, n_p, "world_size");
+    if (M <= 0 || n <= 0 || world <= 0) return RAD_E_UNSUPPORTED;
+    const bool has_res = RAD_FUSE_HAS(present, 1) != 0;
+    /* Without a residual there is no `add`. */
+    const int s = (step >= 1 && !has_res) ? step + 1 : step;
+
+    switch (s) {
+    case 0: {
+        Step st(out, "all_reduce");
+        st.mirror(p, n_p, "world_size").pint("numel", (long long)(M * n))
+          .mirror(p, n_p, "dtype").pint("exact", 1);
+        return st.wire({ 0, RAD_FUSE_NONE });       /* x (inout), y */
+    }
+    case 1: {
+        Step st(out, "add");
+        st.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "dtype");
+        return st.wire({ 0, 1, 1 });                /* a, b, y */
+    }
+    case 2: {
+        Step st(out, "rmsnorm");
+        st.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps")
+          .mirror(p, n_p, "dtype").mirror_opt(p, n_p, "wadd");
+        return st.wire({ has_res ? (int16_t)1 : (int16_t)0, 2, 3 });   /* x, w, y */
     }
     default:
         return RAD_E_NOTFOUND;

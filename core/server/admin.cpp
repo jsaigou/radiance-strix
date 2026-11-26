@@ -17,7 +17,7 @@
 #include "rad_internal.h"
 #include "text/tokenizer.h"
 
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 namespace rad {
 namespace server {
@@ -243,10 +243,13 @@ HttpResponse Server::handle_detokenize(const HttpRequest& req) {
         toks.push_back(id);
     }
 
-    /* `prompt` is vLLM's key and `content` llama-server's, for the same text. */
+    /* `prompt` is vLLM's key and `content` llama-server's, for the same text. (Through a
+     * named copy: o["content"] = o["prompt"] reads through a member reference that inserting
+     * the second member may have just invalidated.) */
+    const std::string text = deps_.tok->decode(toks);
     json o;
-    o["prompt"] = deps_.tok->decode(toks);
-    o["content"] = o["prompt"];
+    o["prompt"] = text;
+    o["content"] = text;
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, json_dump(o));
 }
@@ -391,6 +394,8 @@ HttpResponse Server::handle_tokenizer_info(const HttpRequest& req) {
 }
 
 /* ================================================================== capabilities */
+std::string Server::capabilities_json() const { return capabilities().dump(); }
+
 json Server::capabilities() const {
     json caps;
     const bool rerank = is_reranker(deps_.embed);

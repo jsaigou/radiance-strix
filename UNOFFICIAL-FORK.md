@@ -6,6 +6,35 @@ documentation, support and bug reports. This fork is not affiliated with or endo
 
 All credit for Radiance belongs to Deadcode and the radiance contributors listed in [`NOTICE`](NOTICE).
 
+## Branch `radiance-2x-port`: the kernel work on upstream 2.x
+
+This branch is the original at commit [`f1113ee9`](https://codeberg.org/StillDeadcode/radiance) (`v2.2.0` plus 102 commits) with this fork's kernel, format,
+architecture-plugin and tooling work forward-ported onto it. It is published as **one snapshot commit** on top of this fork's 1.17-based history; the
+original's own per-commit history, and its authors, are in the original repository. All credit for the 2.x engine belongs to Deadcode and the radiance
+contributors (see [`NOTICE`](NOTICE)). The Haru work on this fork's `main` is **not** included.
+
+**One file is left out.** `data/flint-zero-bias.safetensors` (an all-zero tensor that the Flint conversion recipes pass to `rad-convert --add`) is not
+published here, because this repository's push guard never publishes `*.safetensors` files. Take it from the original at the commit above.
+
+**Identifiers that moved** (upstream 2.x had taken the same numbers; its meanings are kept): routed-expert formats IQ4_NL, Q5_0, Q2_0, IQ3_XXS, IQ2_S,
+`w3nl64a8h` and IQ4_XS are 13 to 19 (were 10 to 16); the kernel template value of the 3-bit codebook is `W4 = 12` (was 5); its interleave mode bit is 7 (was 5).
+
+**Behaviour differences from the 1.17-based fork.** 2.x takes its settings from a YAML file (`radiance --config FILE`), and the packed KV caches (`fp8_v4`,
+`k6_v4`) no longer exist: use `i8`.
+
+**What was tested** (Strix Halo, gfx1151, ROCm 10.1.0; one container, Qwen3.8-Flash-Next `flash-size.rad`, `RADIANCE_KERNELS=libhalo`, one GPU):
+
+- Against the 1.17-based fork engine on the same container with `bf16` KV: mean KL 0.000000 and top-1 agreement 1.0000 over 1,575,352 positions.
+- 1,405 English and Japanese benchmark prompts (old engine with `k6_v4` KV, this branch with `i8`): 93.8% against 93.9% (English, 835), 85.3% against 84.9%
+  (Japanese, 570); no task differs significantly.
+- Speed against the old engine: single-stream decode about 2-3% **slower**; three-stream decode and time to first token level.
+- At 131072 tokens with 3 sequences and speculation depth 2: tool calls, prefix-cache reuse across turns, and three concurrent 126k-token prompts.
+- CPU test suite: the failing tests are the ones that also fail on the unmodified base commit with this toolchain (`museglimmer_test` does not compile there
+  either). The two GPU tests that fail also fail identically on the base.
+
+**Not tested on this branch:** every other container (including the Qwen3.6 and Qwen3.8-27B ones the 1.17-based branches were checked on), the lossless
+GGUF import end to end, multiple GPUs, other GPUs, long soaks.
+
 ## Why this fork exists
 
 We run Radiance on AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S, gfx1151) and found some bugs while evaluating it.

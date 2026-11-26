@@ -70,6 +70,9 @@ set(R4D_UNITS
   "r4d_attn_paged_h128_gqa2|"
   # Sixteen queries per KV head at head_dim 128 (Nemotron-H's 32 over 2 at one or two ranks).
   "r4d_attn_paged_h128_gqa16|"
+  # Seven queries per KV head at head_dim 128: Nanbeige4.3-33B (56 over 8). Seven divides neither
+  # 384 nor 64, so the unit runs 21 warps and caps a decode workgroup at 63 rows; see its header.
+  "r4d_attn_paged_h128_gqa7|"
   "r4d_attn_vit_h72_bf16|"
   # An encoder's dense attention (bidirectional, GQA in the workgroup, a two-sided window) and
   # the small ops around it: act_mul, seg_mean, qk_norm_rope with a v norm, the f32 widening.
@@ -101,6 +104,8 @@ set(R4D_UNITS
   # Vision tower ops: layer norm, the learned-grid position embedding, and the biased GEMM with
   # activation and residual fused into its store.
   "r4d_vit_bf16|"
+  # Muse Glimmer's vision-tower coordinate ops: grid_embed_pad, window_order.
+  "r4d_vit_muse|"
   # The same biased GEMM over f32 operands (a diffusion transformer's patch projections and heads,
   # a video decoder's 1x1 projections), on the f32 FMA tile r4d_audio's f32 convolutions share.
   "r4d_gemm_f32_nt_bias|"
@@ -120,11 +125,10 @@ set(R4D_UNITS
   "r4d_kda|"
   # Mamba-2's selective state update (Nemotron-H), the KDA kernel's register layout.
   "r4d_ssd|"
-  "r4d_moe_mxfp4|"
-  "r4d_fp8_f32scale|"
   "r4d_ngram_ids|"
   "r4d_ple_gate_bf16|"
   "r4d_ple_conv_bf16|"
+  "r4d_l2_clip_bf16|"
   # The all-reduce kernels share one instance (peer scratch, IPC-equivalent pointers, per-block
   # flags, device sequence counters) set up by one rendezvous across ranks, so all entry points
   # live in r4d_ar_entry. Spreading them across the kernel units would give each its own copy.
@@ -138,11 +142,14 @@ set(R4D_UNITS
   "r4d_ar_twoshot_Nrank_ti8|"
   "r4d_gemm_bf16_nt_m16|"
   "r4d_gemm_bf16_nt_m64|"
+  # The same GEMM over bf16x12 weights (a bf16 weight in 12.25 bits a value, losslessly), all three
+  # of its rows: gemm_bf16x12_nt_m16 forwards to _m64, and _tiled unpacks the weight for
+  # r4d_gemm_bf16_nt_tiled.
+  "r4d_gemm_bf16x12_nt_m64|"
   "r4d_gemm_bf16_nt_tiled|"
   "r4d_gemm_w4a16_nt_m64|"
   "r4d_gemm_w5a16_nt_m64|"
   "r4d_gemm_wpa8i8_tiled|"
-  "r4d_givens_dense|"
   "r4d_gemm_w8a16_nt_m64|"
   "r4d_gemm_w2a8_nt|"
   "r4d_gemm_w4a8_nt_m64|"
@@ -154,19 +161,18 @@ set(R4D_UNITS
   "r4d_gemm_mxfp4a8_tiled|"
   "r4d_gemm_mxfp4a8_decode|"
   "r4d_gemm_mxfp4a8_gemv|"
-  # M2XFP4 (arXiv 2601.19213 §4.4.2): the decode and tiled rows at the m2xfp4 encoding, one meta
-  # plane more. Same bands and fold as the OCP rows; the meta multipliers ride r4d_m2xfp4.h's table.
-  "r4d_gemm_m2xfp4a8_tiled|"
-  "r4d_gemm_m2xfp4a8_decode|"
   # Block-scaled FP8 (the format Qwen3.8-27B-FP8 ships in). The 128x128 block is fixed by the
   # checkpoint, and the entry points reject a mismatch.
   "r4d_gemm_fp8a16_nt_m1|"
   "r4d_gemm_fp8a8|"
   "r4d_gemm_iqr|"
+  "r4d_gemm_iqr_p1|"
+  "r4d_gemm_iqr_p2|"
+  "r4d_gemm_iqr_p3|"
+  "r4d_moe_iqr|"
   "r4d_iqr_embed|"
   "r4d_logits_vocab|"
   "r4d_quant_act_fp8|"
-  "r4d_givens_rotate|"
   "r4d_fused_quant_fp8|"
   "r4d_gram_accum_fp8|"
   "r4d_qsa_block_key_bf16|"
@@ -192,6 +198,8 @@ set(R4D_UNITS
   "r4d_rmsnorm_had_quant_i8|"
   "r4d_ar_ln_had_quant_i8|"
   "r4d_gated_had_quant_i8|"
+  # gated_quant_i8: the unrotated grouped int8 sibling, one workgroup a row for any row count.
+  "r4d_gated_quant_i8|"
   "r4d_qk_norm_rope_gate|"
   "r4d_gdn_gated_norm_had_quant_i8|"
   "r4d_dequant_w4_bf16|"
@@ -200,6 +208,13 @@ set(R4D_UNITS
   "r4d_pair_argmax_f32|"
   # LiLiCorr's correlator: candidates, lattice attention, factor input, walk.
   "r4d_lili|"
+  # Inkling 2's attention (attn_paged_rel): the relative-position bias and the row sinks at head_dim
+  # 128, any gqa, a plain kernel for every band.
+  "r4d_attn_rel|"
+  # Block attention residuals (Inkling 2): a softmax over depth, one workgroup a row.
+  "r4d_attn_res|"
+  # SiTU, Inkling 2's expert activation over a fused gate_up.
+  "r4d_situ|"
   # Gemma 4's sandwich-norm joins (norm_add_norm, norm_add_norm_route, join_add_scale) and
   # expert_scale, each one kernel for a chain of small ones.
   "r4d_norm_join_bf16|"
@@ -213,6 +228,10 @@ set(R4D_UNITS
   # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because
   # the other three only feed the GEMM.
   "r4d_moe|"
+  # NVFP4 experts against an int8 activation: a plain per-column kernel (no WMMA).
+  "r4d_moe_nvfp4|"
+  # Blocks a row keeps for an output buffer, freed with the memory they serve (r4d_keyed.h).
+  "r4d_keyed|"
 )
 
 set(R4D_SRC "")
@@ -238,7 +257,12 @@ endforeach()
 # descriptions and fusion claims. They are pure host C++ that includes neither r4d.h nor
 # hip_runtime.h, so these tables compile and can be inspected without ROCm.
 set(R4D_DECLARATION r4d_rows.cpp r4d_layout.cpp r4d_fp8_layout.cpp r4d_iqr_layout.cpp r4d_shapes.cpp
-                    r4d_fuse.cpp)
+                    r4d_fuse.cpp r4d_hsimd.cpp)
+# The relayouts' hot loops, once per CPU level (r4d_hsimd.h); r4d_hsimd.cpp picks one at runtime.
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/RadSimdLevels.cmake)
+rad_simd_level_objects(r4d_hsimd ${CMAKE_CURRENT_SOURCE_DIR}/r4d_hsimd_kernels.cpp R4D_HSIMD_OBJS
+                       DEFINE R4D_HSIMD_LEVEL INCLUDES ${CMAKE_CURRENT_SOURCE_DIR})
+list(APPEND R4D_DECLARATION ${R4D_HSIMD_OBJS})
 
 rad_add_plugin(libr4d kernels
   SOURCES     ${R4D_DECLARATION}

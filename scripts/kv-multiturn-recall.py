@@ -32,8 +32,8 @@ MODEL = os.environ.get("MODEL", "/models/qwen3.8-next-flash-fp8-iq4r-moe.rad")
 OUT = os.environ.get("OUT", "/tmp/radiance-kv-multiturn")
 BASE = ["--model", MODEL, "--tp", "2", "--tp-wire", "exact", "--max-num-seqs", "2",
         "--max-model-len", "65536",
-        "--placement", "expert_tiered", "--host-pool-mib", "23652", "--gpu-headroom-mib", "96",
-        "--kv-cache-dtype", "fp8", "--prefix-cache-mib", "1024", "--prefix-cache-ttl", "0",
+        "--placement", "expert_tiered", "--host-pool-mib", "47304", "--gpu-headroom-mib", "96",
+        "--kv-cache-dtype", "i8", "--prefix-cache-mib", "1024", "--prefix-cache-ttl", "0",
         "--vision-tower-placement", "ram", "--num-speculative-tokens", "0", "--deterministic",
         "--host", "127.0.0.1", "--api-key", "test"]
 
@@ -120,7 +120,7 @@ class Server:
             "--device", "/dev/kfd", "--device", "/dev/dri", "--group-add", "990", "--group-add", "44",
             "--security-opt", "seccomp=unconfined", "--network", "host",
             "-v", f"{ROOT}:/src", "-v", f"{MODELS}:/models", "-w", "/src", "rad-toolchain:latest",
-            "bash", "-lc", f"RADIANCE_HOME={BUILD}/radiance_home {BUILD}/bin/radiance " + " ".join(self.flags)],
+            "bash", "-lc", f"RADIANCE_HOME={BUILD}/radiance_home /src/scripts/radiance-flags {BUILD}/bin/radiance " + " ".join(self.flags)],
             stdout=open(self.logf, "w"), stderr=subprocess.STDOUT)
         t0 = time.time()
         while time.time() - t0 < 300:

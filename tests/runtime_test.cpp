@@ -133,6 +133,15 @@ static const RadOpSchema g_moe_schema = {
     "moe_gemm", g_gemm_params, 4, g_moe_opds, 3, "A[M,K] x B[e][N,K]^T -> Y[M,N]"
 };
 
+/* A grouped GEMM over two tables, as a routed layer's classes of experts are. */
+static const RadOperandSpec g_moe2_opds[] = {
+    { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_WTAB, 0 }, { "c", RAD_OPD_WTAB, 0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
+static const RadOpSchema g_moe2_schema = {
+    "moe_gemm2", g_gemm_params, 4, g_moe2_opds, 4, "A[M,K] x {B, C}[e][N,K]^T -> Y[M,N]"
+};
+
 static uint16_t g_weight_bytes[64];   /* somewhere for WeightInfo::ptr to point */
 static uint16_t g_moved_bytes[64];    /* where a "relocated" weight lives */
 
@@ -361,6 +370,53 @@ TEST(arena_offsets_and_operand_offsets) {
     CHECK_EQ(g_rec[0].t[1].shape[0], (int64_t)8);
     CHECK_EQ(g_rec[0].t[1].shape[1], (int64_t)4);
     CHECK_EQ((int)g_rec[0].t[1].dtype, (int)RAD_BF16);
+}
+
+
+/* Check the operand delivered to a kernel, rather than only its replacement descriptor. */
+TEST(generator_replacement_slots_bind_without_changing_the_base_weight) {
+    Fixture f;
+    uint16_t base[4] = {0x3f80,0x4000,0x4040,0x4080}; // BF16 1,2,3,4.
+    const uint16_t slot_values[8] = {0x4120,0x4130,0x4140,0x4150,
+                                     0x41a0,0x41a8,0x41b0,0x41b8};
+    const rad_weight w = f.add_weight("projector.weight", RAD_BF16, 1, 4, base);
+    const rad_buf x = f.add_buffer("x", RAD_BF16, 1, 4, 0);
+    const rad_buf y = f.add_buffer("y", RAD_BF16, 1, 1, 128);
+    const rad_buf slots = f.add_buffer("replacement.slots", RAD_BF16, 2, 4, 256);
+    auto& replacement = f.P.lora_replacements[w];
+    replacement.slots = slots; replacement.rows = 4; replacement.row_mixer = true;
+    const rad_op op = f.add_op("gemm_nt", "M", {16}, {k_m16}, {"replacement"},
+                               &g_gemm_schema, {w});
+    f.P.ops[op].base.set_i("N", 1);
+    f.P.ops[op].bands[0].dom[RAD_DOMAIN_DEVICE].geom.set_i("N", 1);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    auto* packed = static_cast<uint16_t*>(f.ctx.buf_ptr(slots));
+    REQUIRE(packed);
+    std::memcpy(packed, slot_values, sizeof(slot_values));
+    f.batch.gen = 1;
+    int tick = 0;
+    for (const int slot : {-1,0,1,-1}) {
+        f.ctx.set_gen_lora_slot(slot);
+        g_rec.clear();
+        CHECK_OK(f.step(1, tick++, [&](Ctx& ctx) {
+            RadOperand operands[3] = {RAD_B(x), RAD_W(w), RAD_B(y)};
+            CHECK_OK(ctx.issue(op, operands, 3, RAD_N_BATCH));
+        }));
+        REQUIRE_EQ(g_rec.size(), size_t(1));
+        const uint16_t* expected = slot < 0 ? base : slot_values + 4 * slot;
+        REQUIRE(g_rec[0].t[1].data == (slot < 0 ? base : packed + 4 * slot));
+        CHECK_EQ(g_rec[0].t[1].dtype, uint32_t(RAD_BF16));
+        auto* actual = static_cast<const uint16_t*>(g_rec[0].t[1].data);
+        for (int i = 0; i < 4; ++i) CHECK_EQ(actual[i], expected[i]);
+        CHECK(f.ctx.weight_ptr(w) == base);
+        CHECK_EQ(base[0], uint16_t(0x3f80));
+    }
+    f.ctx.set_gen_lora_slot(2);
+    CHECK_EQ(f.step(1, tick, [&](Ctx& ctx) {
+        RadOperand operands[3] = {RAD_B(x), RAD_W(w), RAD_B(y)};
+        ctx.issue(op, operands, 3, RAD_N_BATCH);
+    }), RAD_E_STATE);
+    f.ctx.set_gen_lora_slot(-1);
 }
 
 /* rows > 0 narrows dim 0 and leaves every stride alone. That is how a prefill chunk of `rows`
@@ -628,6 +684,84 @@ TEST(a_weight_table_resolves_only_the_entries_that_moved) {
     CHECK(v[2] == (void*)moved_expert);
 }
 
+/* An op's tables are patched together. A routed GEMM names a table a class of experts, and a pass
+ * the stager armed for moves a few entries of each at every issue: the entries that moved go out
+ * in one dispatch for the op, not one a table, as long as they fit a patch block; a second block
+ * is dispatched when they do not, and every entry lands either way. */
+TEST(an_ops_weight_tables_are_patched_in_one_dispatch) {
+    constexpr int kE = 32;                       /* experts a table */
+    static uint16_t home[2 * kE][8], away[2 * kE][8];
+    Fixture f;
+    std::vector<rad_weight> w;
+    for (int e = 0; e < 2 * kE; ++e)
+        w.push_back(f.add_weight(("blk.0.e" + std::to_string(e)).c_str(), RAD_BF16, 8, 4, home[e]));
+    rad_buf x = f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_buf y = f.add_buffer("y", RAD_BF16, 64, 8, 1024);
+    rad_op  op = f.add_op("moe_gemm2", "M", { 8192 }, { k_pre }, { "prefill" }, &g_moe2_schema, w);
+    f.P.ops[op].weight_opd.assign((size_t)kE, 1);
+    f.P.ops[op].weight_opd.insert(f.P.ops[op].weight_opd.end(), (size_t)kE, 2);
+
+    TableResidency res;
+    res.slot.assign(f.P.weights.size(), rad::WeightSlot{});
+    for (int e = 0; e < 2 * kE; ++e) res.slot[(size_t)w[(size_t)e]].ptr = home[e];
+    CHECK_OK(f.start(&res));
+
+    auto issue = [&](int step_no) {
+        g_rec.clear();
+        CHECK_OK(f.step(4, step_no, [&](Ctx& c) {
+            RadOperand opd[4] = { RAD_B(x), RAD_WTAB(w[0], kE), RAD_WTAB(w[(size_t)kE], kE),
+                                  RAD_B(y) };
+            CHECK_OK(c.issue(op, opd, 4, RAD_N_BATCH));
+        }));
+        REQUIRE_EQ(g_rec.size(), (size_t)1);
+    };
+    /* The two device tables as the kernel would read them, behind the step's stream. */
+    auto entries = [&]() {
+        std::vector<void*> v((size_t)(2 * kE), nullptr);
+        for (int t = 0; t < 2; ++t)
+            CHECK_OK(rad_memcpy_async(v.data() + t * kE, g_rec[0].t[1 + t].data,
+                                      kE * sizeof(void*), f.ctx.stream()));
+        CHECK_OK(rad_stream_sync(f.ctx.stream()));
+        return v;
+    };
+    auto where = [&](const std::vector<void*>& v, int e) { return v[(size_t)e]; };
+
+    /* The first issue uploads both tables whole: no patch. */
+    issue(0);
+    CHECK_EQ(f.ctx.wtab_patches(), (int64_t)0);
+    std::vector<void*> v = entries();
+    for (int e = 0; e < 2 * kE; ++e) CHECK(where(v, e) == (void*)home[e]);
+
+    /* Three entries of the first table and two of the second move: one dispatch carries all. */
+    for (int e : { 1, 7, 30, kE + 0, kE + 31 }) res.move(w[(size_t)e], away[e]);
+    issue(1);
+    CHECK_EQ(f.ctx.wtab_patches(), (int64_t)1);
+    v = entries();
+    for (int e = 0; e < 2 * kE; ++e) {
+        const bool moved = e == 1 || e == 7 || e == 30 || e == kE || e == kE + 31;
+        CHECK(where(v, e) == (moved ? (void*)away[e] : (void*)home[e]));
+    }
+
+    /* Nothing moved: nothing is dispatched. */
+    issue(2);
+    CHECK_EQ(f.ctx.wtab_patches(), (int64_t)1);
+
+    /* More than a block's worth across the two tables (every entry back or away): the first full
+     * block goes out while the tables are walked, the rest before the launch. */
+    for (int e = 0; e < 2 * kE; ++e) {
+        const bool at_home = !(e == 1 || e == 7 || e == 30 || e == kE || e == kE + 31);
+        res.move(w[(size_t)e], at_home ? (void*)away[e] : (void*)home[e]);
+    }
+    issue(3);
+    const int64_t blocks = (2 * kE + rad::kWtabPatch - 1) / rad::kWtabPatch;
+    CHECK_EQ(f.ctx.wtab_patches(), (int64_t)1 + blocks);
+    v = entries();
+    for (int e = 0; e < 2 * kE; ++e) {
+        const bool at_home = e == 1 || e == 7 || e == 30 || e == kE || e == kE + 31;
+        CHECK(where(v, e) == (at_home ? (void*)home[e] : (void*)away[e]));
+    }
+}
+
 /* A table's run is fixed by the declaration. The weights declared at a table position (OpInfo::
  * weight_opd) are bound as one table before the first step. A declared run with a gap is refused
  * there (the kernel strides from one base, so a gap reads the wrong expert), and an issue naming
@@ -822,6 +956,47 @@ TEST(a_bank_is_credited_once_for_every_pass_of_its_step) {
     CHECK_OK(f.step(1, 9, report));
     CHECK_OK(f.step(1, 9 + rad::kRouteBanks, report));
     CHECK_EQ(f.ctx.route_dropped(), (uint64_t)1);
+}
+
+/* A plugin's routing table (rad_route_table) is the card-side rows: a layer's row is the table's,
+ * a report naming it is read from there at the end of the pass, and a report naming another
+ * buffer is copied into it. A table short of a row per reporting layer is refused at bind. */
+TEST(a_routing_table_holds_the_card_side_rows) {
+    Fixture f;
+    f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    const rad_buf tab = f.add_buffer("ecnt", RAD_I32, 2, 4, 1024);
+    f.P.route_table = tab;
+    CHECK_OK(f.start());
+    int32_t* const rows = (int32_t*)f.ctx.buf_ptr(tab);
+    REQUIRE(rows != nullptr);
+    CHECK(f.ctx.route_counts(0, 4) == rows);
+    CHECK(f.ctx.route_counts(1, 4) == rows + 4);
+
+    const int32_t in_place[4] = { 5, 0, 2, 1 };
+    std::memcpy(rows + 4, in_place, sizeof in_place);
+    RadRouting r{};
+    r.n_expert = 4;
+    r.top_k = 2;
+    r.expert_count = rows + 4;
+    CHECK_OK(f.step(1, 0, [&](Ctx& c) { CHECK_OK(c.route_report(1, &r)); }));
+    int b = -1;
+    while ((b = f.ctx.next_histogram(1, -1, 1)) < 0) std::this_thread::yield();
+    const int32_t* h = f.ctx.last_histogram(1, b);
+    CHECK(h != nullptr);
+    if (h) { CHECK_EQ(h[0], 5); CHECK_EQ(h[2], 2); CHECK_EQ(h[3], 1); }
+
+    static const int32_t elsewhere[4] = { 9, 8, 7, 6 };
+    r.expert_count = elsewhere;
+    CHECK_OK(f.step(1, 1, [&](Ctx& c) { CHECK_OK(c.route_report(0, &r)); }));
+    CHECK_OK(rad_stream_sync(f.ctx.stream()));
+    CHECK_EQ(rows[0], 9);
+    CHECK_EQ(rows[3], 6);
+    CHECK_EQ(rows[4], 5);                    /* the other layer's row is untouched */
+
+    Fixture g;
+    g.add_buffer("x", RAD_BF16, 64, 4, 0);
+    g.P.route_table = g.add_buffer("ecnt", RAD_I32, 1, 4, 1024);
+    CHECK_EQ(g.start(), RAD_E_SHAPE);
 }
 
 /* Every event the context creates at bind is one Ctx::shutdown destroys: the routing ring holds
@@ -2296,6 +2471,36 @@ TEST(a_host_op_reads_what_an_earlier_device_op_wrote_to_the_host_arena) {
     CHECK_EQ(f.ctx.host_syncs(), (int64_t)3);
 }
 
+/* The same in a recorded pass, at every play: the host op waits for the device op the play just
+ * submitted, whatever the pass was entered with. This pass leaves no host-arena touch pending
+ * (its host op joined the only one), so every pass after the first is entered with none; a play
+ * that went by the mark at entry ran the host op at once, on the poison. The host backend records
+ * no tape and runs every round live. */
+TEST(a_played_pass_joins_its_host_op_to_the_device_op_it_replays) {
+    ord_setup();
+    Fixture f;
+    rad_buf hb = f.add_buffer("ids", RAD_I32, 4, 1, 0);
+    f.P.buffers[hb].decl.domain = RAD_DOMAIN_HOST;
+    rad_op dev = f.add_op("rope", "M", { 8192 }, { k_late_write }, { "late_write" }, nullptr, {});
+    rad_op hst = host_op(f, k_host_read, "host_read");
+    CHECK_OK(f.start(nullptr, false, /*record=*/true));
+    REQUIRE(f.ctx.set_op_domain(hst, RAD_DOMAIN_HOST) == RAD_OK);
+    f.batch.phase = RAD_PHASE_DECODE;
+    for (int round = 0; round < 8; ++round) {
+        *g_ord_value = 2000 + round;
+        *(int32_t*)f.ctx.buf_ptr(hb) = -7;            /* the poison */
+        g_ord_seen = -1;
+        CHECK_OK(f.step(1, round, [&](Ctx& c) {
+            const RadOperand o[1] = { RAD_B(hb) };
+            CHECK_OK(c.issue(dev, o, 1, RAD_N_BATCH));
+            CHECK_OK(c.issue(hst, o, 1, RAD_N_BATCH));
+        }));
+        CHECK_EQ(g_ord_seen, 2000 + round);
+        CHECK_OK(rad_stream_sync(f.ctx.stream()));
+    }
+    if (f.ctx.records_passes()) CHECK(f.ctx.pass_counts().played > 0);
+}
+
 /* A host op naming memory the arena does not track (a raw pointer) cannot know which device op
  * wrote it, so it drains the stream first and still reads the written value. */
 TEST(a_host_op_on_untracked_memory_drains_the_stream_first) {
@@ -2473,6 +2678,49 @@ TEST(issue_passes_only_proven_kv_host_summaries) {
     CHECK_EQ(issue(used_device + 1, 1, 2, RAD_PHASE_DECODE, 0), 2050);
     CHECK_EQ(issue(used_device, 3, 2, RAD_PHASE_DECODE, 1), -1);   // still nothing to bound
     CHECK_EQ(issue(used_device, 2, 2, RAD_PHASE_PREFILL, 0), 1152); // prefill keeps the exact one
+}
+
+/* Under an architecture's pass-key callback as without one, a decode, verify or draft launch reads
+ * the step's keyed context bound, so those passes record; a prefill launch keeps the exact
+ * maximum that the callback keys. */
+TEST(an_arch_keyed_program_issues_decode_passes_at_the_keyed_bound) {
+    Fixture f;
+    rad_op op = f.add_op("rope", "M", { 8192 }, { k_pre }, { "prefill" }, nullptr, {});
+    CHECK_OK(f.start(nullptr, false, false, test_prefill_geometry_key));
+
+    int32_t used_device[2] = { 896, 1152 }, used_host[2] = { 896, 1152 };
+    RadKVGroupBatch kv{};
+    kv.group = 1;
+    kv.seqused = used_device;
+    kv.seqused_h = used_host;
+    int32_t used_max[1] = { 1152 };
+    f.batch.n_kv_groups = 1;
+    f.batch.kv = &kv;
+    f.batch.kv_used_max_h = used_max;
+    f.batch.max_ctx_len = 2048;
+    f.batch.max_q_len = 2;
+
+    auto issue = [&](int phase, int n_spec, int draft_pass) -> int32_t {
+        f.batch.phase = phase;
+        f.batch.n_tok = 4;
+        f.batch.n_seq = 2;
+        f.batch.n_spec = n_spec;
+        f.batch.draft_pass = draft_pass;
+        g_rec.clear();
+        g_body = [&](Ctx& c) {
+            const RadOperand arg[1] = { RAD_P_T2(used_device, RAD_I32, 2, 1) };
+            (void)c.issue(op, arg, 1, RAD_N_BATCH);
+        };
+        const int status = f.ctx.run_step(&f.batch);
+        g_body = nullptr;
+        if (status < 0 || g_rec.size() != 1) return -999;
+        return g_rec[0].kv_used_max_h;
+    };
+    CHECK_EQ(issue(RAD_PHASE_DECODE, 0, 0), 2050);
+    CHECK_EQ(issue(RAD_PHASE_DECODE, 1, 0), 2050);
+    CHECK_EQ(issue(RAD_PHASE_DECODE, 0, 1), 2050);
+    CHECK_EQ(issue(RAD_PHASE_PREFILL, 0, 0), 1152);
+    CHECK_EQ(issue(RAD_PHASE_MIXED, 0, 0), 1152);
 }
 
 TEST(the_prefill_geometry_key_reuses_equal_grids_and_separates_changed_grids) {
@@ -2776,7 +3024,11 @@ OracleRun oracle_run(rad::Registry* reg, const char* env, RadLaunchFn dev, RadLa
         if (out.status < 0) return;
         float* pa = (float*)f.ctx.buf_ptr(a);
         float* pb = (float*)f.ctx.buf_ptr(b);
-        for (int i = 0; i < 32; ++i) { pa[i] = (float)i; pb[i] = 0.5f * (float)i; }
+        /* The output starts at a value no kernel here writes: the arena is fresh heap memory, and
+         * leftover bytes that equal the first launch's result (a freed arena of an earlier run
+         * holds exactly that) make repeat mode see an output that never changed. */
+        float* py = (float*)f.ctx.buf_ptr(y);
+        for (int i = 0; i < 32; ++i) { pa[i] = (float)i; pb[i] = 0.5f * (float)i; py[i] = -1.0f; }
         out.status = f.step(4, 0, [&](Ctx& c) {
             CHECK_OK(c.set_lane(lane));
             const RadOperand o[3] = { RAD_B(a), RAD_B(b), RAD_B(y) };

@@ -86,10 +86,10 @@ run_arm() {
   local log="$OUT/$arm.log" req="$OUT/$arm.req.json" resp="$OUT/$arm.json"
   local envs=("$@")
   echo "== $arm: $flags ${envs[*]:-} =="
-  ( exec env "${envs[@]}" "$BIN" --model "$MODEL" \
+  ( exec env "${envs[@]}" "$ROOT/scripts/radiance-flags" "$BIN" --model "$MODEL" \
       --tp 2 --tp-wire exact \
-      --max-num-seqs 1 --max-model-len "$MAXLEN" --placement expert_tiered --host-pool-mib 23652 \
-      --kv-cache-dtype fp8 --prefix-cache-mib 4096 --vision-tower-placement ram \
+      --max-num-seqs 1 --max-model-len "$MAXLEN" --placement expert_tiered --host-pool-mib 47304 \
+      --kv-cache-dtype i8 --prefix-cache-mib 4096 --vision-tower-placement ram \
       --num-speculative-tokens 0 --deterministic \
       $flags --host 127.0.0.1 --port "$PORT" --api-key test ) > "$log" 2>&1 &
   SERVER_PID=$!

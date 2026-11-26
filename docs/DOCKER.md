@@ -72,9 +72,22 @@ docker run --rm --device /dev/kfd --device /dev/dri --security-opt seccomp=uncon
 
 ## Run it
 
-The entrypoint is `radiance`. The other installed tools (`rad-convert`, `rad-info`, `rad-kbench`,
-`rad-tune`, `rad-schemas`, `rad-tokcheck`) are on `PATH`, and the recipes are in
+The entrypoint is `radiance`, which reads its settings from a YAML file named by `--config`
+([`docs/GUIDE.md`](GUIDE.md) §4, [`docs/MULTIMODEL.md`](MULTIMODEL.md) §4). The other installed tools (`rad-convert`, `rad-info`, `rad-kbench`,
+`rad-tune`, `rad-schemas`, `rad-tokcheck`, `rad-yaml`, and `rad-export`, which runs on the host
+since the image has no Python) are on `PATH`, and the recipes are in
 `/opt/radiance/share/radiance/recipes/`.
+
+```yaml
+# /srv/radiance/radiance.yaml
+server:
+  host: "::"
+  port: 8000
+models:
+  m:
+    model: /models/m.rad
+    tp: 2
+```
 
 ```sh
 docker run --rm -v /srv/models/rad:/models:ro --entrypoint rad-info radiance /models/m.rad
@@ -84,7 +97,8 @@ docker run -d --name radiance --network host --init --ulimit memlock=-1 \
     --group-add "$(getent group render | cut -d: -f3)" \
     --group-add "$(getent group video | cut -d: -f3)" \
     -v /srv/models/rad:/models:ro \
-    radiance --model /models/m.rad --tp 2 --host :: --port 8000
+    -v /srv/radiance/radiance.yaml:/etc/radiance/radiance.yaml:ro \
+    radiance --config /etc/radiance/radiance.yaml
 ```
 
 The options:
@@ -93,14 +107,16 @@ The options:
   the GPUs.
 - `--security-opt seccomp=unconfined`: Docker's default seccomp profile refuses io_uring and the
   NUMA binding calls the ROCm runtime makes for host memory. Qwen3.8-Flash-Next's n-gram embedding
-  table is read from the container through io_uring, so without this the model cannot serve.
+  table is read from the container through io_uring. Without this flag the table reads fall back
+  to synchronous pread: the model starts and serves, the n-gram reads are slower. The flag keeps
+  the fast path.
 - `--init`: an init process runs as PID 1 and forwards SIGTERM to the engine, which finishes its
   step and releases the cards.
 - `--ulimit memlock=-1`: where no device kernel gathers the n-gram table (a run on the host
-  backend), `--ngram-placement ram` locks a copy of it in RAM (47.7 GiB for Qwen3.8-Flash-Next, far
+  backend), `ngram-placement: ram` locks a copy of it in RAM (47.7 GiB for Qwen3.8-Flash-Next, far
   past Docker's default memlock limit). Without the limit raised, `auto` reads the table from the
   container and `ram` refuses the start. On the cards the copy is pinned memory the cards read,
-  which the limit does not count. `deploy/compose/common.yaml` sets it.
+  which the limit does not count. The compose files set it.
 - `--network host`: the server binds the host's addresses directly, IPv4 and IPv6, with no NAT in
   front of it.
 
@@ -113,7 +129,7 @@ and put first on the search path; nothing in the image changes:
 ```sh
 docker run ... -v /srv/radiance-plugins:/plugins:ro \
     -e RADIANCE_HOME=/plugins:/opt/radiance/share/radiance \
-    radiance --model /models/m.rad
+    radiance --config /etc/radiance/radiance.yaml
 ```
 
 `/plugins` holds any of `kernels/`, `architectures/` and `quantizers/`, built against the same
@@ -123,80 +139,55 @@ the cards the engine runs on.
 
 ## Compose
 
-`deploy/compose/` has one file per model and a `common.yaml` that each of them extends:
+`deploy/compose/` has two compose files, `tp1.yaml` for one card (`RADIANCE_GPU` names
+it) and `tp2.yaml` for two, each with the server's configuration in a file beside it
+(`tp1.radiance.yaml`, `tp2.radiance.yaml`). Each runs one container that serves eleven models behind one port and
+brings a model onto the cards when a request names it, parking or unloading others to make room
+([`docs/MULTIMODEL.md`](MULTIMODEL.md));
+[`deploy/compose/README.md`](../deploy/compose/README.md) lists the models of each.
 
-| file | container | what it is |
-|---|---|---|
-| `flashnext.yaml` | `qwen3.8-next-flash-fp8-iq4r-moe.rad` | Qwen3.8-Flash-Next, 4-bit codebook experts and an int8 trunk; MTP depth 3; finished conversations kept in host memory (`--prefix-cache-mib`) |
-| `flashnext-tp1.yaml` | `qwen3.8-next-flash-fp8-iq4r-moe.rad` | The same on one card: a 42 GiB pinned host pool for the experts that do not fit, 4096-token prefill steps, 4 sequences |
-| `flashnext-bf16.yaml` | `qwen3.8-flash-next-bf16.rad` | Qwen3.8-Flash-Next in bf16, streamed from the disk tier. A reference, not a production server |
-| `qwen3.6-35b-a3b.yaml` | `qwen3.6-35b-a3b-fp8.rad` | Qwen3.6-35B-A3B, FP8 |
-| `ornith-1.5-35b-a3b.yaml` | `ornith-1.5-35b-a3b-fp8.rad` | Ornith-1.5-35B-A3B, FP8, MTP, vision |
-| `ornith-1.5-35b-a3b-w4a8.yaml` | `ornith-1.5-35b-a3b-w4a8.rad` | Ornith-1.5-35B-A3B with four-bit experts (GPTQ), a block-FP8 trunk, MTP, vision |
-| `ornith-1.5-35b-a3b-w4a8-tp1.yaml` | `ornith-1.5-35b-a3b-w4a8.rad` | The same on one card, every weight in VRAM |
-| `ornith-1.5-122b.yaml` | `ornith-1.5-122b-fp8.rad` | Ornith-1.5-122B, FP8, MTP, vision, on four cards with a 3 GiB pinned host pool per card and the vision tower in host memory |
-| `ornith-1.5-122b-df2.yaml` | `ornith-1.5-122b-fp8-dflash2.rad` | The same with incoai's DFlash2 drafter in place of the MTP head |
-| `ornith-1.5-122b-w4a8.yaml` | `ornith-1.5-122b-w4a8.rad` | Ornith-1.5-122B with four-bit experts (GPTQ), a block-FP8 trunk, MTP, vision, every weight in VRAM on four cards |
-| `ornith-1.5-122b-w4a8-df2.yaml` | `ornith-1.5-122b-w4a8-dflash2.rad` | The same with incoai's DFlash2 drafter in place of the MTP head |
-| `sage-a1.5.yaml` | `sage-a1.5-fp8.rad` | Sage-A1.5, FP8, MTP, vision |
-| `sage-a1.5-tp1.yaml` | `sage-a1.5-fp8.rad` | The same on one card: the expert plane partly in an 8 GiB pinned host pool, one 262,144-token session |
-| `sage-a1.5-df2.yaml` | `sage-a1.5-fp8-df2.rad` | Sage-A1.5 with incoai's Qwen3.6-35B-A3B DFlash2 drafter in place of the MTP head, vision |
-| `sage-a1.5-mxfp4-df2.yaml` | `sage-a1.5-mxfp4-df2.rad` | The same with the trunk, the experts and the drafter at MXFP4; ten 262,144-token sessions |
-| `qwen3.8-27b-fp8.yaml` | `qwen3.8-27b-fp8.rad` | Qwen3.8-27B FP8 with its DFlash2 drafter and vision tower |
-| `qwen3.8-27b-mxfp4.yaml` | `qwen3.8-27b-mxfp4.rad` | Qwen3.8-27B with AMD's Quark AWQ-MXFP4 trunk, its DFlash2 drafter and vision tower |
-| `qwen3.8-27b-iqr-v4.yaml` | `qwen3.8-27b-${IQR_V4}.rad` | Qwen3.8-27B in IQR-V4 at the size `IQR_V4` names (default `iq4r-s-v4`), its DFlash2 drafter and vision tower |
-| `qwen3.8-27b-paro.yaml` | `qwen3.8-27b-paro-int4.rad` | Qwen3.8-27B ParoQuant int4 (learned rotations) with its DFlash2 drafter and vision tower, on one card; the int5 and MXFP4 containers serve from it too |
-| `qwen3.8-27b-bf16.yaml` | `qwen3.8-27b-bf16.rad` | Qwen3.8-27B in bf16 |
-| `gemma4-31b-w4a8.yaml` | `gemma4-31b-w4a8.rad` | Gemma 4 31B, int4 trunk with int8 activations, its assistant head as the MTP drafter, vision tower |
-| `gemma4-31b-heretic-ara-w4a8.yaml` | `gemma4-31b-heretic-ara-w4a8.rad` | The same for Gemma 4 31B heretic-ara (refusals removed) |
-| `gemma4-12b-bf16.yaml` | `gemma4-12b-bf16.rad` | Gemma 4 12B in bf16, its assistant head as the MTP drafter, pictures and audio through the 12B's embedders, on two cards |
-| `gemma4-12b-i8g.yaml` | `gemma4-12b-i8g.rad` | The same with the trunk at int8 (i8a8), on one card |
-| `nemotron-3.5-bolt-e4b-bf16.yaml` | `nemotron-3.5-bolt-e4b-bf16.rad` | NVIDIA-Nemotron-3.5-Bolt-E4B (Gemma 4 E4B) in bf16 with NVIDIA's DFlash drafter, the vision tower in pinned host memory, on one card |
-| `nemotron-3.5-bolt-e4b-i8g.yaml` | `nemotron-3.5-bolt-e4b-i8g.rad` | The same with the trunk at int8 (i8a8) |
-| `nemotron-3.5-bolt-e4b-a4.yaml` | `nemotron-3.5-bolt-e4b-a4.rad` | The same with the feed-forward at four bits (GPTQ), attention and layers 19-23 at i8a8 |
-| `nemotron-3.5-bolt-74b-w4a8.yaml` | `nemotron-3.5-bolt-74b-w4a8.rad` | NVIDIA-Nemotron-3.5-Bolt-74B-A9B with four-bit experts and a block-FP8 trunk, NVIDIA's LiLiCorr drafter, vision, on two cards |
-| `nemotron-3.5-bolt-74b-fp8.yaml` | `nemotron-3.5-bolt-74b-fp8.rad` | NVIDIA-Nemotron-3.5-Bolt-74B-A9B in block FP8 with NVIDIA's LiLiCorr drafter, vision, on four cards |
-| `translategemma-27b.yaml` | `translategemma-27b-mxfp4-gptq.rad` | TranslateGemma 27B MXFP4 with its chat template (`gemma3.jinja`) |
-| `glm53-flash.yaml` | `glm53-flash-mxfp4.rad` | GLM-5.3-Flash, MXFP4 experts and block-FP8 attention, on eight cards |
-| `minicpm5-2b.yaml` | `minicpm5-2b-fp8.rad` | MiniCPM5-2B FP8 with its DSpark drafter |
-| `minicpm5-2b-bf16.yaml` | `minicpm5-2b-bf16.rad` | MiniCPM5-2B in bf16 with its DSpark drafter |
-| `embeddinggemma2.yaml` | `embeddinggemma2-bf16.rad` | EmbeddingGemma 2 in bf16: text, image, video and audio embeddings on one card (`RADIANCE_GPU`) |
-| `qwen-image-2.1.yaml` | `qwen-image-2.1-fp8.rad` | Qwen-Image 2.1 as block fp8 on two cards: OpenAI's images API, generation and edits |
-| `qwen-image-2.1-turbo.yaml` | `qwen-image-2.1-turbo-fp8.rad` | Qwen-Image 2.1 Turbo, the same in 8 steps |
-| `krea-2-turbo.yaml`, `krea-2-raw.yaml` | `krea-2-turbo-fp8.rad`, `krea-2-raw-fp8.rad` | Krea 2 Turbo and Raw as block fp8: text to image on one card (`RADIANCE_GPU`) |
-| `anima.yaml` | `anima-aesthetic-fp8.rad` | Anima Aesthetic as block fp8: text to image on one card (`RADIANCE_GPU`); the Base and Turbo containers serve the same way |
-| `flux-3-klein.yaml` | `flux-3-klein-fp8.rad` | FLUX.3 [klein] as block fp8: generation and edits on one card (`RADIANCE_GPU`); the base container serves the same way |
-| `sdxl.yaml` | `illustrious-xl-v2.0-bf16.rad` | Stable Diffusion XL in bf16 (here Illustrious-XL v2.0; any single-file SDXL checkpoint converts the same way): text to image on one card (`RADIANCE_GPU`) |
-| `qwen3-asr-1.7b.yaml` | `Qwen3-ASR-1.7B-hf/` (the checkpoint) | Qwen3-ASR 1.7B: `/v1/audio/transcriptions` and live `/v1/realtime`, on one card (`RADIANCE_GPU`) |
-| `minimax-h3.yaml` | `minimax-h3-fp8.rad` | MiniMax-H3 as block fp8: video with its stereo soundtrack on `/v1/videos`, two cards and about 39 GiB of pinned host memory |
-| `fasth3.yaml` | `fasth3-8-step-v2-fp8.rad` | FastVideo's FastH3 8-Step V2, the same in eight steps |
-| `ltx-2.5.yaml` | `ltx-2.5-distilled-fp8.rad` | LTX-2.5 distilled as block fp8: video with its stereo soundtrack on `/v1/videos`, one card (`RADIANCE_GPU`), the text encoder in pinned host memory; the base container serves the same way |
-| `minimax-music3.yaml` | `minimax-music3-bf16.rad` | MiniMax-Music3 in bf16: songs from lyrics and a description on `/v1/audio/speech` |
-| `breeze-tts2.yaml` | `breeze-tts2-bf16.rad` | Breeze-TTS-2 in bf16: speech on `/v1/audio/speech` and live over `/v1/audio/speech/stream`, on one card (`RADIANCE_GPU`) |
+A compose file names its configuration as a compose config (top-level `configs:`, its `file:`
+the `.radiance.yaml` beside it), which Compose places in the container at
+`/etc/radiance/radiance.yaml`, read-only, where `command: --config /etc/radiance/radiance.yaml`
+names it. The configuration is plain radiance YAML: `radiance --config tp2.radiance.yaml --check`
+parses and validates it without serving (with `RADIANCE_API_KEY` set, since the file names it),
+and Compose substitutes nothing in it, so the port is the
+`server.port` the file states (8000), which the compose file's health check asks too. The API key
+stays in the container's environment, read through `server.api-key-env`, and never appears in the
+configuration. An entry's name under `models:` is the model id a request gives in `model`. Delete
+the entries of the containers you do not have; any other model is added as an entry with its keys
+from the table in [`README.md`](../README.md#run-without-docker) (a `memory:` key holds for the
+whole file). To change a setting, edit the model's entry.
 
-The container names are the files the README's model table downloads or converts.
+The entries carry no `priority`, so the model used least recently gives way to the one a request
+asks for. Priorities are strict: a model never displaces an idle one of higher priority, so with
+priorities on the small models MiniMax-Music3 and Hunyuan3D-2 waited out `scheduler.load-timeout`.
+On `tp1.yaml`, Flash-Next pins a 42 GiB expert pool in host memory and the fleet keeps 8 GiB of the
+host free; on a host with 61 GB of memory it is unloaded when another model loads and answered its
+next request after 17 to 19 s, loaded from its container again (its entry's `prefix-cache-mib: 1024`
+keeps its host pins within that host). Qwen-Image's `max-model-len` in both files keeps its cache
+grant within the cards beside the other models ([`README.md`](../README.md#run-without-docker)).
 
 Copy the directory to the serving host and fill in `.env` from `.env.example`. It sets the image,
-the models directory (mounted read-only at `/models`), the API key, the port, the user and GPU
-groups the server runs as, and the card a one-card model uses. The models directory must be on a
+the models directory (mounted read-only at `/models`), the API key, the user and GPU
+groups the server runs as, and the card `tp1.yaml` runs on. The models directory must be on a
 local filesystem that does direct I/O, such as ext4, XFS or btrfs: Qwen3.8-Flash-Next reads its
 n-gram table from the container that way. On btrfs with compression on, extents stored compressed
 are read through the page cache instead, which works but loses the benefit of direct reads; a
 container copied into a directory set `chattr +C` is stored uncompressed. Then:
 
 ```sh
-docker compose -f flashnext.yaml up -d      # start; restarts with the Docker daemon
-docker compose -f flashnext.yaml logs -f    # follow the log
-docker compose -f flashnext.yaml down       # stop
+docker compose -f tp2.yaml up -d      # start; restarts with the Docker daemon
+docker compose -f tp2.yaml logs -f    # follow the log
+docker compose -f tp2.yaml down       # stop
 ```
 
-Every model listens on the same port and most take both cards (`flashnext-tp1.yaml`,
-`ornith-1.5-35b-a3b-w4a8-tp1.yaml`, `qwen3.8-27b-paro.yaml`, the `nemotron-3.5-bolt-e4b-*.yaml` files and the files that read `RADIANCE_GPU` take one, the
-`ornith-1.5-122b*.yaml` files four, `glm53-flash.yaml` eight), so run one at a time: `down` one before `up` on another. The server runs as the host user given in `.env`. `/health`, `/ping` and
-the dashboard page answer without the API key, and the health check fetches `/health` with
-busybox's `wget`.
+`tp1.yaml` takes the same commands. The two files listen on the same port, so run one at a time:
+`down` one before `up` on the other. The server runs as the host user given in `.env`. `/health`,
+`/ping` and the dashboard page answer without the API key, and the health check fetches `/health`
+with busybox's `wget`.
 
 A container serving MiniMax-H3 also serves ComfyUI's Radiance MiniMax node
 (`integrations/comfyui/ComfyUI-Radiance-MiniMax`), a client of `/v1/videos`. With
-`--lora-dir /models/loras/h3` in the command, the node's adapter lists show the files under
+`lora-dir: /models/loras/h3` in the model's entry, the node's adapter lists show the files under
 `$RADIANCE_MODELS/loras/h3`.

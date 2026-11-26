@@ -3,7 +3,8 @@
 Every flag of every tool, with examples. Start with [GUIDE.md](GUIDE.md).
 
 Six binaries and the `rad-export` script are installed beside `radiance`; the shell harnesses
-live in `scripts/`:
+live in `scripts/`. The tools take command-line flags; the server itself reads only a YAML file
+(GUIDE.md §4), and [`rad-yaml`](#rad-yaml) writes that file from a server command line:
 
 | | |
 |---|---|
@@ -14,7 +15,8 @@ live in `scripts/`:
 | [`rad-tune`](#rad-tune) | benchmark each kernel's tunable space at this model's shapes, on this machine |
 | [`rad-schemas`](#rad-schemas) | print and diff the op schemas plugins declare |
 | [`rad-tokcheck`](#rad-tokcheck) | compare the tokeniser with its reference encoder and with HuggingFace's ids over real text, and time it |
-| [`radiance --kld-*`](#the-kl-mode) | KL divergence of a quantised model against the bf16 one, at every position of a corpus |
+| [`radiance`, `kld-*` keys](#the-kl-mode) | KL divergence of a quantised model against the bf16 one, at every position of a corpus |
+| [`rad-yaml`](#rad-yaml) | print the server's YAML file for a command line written for an earlier release |
 | [`scripts/`](#the-shell-harnesses) | bring a model up, measure it, assert on what comes back |
 
 [`rad-avx-check`](#rad-avx-check), which checks a host kernel library against libref without a GPU,
@@ -26,8 +28,9 @@ the same plugins, in the same hierarchy, through the same declare phase, so they
 as the engine does.
 
 Every tool that loads plugins honours `RADIANCE_HOME` and `RADIANCE_KERNELS`, and reads them, and
-`--kernels`, as the engine does. A numeric option takes a whole number, as the engine's do: `12k`,
-`auto` (where the option does not name it) or an empty value is refused with exit status 2.
+`--kernels`, as the engine does with `server.kernels`. A numeric option takes a whole number, as the
+engine's keys do: `12k`, `auto` (where the option does not name it) or an empty value is refused
+with exit status 2.
 
 ---
 
@@ -42,6 +45,12 @@ rad-info --plugins [--home DIRS]
       --vocab        print the vocab summary and its normaliser chain, and stop
       --profile N    print the top N entries of the expert profile (default 20, 0 = all)
       --recipe       print the recipe the container was converted with, and stop
+      --unreferenced [N]  print the byte ranges of at least N bytes (default 1048576)
+                     that no table and no plane names, one `offset bytes` a line, and
+                     stop: what `rad-convert --in-place --replace` left behind. Nothing
+                     reads them, so `fallocate --punch-hole` gives their disk back.
+      --planes GLOB  print the planes of every weight whose name the glob matches, one
+                     `offset bytes name` a line, and stop
       --plugins      print every plugin the $RADIANCE_HOME search path offers, as the
                      engine loads it, and stop
       --home DIRS    the search path for --plugins (default $RADIANCE_HOME)
@@ -77,7 +86,7 @@ flashnext-w4.rad
 
 The metadata table, the weight directory (grouped by layer and movement unit), the vocab and the
 expert profile follow. With `-v`, every weight is listed with its encoding
-(`fp8_e4m3*bf16[128x128]`, `i4*bf16[1x128]/fwht128`, `bf16`), its logical shape and what made it:
+(`i8*bf16[1x128]`, `i4*bf16[1x128]/fwht128`, `bf16`), its logical shape and what made it:
 the checkpoint as it stood, or the quantiser and options of the recipe rule that matched. Totals
 are given by encoding and by what made the weight.
 
@@ -87,6 +96,8 @@ rad-info --vocab m.rad                        # vocab + normaliser chain
 rad-info --recipe m.rad                       # the recipe, expanded, one rule a line
 rad-info -v m.rad | head -40                  # every tensor, its encoding, shape and planes
 rad-info --profile 0 m.rad                    # the whole expert-popularity profile
+rad-info --unreferenced m.rad                 # ranges nothing names: `offset bytes` lines
+rad-info --planes 'blk.3.ffn_down_exps.*' m.rad   # where those weights' planes sit
 rad-info --plugins                            # every plugin on the search path
 ```
 
@@ -115,22 +126,34 @@ rad-convert [options] <input> -o <model.rad>
       --config DIR     config.json, generation_config.json and tokenizer.json from DIR, for a
                        single-file checkpoint that ships none
       --imatrix F      llama.cpp imatrix: expert profile, column importances, error weighting
+      --chat-template F  a jinja template baked as the container's chat template, overriding
+                       the checkpoint's own (or its absence)
       --set K=V        a metadata key, seen by declare and written into the container. Repeatable
       --max-tok N      the max_tok declare is run at (default 8192)
       --max-ctx N      the context bound declare is run at. Default: the checkpoint's
                        training context
       --draft-model DIR  a drafter that ships as its own repository, merged under `draft.`
-      --kv-cache-dtype T  bf16 | fp8, the cache width declare is run at. Default: the first
-                       at which every op resolves; the container is the same at either
+      --kv-cache-dtype T  bf16 | i8, the cache width declare is run at. Default: the first of
+                       bf16, i8 at which every op resolves; the container is the same at either
       --max-spec N     the max_spec declare is run at (default 4, or the block a drafter
                        states; a number given here is used as given). 0 leaves the draft
                        head out
       --reuse FILE     copy every weight an earlier container holds identically
+      --reuse-only     with --reuse, refuse any selected weight without a matching source
       --changed FILE   with --reuse: checkpoint tensors (one name a line) that differ from
                        the --reuse container's source; every weight that reads one is converted
+      --lora FILE|DIR  a PEFT adapter merged into the checkpoint tensors it names before they
+                       are converted (W + strength * alpha/r * B @ A). Repeatable
+      --lora-strength F  the strength of every --lora (default 1)
+      --lora-map FILE  with --lora: a JSON map for adapters trained on other module names
       --in-place       with --reuse: extend that container instead of writing a new one
+      --replace GLOB   with --in-place: write the matching weights again past the end where
+                       their rule changed; the old planes stay as unreachable bytes
+      --defer GLOB     leave the matching weights out, for a later --in-place run to add
       --gpus LIST      the cards (HIP device numbers, comma separated) quantisers may run on;
                        large weights then run two at a time. The bytes are the host's
+      --gpu-workers N  with --gpus, prefer N OpenMP workers for small trellis GPTQ jobs;
+                       N must leave at least one worker for other jobs and cannot exceed the cards in --gpus
       --plan-only      declare, plan every weight's encoding, print the plan, and stop
       --report N       the worst N quantisation errors to print (default 20)
   -v, --verbose
@@ -159,24 +182,28 @@ decides the numbers:
 
 A recipe is an ordered list of rules from a logical weight name to a quantiser and its options.
 The first rule whose pattern matches decides. A weight no rule matches keeps the checkpoint's
-encoding, which must be one the engine serves as it is: bf16, f16, f32, or block-scaled FP8
-(`X.weight` with `X.weight_scale_inv`). Anything else is named and refused.
+encoding: plain f32, f16 or bf16, FP8 with a block or per-row scale plane, or Quark's MXFP4
+(`core/format/checkpoint.h`, "Trivial"), or an imported form. Anything else is named and refused.
+The plugins' declare then judges the planned encodings as the engine will: a block-fp8, MXFP4,
+M2XFP4 or ParoQuant trunk weight is refused there by name (`linear_retired`,
+`arch/common/rad_fp8.h`), so a release stored that way takes rules that re-quantise it.
 
 ```
 # PATTERN                      QUANTISER  OPTIONS
 blk.*.ffn_*_exps.*.weight      gptq       codes=i4 group=128 scale=bf16 transform=fwht128 calib=$CALIB
 blk.*.ple_ngram.weight         rtn        codes=fp8_e4m3 block=*x* scale=bf16 rule=fixed scale_value=1.99317932128906e-4
-output.weight                  rtn        codes=fp8_e4m3 block=128x128 scale=bf16
-blk.*.weight                   rtn        codes=fp8_e4m3 block=128x128 scale=bf16
+output.weight                  rtn        codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.attn_qg.weight           rtn        codes=i8 group=128 scale=bf16 clamp=sym rule=search
 ```
 
 A ParoQuant M2XFP4 checkpoint (`quant_method` `paroquant_m2xfp4`) is imported plane by plane: the
-codes, exponents and metadata bytes as shipped, the rotations as the encoding's `givens` tables.
+codes, exponents and metadata bytes as shipped, the rotations as the encoding's `givens` tables;
+a rule re-quantises each weight from that exact dequantisation.
 
 A pattern is a glob over the whole name: `*` crosses dots, `?` is one character. `$NAME` (or
 `${NAME}`) in an option is taken from the environment; an unset variable is refused. `--quant`
 adds rules ahead of the file's:
-`--quant 'output.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16'`. A quantiser that declines a
+`--quant 'output.weight=rtn:codes=i8,group=128,scale=bf16,clamp=sym'`. A quantiser that declines a
 weight leaves it in the checkpoint's encoding; `rtn` declines a rank-1 tensor, so a pattern that
 also matches a norm leaves the norm as it is.
 
@@ -189,18 +216,19 @@ also matches a norm leaves the norm as it is.
 | `gptq` | error feedback against the layer's input Hessian (`calib=DIR`, damped by `damp`, default 0.01 of its mean diagonal), scales fixed from the weight first; `act_order=1` quantises the columns by descending input energy and stores the permutation as the encoding's `perm` transform; `cd=N` adds N sweeps of coordinate descent after the loop, every code re-chosen at its conditional optimum against the same Hessian |
 | `awq` | each input column scaled by its activation magnitude to a searched power, then a per-block clip search, both against the Hessian; the column scales are the encoding's last scale level |
 | `autoround` | sign-gradient descent on a rounding offset per value and a range factor per block, against the Hessian; `iters` steps of N·K² multiply-adds each |
-| `paroquant` | a channel scaling and `stages` rounds of Givens pair rotations, learned against the Hessian, then AutoRound on the rotated weight; the encoding's `givens` transform |
-| `m2xfp4` | M2XFP's weight-side Sg-EM (arXiv 2601.19213): MXFP4 plus one metadata byte a group of 32, each subgroup of 8's extra mantissa k and the exponent's bias chosen by least squared error; its own scheme `m2xfp4` (spec.md), served by `gemm_nt_q` at dtype m2xfp4. `adaptive=0` pins the bias, `wide=1` widens it to {-2..2} |
+| `paroquant` | a channel scaling and `stages` rounds of Givens pair rotations, learned against the Hessian, then AutoRound on the rotated weight; the encoding's `givens` transform, which no architecture plugin of this build serves |
+| `m2xfp4` | M2XFP's weight-side Sg-EM (arXiv 2601.19213): MXFP4 plus one metadata byte a group of 32, each subgroup of 8's extra mantissa k and the exponent's bias chosen by least squared error; its own scheme `m2xfp4` (spec.md), which libref's `gemm_nt_q` reads at dtype m2xfp4 and the architecture plugins refuse at declare. `adaptive=0` pins the bias, `wide=1` widens it to {-2..2} |
 | `ggml` | `type=` one of llama.cpp's formats (q4_0, q4_1, q5_0, q5_1, q8_0, q2_K..q6_K, iq4_nl, iq4_xs, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq1_s, iq1_m), chosen by llama.cpp's own search, imatrix-weighted; the codes are byte for byte llama.cpp's, stored as each type's affine planes. iq2_xxs, iq2_xs and iq1_s need `--imatrix` |
 | `cast` | a float weight in another float dtype (`dtype=` f32, bf16, f16, fp8_e4m3, fp8_e5m2), no scale |
+| `bf16x12` | a bf16 weight packed losslessly in 12 bits and a quarter a value: the sign and mantissa as they are, the exponent as a 4-bit offset below the largest of its 32-value block. A block whose exponents span more than 15 (or hold an inf or NaN) is kept whole in an escape table sized `esc=` of the weight's blocks (default 0.004; at least 64 rows, at most a row a block); a weight with more such blocks, or a value that is not a bf16, is refused by name. A scheme of its own, decoded by its hook |
 | `import` | rad-convert's own, not a plugin: the numbers a quantised release ships, in the spelling the kernels read, instead of quantising again. `codes=uN` makes a symmetric grid's signed codes unsigned under a zero point of 2^(N-1); `zero=` is the zero plane's dtype (u4, u8); `scale=` the scale's (f16, bf16, f32), each shipped scale rounded to nearest; `block=RxC` repeats an FP8 scale shipped per row or per tensor over that block grid. It reads an imported integer grid (GPTQ, CT-INT4) or an FP8 weight with a scale per row or per tensor, refuses any other quantised form by name, and keeps a plain float weight as it is. The run reports per rule how many weights it re-expressed and how many scales the new dtype rounded |
 
-Every quantiser except `m2xfp4`, `ggml`, `cast` and `import` takes the grid options:
+Every quantiser except `m2xfp4`, `ggml`, `cast`, `bf16x12` and `import` takes the grid options:
 
 | option | |
 |---|---|
 | `codes` | `i2`..`i8`, `i16`, `i32` symmetric; `u1`..`u8`, `u16` with `zero=`; `fp8_e4m3`, `fp8_e5m2`, `fp6_e2m3`, `fp6_e3m2`, `fp4_e2m1` |
-| `table` | a codebook the codes index instead: `nf4`, `iq4nl`, `w4nl`, `w5nl`, `binary` (one bit), `ternary`, or the values, `;`-separated |
+| `table` | a codebook the codes index instead: `nf4`, `iq4nl`, `w4nl`, `w5nl`, `w6nl`, `binary` (one bit), `ternary`, or the values, `;`-separated |
 | `group=N` / `block=RxC` | where the scales sit; `*` is a whole extent |
 | `scale` | f32, bf16, f16, fp8_e4m3, e8m0; under `scale2` also an integer sub-scale, u4..u8, i6, i8 |
 | `scale2`, `group2` / `block2` | a second scale level the first is relative to (default the whole tensor) |
@@ -217,10 +245,12 @@ group=32 scale=u6 scale2=f16 group2=256`; a ternary BitNet weight is `table=tern
 A container can hold only what some kernel reads. The converter checks every planned encoding
 against the layout hooks of the kernels declare resolved and refuses one that no kernel accepts,
 so a grid libquant can write is usable only once a kernel library takes it. libr4d reads the plain
-floats; block-scaled fp8 and fp8 rows; int8 block rows (the W8A8 trunk and lm_head), plain or
-rotated (`i8*bf16[1x128]/fwht128`); the routed experts as fp8, int4 (`i4*bf16[1x128]/fwht128`) or
-the `w4nl`/`w5nl` codebooks under E4M3 scales ([MOE-W4.md](MOE-W4.md)); the dense w4, w8 and mxfp4
-GEMM rows; and the 2-bit draft head. Every encoding also decodes through the core, which the
+floats; fp8 rows (Flash-Next's mixing and MTP fc matrices, its n-gram table); int8 block rows (the
+W8A8 trunk and lm_head), plain or rotated (`i8*bf16[1x128]/fwht128`, IQ8R); the IQR forms
+([IQR.md](IQR.md)); the routed experts as int4 (`i4*bf16[1x128]/fwht128`), rotated int8, IQR or
+the `w4nl`/`w5nl`/`w6nl` codebooks under E4M3 scales ([MOE-W4.md](MOE-W4.md),
+[MOE-W6.md](MOE-W6.md)); the dense w4 and w8 GEMM
+rows and the MXFP4 rows a drafter's linears take; and the 2-bit draft head. Every encoding also decodes through the core, which the
 converter's error report, the oracle and the quantisers' tests use.
 
 The recipes for the containers this tree serves are in `data/recipes/`. `scripts/convfn.sh` and
@@ -236,30 +266,27 @@ CALIB=<calibration dir> rad-convert <Qwen3.8-Flash-Next checkpoint> \
     -o w4nl64-i8lm.rad --recipe data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe \
     --home $RADIANCE_HOME -v
 
-# A --quant rule goes ahead of the recipe's: the experts as plain int4 by GPTQ, under a recipe
-# whose own expert rule rounds to nearest
+# A --quant rule goes ahead of the recipe's: the experts as the rotated int4 plane by GPTQ in
+# place of the recipe's own expert rule
 CALIB=<calibration dir> rad-convert <Qwen3.8-Flash-Next checkpoint> -o flashnext-w4.rad \
     --quant 'blk.*.ffn_*_exps.*.weight=gptq:codes=i4,group=128,scale=bf16,transform=fwht128,calib=$CALIB' \
-    --recipe data/recipes/qwen4exp-w4-hc8m.recipe --home $RADIANCE_HOME -v
+    --recipe data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe --home $RADIANCE_HOME -v
 
-# A block-fp8 checkpoint needs no recipe: every weight is kept as it is. It needs no container
-# either (`radiance --model` serves the checkpoint directly) unless a tier only a container
-# has is wanted (GUIDE §3.4)
-rad-convert <Qwen3.8-27B-FP8 checkpoint> -o q38-27b-fp8.rad
-
-# A bf16 checkpoint of the same model, as that release's block fp8 (the recipe's header has the
-# --set keys that select the fp8 plugin)
-rad-convert <Qwen3.8-27B or a finetune> -o q38-27b-fp8.rad --recipe data/recipes/q38-27b-fp8block-df2.recipe \
-    --draft-model <DFlash2 checkpoint> --set quantization_config.quant_method=fp8 \
-    --set quantization_config.fmt=e4m3 --set "quantization_config.weight_block_size=128 128" \
-    --set quantization_config.activation_scheme=dynamic
+# A bf16 Qwen3.8-27B or a finetune in IQ8R with its DFlash2 drafter (the recipe's header has the
+# --set keys that select qwen35_w8a8)
+rad-convert <Qwen3.8-27B or a finetune> -o q38-27b-iq8r.rad --recipe data/recipes/q38-27b-iq8r-rtn.recipe \
+    --draft-model <DFlash2 checkpoint> --set quantization_config.quant_method=w8a8 \
+    --set quantization_config.fmt=fwht128
 
 # Check the plan without writing anything
 rad-convert $SRC -o /dev/null --recipe r.recipe --plan-only -v
 
-# Merge a drafter that ships as its own repository
-rad-convert <MiniCPM5-2B checkpoint> -o minicpm5-2b-dspark.rad \
-    --draft-model <MiniCPM5-2B-DSpark checkpoint> --recipe data/recipes/minicpm5-2b-dspark.recipe
+# Merge a drafter that ships as its own repository, the trunk and the drafter as IQ8R
+rad-convert <MiniCPM5-2B checkpoint> -o minicpm5-2b-iq8r.rad \
+    --draft-model <MiniCPM5-2B-DSpark checkpoint> --recipe data/recipes/minicpm5-2b-iq8r.recipe
+# ...or the trunk as the checkpoint ships it, the drafter IQ8R
+rad-convert <MiniCPM5-2B checkpoint> -o minicpm5-2b-bf16.rad \
+    --draft-model <MiniCPM5-2B-DSpark checkpoint> --recipe data/recipes/minicpm5-2b-bf16-dspark.recipe
 
 # Re-quantise only the experts of an existing container
 rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
@@ -275,8 +302,15 @@ rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
   declare and written into the container. A weight's storage format is not such a choice (the
   encoding is in the container and the plugin reads it there), but the serving plugin is: a
   `quantization_config.*` key re-derives the descriptor the plugin is chosen by. A bf16 checkpoint
-  whose recipe writes Qwen's block fp8 is therefore declared as that format and converted for the
-  fp8 plugin (`data/recipes/q38-27b-fp8block-df2.recipe` has the keys).
+  whose recipe writes IQ8R is therefore declared as `w8a8_fwht128` and converted for
+  `qwen35_w8a8` (`data/recipes/q38-27b-iq8r.recipe` has the keys).
+- `--chat-template F` bakes a jinja template as the container's chat template, overriding the
+  checkpoint's own or standing in for a release that ships none (trailing newlines stripped).
+- `--lora` merges a PEFT adapter into the checkpoint tensors it names before conversion, at
+  `--lora-strength` (default 1) times `alpha / r` where the adapter states one; each merged tensor
+  joins the `--changed` set, so `--reuse` never copies an unmerged weight. `--lora-map` maps an
+  adapter trained on other module names (prefixes to strip, and module patterns to their targets,
+  several targets splitting a fused projection's rows).
 - `--max-ctx`: some graphs depend on the context bound. Qwen4-Exp sizes its QSA buffers by it and
   refuses a `--max-tok` and context pair whose score plane would pass 2 GiB.
 - `--max-spec`: a container carries what the model can serve, so a draft head is written even when
@@ -287,9 +321,9 @@ rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
   repository supplies the config and tokenizer the plugin is sized by, and a second tokenizer.json
   (with its `tokenizer_config.json` beside it) becomes the container's second vocab section, which
   a generator declaring `aux_tokens` reads its prompt through. GUIDE §3.2 has the Anima command.
-- `--draft-model` merges a drafter here; the engine refuses the flag. The drafter's tensors go in
-  under a `draft.` prefix and its config under `draft.` keys. It has no embedding and no `lm_head`
-  of its own; it uses the target's.
+- `--draft-model` merges a drafter here; the server's `draft-model` key refuses and names this.
+  The drafter's tensors go in under a `draft.` prefix and its config under `draft.` keys. It has
+  no embedding and no `lm_head` of its own; it uses the target's.
 - `--imatrix` supplies the expert-popularity profile the placement planner ranks units by, hands
   each quantiser its weight's column importances, and weights the error report.
 - `calib=DIR` (`gptq`, `awq`, `autoround`, `paroquant`) is a directory an engine run wrote with
@@ -305,12 +339,38 @@ rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
 - `autoround` and `paroquant` are slow. AutoRound's 200 default steps each cost N·K² multiply-adds;
   on a 16-core Zen 5 at about 2.5 TFLOP/s that is minutes for a 17408-wide down projection and
   most of a working day for a 27B dense model. `iters=50` takes a quarter of the time.
+- `--gpu-workers N` separates small trellis GPTQ jobs from other converter jobs: N OpenMP
+  workers prefer the trellis queue and the rest prefer the host/copy queue; workers steal from the
+  other queue once their own is empty. It requires `--gpus`, at most one worker per listed card, and at least one remaining host worker,
+  e.g. `OMP_NUM_THREADS=8 rad-convert ... --gpus 0 --gpu-workers 4`. Large jobs retain their
+  existing scheduling. The option can reduce starvation but cannot guarantee card utilization:
+  Hessian preparation, storage, CPU work and the last few jobs may still leave cards idle.
+- `--reuse-only` requires `--reuse` without `--in-place` and refuses a selected, non-deferred
+  weight unless one of the supplied containers matches its encoding, quantiser, options, shape and
+  expert slot. It is useful for assembling verified partial containers without silently
+  quantising a missing weight. `--plan-only` stops before matching reusable weights; it is not a
+  reuse-only completeness check.
 - `--reuse` / `--in-place` match a weight on its encoding, quantiser, options and shape, not on its
   source bytes, and carry whatever calibration made the old planes. Use `--reuse` only when the
   source and the calibration are the same, or name the changed source tensors with `--changed`.
   `--in-place` writes new weights past the container's end and the header last; it refuses to
-  change a weight the container holds or to add an expert, and keeps the old header and length in
-  `<file>.pre-append`.
+  add an expert to a layer whose experts it keeps, and keeps the old header and length in
+  `<file>.pre-append`. A weight the container holds under another encoding or rule is refused
+  unless a `--replace GLOB` names it: it is then written again past the end and its old planes stay
+  in the file as unreachable bytes, which a conversion to a new file with `--reuse` drops. A
+  layer's experts sit in one stride table, so when any of them is written again the layer's others
+  move with it, their planes copied as they are: one projection of a layer can be requantised
+  without the other. `rad-info --unreferenced` lists the bytes left behind, and
+  `fallocate --punch-hole` over those ranges gives their disk back while the file keeps its length.
+  A further `--reuse` container supplies the planes of a replaced weight it holds as the recipe now
+  states it, so a projection can be taken from another container without converting it again.
+  This is how a few weights of a container larger than the free disk are requantised.
+- `--defer GLOB` leaves weights out of the container, and their checkpoint tensors unread. A
+  checkpoint larger than the disk converts in pieces this way: the first run defers every layer
+  whose tensors are not there yet, and each `--in-place` run after it, with the same recipe and a
+  shorter `--defer` list, appends the layers that have arrived (a layer's experts as one whole
+  table). The disk then holds the container and one piece of the checkpoint at a time. A container
+  with weights left out does not load.
 
 ---
 
@@ -359,7 +419,7 @@ tuned `.rad` loads with the same serve line as the stock one.
    embedding has rows is refused.
 2. **The recipe** comes from the image (`/opt/radiance/share/radiance/recipes`, copied out once
    per image) or from the installed `rad-convert`'s `share/radiance/recipes`. `auto` matches the
-   base model's name against each recipe's header; when several fit (a bf16 and an fp8 recipe of
+   base model's name against each recipe's header; when several fit (a bf16 and an IQ8R recipe of
    the same model), it names them and asks. The recipe's own usage line supplies the `--set` keys
    and says whether a drafter is merged.
 3. **rad-convert runs on the CPU.** It opens no GPU, so it is safe beside a running serve. Under
@@ -369,15 +429,15 @@ tuned `.rad` loads with the same serve line as the stock one.
 ```bash
 rad-export ~/outputs/my-run/checkpoint-400 --dry-run            # what it would run
 rad-export ~/outputs/my-run/checkpoint-400                      # adapter -> my-run-checkpoint-400.rad
-rad-export ~/exports/merged -o ~/models/mine.rad --recipe q38-27b-fp8block-df2 --draft ~/Qwen3.8-27B-DFlash2
+rad-export ~/exports/merged -o ~/models/mine.rad --recipe q38-27b-iq8r-rtn --draft ~/Qwen3.8-27B-DFlash2
 ```
 
 `~/.config/rad-export/config.json` (or `--config`) pins what auto cannot know -- every key optional:
 
 ```json
 {"image": "stilldeadcode/radiance", "out_dir": "~/models/rad",
- "recipes": {"Qwen3.8-27B": "q38-27b-fp8block-df2"},
- "drafts":  {"q38-27b-fp8block-df2": "~/models/Qwen3.8-27B-DFlash2"},
+ "recipes": {"Qwen3.8-27B": "q38-27b-iq8r-rtn"},
+ "drafts":  {"q38-27b-iq8r-rtn": "~/models/Qwen3.8-27B-DFlash2"},
  "bases":   {"Qwen/Qwen3.8-27B": "~/models/Qwen3.8-27B"}}
 ```
 
@@ -570,7 +630,7 @@ section says how with the calibration it was checked against (`tools/kbench_time
 | `--max-ctx N` | the deepest context considered: declare runs at it and the attention sweep builds to it (default: the checkpoint's training context for declare, 16384 for the sweep). Attention is swept over depth as well as query length |
 | `--max-tok N` | the `max_tok` declare runs at (default 512, small on purpose) |
 | `--mm-max-patches N` | the encoder pass declare runs at, so a media tower's kernels are in the graph (default 2048, rounded to whole output rows, when the container carries an encoder; 0 leaves it out) |
-| `--kv-cache-dtype T` | `bf16` or `fp8`, the cache width declare runs at, as on the engine (default bf16) |
+| `--kv-cache-dtype T` | `bf16` or `i8`, the cache width declare runs at, as on the engine (default bf16) |
 | `--num-speculative-tokens N` | draft depth to declare at (default: the container's own); puts the drafter's kernels in the checked graph |
 | `--max-cases N` | runs per distinct (op, kernel, library, domain, geometry, operand shapes); 0 means every one (default 4) |
 | `--max-bytes MIB` | skip a case whose operands would need more than this, by name (default: half the memory available at start, at most 8192 and at least 512) |
@@ -744,22 +804,24 @@ serves fails in either case: the selector would resolve to it and the step would
 ## r4d_selftest
 
 ```
-r4d_selftest <libr4d.so> [--case <row>]
-r4d_selftest <libr4d.so> --perf N K M [iters]      (and the other --perf* modes in its usage text)
+r4d_selftest <libr4d.so> [--case <row>] [--jobs N]
+r4d_selftest <libr4d.so> --perfmxd N K M [iters]   (and the other --perf* modes in its usage text)
 ```
 
 With no mode it runs libr4d's catalogue and static checks, then each row's smoke and numeric cases
 in a child process of its own, the fusion claims compared byte for byte (ctest runs it as
 `r4d_selftest`, labels `slow`, `gpu`); `--case` runs one row in this process, as the reproducer.
+The children run `--jobs` at a time on each card (6 by default; at 8 the cards run out of SDMA queues), each seeing every card with its own
+first; a row that fails or crashes there runs again alone, and only that run counts. `--jobs 0` runs
+every row alone. The run ends with its wall time and its slowest rows.
 The `--perf*` modes time rows at one shape on a card. Two that cover the dense GEMMs:
 
 | | |
 |---|---|
-| `--perf N K M [iters]` | the fp8 decode GEMMs, and the fp8 head (`logits_gemm_fp8`) |
-| `--perfmxd N K M [iters]` | the dense OCP-MXFP4 rows (`gemm_mxfp4a8_gemv`, `_decode`, `_nt_m64`, `_tiled`) at one shape, with the weight bandwidth each reaches; at a gate_up shape (N a multiple of 256, K of 128, M up to 64) also the ops after the GEMM, `gated_quant_fp8` (SwiGLU) and `gelu_mul` + `quant_act_fp8` (GeGLU), and the fold that replaces them at both activations, `gemm_mxfp4a8_gated_gemv` (M ≤ 8) or `_gated_gemv_wide` (9..64) |
+| `--perfiqr N K M B [iters]` | the IQR row over a B-bit V4 trunk form (B + 10: the head-fed form, a bf16 scale a (row, 128)), then `--perfmxd`'s rows |
+| `--perfmxd N K M [iters]` | the dense OCP-MXFP4 rows (`gemm_mxfp4a8_gemv`, `_decode`, `_nt_m64`, `_tiled`) at one shape, with the weight bandwidth each reaches; at a gate_up shape (N a multiple of 256, K of 128, M up to 64) also the ops after the GEMM, `gated_quant_fp8` (SwiGLU) and `gelu_mul` + `quant_act_fp8` (GeGLU) |
 
-`--perfmx` is the MXFP4 expert GEMM (`M`, experts, `top_k`, skew), not the dense rows. `--cold MIB`
-times each launch alone behind a cache flush instead of back to back.
+`--cold MIB` times each launch alone behind a cache flush instead of back to back.
 
 ---
 
@@ -791,23 +853,65 @@ so the tool can gate a change.
 
 ---
 
-## The KL mode
+## rad-yaml
 
 ```
-radiance --model BF16.rad ... --kld-record DIR --kld-corpus CORPUS.jsonl    the reference, once
-radiance --model QUANT.rad ... --kld-ref DIR [--kld-out REPORT.json]        each candidate
+rad-yaml FLAGS...      print the YAML file these radiance flags configure
+```
+
+```sh
+rad-yaml --model /models/q.rad --tp 2 --port 8000 > radiance.yaml
+radiance --config radiance.yaml
+```
+
+The server reads only a YAML file (GUIDE.md §4, MULTIMODEL.md §4). `rad-yaml` takes a command line
+in the flag form earlier releases accepted and prints the equivalent file: `server:` and
+`memory:` keys at their levels, everything else under one entry in `models:`, named by
+`--served-model-name` or else by the container's file name without its extension. `-v` and `-vv`
+become `server.log: debug` and `trace`, switches become `key: true`, repeated flags a list, and a
+JSON argument a flow mapping. The flags go through the engine's own parser first, so a line the
+server would have refused is refused here with the same message, and the file is loaded back
+before it is printed. The server prints the same file when it is started with flags. It is built
+into the build's `bin/`; `scripts/radiance-flags BIN FLAGS...` uses it to run a server binary from
+a flag list.
+
+---
+
+## The KL mode
+
+```yaml
+# ref.yaml: the reference, once
+models:
+  bf16:
+    model: BF16.rad
+    kld-record: DIR
+    kld-corpus: CORPUS.jsonl
+```
+
+```yaml
+# cand.yaml: each candidate (kld-out optional)
+models:
+  quant:
+    model: QUANT.rad
+    kld-ref: DIR
+    kld-out: REPORT.json
+```
+
+```sh
+radiance --config ref.yaml
+radiance --config cand.yaml
 ```
 
 Measures how far a quantised model is from the one it was quantised from, as the distribution of
 the per-position KL(P_bf16 || Q_quant) over the whole vocabulary: mean, median, 99th, 99.9th and
 99.99th percentiles and maximum, top-1 agreement (the candidate's argmax is the reference's), and
 both models' perplexity on the corpus's own next tokens, overall and per source. It is a mode of
-the engine, like `--debug-graph`: it starts as a serve would, with the same placement and kernels,
+the engine, like `debug-graph`: it starts as a serve would, with the same placement and kernels,
 runs the corpus through prefill instead of listening, and exits.
 
-The reference is computed once. `--kld-record` writes the bf16 model's log-probabilities at every
+The reference is computed once. `kld-record` writes the bf16 model's log-probabilities at every
 scored position to DIR (f16 over the whole vocabulary, the 16 most likely tokens exactly, and the
-tokens themselves). `--kld-ref` runs a candidate over those stored tokens and scores its own f32
+tokens themselves). `kld-ref` runs a candidate over those stored tokens and scores its own f32
 logits against the stored rows, so a candidate costs one prefill of the corpus. DIR is never
 overwritten, and is read only once its `kld.json` exists, which the recording writes last.
 
@@ -821,44 +925,49 @@ needs many positions: the 99.99th percentile of 83K positions rests on eight of 
 The mode changes these settings itself:
 
 - Speculation and the prefix cache are off: a drafter writes no scored row, and a prefix hit would
-  skip positions the reference holds. An explicit `--num-speculative-tokens` above 0 is refused.
+  skip positions the reference holds. An explicit `num-speculative-tokens` above 0 is refused.
 - The step pipeline is off, since the scored rows are copied off the cards after the step.
 - The logits buffer holds a row for every token of a step (`RadBuildCtx::max_out_rows`). At
-  `--max-num-batched-tokens 4096` with a 248320-token vocabulary over two ranks that is about
+  `max-num-batched-tokens: 4096` with a 248320-token vocabulary over two ranks that is about
   2 GiB per rank, plus the same in pinned host memory.
 
-Everything else comes from the command line: run every candidate with the same flags, and the
+Everything else comes from the model's entry: run every candidate with the same keys, and the
 reference with the exact wire and a bf16 KV cache.
 
-A loaded control vector is applied at the deployment's default: `--control-vector on` scores every
-document with the projection, `--control-vector off` without it.
+A loaded control vector is applied at the deployment's default: `control-vector: on` scores every
+document with the projection, `control-vector: off` without it.
 
 **The sparse reference.** A full row is the vocabulary in f16, so ten million positions of a
-248K-token vocabulary would be 5 TB. `--kld-record DIR --kld-top N` keeps, per position, the `N`
+248K-token vocabulary would be 5 TB. `kld-record: DIR` with `kld-top: N` keeps, per position, the `N`
 most likely tokens exactly (f32 log p) and the mass of every other token, summed from the full row
 (one minus the head would cancel to noise on a confident position): 8 bytes a token, 4 KiB a
-position at `N` = 512. `--kld-ref` reads the form from the manifest and scores the KL between the
+position at `N` = 512. `kld-ref` reads the form from the manifest and scores the KL between the
 two distributions coarsened to the reference's `N` tokens and one bucket for the rest. By the
 data-processing inequality that is at most the full KL; it loses only how each model spreads the
 tail inside the bucket, which is small where the reference's tail mass is small and nothing on a
 confident position. The report's `ref_form` says which form a number was scored against, and
 numbers from the two forms do not compare.
 
-`--kld-out FILE` writes the report as JSON, and every position's KL, both NLLs and the argmax
+`kld-out: FILE` writes the report as JSON, and every position's KL, both NLLs and the argmax
 agreement to `FILE.rows` (`[positions, 4]` f32, reference row order), so two candidates can be
 compared position by position.
 
-A runtime LoRA adapter (GUIDE.md §4.9.1) is scored the same way: `--lora NAME=DIR --kld-lora NAME`
+A runtime LoRA adapter (GUIDE.md §4.9.1) is scored the same way: `lora: {NAME: DIR}` with `kld-lora: NAME`
 runs every document through the adapter, against a reference recorded from the merged checkpoint
-(or from PEFT itself). `--kld-lora-sources PREFIX` runs only the documents whose `source` starts
+(or from PEFT itself). `kld-lora-sources: PREFIX` runs only the documents whose `source` starts
 with `PREFIX` through it and the rest as the base, in the same steps. The steps are those of the
-all-adapter and all-base runs with the same flags, so each document's rows should be byte for byte
+all-adapter and all-base runs with the same keys, so each document's rows should be byte for byte
 theirs: that is how a mixed batch is checked.
 
 ## The calibration mode
 
-```
-radiance --model BF16.rad ... --calib-corpus CORPUS.jsonl --calib-dir DIR [--calib-layers LO:HI]
+```yaml
+models:
+  bf16:
+    model: BF16.rad
+    calib-corpus: CORPUS.jsonl
+    calib-dir: DIR
+    calib-layers: LO:HI      # optional
 ```
 
 Records GPTQ's Hessian, `H = sum over tokens of x x^T`, of the whole input of every linear in a
@@ -869,17 +978,17 @@ flight, its own included, fit the KV pool at once, so none is preempted (a re-pr
 its tokens twice), and a run that preempts all the same fails. The corpus is the KL mode's JSONL;
 only `prompt` is read.
 
-`--calib-dir` beside `--kld-record` (no `--calib-corpus`) records both in one run: the reference
-over `--kld-corpus`, and the Hessians over the same tokens, fed the same way.
+`calib-dir` beside `kld-record` (no `calib-corpus`) records both in one run: the reference
+over `kld-corpus`, and the Hessians over the same tokens, fed the same way.
 
 Under tensor parallelism a linear split by its input columns (`o_proj`, the delta net's
 `out_proj`, `down_proj`) sees only its rank's columns, and a Gram of those is one diagonal block
 of H. The tap gathers such an input to its whole width before taking the Gram, so the files hold
-the whole matrix at any `--tp`. One rank records each layer (layer modulo the rank count): its card
+the whole matrix at any `tp`. One rank records each layer (layer modulo the rank count): its card
 sums a step's rows into an f32 scratch (`gram_accum`, upper triangle only), and the host adds the
 step's sum into an accumulator of the packed upper triangle. The host holds every recorded input of
 its rank, 786 MB a layer at Qwen3.8-27B (50 GB for 64 layers), so a large model is recorded in
-several runs over the same corpus, each with its own `--calib-layers`; the run whose range ends at
+several runs over the same corpus, each with its own `calib-layers`; the run whose range ends at
 the last layer also records the lm_head's input.
 
 The files, written once the corpus is through: `DIR/<checkpoint prefix>.<layer>.<site>.safetensors`
@@ -888,12 +997,68 @@ after row `i-1`'s), with metadata `k`, `rows` and `linears`, the checkpoint line
 input (q, k and v share one; so do gate and up). H is the raw sum: divide by `rows` for the mean
 second moment.
 
+`qwen4exp` (Qwen3.8-Flash-Next) records its trunk the same way: two inputs a layer, the mixer's (the
+delta net's in projection, or q, k and v) and its output projection's, in files named by the
+container's weights (`blk.<layer>.ssm_inz.input`, `.ssm_out.input`, `.attn_qkv.input`,
+`.attn_output.input`), whose `linears` are the weight names a recipe's rules match. A bf16
+container is recorded at any `tp`; an int8 trunk at `tp: 1` from the codes its GEMMs read, with a
+`domain` in the metadata when those are rotated. Its routed experts' Grams are the older tap's
+(`RADIANCE_CALIB_DIR`, `RADIANCE_CALIB_TOKENS` set to the corpus's token count), which the same
+run fills. The quantisers read `gram.r<rank>.<weight>.bin`; a file here is that matrix once its
+triangle is mirrored.
+
 ```python
 import numpy as np, safetensors.numpy as st
 t = st.load_file("model.language_model.layers.3.mlp.down_proj.input.safetensors")["hessian_upper"]
 k = int((np.sqrt(8 * t.size + 1) - 1) / 2)
 H = np.zeros((k, k), np.float32); H[np.triu_indices(k)] = t; H = H + np.triu(H, 1).T
 ```
+
+---
+
+## The diagnose mode
+
+```yaml
+# diag.yaml: the model's own keys, plus the mode
+models:
+  quant:
+    model: M.rad
+    diagnose: DIR
+```
+
+```sh
+radiance --config diag.yaml        # the workload, the report, and the exit code
+```
+
+Runs a fixed workload on the engine instead of serving it — decode by prompt category, a
+concurrency sweep, a prefill sweep with decode at each depth, and a prompt arriving into running
+streams — and writes `DIR/diagnose.json` and `DIR/diagnose.md`: step times and their spread, tokens
+a step, draft positions drafted and accepted, TTFT, per-token emission intervals and jitter, per
+request and per phase, with the machine and the settings it ran under. It starts as a serve would
+(same placement, same kernels, same prefix cache) and exits, so it can be run on every candidate
+build and compared.
+
+| key | default | |
+|---|---|---|
+| `diagnose: DIR` | — | run the workload and write the report to DIR; `diagnose.json` is the whole report, `diagnose.md` reads it |
+| `diagnose-tokens: N` | 256 | tokens a decode stream generates |
+| `diagnose-runs: N` | 3 | measured runs of each point, after one unmeasured; median and spread are reported |
+| `diagnose-concurrency: LIST` | 1,2,4,8 | stream counts of the concurrency sweep; a count above `max-num-seqs` is skipped and reported |
+| `diagnose-prefill: LIST` | 1024,4096,16384,65536 | prompt lengths of the prefill sweep, in tokens; a length the context cannot hold is skipped and reported |
+| `diagnose-corpus: FILE` | built-in | JSONL, one `{"category", "messages" or "prompt", "max_tokens"?}` a line: code, reasoning, prose, json, file_edit, summarization |
+| `diagnose-baseline: FILE` | — | an earlier `diagnose.json` of the same workload: compare every request's tokens with it and fail the run on any difference |
+
+Every prompt is salted so the prefix cache serves none of it, the cache is emptied before every
+run, and each request's cached-token count is checked afterwards: a hit, or step records the ring
+overwrote before they were read, makes the verdict `NOT A MEASUREMENT` and the exit code non-zero.
+Requests run at temperature 1 with the server's top_k/top_p/min_p and a fixed seed per request, so
+two builds of the same model are compared token for token. `diagnose` is a mode of the engine
+like `kld-ref`: it cannot be combined with the KL keys, `calib-corpus` or `debug-graph`, and the
+file names one model. `diagnose-corpus` and `diagnose-baseline` need it.
+
+The report says in `not_measured` what it does not cover — per-kernel device time, placement and
+link counters per phase, op correctness over a step window, and the HTTP path. What the numbers
+mean, what makes a run a measurement and what is still missing: [DIAGNOSE.md](DIAGNOSE.md).
 
 ---
 
@@ -924,11 +1089,11 @@ Which ones stop a running server:
 
 | | knobs |
 |---|---|
-| `mcserve.sh` | MiniCPM5-2B + DSpark drafter (`minicpm5-2b-dspark.v2.rad`), left running. `P` `TP` `MLEN` `SEQS` `M` `KVD` `HR` `MNBT` `EXTRA` `EXTRA_ENV` |
+| `mcserve.sh` | MiniCPM5-2B IQ8R + DSpark drafter (`minicpm5-2b-iq8r.rad`), left running. `P` `TP` `MLEN` `SEQS` `M` `KVD` `HR` `MNBT` `EXTRA` `EXTRA_ENV` |
 | `fnserve.sh` | Qwen3.8-Flash-Next, the production container `w4nl64-i8lm.rad`, left running. `P` `TP` `MLEN` `SEQS` `M` `NS` `HOSTPOOL` `KVD` `HR` `MNBT` `WIRE` `KVHOST` `EXTRA` `EXTRA_ENV` |
 | `fnstop.sh` | stops whichever is running and waits for the process to exit |
 | `convdspark.sh`, `convfn.sh` | rebuild the containers those two serve; the reference conversions. `convfn.sh` needs `CALIB=<dir>`: the production recipe's expert rule runs GPTQ against the calibration Grams there |
-| `hfget.sh` | fetch a checkpoint from Hugging Face with `curl` and `jq`. Resumable; a file changed at the same size is fetched again (`.hfget-manifest`). `radiance --model <owner/name>` runs it too |
+| `hfget.sh` | fetch a checkpoint from Hugging Face with `curl` and `jq`. Resumable; a file changed at the same size is fetched again (`.hfget-manifest`). a server whose `model` is `<owner/name>` runs it too |
 
 ```sh
 scripts/fnserve.sh                             # defaults: port 8100, tp 2, 200K ctx

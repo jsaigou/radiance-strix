@@ -47,6 +47,7 @@
 // boundary early). Each split's partial is converted to absolute units before it is written,
 // since splits end in different blocks.
 #include "r4d.h"
+#include "r4d_keyed.h"
 #include "r4d_gemm_args.h"
 #include "r4d_common.h"
 #include "r4d_mxfp4.h"
@@ -488,39 +489,11 @@ void r4d_gemm_mxfp4a8_decode1_kernel(
 namespace {
 // The arrival counters, one block per output buffer (see the header). They cannot live in the
 // scratch, which other ops overwrite, because they must be zero at entry. One allocation per
-// (device, output), kept zero by the reducer and never freed (a recorded pass replays the
-// pointer), as gemm_fp8a8_nt_m16's split_ctr.
+// (device, output), kept zero by the reducer and freed only with the output's memory (a recorded
+// pass replays the pointer; r4d_keyed.h), as gemm_fp8a8_nt_m16's split_ctr.
 unsigned* mxd_out_ctr(const void* out) {
-  static std::mutex mu;
-  static std::map<std::pair<int, const void*>, unsigned*> blocks;
-  int dev = 0;
-  if (hipGetDevice(&dev) != hipSuccess) return nullptr;
-  const auto key = std::make_pair(dev, out);
-  {
-    // Not held while the block is made, as in split_ctr (r4d_gemm_fp8a8.hip): the zeroing waits
-    // for the card.
-    std::lock_guard<std::mutex> lk(mu);
-    if (auto it = blocks.find(key); it != blocks.end()) return it->second;
-  }
-  const size_t n = R4D_MXD_MAX_N / (R4D_MXD_DWN * 16);
-  unsigned* p = nullptr;
-  if (hipMalloc((void**)&p, n * sizeof(unsigned)) != hipSuccess) return nullptr;
-  // Zero before any launch reads it. In the engine hipMemset is the AQL backend's and has finished
-  // when it returns (core/device/aql.cpp); under HIP's own runtime (r4d_selftest) it runs on the
-  // null stream, which a non-blocking stream does not wait for, so wait here.
-  if (hipMemset(p, 0, n * sizeof(unsigned)) != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
-    (void)hipFree(p);
-    return nullptr;
-  }
-  unsigned* kept = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(mu);
-    const auto [it, fresh] = blocks.emplace(key, p);
-    if (fresh) return it->second;
-    kept = it->second;
-  }
-  (void)hipFree(p);  // another thread made this key's block in the meantime
-  return kept;
+  return r4d::keyed_block(r4d::Keyed::MxDecode, nullptr, out,
+                          (size_t)(R4D_MXD_MAX_N / (R4D_MXD_DWN * 16)) * sizeof(unsigned));
 }
 
 // The split, slab and load hint for a launch, from M, the shape and the tunables (0 = the rule; see

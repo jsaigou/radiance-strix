@@ -1,6 +1,7 @@
 #include "text/tokenizer_regex.h"
 #include "text/tokenizer_ucd.h"
 #include "rad_internal.h"
+#include "util/simd.h"
 
 #include <algorithm>
 #include <cstring>
@@ -994,6 +995,18 @@ struct TokRegex::Dfa {
     std::vector<uint32_t> start_after;    /* start row after a codepoint of each class */
     bool uses_behind = false;
 
+    /* The same automaton with rows of 128, for the scan: trans_ascii is indexed by the byte
+     * itself, so an ASCII step is one load in the state chain where the class table needs two
+     * (byte -> class, then row + class). Shipped pre-tokeniser patterns determinise to tens of
+     * states, so the byte table is tens of KiB; past the cap it is left empty and the class
+     * tables serve. trans_cls is `trans` re-encoded to rows of 128 for the non-ASCII steps.
+     * State 0 is the dead row in both encodings. */
+    static constexpr uint32_t kAsciiRowsMax = 512;
+    std::vector<uint32_t> trans_ascii;    /* state * 128 + byte -> next state * 128 | kMatch */
+    std::vector<uint32_t> trans_cls;      /* state * ncls + class -> next state * 128 | kMatch */
+    uint32_t              start_text_a = 0;
+    std::vector<uint32_t> start_after_a;
+
     uint8_t  ascii[128];
     std::vector<uint16_t> stage1;         /* cp >> 8 -> block */
     std::vector<uint8_t>  stage2;         /* block * 256 + (cp & 255) -> class */
@@ -1243,6 +1256,28 @@ int TokRegex::compile(std::string_view pattern, std::unique_ptr<TokRegex>* out, 
     d->start_text *= d->ncls;
     for (uint32_t& t : d->start_after) t *= d->ncls;
 
+    /* The byte-indexed copy for the scan (Dfa::trans_ascii), converted once here where the
+     * division back to state ids costs nothing. */
+    if (kernels.size() <= Dfa::kAsciiRowsMax) {
+        const uint32_t ns = (uint32_t)kernels.size(), nc = d->ncls;
+        d->trans_cls.assign((size_t)ns * nc, 0);
+        for (uint32_t s = 0; s < ns; ++s)
+            for (uint32_t c = 0; c < nc; ++c) {
+                const uint32_t t = d->trans[(size_t)s * nc + c];
+                d->trans_cls[(size_t)s * nc + c] =
+                    ((t & ~Dfa::kMatch) / nc) * 128u | (t & Dfa::kMatch);
+            }
+        d->trans_ascii.assign((size_t)ns * 128, 0);
+        for (uint32_t s = 0; s < ns; ++s)
+            for (uint32_t b = 0; b < 128; ++b)
+                d->trans_ascii[(size_t)s * 128 + b] =
+                    d->trans_cls[(size_t)s * nc + d->ascii[b]];
+        d->start_text_a = (d->start_text / nc) * 128u;
+        d->start_after_a.assign(d->start_after.size(), 0);
+        for (size_t c = 0; c < d->start_after.size(); ++c)
+            d->start_after_a[c] = (d->start_after[c] / nc) * 128u;
+    }
+
     std::unique_ptr<TokRegex> re(new TokRegex());
     re->pattern_ = std::string(pattern);
     re->dfa_ = std::move(d);
@@ -1254,10 +1289,29 @@ int64_t TokRegex::match_at(std::string_view text, size_t pos) const {
     const Dfa& d = *dfa_;
     const uint8_t* s = (const uint8_t*)text.data();
     const size_t n = text.size();
-    uint32_t state = pos == 0 || !d.uses_behind ? d.start_text : d.start_after[d.prev_class(s, pos)];
-    const uint32_t* trans = d.trans.data();
     int64_t best = -1;
     size_t q = pos;
+    if (!d.trans_ascii.empty()) {
+        /* Rows of 128: an ASCII byte indexes its transition directly. */
+        uint32_t state = pos == 0 || !d.uses_behind ? d.start_text_a
+                                                    : d.start_after_a[d.prev_class(s, pos)];
+        const uint32_t* ta = d.trans_ascii.data();
+        const uint32_t* tc = d.trans_cls.data();
+        while (q < n) {
+            uint32_t len, t;
+            const uint32_t b = s[q];
+            if (b < 0x80) { t = ta[state + b]; len = 1; }
+            else          { t = tc[(state >> 7) * d.ncls + d.cls_of(decode_canon(s + q, &len))]; }
+            if (t & Dfa::kMatch) best = (int64_t)q;
+            state = t & ~Dfa::kMatch;
+            if (state == 0) return best;
+            q += len;
+        }
+        if (d.eoi_match[state >> 7]) best = (int64_t)n;
+        return best;
+    }
+    uint32_t state = pos == 0 || !d.uses_behind ? d.start_text : d.start_after[d.prev_class(s, pos)];
+    const uint32_t* trans = d.trans.data();
     while (q < n) {
         uint32_t len, cls;
         const uint32_t b = s[q];
@@ -1277,6 +1331,74 @@ void TokRegex::find_iter(std::string_view text, std::vector<TokSpan>& out) const
     /* Oniguruma's iteration as the `onig` crate drives it: search from the end of the previous
      * match for the leftmost position with a match; an empty match exactly at the end of the
      * previous one is skipped by advancing one codepoint and searching again. */
+    if (!dfa_->uses_behind) {
+        /* Fused into one walk: the loop re-enters the DFA at every search position exactly as
+         * the match_at loop below does -- same restarts, same rewalks of a dead run's tail,
+         * same empty-match rule -- without a call and a fresh setup per piece, which at a piece
+         * every few bytes was a visible share of splitting. The tag selects the byte-indexed
+         * table (rows of 128) over the class table (rows of ncls); the state encoding differs,
+         * hence the two instantiations. The decision at each death (or at the end of the text)
+         * is the loop below's, word for word: e is what match_at(pos) would have returned. */
+        const Dfa& d = *dfa_;
+        auto run = [&](auto ascii_tag) {
+            constexpr bool Ascii = decltype(ascii_tag)::value;
+            const uint8_t* s = (const uint8_t*)text.data();
+            const size_t n = text.size();
+            const uint32_t* ta = Ascii ? d.trans_ascii.data() : d.trans.data();
+            const uint32_t start = Ascii ? d.start_text_a : d.start_text;
+            size_t pos = 0;            /* search start */
+            bool have_prev = false;
+            size_t prev_end = 0;
+            uint32_t state = start;
+            int64_t best = -1;         /* match end match_at(pos) would report so far */
+            size_t q = 0;              /* walk position */
+            for (;;) {
+                int64_t e;
+                if (q < n) {
+                    uint32_t len, t;
+                    const uint32_t b = s[q];
+                    if (b < 0x80) {
+                        t = Ascii ? ta[state + b] : ta[state + d.ascii[b]];
+                        len = 1;
+                    } else if (Ascii) {
+                        t = d.trans_cls[(state >> 7) * d.ncls +
+                                        d.cls_of(decode_canon(s + q, &len))];
+                    } else {
+                        t = ta[state + d.cls_of(decode_canon(s + q, &len))];
+                    }
+                    if (t & Dfa::kMatch) best = (int64_t)q;
+                    state = t & ~Dfa::kMatch;
+                    if (state != 0) { q += len; continue; }
+                    e = best;              /* died: match_at(pos) returns here */
+                } else {
+                    const uint32_t sid = Ascii ? state >> 7 : state / d.ncls;
+                    e = d.eoi_match[sid] ? (int64_t)n : best;
+                }
+                if (e >= 0 && !((size_t)e == pos && have_prev && prev_end == pos)) {
+                    out.push_back({ (uint32_t)pos, (uint32_t)e });
+                    have_prev = true;
+                    prev_end = (size_t)e;
+                    if ((size_t)e > pos) {
+                        pos = (size_t)e;
+                        q = pos;
+                        state = start;
+                        best = -1;
+                        continue;
+                    }
+                }
+                if (pos == n) break;
+                uint32_t len;
+                decode_canon(s + pos, &len);
+                pos += len;
+                q = pos;
+                state = start;
+                best = -1;
+            }
+        };
+        if (!d.trans_ascii.empty()) run(std::true_type{});
+        else                        run(std::false_type{});
+        return;
+    }
     const uint8_t* s = (const uint8_t*)text.data();
     const size_t n = text.size();
     size_t pos = 0;
@@ -1391,13 +1513,10 @@ bool utf8_is_canonical(std::string_view str) {
     const size_t n = str.size();
     size_t i = 0;
     while (i < n) {
-        if (i + 8 <= n) {
-            uint64_t w;
-            std::memcpy(&w, p + i, 8);
-            if (!(w & 0x8080808080808080ull)) { i += 8; continue; }
-        }
+        /* ASCII is canonical as it stands: jump to the next non-ASCII byte. */
+        i += simd::first_non_ascii((const char*)p + i, n - i);
+        if (i >= n) break;
         const uint8_t b = p[i];
-        if (b < 0x80) { ++i; continue; }
         if (b < 0xC2) return false;                         /* continuation, or overlong C0/C1 */
         if (b < 0xE0) {
             if (i + 1 >= n || (p[i + 1] & 0xC0) != 0x80) return false;

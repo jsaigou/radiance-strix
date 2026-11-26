@@ -8,7 +8,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
-#include <nlohmann/json.hpp>
+#include "util/json.h"
 
 namespace rad {
 namespace legacy {
@@ -108,7 +108,7 @@ std::string trimmed(const std::string& v) {
 }
 
 size_t read_call(const std::string& s, size_t f, const XmlCallSyntax& x,
-                 std::string* name, nlohmann::ordered_json* args) {
+                 std::string* name, Json* args) {
     const std::string fn_open(x.fn_open), fn_name_end(x.fn_name_end), fn_close(x.fn_close);
     const std::string arg_open(x.arg_open), arg_name_end(x.arg_name_end), arg_close(x.arg_close);
 
@@ -119,7 +119,7 @@ size_t read_call(const std::string& s, size_t f, const XmlCallSyntax& x,
     *name = s.substr(ns, ne - ns);
     if (name->empty() || name->find('<') != std::string::npos) return std::string::npos;
 
-    *args = nlohmann::ordered_json::object();
+    *args = Json::object();
     size_t p = ne + fn_name_end.size();
     while (true) {
         p = skip_ws(s, p);
@@ -215,7 +215,7 @@ size_t toolparse_lift_xml_calls(std::string& s, std::vector<ToolCall>& out) {
         if (!x) { scan = at + 1; continue; }
 
         std::string name;
-        nlohmann::ordered_json args;
+        Json args;
         size_t end = read_call(s, f, *x, &name, &args);
         if (end == std::string::npos) { scan = at + 1; continue; }
         if (wrap != std::string::npos) {
@@ -301,18 +301,18 @@ bool extends(const std::string& sent, const std::string& cand) {
     return cand.size() >= sent.size() && cand.compare(0, sent.size(), sent) == 0;
 }
 
-std::string chunk(const nlohmann::ordered_json& delta) {
-    nlohmann::ordered_json ch;
+std::string chunk(const Json& delta) {
+    Json ch;
     ch["index"] = 0;
     ch["delta"] = delta;
     ch["finish_reason"] = nullptr;
-    nlohmann::ordered_json o;
+    Json o;
     o["id"] = "chatcmpl-legacy";
     o["object"] = "chat.completion.chunk";
     o["created"] = 0;
     o["model"] = "legacy";
-    o["choices"] = nlohmann::ordered_json::array({ ch });
-    return "data: " + o.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace) +
+    o["choices"] = Json::array({ ch });
+    return "data: " + o.dump(-1, ' ', false, Json::error_handler_t::replace) +
            "\n\n";
 }
 
@@ -328,12 +328,12 @@ std::string grow(std::string& sent, const std::string& cand, bool is_final) {
 }
 
 /* A delta carrying call `i`'s function fields. */
-std::string call_chunk(size_t i, const nlohmann::ordered_json& function) {
-    nlohmann::ordered_json e;
+std::string call_chunk(size_t i, const Json& function) {
+    Json e;
     e["index"] = (int64_t)i;
     e["function"] = function;
-    nlohmann::ordered_json d;
-    d["tool_calls"] = nlohmann::ordered_json::array({ e });
+    Json d;
+    d["tool_calls"] = Json::array({ e });
     return chunk(d);
 }
 
@@ -344,13 +344,13 @@ size_t LegacyDeltaStream::push(const std::string& full_text, bool is_final) {
     size_t out = 0;
     const std::string r = grow(reasoning_, p.reasoning, is_final);
     if (!r.empty()) {
-        nlohmann::ordered_json d;
+        Json d;
         d["reasoning_content"] = r;
         out += chunk(d).size();
     }
     const std::string c = grow(content_, p.content, is_final);
     if (!c.empty()) {
-        nlohmann::ordered_json d;
+        Json d;
         d["content"] = c;
         out += chunk(d).size();
     }
@@ -361,14 +361,14 @@ size_t LegacyDeltaStream::push(const std::string& full_text, bool is_final) {
             names_.resize(i + 1);
             args_.resize(i + 1);
             names_[i] = tc.name;
-            nlohmann::ordered_json f;
+            Json f;
             f["name"] = tc.name;
             f["arguments"] = "";
             out += call_chunk(i, f).size();
         }
         const std::string a = grow(args_[i], tc.arguments, is_final);
         if (a.empty()) continue;
-        nlohmann::ordered_json f;
+        Json f;
         f["arguments"] = a;
         out += call_chunk(i, f).size();
     }

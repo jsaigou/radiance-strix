@@ -12,6 +12,8 @@
 #include "r4d_iqr.h"
 #include "r4d_fp8_frag.h"
 #include "r4d_enc.h"
+#include "r4d_hsimd.h"
+#include "r4d_par.h"
 
 #include <algorithm>
 #include <atomic>
@@ -159,6 +161,13 @@ bool classify(const RadEncoding* enc, const char* tr, Form* f, int64_t* entries)
 
 struct Geom { long long N, K, nkb; };
 
+/* tcq_code=mad's value of state `st`: bytesum((st * A + B) mod 2^32 & 0x3F3F3F3F) - 126, the
+ * product from the low 24 bits of each factor (libquant's grid_tcq_mad_values). */
+inline int mad_value(uint32_t st, uint32_t a, uint32_t b) {
+    const uint32_t h = ((st & 0xFFFFFFu) * (a & 0xFFFFFFu) + b) & 0x3F3F3F3Fu;
+    return (int)((h & 0xFFu) + ((h >> 8) & 0xFFu) + ((h >> 16) & 0xFFu) + (h >> 24)) - 126;
+}
+
 int geom(const RadParam* p, int n_p, Geom* g) {
     g->N = r4d_pgeti_or(p, n_p, "N", 0);
     g->K = r4d_pgeti_or(p, n_p, "K", 0);
@@ -242,16 +251,45 @@ inline void put_bits(uint8_t* dst, long long o, uint64_t v, int n) {
     for (int i = 0; i < bytes; ++i) b[i] |= (uint8_t)(v >> (8 * i));
 }
 
-/* Runs f(lo, hi) over [0, n) in parallel chunks. A model's weights relayout at load, gigabytes of
- * them, so the walk is split over the host's cores. */
-template <typename F>
-void par_for(long long n, F f) {
-    const unsigned hc = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
-    const long long per = std::max(1ll, (n + hc - 1) / hc);
-    std::vector<std::thread> th;
-    for (long long lo = 0; lo < n; lo += per) th.emplace_back(f, lo, std::min(n, lo + per));
-    for (std::thread& t : th) t.join();
+using r4d_par::par_for;
+
+/* 16-row tiles a relayout thread takes: about 16 MiB of codes. */
+long long tiles_a_thread(const Form& f, long long K) {
+    return std::max(1ll, ((long long)16 << 20) / std::max(1ll, (long long)(K / 128) * unit_bytes(f)));
 }
+
+/* Bits [o, o + n) of a plane row, n <= 32, read with one unaligned 8-byte load (fewer bytes where
+ * the plane ends within 8 bytes, at `end`). */
+inline uint32_t peek_bits(const uint8_t* row, long long o, int n, const uint8_t* end) {
+    const uint8_t* b = row + (o >> 3);
+    uint64_t w = 0;
+    if (end - b >= 8) std::memcpy(&w, b, 8);
+    else std::memcpy(&w, b, (size_t)(end - b));
+    return (uint32_t)((w >> (o & 7)) & ((1ull << n) - 1ull));
+}
+
+/* Appends fields of up to 32 bits to a byte-aligned stream, a dword at a time. */
+struct BitOut {
+    uint8_t* p;
+    uint64_t acc = 0;
+    int      n = 0;   /* bits held, below 32 between puts */
+    explicit BitOut(uint8_t* at) : p(at) {}
+    void put(uint64_t v, int w) {
+        acc |= v << n;
+        n += w;
+        if (n >= 32) {
+            const uint32_t x = (uint32_t)acc;
+            std::memcpy(p, &x, 4);
+            p += 4;
+            acc >>= 32;
+            n -= 32;
+        }
+    }
+    /* The held bits, a whole number of bytes at a segment's end. */
+    void done() {
+        for (; n > 0; n -= 8, acc >>= 8) *p++ = (uint8_t)acc;
+    }
+};
 
 /* Visits each code of the weight with its row-major position (row r, code column c in the codes
  * plane) and its bit in the stored codes plane: the one definition of r4d_iqr.h's order, walked
@@ -294,24 +332,77 @@ int scalar_value(const Form& f, const Planes& v, int64_t entries, long long r, l
     return 0;
 }
 
+/* The codes in r4d_iqr.h's lane segments. A trellis tile goes to r4d_hsimd::iqr_trellis_tile;
+ * for the other forms, a segment at a time, each of the tile's 16 rows gives a lane its codes
+ * 4l .. 4l + 3 (4/V for a grid) as one field read with a single load, and the segment is written
+ * as a stream of dwords. walk_tile's order, which the unrelayout walks, element
+ * for element: relayout_iqr_test holds the two to each other on every form. A code the form cannot
+ * read (no entry answers it, or its value is outside -127..127) refuses the weight. */
 int weight_relayout(const Form& f, const Geom& g, int64_t entries, const Planes& v, uint8_t* d,
                     int64_t bytes) {
     if (bytes != weight_bytes(f, g.N, g.K) || !v.codes->data) return RAD_E_SHAPE;
-    std::memset(d, 0, (size_t)bytes);
+    /* The segments cover the codes area whole; only what follows it is cleared. */
+    const int64_t cb = codes_bytes(f, g.N, g.K);
+    std::memset(d + cb, 0, (size_t)(bytes - cb));
     std::atomic<int> bad{ RAD_OK };
     const int B = (int)f.bits;
-    par_for(g.N / 16, [&](long long lo, long long hi) {
-        for (long long rt = lo; rt < hi; ++rt)
-            walk_tile(f, g.K, rt, [&](long long r, long long c, long long bit) {
-                const uint32_t code = (uint32_t)get_bits(r4d_enc::row(*v.codes, r), c * B, B);
-                if (f.kind == kSigned || f.kind == kTable || f.kind == kZero) {
-                    const int val = scalar_value(f, v, entries, r, c, code);
-                    if (val < -127 || val > 127) bad = RAD_E_FORMAT;
-                } else if (f.kind == kGrid && (int64_t)code >= entries) {
-                    bad = RAD_E_FORMAT;
+    const bool tr = is_trellis(f.kind);
+    const int per = f.kind == kGrid ? 4 >> f.lv : 4;   /* codes a row gives a lane */
+    const int w = per * B;
+    const uint32_t m = (1u << B) - 1u;
+    const long long rb = rad_dtype_bytes(v.codes->dtype, v.codes->shape[1]);
+    const uint8_t* c0p = (const uint8_t*)v.codes->data;
+    const uint8_t* end = c0p + rb * g.N;
+    const long long ub = unit_bytes(f), lb = lane_bits(f) / 8;
+    /* Which codes refuse, for the forms whose check is the code alone. */
+    std::vector<uint8_t> refuse;
+    if (f.kind == kSigned || f.kind == kTable || f.kind == kGrid) {
+        refuse.assign((size_t)1 << B, 0);
+        for (uint32_t c = 0; c <= m; ++c) {
+            const int val = f.kind == kGrid ? 0 : scalar_value(f, v, entries, 0, 0, c);
+            refuse[c] = f.kind == kGrid ? (int64_t)c >= entries : (val < -127 || val > 127);
+        }
+    }
+    const int zb = f.kind == kZero ? unsigned_bits(v.aux->dtype) : 0;
+    par_for(g.N / 16, tiles_a_thread(f, g.K), [&](long long lo, long long hi) {
+        uint32_t ch[16];
+        int zero[16];
+        for (long long rt = lo; rt < hi; ++rt) {
+            const uint8_t* rows = c0p + rt * 16 * rb;
+            /* A trellis tile is a transpose of its codes, done a unit at a time in vector
+             * registers (r4d_hsimd.h). */
+            if (tr) {
+                r4d_hsimd::iqr_trellis_tile(rows, rb, B, g.nkb, d + rt * g.nkb * ub);
+                continue;
+            }
+            for (long long kb = 0; kb < g.nkb; ++kb) {
+                uint8_t* u = d + (rt * g.nkb + kb) * ub;
+                if (f.kind == kZero)
+                    for (int r = 0; r < 16; ++r)
+                        zero[r] = (int)rad_load_bits(r4d_enc::row(*v.aux, rt * 16 + r), zb, kb);
+                for (int lane = 0; lane < 32; ++lane) {
+                    const long long c = f.kind == kGrid ? (kb * 128 + 4 * lane) >> f.lv : kb * 128 + 4 * lane;
+                    for (int r = 0; r < 16; ++r) ch[r] = peek_bits(rows + r * rb, c * B, w, end);
+                    BitOut o(u + lane * lb);
+                    {
+                        if (!refuse.empty()) {
+                            uint32_t any = 0;
+                            for (int r = 0; r < 16; ++r)
+                                for (int e = 0; e < per; ++e) any |= refuse[(ch[r] >> (e * B)) & m];
+                            if (any) bad = RAD_E_FORMAT;
+                        } else if (f.kind == kZero) {
+                            for (int r = 0; r < 16; ++r)
+                                for (int e = 0; e < per; ++e) {
+                                    const int val = (int)((ch[r] >> (e * B)) & m) - zero[r];
+                                    if (val < -127 || val > 127) bad = RAD_E_FORMAT;
+                                }
+                        }
+                        for (int r = 0; r < 16; ++r) o.put(ch[r], w);
+                    }
+                    o.done();
                 }
-                put_bits(d, bit, code, B);
-            });
+            }
+        }
     });
     if (bad != RAD_OK) return bad;
     uint8_t* aux = d + aux_off(f, g.N, g.K);
@@ -321,17 +412,16 @@ int weight_relayout(const Form& f, const Geom& g, int64_t entries, const Planes&
         const int8_t* t = (const int8_t*)v.aux->data;
         for (long long i = 0; i < n; ++i)
             if (t[i] < -127 && f.kind != kTable) return RAD_E_FORMAT;
-        std::memcpy(aux, t, (size_t)n);
         if (f.kind == kTrellisMad) {
-            /* The kernels compute the values from A and B: the stored table must be that code. */
+            /* The kernels compute the values from A and B, which is all the layout keeps: the
+             * stored table must be that code. */
             if (!v.mad || !v.mad->data) return RAD_E_SHAPE;
             const uint32_t a = ((const uint32_t*)v.mad->data)[0], b = ((const uint32_t*)v.mad->data)[1];
-            for (long long st = 0; st < n; ++st) {
-                const uint32_t h = (((uint32_t)st & 0xFFFFFFu) * (a & 0xFFFFFFu) + b) & 0x3F3F3F3Fu;
-                const int q = (int)((h & 0xFFu) + ((h >> 8) & 0xFFu) + ((h >> 16) & 0xFFu) + (h >> 24)) - 126;
-                if (q != t[st]) return RAD_E_FORMAT;
-            }
-            std::memcpy(aux + n, v.mad->data, 8);
+            for (long long st = 0; st < n; ++st)
+                if (mad_value((uint32_t)st, a, b) != t[st]) return RAD_E_FORMAT;
+            std::memcpy(aux, v.mad->data, 8);
+        } else {
+            std::memcpy(aux, t, (size_t)n);
         }
     } else if (f.kind == kZero) {
         const int zb = unsigned_bits(v.aux->dtype);
@@ -348,7 +438,7 @@ int weight_unrelayout(const Form& f, const Geom& g, int64_t entries, const Plane
     const int B = (int)f.bits;
     const long long rb = rad_dtype_bytes(v.codes->dtype, v.codes->shape[1]);
     std::memset(v.codes->data, 0, (size_t)(rb * g.N));
-    par_for(g.N / 16, [&](long long lo, long long hi) {
+    par_for(g.N / 16, tiles_a_thread(f, g.K), [&](long long lo, long long hi) {
         for (long long rt = lo; rt < hi; ++rt)
             walk_tile(f, g.K, rt, [&](long long r, long long c, long long bit) {
                 put_bits((uint8_t*)v.codes->data + r * rb, c * B, get_bits(s, bit, B), B);
@@ -357,8 +447,16 @@ int weight_unrelayout(const Form& f, const Geom& g, int64_t entries, const Plane
     const uint8_t* aux = s + aux_off(f, g.N, g.K);
     if (f.kind == kTable || f.kind == kGrid || is_trellis(f.kind)) {
         const long long n = f.kind == kGrid ? entries << f.lv : entries;
-        std::memcpy(v.aux->data, aux, (size_t)n);
-        if (f.kind == kTrellisMad && v.mad && v.mad->data) std::memcpy(v.mad->data, aux + n, 8);
+        if (f.kind == kTrellisMad) {
+            /* The table back from the constants the layout kept. */
+            uint32_t ab[2];
+            std::memcpy(ab, aux, 8);
+            for (long long st = 0; st < n; ++st)
+                ((int8_t*)v.aux->data)[st] = (int8_t)mad_value((uint32_t)st, ab[0], ab[1]);
+            if (v.mad && v.mad->data) std::memcpy(v.mad->data, aux, 8);
+        } else {
+            std::memcpy(v.aux->data, aux, (size_t)n);
+        }
     } else if (f.kind == kZero) {
         const int zb = unsigned_bits(v.aux->dtype);
         const long long zr = rad_dtype_bytes(v.aux->dtype, v.aux->shape[1]);
@@ -612,10 +710,11 @@ extern "C" int r4d_rad_relayout_iqr_embed(const RadParam* p, int n_p, int operan
         (v.scale2 && !v.scale2->data))
         return RAD_E_SHAPE;
     uint8_t* d = (uint8_t*)dst;
-    std::memset(d, 0, (size_t)dst_bytes);
     const long long nkb = dim / 128, crow = rad_dtype_bytes(v.codes->dtype, v.codes->shape[1]);
     if (crow != o.codes_row) return RAD_E_SHAPE;
+    /* The codes are copied whole; only what follows them is cleared first. */
     std::memcpy(d, v.codes->data, (size_t)(rows * crow));
+    if (dst_bytes > rows * crow) std::memset(d + rows * crow, 0, (size_t)(dst_bytes - rows * crow));
     uint8_t* aux = d + o.aux;
     if (f.kind == kTable || f.kind == kGrid || f.kind == kTrellis) {
         const long long na = f.kind == kGrid ? entries << f.lv : entries;
@@ -699,13 +798,17 @@ extern "C" int r4d_rad_relayout_iqr_logits(const RadParam* p, int n_p, int opera
     if (dst_bytes != lm_bytes(f, rows, dim) || !v.codes->data || !v.scale->data || !v.aux->data)
         return RAD_E_SHAPE;
     uint8_t* d = (uint8_t*)dst;
-    std::memset(d, 0, (size_t)dst_bytes);
     const long long stride = lm_row(f, dim), cb = dim / 8 * f.bits, nkb = dim / 128;
+    /* Each row written once: its codes, its scales, then the padding cleared; then everything
+     * past the rows, the table's area included. */
+    const long long used = cb + 2 * nkb;
     for (long long r = 0; r < rows; ++r) {
         uint8_t* row = d + r * stride;
         std::memcpy(row, r4d_enc::row(*v.codes, r), (size_t)cb);
         std::memcpy(row + cb, r4d_enc::row(*v.scale, r), (size_t)(2 * nkb));
+        if (stride > used) std::memset(row + used, 0, (size_t)(stride - used));
     }
+    if (dst_bytes > rows * stride) std::memset(d + rows * stride, 0, (size_t)(dst_bytes - rows * stride));
     const int8_t* t = (const int8_t*)v.aux->data;
     for (int64_t i = 0; i < entries; ++i)
         if (t[i] < -127) return RAD_E_FORMAT;
@@ -800,3 +903,69 @@ extern "C" int r4d_rad_unrelayout_iqr_vocab(const RadParam* p, int n_p, int oper
     if (rc != RAD_OK) return rc;
     return r4d_rad_unrelayout_iqr(q, 4, il, enc, sel, src, src_bytes, pl, n);
 }
+
+/* ==================================================================== the routed experts
+ *
+ * moe_gemm_iqr's tables: every entry is one expert's IQR weight, relayouted by the dense hooks at
+ * its class's geometry. The op's class operands (r4d_layout.cpp's moe_view: `w` / `w_scale` at
+ * 2 / 3, the odd class at 6 / 7 with N_odd and K_odd; under four classes 6 .. 11 with N_q and K_q)
+ * are answered as the dense GEMM's weight and scale operands with N and K set to the class's. */
+namespace {
+
+struct MoeParams {
+    RadParam p[32];
+    int      n = 0;
+    int      operand = 0;
+};
+
+int moe_params(const RadParam* p, int n_p, int operand, bool mod4, MoeParams* v) {
+    if (n_p < 0 || n_p > 32 || (n_p > 0 && !p)) return RAD_E_INVAL;
+    v->n = n_p;
+    v->operand = operand;
+    for (int i = 0; i < n_p; ++i) v->p[i] = p[i];
+    if (operand < 6 || operand > (mod4 ? 11 : 7)) return RAD_OK;
+    static const char* const kN[4] = { "N", "N_1", "N_2", "N_3" };
+    static const char* const kK[4] = { "K", "K_1", "K_2", "K_3" };
+    const int q = (operand - 4) / 2;                 /* 6/7 -> 1, 8/9 -> 2, 10/11 -> 3 */
+    v->operand = 2 + (operand & 1);
+    const long long nq = r4d_pgeti_or(p, n_p, mod4 ? kN[q] : "N_odd", -1);
+    const long long kq = r4d_pgeti_or(p, n_p, mod4 ? kK[q] : "K_odd", -1);
+    for (int i = 0; i < n_p; ++i) {
+        if (!v->p[i].key) continue;
+        if (nq > 0 && std::strcmp(v->p[i].key, "N") == 0) v->p[i].ival = nq;
+        if (kq > 0 && std::strcmp(v->p[i].key, "K") == 0) v->p[i].ival = kq;
+    }
+    return RAD_OK;
+}
+
+}  /* namespace */
+
+#define R4D_MOE_IQR_HOOKS(name, mod4)                                                             \
+    extern "C" int r4d_rad_layout_##name(const RadParam* p, int n_p, int operand,                \
+                                         const RadEncoding* enc, const int* sel,                 \
+                                         const RadTensor* pl, int n, RadLayout* out) {           \
+        MoeParams v;                                                                              \
+        const int rc = moe_params(p, n_p, operand, mod4, &v);                                     \
+        return rc != RAD_OK ? rc : r4d_rad_layout_iqr(v.p, v.n, v.operand, enc, sel, pl, n, out); \
+    }                                                                                             \
+    extern "C" int r4d_rad_relayout_##name(const RadParam* p, int n_p, int operand,              \
+                                           const RadEncoding* enc, const int* sel,               \
+                                           const RadTensor* pl, int n, void* dst,                \
+                                           int64_t dst_bytes) {                                  \
+        MoeParams v;                                                                              \
+        const int rc = moe_params(p, n_p, operand, mod4, &v);                                     \
+        return rc != RAD_OK ? rc : r4d_rad_relayout_iqr(v.p, v.n, v.operand, enc, sel, pl, n,    \
+                                                        dst, dst_bytes);                          \
+    }                                                                                             \
+    extern "C" int r4d_rad_unrelayout_##name(const RadParam* p, int n_p, int operand,            \
+                                             const RadEncoding* enc, const int* sel,             \
+                                             const void* src, int64_t src_bytes,                 \
+                                             const RadTensor* pl, int n) {                       \
+        MoeParams v;                                                                              \
+        const int rc = moe_params(p, n_p, operand, mod4, &v);                                     \
+        return rc != RAD_OK ? rc : r4d_rad_unrelayout_iqr(v.p, v.n, v.operand, enc, sel, src,    \
+                                                          src_bytes, pl, n);                      \
+    }
+R4D_MOE_IQR_HOOKS(moe_iqr, false)
+R4D_MOE_IQR_HOOKS(moe_iqr_mod4, true)
+#undef R4D_MOE_IQR_HOOKS

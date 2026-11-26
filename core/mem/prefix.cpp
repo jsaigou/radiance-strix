@@ -14,8 +14,10 @@ namespace rad {
 /* A 128-bit chained mix, not a cryptographic hash: every entry stores its block's token ids and
  * compares them on a hit, so a collision is a miss, and the hash only needs to keep buckets short.
  *
- * splitmix64's finaliser is a 64-bit bijection, so folding one token cannot lose the bits of the
- * previous one (the weakness of a plain multiply-xor chain). */
+ * Four independent lanes fold token pairs in position order. Each lane update is a bijection for
+ * a fixed pair, so no lane loses earlier bits before the final compression; splitmix64 then gives
+ * the two outputs their avalanche. This keeps the serial dependency to one multiply-rotate step
+ * per eight tokens instead of two full splitmix steps per token. */
 static inline uint64_t mix64(uint64_t x) {
     x += 0x9e3779b97f4a7c15ull;
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
@@ -23,33 +25,78 @@ static inline uint64_t mix64(uint64_t x) {
     return x ^ (x >> 31);
 }
 
+static inline uint64_t rotl64(uint64_t x, unsigned r) { return (x << r) | (x >> (64 - r)); }
+
+static inline uint64_t lane_update(uint64_t s, uint64_t w, uint64_t add, uint64_t mul,
+                                   unsigned rot) {
+    return rotl64((s ^ (w + add)) * mul, rot);
+}
+
 std::string BlockHash::str() const { return fmt("%016llx%016llx", (unsigned long long)hi,
                                                 (unsigned long long)lo); }
 
 BlockHash chain_block_hash(const BlockHash& parent, const int32_t* toks, int32_t n,
                            const MMContentKey* mm, int32_t n_mm, int64_t block_begin) {
-    /* The parent seeds both lanes, so identical tokens under a different prefix hash differently. */
-    BlockHash h;
-    h.hi = mix64(parent.hi ^ 0x243f6a8885a308d3ull);
-    h.lo = mix64(parent.lo ^ 0x13198a2e03707344ull);
-    h.hi = mix64(h.hi ^ (uint64_t)block_begin);
+    constexpr uint64_t PHI = 0x9e3779b97f4a7c15ull;
+    const uint64_t bb = static_cast<uint64_t>(block_begin);
+    const uint64_t z = parent.lo ^ rotl64(parent.hi, 27);
+    uint64_t s0 = z + 0x243f6a8885a308d3ull + bb;
+    uint64_t s1 = parent.hi + 0x13198a2e03707344ull + (bb << 1);
+    uint64_t s2 = rotl64(z, 19) ^
+                  (static_cast<uint64_t>(static_cast<uint32_t>(n)) * PHI) ^
+                  0xa4093822299f31d0ull;
+    uint64_t s3 = rotl64(parent.hi ^ 0x082efa98ec4e6c89ull, 43) +
+                  bb * 0xc2b2ae3d27d4eb4full;
 
-    for (int32_t i = 0; i < n; ++i) {
-        uint64_t t = (uint64_t)(uint32_t)toks[i];
-        h.lo = mix64(h.lo ^ t);
-        h.hi = mix64(h.hi + h.lo + t);
+    uint64_t salt = 0x452821e638d01377ull;
+    uint64_t pair_idx = 0;
+    auto fold = [&](uint64_t w) {
+        salt += PHI;
+        switch (pair_idx++ & 3u) {
+            case 0: s0 = lane_update(s0, w, salt, 0xbf58476d1ce4e5b9ull, 23); break;
+            case 1: s1 = lane_update(s1, w, salt, 0x94d049bb133111ebull, 41); break;
+            case 2: s2 = lane_update(s2, w, salt, 0xff51afd7ed558ccdull, 31); break;
+            default: s3 = lane_update(s3, w, salt, 0xc4ceb9fe1a85ec53ull, 53); break;
+        }
+    };
+    auto pack = [&](int32_t i) -> uint64_t {
+        const uint64_t lo = static_cast<uint32_t>(toks[i]);
+        const uint64_t hi = i + 1 < n ? static_cast<uint32_t>(toks[i + 1]) : 0;
+        return lo | (hi << 32);
+    };
+
+    int32_t i = 0;
+    for (; n - i >= 8; i += 8) {
+        salt += PHI;
+        s0 = lane_update(s0, pack(i), salt, 0xbf58476d1ce4e5b9ull, 23);
+        salt += PHI;
+        s1 = lane_update(s1, pack(i + 2), salt, 0x94d049bb133111ebull, 41);
+        salt += PHI;
+        s2 = lane_update(s2, pack(i + 4), salt, 0xff51afd7ed558ccdull, 31);
+        salt += PHI;
+        s3 = lane_update(s3, pack(i + 6), salt, 0xc4ceb9fe1a85ec53ull, 53);
+        pair_idx += 4;
     }
+    for (; i < n; i += 2) fold(pack(i));
 
     /* Fold in overlapping multimodal spans by content hash plus offsets, so different images
      * behind identical placeholder ids never alias (spec §11). */
     const int64_t lo_pos = block_begin, hi_pos = block_begin + n;
-    for (int32_t i = 0; i < n_mm; ++i) {
-        const MMContentKey& m = mm[i];
+    for (int32_t j = 0; j < n_mm; ++j) {
+        const MMContentKey& m = mm[j];
         if (m.tok_end <= lo_pos || m.tok_begin >= hi_pos) continue;
-        h.lo = mix64(h.lo ^ m.hash);
-        h.hi = mix64(h.hi ^ mix64(m.hash + (uint64_t)(m.tok_begin - lo_pos) * 1000003ull
-                                  + (uint64_t)(m.tok_end - lo_pos)));
+        uint64_t w = m.hash + 0x4d4d000000000000ull;
+        w ^= static_cast<uint64_t>(m.tok_begin - lo_pos) * 0xbf58476d1ce4e5b9ull;
+        w = rotl64(w, 29);
+        w ^= static_cast<uint64_t>(m.tok_end - lo_pos) * 0x94d049bb133111ebull;
+        fold(w);
     }
+
+    BlockHash h;
+    const uint64_t a = (s0 ^ rotl64(s1, 17)) + (s2 ^ rotl64(s3, 41));
+    const uint64_t b = (s3 ^ rotl64(s2, 29)) + (s1 ^ rotl64(s0, 53));
+    h.lo = mix64(a ^ bb);
+    h.hi = mix64(b ^ (static_cast<uint64_t>(static_cast<uint32_t>(n)) << 32) ^ pair_idx);
     /* Never let a block hash to zero: a zeroed BlockHash is the chain root and must be unique. */
     if (!h.valid()) h.lo = 1;
     return h;
@@ -171,7 +218,7 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
     per_.clear();
     entry_groups_.clear();
     map_.clear(); lru_.clear();
-    ck_by_prefix_.clear(); ck_by_session_.clear();
+    ck_by_prefix_.clear(); ck_by_session_.clear(); ck_positions_.clear();
     /* set_policy() may override this afterwards. */
     policy_ = make_checkpoint_policy(cfg.checkpoint_policy, checkpoint_interval);
     policy_->set_floor(drafter_floor_);
@@ -300,27 +347,36 @@ std::vector<BlockHash> PrefixCache::chain_all(const std::vector<int32_t>& tokens
     return hs;
 }
 
-/* A snapshot is on the chain when its key equals the chain hash at its position. */
+/* A snapshot is on the chain when its key equals the chain hash at its position. Probe the
+ * positions that hold snapshots, deepest first, and stop at the first chain match: positions are
+ * few (the checkpoint interval's multiples and prompt tails) beside either the snapshot count or
+ * a long chain's blocks, and the resumed snapshot is normally at or near the limit. */
 std::unordered_map<BlockHash, PrefixCache::Ckpt, BlockHashHash>::iterator
 PrefixCache::deepest_ckpt(const std::vector<BlockHash>& hs, int64_t limit) const {
-    auto best = ck_by_prefix_.end();
-    for (auto it = ck_by_prefix_.begin(); it != ck_by_prefix_.end(); ++it) {
+    if (block_size_ <= 0 || limit <= 0 || hs.empty() || ck_positions_.empty())
+        return ck_by_prefix_.end();
+    const int64_t max_pos = std::min(limit, (int64_t)hs.size() * block_size_);
+    for (auto pit = ck_positions_.upper_bound(max_pos); pit != ck_positions_.begin();) {
+        --pit;
+        const int64_t pos = pit->first;
+        if (pos <= 0 || pos % block_size_ != 0) continue;
+        auto it = ck_by_prefix_.find(hs[(size_t)(pos / block_size_ - 1)]);
+        if (it == ck_by_prefix_.end()) continue;
         const Ckpt& c = it->second;
-        if (!c.valid || c.slot < 0 || c.pos <= 0 || c.pos > limit || c.pos % block_size_ != 0 ||
-            c.pos / block_size_ > (int64_t)hs.size())
-            continue;
-        if (best != ck_by_prefix_.end() && c.pos <= best->second.pos) continue;
-        if (hs[(size_t)(c.pos / block_size_ - 1)] != it->first) continue;
-        best = it;
+        if (c.valid && c.slot >= 0 && c.pos == pos) return it;
     }
-    return best;
+    return ck_by_prefix_.end();
+}
+
+void PrefixCache::touch(Entry& e, uint64_t now_ns) const {
+    if (!e.in_lru) return;
+    lru_.splice(lru_.end(), lru_, e.lru);
+    e.used_ns = now_ns;
 }
 
 void PrefixCache::touch(const BlockHash& h, uint64_t now_ns) const {
     auto it = map_.find(h);
-    if (it == map_.end() || !it->second.in_lru) return;
-    lru_.splice(lru_.end(), lru_, it->second.lru);
-    it->second.used_ns = now_ns;
+    if (it != map_.end()) touch(it->second, now_ns);
 }
 
 CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
@@ -337,6 +393,10 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
 
     int64_t matched = 0;
     bool departed = false;              /* the prompt goes on where nothing is cached */
+    /* Entries are node-stable in the map and lookup inserts nothing, so retain the matched ones:
+     * the LRU touch and block copy below would otherwise re-find every block of a long hit. */
+    std::vector<Entry*> matched_entries;
+    matched_entries.reserve((size_t)std::min<int64_t>(n_full, 256));
     for (; matched < n_full; ++matched) {
         auto it = map_.find(hs[(size_t)matched]);
         if (it == map_.end()) { departed = true; break; }
@@ -345,9 +405,10 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
          * the caller may promote and look up again (restorable_from). */
         if (!it->second.in_lru) break;
         if (!same_tokens(it->second, tokens.data() + matched * block_size_)) break;
+        matched_entries.push_back(&it->second);
     }
 
-    if (departed && matched > 0 && map_.find(hs[(size_t)matched - 1])->second.n_children >= 2)
+    if (departed && matched > 0 && matched_entries[(size_t)matched - 1]->n_children >= 2)
         hit.branch_at = (int32_t)(matched * block_size_);
 
     /* Back a full hit off by one entry so one token remains to compute a logit from. */
@@ -376,10 +437,10 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     const uint64_t now = rad_mono_ns();
     /* Deepest first, so the chain's first block is the most recent: under pressure a conversation
      * loses its end before its start, and what is left still hits. */
-    for (int64_t b = matched - 1; b >= 0; --b) touch(hs[(size_t)b], now);
+    for (int64_t b = matched - 1; b >= 0; --b) touch(*matched_entries[(size_t)b], now);
     if (blocks_out)
         for (int64_t b = 0; b < matched; ++b) {
-            const Entry& e = map_.find(hs[(size_t)b])->second;
+            const Entry& e = *matched_entries[(size_t)b];
             for (size_t k = 0, g = 0; g < groups_.size(); ++g)
                 for (int32_t j = 0; j < per_[g]; ++j, ++k)
                     (*blocks_out)[g].push_back(e.blocks[k]);
@@ -434,7 +495,7 @@ int PrefixCache::insert(uint64_t session,
                         const std::vector<int32_t>& tokens,
                         const std::vector<MMContentKey>& mm,
                         const std::vector<std::vector<int32_t>>& blocks,
-                        int64_t n_tokens, const std::string& label) {
+                        int64_t n_tokens, const std::string& label, int32_t lora_slot) {
     if (!enabled_) return RAD_OK;
     if (blocks.size() != groups_.size()) return RAD_E_INVAL;
     if (n_tokens > (int64_t)tokens.size()) return RAD_E_INVAL;
@@ -446,6 +507,11 @@ int PrefixCache::insert(uint64_t session,
 
     std::vector<BlockHash> hs = chain_all(tokens, mm, n_full);
     const uint64_t now = rad_mono_ns();
+    /* The chain's entries, retained as the loop finds or makes them: map nodes are stable
+     * across inserts, so the touch and tier passes below need no second and third find per
+     * block of a long publish. */
+    std::vector<Entry*> entries;
+    entries.reserve((size_t)std::min<int64_t>(n_full, 256));
     for (int64_t b = 0; b < n_full; ++b) {
         const BlockHash& h = hs[(size_t)b];
         auto it = map_.find(h);
@@ -453,12 +519,16 @@ int PrefixCache::insert(uint64_t session,
          * it was published with, wherever it is held: a snapshot deeper in the chain was computed
          * from them, and a recompute in another step shape can round the KV differently. The
          * recomputed blocks go with the request's sequence; a later hit restores the tier copy. */
-        if (it != map_.end() && (it->second.in_lru || has_linear_)) continue;   /* touched below */
+        if (it != map_.end() && (it->second.in_lru || has_linear_)) {
+            entries.push_back(&it->second);
+            continue;   /* touched below */
+        }
         if (it != map_.end()) {
             /* Without snapshots, an off-device entry this request recomputed (a restore that did
              * not fit, or a chain cut short): its blocks become the entry's device copy and the
              * tier copy goes (IdleTiers::rebound). An entry with a promotion in flight is left
              * alone. */
+            entries.push_back(&it->second);
             if (!tiers_ || !tiers_->resident_off_device(h)) continue;
             std::vector<int32_t> mine;
             if (!retain_entry(blocks, b, &mine)) return RAD_E_STATE;
@@ -480,14 +550,15 @@ int PrefixCache::insert(uint64_t session,
         lru_.push_back(h);
         e.lru = std::prev(lru_.end());
         e.in_lru = true;
-        map_.emplace(h, std::move(e));
+        auto ins = map_.emplace(h, std::move(e));
+        entries.push_back(&ins.first->second);
         if (b > 0) {
-            auto p = map_.find(hs[(size_t)b - 1]);
-            if (p != map_.end() && p->second.n_children < 255) ++p->second.n_children;
+            Entry* p = entries[(size_t)b - 1];
+            if (p->n_children < 255) ++p->n_children;
         }
     }
     /* Deepest first, as in lookup: the first block ends most recent. */
-    for (int64_t b = n_full - 1; b >= 0; --b) touch(hs[(size_t)b], now);
+    for (int64_t b = n_full - 1; b >= 0; --b) touch(*entries[(size_t)b], now);
 
     /* The tiers learn the chain only here: insert() is the one call that knows a chain was
      * completed, and the only place every entry's block ids are in hand.
@@ -496,14 +567,11 @@ int PrefixCache::insert(uint64_t session,
      * above kept the cache's blocks, and `blocks` belongs to a sequence about to be freed; the
      * tiers would copy from blocks reassigned to another sequence. */
     if (tiers_ && demotable_) {
-        for (int64_t b = 0; b < n_full; ++b) {
-            auto it = map_.find(hs[(size_t)b]);
-            if (it == map_.end()) continue;
-            tiers_->note_used(hs[(size_t)b], it->second.blocks, now, b);
-        }
+        for (int64_t b = 0; b < n_full; ++b)
+            tiers_->note_used(hs[(size_t)b], entries[(size_t)b]->blocks, now, b);
     }
     /* The session index names no blocks, so it is kept with or without a host copy. */
-    if (tiers_) tiers_->note_session(session, hs, n_tokens, now, label);
+    if (tiers_) tiers_->note_session(session, hs, n_tokens, now, label, lora_slot);
 
     take_over(session, hs, n_full * block_size_);
     return RAD_OK;
@@ -511,19 +579,25 @@ int PrefixCache::insert(uint64_t session,
 
 void PrefixCache::take_over(uint64_t session, const std::vector<BlockHash>& hs,
                             int64_t upto) const {
-    for (auto& kvp : ck_by_prefix_) {
-        Ckpt& c = kvp.second;
-        if (c.session == session || c.pos <= 0 || c.pos > upto || c.pos % block_size_ != 0 ||
-            hs[(size_t)(c.pos / block_size_ - 1)] != kvp.first)
-            continue;
+    if (block_size_ <= 0 || upto <= 0 || hs.empty() || ck_positions_.empty()) return;
+    const int64_t max_pos = std::min(upto, (int64_t)hs.size() * block_size_);
+    /* Only the snapshot whose key is the chain hash at its position is on this chain; probe the
+     * positions that hold snapshots instead of walking every snapshot of every session. */
+    for (auto pit = ck_positions_.begin(); pit != ck_positions_.upper_bound(max_pos); ++pit) {
+        const int64_t pos = pit->first;
+        if (pos <= 0 || pos % block_size_ != 0) continue;
+        auto it = ck_by_prefix_.find(hs[(size_t)(pos / block_size_ - 1)]);
+        if (it == ck_by_prefix_.end()) continue;
+        Ckpt& c = it->second;
+        if (c.session == session || c.pos != pos) continue;
         auto old = ck_by_session_.find(c.session);
         if (old != ck_by_session_.end()) {
-            old->second.erase(std::remove(old->second.begin(), old->second.end(), kvp.first),
+            old->second.erase(std::remove(old->second.begin(), old->second.end(), it->first),
                               old->second.end());
             if (old->second.empty()) ck_by_session_.erase(old);
         }
         c.session = session;
-        ck_by_session_[session].push_back(kvp.first);
+        ck_by_session_[session].push_back(it->first);
     }
 }
 
@@ -722,12 +796,13 @@ int64_t PrefixCache::trim_sparing(int64_t n_entries,
     return done;
 }
 
-int64_t PrefixCache::drop_clean() {
+int64_t PrefixCache::drop_clean(int64_t loan_goal) {
     if (!tiers_ || !kv_) return 0;
     drop_scratch_.clear();
     tiers_->take_clean(&drop_scratch_);
     const uint64_t frees = kv_->seq_frees();
-    if (frees != frees_seen_ || released_) {
+    const bool recheck = frees != frees_seen_ || released_;
+    if (recheck) {
         frees_seen_ = frees;
         released_ = false;
         for (const BlockHash& h : drop_wait_) {
@@ -754,6 +829,53 @@ int64_t PrefixCache::drop_clean() {
         e.in_lru = false;
         ++stats_.drops;
         tiers_->drop_commit(h);
+        ++n;
+    }
+    return n + drop_stragglers(loan_goal, recheck);
+}
+
+/* drop_clean's second half: resident entries with no host copy coming that are stragglers inside
+ * a loan of `loan_goal` tokens. One walk of the resident list, taken only while something is held
+ * above a group's mark, and then when a sequence has freed blocks (`recheck`) or the marks have
+ * moved since the last walk, a second or more ago. */
+int64_t PrefixCache::drop_stragglers(int64_t loan_goal, bool recheck) {
+    if (loan_goal <= 0 || !tiers_->host_on()) return 0;
+    const size_t ng = entry_groups_.size();
+    strag_mark_.assign(2 * ng, 0);
+    bool any = false;
+    for (size_t k = 0; k < ng; ++k) {
+        const int32_t g = entry_groups_[k];
+        const int64_t top = kv_->held_top_blocks(g);
+        const int64_t mark = !kv_->lendable(g) ? INT64_MAX
+                           : std::max(kv_->straggler_mark(g), kv_->live_blocks_at(g, loan_goal));
+        strag_mark_[k] = mark;
+        strag_mark_[ng + k] = top;
+        any = any || top > mark;
+    }
+    if (!any) return 0;
+    const uint64_t now = rad_mono_ns();
+    if (!recheck && (strag_mark_ == strag_seen_ || now - strag_ns_ < 1000000000ull)) return 0;
+    strag_seen_ = strag_mark_;
+    strag_ns_ = now;
+
+    int64_t n = 0;
+    for (auto it = lru_.begin(); it != lru_.end();) {
+        const BlockHash h = *it;
+        auto m = map_.find(h);
+        if (m == map_.end()) { ++it; continue; }
+        Entry& e = m->second;
+        bool above = false;
+        for (size_t k = 0; k < ng && k < e.blocks.size(); ++k)
+            above = above || e.blocks[k] >= strag_mark_[k];
+        if (!above || held_.count(h) > 0 || shared_with_live(e) || !tiers_->no_copy_coming(h)) {
+            ++it;
+            continue;
+        }
+        release_blocks(e);
+        it = lru_.erase(it);
+        tiers_->forget(h);
+        map_.erase(m);
+        ++stats_.evictions;
         ++n;
     }
     return n;
@@ -924,6 +1046,7 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
     c.used = c.made = ++clock_;
     c.used_ns = rad_mono_ns();
     ck_by_prefix_.emplace(prefix, c);
+    ++ck_positions_[pos];
     ck_by_session_[session].push_back(prefix);
     /* A save target until committed: a lookup's take_over may index it under another session
      * before the save, where retention run by a later reservation in this step would weigh it by
@@ -953,6 +1076,8 @@ void PrefixCache::retire_ckpt(std::unordered_map<BlockHash, Ckpt, BlockHashHash>
     /* The tiers record the slot for the session view and must stop naming it before it is reused. */
     if (tiers_) tiers_->release_snapshot(it->first);
     if (it->second.slot >= 0) kv_->free_checkpoint(it->second.slot);
+    const auto pit = ck_positions_.find(it->second.pos);
+    if (pit != ck_positions_.end() && --pit->second <= 0) ck_positions_.erase(pit);
     ck_by_prefix_.erase(it);
 }
 

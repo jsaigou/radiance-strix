@@ -13,7 +13,7 @@ TEST(bf16_conversion_preserves_qkv_rows_gate_up_and_tied_head) {
     const std::string ckpt = d / "model";
     REQUIRE(std::filesystem::create_directory(ckpt));
     constexpr int H = 32, Q = 32, K = 16, F = 64, V = 320;
-    nlohmann::ordered_json config = {
+    Json config = {
         {"model_type", "spark2_5"}, {"architectures", {"Spark2_5ForCausalLM"}},
         {"hidden_size", H}, {"num_hidden_layers", 2}, {"num_attention_heads", 4},
         {"num_key_value_heads", 2}, {"head_dim", 8}, {"intermediate_size", F},

@@ -21,6 +21,8 @@ core/plugin/      plugin loader, kernel registry, op schemas, selector, bucket t
 core/build/       the declare phase: builder, weight manifest, buffer plan, graph dump
 core/runtime/     the run phase: RadCtx, rad_issue, the arena
 core/mem/         pools, slab, KV block manager, prefix cache
+core/kvstream/    streamed KV: the host mirror, the VRAM ring and its bring-up (docs/KV-STREAMING.md)
+core/lora/        LoRA adapters loaded beside the base model
 core/sched/       scheduler, RadBatch construction, request lifecycle
 core/place/       placement planner, the mover, the heat engine
 core/sample/      device sampler dispatch, the host reference chain, grammar bitmask
@@ -30,25 +32,36 @@ core/gen/         image generation: the request and the pass driver
 core/format/      the .rad reader and writer, safetensors, recipes, the imatrix, the tune cache
 core/server/      HTTP: the OpenAI, Anthropic and llama-server endpoints, /metrics, the dashboard
 core/diag/        the startup report
-core/kld.*        the KL mode: --kld-record / --kld-ref
+core/fleet/       the YAML file `radiance --config` reads: levels, defaults, the flag table's keys
+core/kld.*        the KL mode: the kld-record / kld-ref keys
 core/engine*      the engine that ties them together; core/main.cpp is the `radiance` binary
 libref/           every op, naively and correctly, host domain: the oracle and last resort
 libr4d/           the RDNA4 (gfx12xx) kernel library: kernels, rows, layouts, fusion claims
+libr3d/           the RDNA3/3.5 (gfx11xx) kernel library
+libhalo/          the Strix Halo (gfx1151) kernel library
 libavx/           the same vocabulary in x86 SIMD, host domain: the production host kernels,
                   built on every x86-64 build because the engine refuses to serve an op that
-                  resolves only to libref (without --debug-accept-reference-kernels)
+                  resolves only to libref (without debug-accept-reference-kernels)
 libquant/         the built-in quantisers rad-convert's recipes name: grids, transforms, rtn, gptq
+plugin/spechub/   the draft-coupling ops (`mtp_couple_propose`, `mtp_couple_verify`, `mtp_trav_verify`,
+                  `dflash_couple_propose`, `draft-coupling: on`): schemas and shapes on the host,
+                  launches on the card and in a host reference
 arch/<id>/        one architecture plugin per directory
-tools/            rad-info, rad-kbench, rad-convert, rad-tune, rad-schemas, rad-tokcheck,
-                  rad-chatparse, rad-gbnf-check
+tools/            rad-info, rad-convert, rad-export, rad-kbench, rad-tune, rad-schemas,
+                  rad-tokcheck, rad-yaml, rad-chatparse, rad-gbnf-check
 cmake/            rad_add_plugin, and the package config an out-of-tree plugin find_package()s
 scripts/          harnesses for serving, tracing and profiling a running engine
+dashboard/        the page the engine serves at `/` (React, built by Vite into
+                  core/server/dashboard_page.h)
+docker/           the image build (`docker/build.sh`) and its licence collection
+deploy/           compose files, chat templates, Grafana dashboards
+integrations/     clients of the HTTP API (ComfyUI nodes)
 data/             kernels.rkb and kernels_moe.rkb: recorded references rad-kbench replays with
                   no model. Two, because no one container declares the whole vocabulary.
                   recipes/: the quantisation recipes of the containers this tree serves
 docs/KERNELS.md   what rad-kbench last measured, generated and checked in
 vendor/           llama.cpp lifts tracked to an upstream commit (vendor/UPSTREAM), changed only
-                  through vendor/patches/; nlohmann/json and cpp-httplib
+                  through vendor/patches/; yyjson and cpp-httplib
 tests/            ctest
 ```
 

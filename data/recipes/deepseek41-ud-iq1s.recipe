@@ -5,11 +5,19 @@
 # own searches (llama.cpp's iq1_s/iq2_xxs procedure, ported in Radiance); iq1_s and iq2_xxs need --imatrix. 251.07 GiB.
 #
 #   data/engram_tables.py <DeepSeek-V4.1-Flash-1017 dir> engram-tables.safetensors   (the release ships none)
+#   data/imatrix_merge.py imatrix_unsloth.gguf_file imatrix-merged.gguf
 #   rad-convert <DeepSeek-V4.1-Flash-1017 dir> --add engram-tables.safetensors \
-#     --recipe data/recipes/deepseek41-ud-iq1s.recipe --imatrix <imatrix.gguf> -o deepseek41-ud-iq1s.rad
+#     --recipe data/recipes/deepseek41-ud-iq1s.recipe --imatrix imatrix-merged.gguf \
+#     --tokenizer <dir>/tokenizer.json --chat-template chat_template.jinja -o deepseek41-ud-iq1s.rad
 #
-# The imatrix is Unsloth's with entries for the fused weights added (data/imatrix_merge.py, docs/deepseek41-hf-direct.md). One rule per weight,
-# experts collapsed per layer; first match wins.
+# engram_tables.py rebuilds the Engram hash tables from the release's tokenizer.json and config.json (0 mismatched
+# ids of 129280 against HF tokenizers). imatrix_merge.py sums Unsloth's split ffn_gate_exps/ffn_up_exps entries
+# (and shexp's) into the fused gate_up weights; iq1_s refuses a fused weight without one. The release names no chat
+# template, so without --chat-template (or override-chat-template at serve time) /v1/chat/completions answers 501.
+# Serving needs the deepseek41 architecture plugin, which this tree does not include. Measured with it on 4x R9700,
+# greedy, thinking off: HumanEval 154/164 (the GGUF UD-IQ1_S 0.963), GSM 194/200 (0.960).
+#
+# One rule per weight, experts collapsed per layer; first match wins.
 # PATTERN  QUANTISER  OPTIONS
 dspark.enc.output_norm.weight  cast  dtype=f32
 dspark.fc.weight  cast  dtype=bf16

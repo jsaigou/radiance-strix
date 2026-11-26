@@ -356,8 +356,10 @@ void IdleTiers::plan_writeback(int64_t max_entries, std::vector<TierJob>* out) {
         RAD_WARN("kv tiers: %lld entries (%lld tokens of context) got no host copy: the host "
                  "tier (--prefix-cache-mib, %s, %lld tokens) is full of context used more "
                  "recently or nearer the start of its conversation. They stay in VRAM only and "
-                 "are prefilled again once VRAM gives them up; a larger --prefix-cache-mib holds "
-                 "more. Counted in /sessions moved.held_back",
+                 "are prefilled again once VRAM gives them up, which it does for a request that "
+                 "needs the room, or where a few of them keep the expert loan from most of the "
+                 "pool; a larger --prefix-cache-mib holds more. "
+                 "Counted in /sessions moved.held_back",
                  (long long)held, (long long)(held * cfg_.block_tokens),
                  humanb(arena_.cap_bytes()).c_str(),
                  (long long)(arena_.capacity() * cfg_.block_tokens));
@@ -373,6 +375,15 @@ void IdleTiers::take_clean(std::vector<BlockHash>* out) {
         out->push_back(k);
     }
     clean_q_.clear();
+}
+
+bool IdleTiers::no_copy_coming(const BlockHash& key) const {
+    std::lock_guard lk(mu_);
+    auto it = recs_.find(key);
+    if (it == recs_.end()) return false;
+    const Rec& r = it->second;
+    if (r.pending || r.doomed || r.tier != KVTier::Device || r.host_slot >= 0) return false;
+    return !r.queued || (wb_stuck_ && arena_.full());
 }
 
 bool IdleTiers::droppable(const BlockHash& key) const {
@@ -544,7 +555,7 @@ static bool chain_extends(const std::vector<BlockHash>& shorter,
 }
 
 void IdleTiers::note_session(uint64_t id, const std::vector<BlockHash>& chain, int64_t n_tokens,
-                             uint64_t now_ns, const std::string& label) {
+                             uint64_t now_ns, const std::string& label, int32_t lora_slot) {
     if (chain.empty()) return;
     std::lock_guard lk(mu_);
 
@@ -581,6 +592,7 @@ void IdleTiers::note_session(uint64_t id, const std::vector<BlockHash>& chain, i
         }
         if (newest) {
             newest->last_used_ns = now_ns;
+            newest->last_lora_slot = lora_slot;
             if (!label.empty()) newest->label = label;
             return;
         }
@@ -588,6 +600,7 @@ void IdleTiers::note_session(uint64_t id, const std::vector<BlockHash>& chain, i
 
     Session& s = sessions_[id];
     s.last_used_ns = now_ns;
+    s.last_lora_slot = lora_slot;
     s.n_tokens = n_tokens;
     s.first_seen_ns = first_seen ? first_seen : now_ns;
     s.chain = chain;
@@ -692,6 +705,7 @@ std::vector<IdleTiers::SessionInfo> IdleTiers::sessions(Occupancy* occ) const {
             si.first_seen_ns = kv.second.first_seen_ns;
             si.label = kv.second.label;
             si.last_used_ns = kv.second.last_used_ns;
+            si.last_lora_slot = kv.second.last_lora_slot;
             si.bytes = (int64_t)kv.second.chain.size() * cfg_.entry_bytes;
             out.push_back(std::move(si));
         }
